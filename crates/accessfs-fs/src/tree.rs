@@ -1,0 +1,143 @@
+use std::collections::HashMap;
+
+use accessfs_core::config::ResolvedConfig;
+use accessfs_core::handler::ContentHandler;
+
+/// Root inode. FUSE convention: root = 1.
+const ROOT_INO: u64 = 1;
+
+pub struct Tree {
+    nodes: HashMap<u64, Node>,
+    by_parent_name: HashMap<(u64, String), u64>,
+    children: HashMap<u64, Vec<u64>>,
+}
+
+pub struct Node {
+    pub parent: u64,
+    pub name: String,
+    pub mode: u16,
+    pub kind: NodeKind,
+}
+
+impl Node {
+    /// Returns a file node's virtual path; directories return an empty string.
+    pub fn virtual_path(&self) -> String {
+        match &self.kind {
+            NodeKind::File(f) => f.virtual_path.clone(),
+            NodeKind::Dir => String::new(),
+        }
+    }
+}
+
+pub enum NodeKind {
+    Dir,
+    File(FileNode),
+}
+
+pub struct FileNode {
+    pub handler: ContentHandler,
+    pub virtual_path: String,
+    /// Stable size reported by getattr. Constant files = exact length; script files = declared upper bound.
+    pub report_size: u64,
+    /// Script (dynamic) files use direct-io to avoid the kernel truncating to attr size / caching across opens.
+    pub direct_io: bool,
+}
+
+impl Tree {
+    /// Build the static inode tree from a resolved config. inodes are assigned sequentially and never reclaimed during the mount.
+    pub fn build(cfg: &ResolvedConfig) -> Self {
+        let mut tree = Tree {
+            nodes: HashMap::new(),
+            by_parent_name: HashMap::new(),
+            children: HashMap::new(),
+        };
+        tree.nodes.insert(
+            ROOT_INO,
+            Node {
+                parent: ROOT_INO,
+                name: String::new(),
+                mode: 0o555,
+                kind: NodeKind::Dir,
+            },
+        );
+        tree.children.insert(ROOT_INO, Vec::new());
+
+        let mut next_ino = ROOT_INO + 1;
+        for entry in &cfg.files {
+            // Ensure each intermediate directory exists, level by level, to get the final parent directory's inode.
+            let mut parent = ROOT_INO;
+            let dirs = &entry.components[..entry.components.len() - 1];
+            for dir_name in dirs {
+                parent = tree.ensure_dir(parent, dir_name, &mut next_ino);
+            }
+
+            // The last component is the file itself.
+            let file_name = entry
+                .components
+                .last()
+                .expect("validated non-empty path")
+                .clone();
+            let (report_size, direct_io) = match (&entry.handler, entry.declared_size) {
+                (ContentHandler::Constant(bytes), _) => (bytes.len() as u64, false),
+                (ContentHandler::Script { .. }, Some(size)) => (size, true),
+                // The resolve stage already guarantees scripts have a size; fall back to 0.
+                (ContentHandler::Script { .. }, None) => (0, true),
+            };
+
+            let ino = next_ino;
+            next_ino += 1;
+            tree.nodes.insert(
+                ino,
+                Node {
+                    parent,
+                    name: file_name.clone(),
+                    mode: entry.mode,
+                    kind: NodeKind::File(FileNode {
+                        handler: entry.handler.clone(),
+                        virtual_path: entry.path.clone(),
+                        report_size,
+                        direct_io,
+                    }),
+                },
+            );
+            tree.by_parent_name.insert((parent, file_name), ino);
+            tree.children.entry(parent).or_default().push(ino);
+        }
+
+        tree
+    }
+
+    /// Returns the inode for the `(parent, name)` directory, creating it if it doesn't exist.
+    fn ensure_dir(&mut self, parent: u64, name: &str, next_ino: &mut u64) -> u64 {
+        if let Some(&ino) = self.by_parent_name.get(&(parent, name.to_string())) {
+            return ino;
+        }
+        let ino = *next_ino;
+        *next_ino += 1;
+        self.nodes.insert(
+            ino,
+            Node {
+                parent,
+                name: name.to_string(),
+                mode: 0o555,
+                kind: NodeKind::Dir,
+            },
+        );
+        self.by_parent_name.insert((parent, name.to_string()), ino);
+        self.children.entry(parent).or_default().push(ino);
+        self.children.entry(ino).or_default();
+        ino
+    }
+
+    pub fn get(&self, ino: u64) -> Option<&Node> {
+        self.nodes.get(&ino)
+    }
+
+    pub fn lookup_child(&self, parent: u64, name: &str) -> Option<u64> {
+        self.by_parent_name.get(&(parent, name.to_string())).copied()
+    }
+
+    pub fn children(&self, ino: u64) -> &[u64] {
+        self.children.get(&ino).map(Vec::as_slice).unwrap_or(&[])
+    }
+}
