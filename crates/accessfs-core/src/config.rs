@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::authz::Enforcement;
 use crate::error::{CoreError, Result};
 use crate::handler::ContentHandler;
 
@@ -12,6 +13,7 @@ use crate::handler::ContentHandler;
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub mount: MountCfg,
+    pub agent: Option<AgentCfg>,
     #[serde(default, rename = "file")]
     pub files: Vec<FileCfg>,
 }
@@ -24,6 +26,12 @@ pub struct MountCfg {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct AgentCfg {
+    /// Override the default agent socket path.
+    pub socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct FileCfg {
     /// Virtual path relative to the mount point, e.g. `env/demo/dev.env`.
     pub path: String,
@@ -33,6 +41,8 @@ pub struct FileCfg {
     pub ttl: Option<String>,
     /// Declared size (upper bound) for script handlers. Required for scripts, ignored for constant files.
     pub size: Option<u64>,
+    /// Enforcement level: `"allow"` (default, monitor), `"deny"`, or `"prompt"`.
+    pub enforcement: Option<String>,
     /// Built-in constant content.
     pub content: Option<String>,
     /// argv for a local script handler.
@@ -45,6 +55,8 @@ pub struct ResolvedConfig {
     pub mount_path: PathBuf,
     pub volname: String,
     pub audit_log: PathBuf,
+    /// Path to the agent's Unix socket (default or config override).
+    pub agent_socket: PathBuf,
     pub files: Vec<FileEntry>,
 }
 
@@ -57,6 +69,8 @@ pub struct FileEntry {
     pub components: Vec<String>,
     pub mode: u16,
     pub ttl: Duration,
+    /// Enforcement level for this file.
+    pub enforcement: Enforcement,
     /// `Some(n)`: declared size upper bound for a script file (reported via direct-io).
     /// `None`: constant file, size determined exactly by its content.
     pub declared_size: Option<u64>,
@@ -91,6 +105,12 @@ impl Config {
 
         let volname = self.mount.volname.unwrap_or_else(|| "AccessFS".to_string());
 
+        let agent_socket = self
+            .agent
+            .and_then(|a| a.socket)
+            .map(|p| expand_tilde(&p))
+            .unwrap_or_else(default_agent_socket);
+
         let mut files = Vec::with_capacity(self.files.len());
         let mut seen = std::collections::HashSet::new();
         for fc in self.files {
@@ -108,6 +128,7 @@ impl Config {
             mount_path,
             volname,
             audit_log,
+            agent_socket,
             files,
         })
     }
@@ -126,6 +147,12 @@ fn resolve_file(fc: FileCfg, base_dir: &Path) -> Result<FileEntry> {
         Some(s) => humantime::parse_duration(s)
             .map_err(|e| CoreError::config(format!("invalid ttl {s:?}: {e}")))?,
         None => Duration::ZERO,
+    };
+
+    let enforcement = match fc.enforcement.as_deref() {
+        Some(s) => Enforcement::parse(s)
+            .ok_or_else(|| CoreError::config(format!("{path}: invalid enforcement {s:?}")))?,
+        None => Enforcement::default(),
     };
 
     let (handler, declared_size) = match (fc.content, fc.read) {
@@ -169,6 +196,7 @@ fn resolve_file(fc: FileCfg, base_dir: &Path) -> Result<FileEntry> {
         components,
         mode,
         ttl,
+        enforcement,
         declared_size,
         handler,
     })
@@ -231,6 +259,14 @@ fn expand_tilde(path: &Path) -> PathBuf {
         }
     }
     path.to_path_buf()
+}
+
+/// Default agent socket: `~/Library/Application Support/floria/agent.sock`.
+fn default_agent_socket() -> PathBuf {
+    let base = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join("Library/Application Support/floria/agent.sock")
 }
 
 fn default_audit_path(mount_path: &Path) -> PathBuf {
@@ -305,6 +341,7 @@ mod tests {
             mode: None,
             ttl: None,
             size: None,
+            enforcement: None,
             content: Some("hi\n".to_string()),
             read: None,
         };
@@ -321,6 +358,7 @@ mod tests {
             mode: None,
             ttl: None,
             size: None,
+            enforcement: None,
             content: None,
             read: Some(vec!["/bin/echo".to_string(), "hi".to_string()]),
         };
@@ -334,6 +372,7 @@ mod tests {
             mode: None,
             ttl: None,
             size: Some(10),
+            enforcement: None,
             content: Some("a".to_string()),
             read: Some(vec!["/bin/echo".to_string()]),
         };

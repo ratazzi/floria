@@ -31,6 +31,42 @@ impl Operation {
     }
 }
 
+/// The enforcement level configured for a path: how strictly its access is gated.
+/// Attached per-file in config; consumed by the policy engine (agent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Enforcement {
+    /// Allow silently, audit only (monitor mode). The default.
+    #[default]
+    Allow,
+    /// Deny outright.
+    Deny,
+    /// Block and ask the user (via the menubar app), subject to the grant cache.
+    Prompt,
+    /// Like `Prompt`, but the user must also pass biometric (Touch ID) to allow.
+    TouchId,
+}
+
+impl Enforcement {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "allow" => Some(Enforcement::Allow),
+            "deny" => Some(Enforcement::Deny),
+            "prompt" => Some(Enforcement::Prompt),
+            "touchid" => Some(Enforcement::TouchId),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Enforcement::Allow => "allow",
+            Enforcement::Deny => "deny",
+            Enforcement::Prompt => "prompt",
+            Enforcement::TouchId => "touchid",
+        }
+    }
+}
+
 /// Authorization decision. The FS only cares about allow/deny; side effects like `notify` are
 /// handled by the authorizer itself and don't belong in this type. `reason`/`rule_id` are for auditing.
 #[derive(Debug, Clone)]
