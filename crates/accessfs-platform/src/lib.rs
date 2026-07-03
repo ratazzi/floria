@@ -1,0 +1,23 @@
+//! Platform-specific process identity forensics. macOS uses libproc + sysctl.
+//!
+//! The only public entry point is [`enrich`]: given the pid/uid/gid from a FUSE
+//! request, it best-effort fills in exe/cmdline/cwd/parent chain and returns a
+//! [`ProcessIdentity`]. Any individual failure just leaves that field `None`;
+//! it never panics and never blocks the caller's `open()`.
+
+use accessfs_core::identity::ProcessIdentity;
+
+#[cfg(target_os = "macos")]
+mod macos;
+
+/// Enrich the process identity. `uid/gid/pid` come from the FUSE request; the rest relies on platform forensics.
+#[cfg(target_os = "macos")]
+pub fn enrich(pid: i32, uid: u32, gid: u32) -> ProcessIdentity {
+    macos::enrich(pid, uid, gid)
+}
+
+/// Fallback for non-macOS platforms: return only the pid/uid/gid known to FUSE.
+#[cfg(not(target_os = "macos"))]
+pub fn enrich(pid: i32, uid: u32, gid: u32) -> ProcessIdentity {
+    ProcessIdentity::bare(pid, uid, gid)
+}
