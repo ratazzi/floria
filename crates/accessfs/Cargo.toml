@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 accessfs-core = { workspace = true }
+accessfs-agent = { workspace = true }
 accessfs-fs = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }

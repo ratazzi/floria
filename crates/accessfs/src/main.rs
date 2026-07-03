@@ -58,7 +58,8 @@ fn cmd_mount(config: &Path) -> Result<()> {
     let cfg = load(config)?;
     std::fs::create_dir_all(&cfg.mount_path)
         .with_context(|| format!("creating mount point {}", cfg.mount_path.display()))?;
-    accessfs_fs::mount(cfg).context("mount failed")
+    let agent = accessfs_agent::SocketAgent::start(&cfg).context("starting agent socket")?;
+    accessfs_fs::mount(cfg, agent).context("mount failed")
 }
 
 fn cmd_unmount(path: Option<PathBuf>, config: &Path) -> Result<()> {
