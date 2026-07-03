@@ -13,9 +13,12 @@ mode = "0444"
 content = "hello from accessfs\nstep-one demo\n"
 
 # Script-handler dynamic file: the script runs on open and its stdout is the content. size is a declared upper bound + direct-io.
+# enforcement gates each open through the menubar app. "prompt" = allow/deny dialog;
+# "touchid" additionally requires Touch ID to allow. Both are subject to the grant cache.
 [[file]]
 path = "env/demo/dev.env"
 mode = "0444"
 ttl  = "0s"
 size = 4096
+enforcement = "touchid"
 read = ["./scripts/render-env", "demo", "dev"]
