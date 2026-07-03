@@ -25,9 +25,11 @@ humantime = "2"
 clap = { version = "4", features = ["derive"] }
 wait-timeout = "0.2"
 ctrlc = "3"
+threadpool = "1"
 sha2 = "0.10"
 chrono = { version = "0.4", features = ["clock"], default-features = false }
 
 accessfs-core = { path = "crates/accessfs-core" }
 accessfs-platform = { path = "crates/accessfs-platform" }
+accessfs-agent = { path = "crates/accessfs-agent" }
 accessfs-fs = { path = "crates/accessfs-fs" }
