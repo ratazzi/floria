@@ -1,0 +1,21 @@
+# AccessFS step-one example config.
+# After mounting: two read-only virtual files appear under ~/.accessfs.
+
+[mount]
+path = "~/.accessfs"
+volname = "AccessFS"
+# audit_log defaults to <name>.audit.jsonl next to the mount point, i.e. ~/.accessfs.audit.jsonl
+
+# Built-in constant demo file: all bytes are known at mount time, so size is exact -- the strongest "plain file" evidence.
+[[file]]
+path = "demo/hello.txt"
+mode = "0444"
+content = "hello from accessfs\nstep-one demo\n"
+
+# Script-handler dynamic file: the script runs on open and its stdout is the content. size is a declared upper bound + direct-io.
+[[file]]
+path = "env/demo/dev.env"
+mode = "0444"
+ttl  = "0s"
+size = 4096
+read = ["./scripts/render-env", "demo", "dev"]

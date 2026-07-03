@@ -1,0 +1,21 @@
+[package]
+name = "accessfs"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "accessfs"
+path = "src/main.rs"
+
+[dependencies]
+accessfs-core = { workspace = true }
+accessfs-fs = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[features]
+# Forwarded to fuser: typecheck-only on machines without macFUSE; do not enable for real mounts.
+macos-no-mount = ["accessfs-fs/macos-no-mount"]
