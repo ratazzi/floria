@@ -8,6 +8,8 @@
 use accessfs_core::identity::ProcessIdentity;
 
 #[cfg(target_os = "macos")]
+mod codesign;
+#[cfg(target_os = "macos")]
 mod macos;
 
 /// Enrich the process identity. `uid/gid/pid` come from the FUSE request; the rest relies on platform forensics.

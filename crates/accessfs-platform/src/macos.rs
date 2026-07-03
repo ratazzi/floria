@@ -15,6 +15,7 @@ pub fn enrich(pid: i32, uid: u32, gid: u32) -> ProcessIdentity {
         tracing::warn!(pid, "pidpath failed; process enrichment degraded");
     }
 
+    let sig = crate::codesign::code_signature(pid);
     ProcessIdentity {
         pid,
         uid,
@@ -23,8 +24,8 @@ pub fn enrich(pid: i32, uid: u32, gid: u32) -> ProcessIdentity {
         cmdline: cmdline(pid),
         cwd: cwd(pid),
         parent_chain: parent_chain(pid),
-        bundle_id: None, // TODO(P1): SecCode / SecStaticCode enrichment
-        team_id: None,   // TODO(P1)
+        bundle_id: sig.bundle_id,
+        team_id: sig.team_id,
     }
 }
 
