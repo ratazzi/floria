@@ -77,5 +77,8 @@ pub fn mount_config(volname: &str) -> fuser::Config {
         // Give slow handlers enough time so the kernel doesn't declare the mount dead.
         MountOption::CUSTOM("daemon_timeout=60".to_string()),
     ];
+    // fuser's event loop is single-threaded on macOS (n_threads > 1 is Linux-only), so a
+    // slow/blocking open() would freeze the whole mount. We keep the event loop free by
+    // running open() work on our own thread pool and replying from there (see lib.rs).
     config
 }

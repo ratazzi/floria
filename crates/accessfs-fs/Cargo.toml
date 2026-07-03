@@ -12,6 +12,7 @@ libc = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 ctrlc = { workspace = true }
+threadpool = { workspace = true }
 
 [features]
 # Typecheck-only on machines without macFUSE: makes fuser skip its pkg-config probe.

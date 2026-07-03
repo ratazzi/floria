@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use accessfs_core::audit::AuditLog;
-use accessfs_core::authz::{AllowAll, AuthRequest, Authorizer, Operation};
+use accessfs_core::authz::{AuthRequest, Authorizer, Operation};
 use accessfs_core::config::ResolvedConfig;
 use accessfs_core::handler::HandlerCtx;
 use accessfs_core::snapshot::SnapshotTable;
@@ -28,27 +28,40 @@ use fuser::{
 use reply::{dir_attr, file_attr, mount_config, TTL};
 use tree::{NodeKind, Tree};
 
-/// FUSE filesystem instance. The tree is immutable for the mount's lifetime; only
-/// the snapshot table and audit log need interior mutability.
-pub struct AccessFs {
+/// Worker threads for open() work. Each pending authorization prompt ties up one thread
+/// (bounded by the 30s prompt timeout); everything else keeps flowing because the fuser
+/// event loop and the fast callbacks never wait on them.
+const OPEN_POOL_THREADS: usize = 32;
+
+/// Shared, thread-movable filesystem state. Behind an `Arc` so open() work can run on a
+/// worker thread — fuser's event loop is single-threaded on macOS, so a blocking open()
+/// on the event-loop thread would freeze the whole mount.
+struct Shared {
     tree: Tree,
     snapshots: SnapshotTable,
     audit: Arc<AuditLog>,
-    /// Authorization decision boundary. Initially AllowAll (monitor mode); a real
-    /// implementation will be supplied by the agent later.
+    /// Authorization decision boundary. Supplied by the agent (or AllowAll in monitor mode).
     authorizer: Arc<dyn Authorizer>,
-    /// Stable timestamp used for all attributes (captured at mount time, never
-    /// changes), so watchers don't trigger accidentally.
+    /// Stable timestamp used for all attributes (captured at mount time, never changes),
+    /// so watchers don't trigger accidentally.
     mount_epoch: SystemTime,
     mount_uid: u32,
     mount_gid: u32,
+}
+
+/// FUSE filesystem instance. Fast callbacks run inline on the event loop; open() (which may
+/// block on an authorization prompt or a slow handler) is dispatched to `pool` and replies
+/// from there, so a slow open never freezes the single-threaded event loop.
+pub struct AccessFs {
+    inner: Arc<Shared>,
+    pool: threadpool::ThreadPool,
 }
 
 impl AccessFs {
     pub fn new(cfg: &ResolvedConfig, audit: Arc<AuditLog>, authorizer: Arc<dyn Authorizer>) -> Self {
         // SAFETY: geteuid/getegid take no arguments, have no side effects, and always succeed.
         let (mount_uid, mount_gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-        AccessFs {
+        let inner = Arc::new(Shared {
             tree: Tree::build(cfg),
             snapshots: SnapshotTable::new(),
             audit,
@@ -56,9 +69,16 @@ impl AccessFs {
             mount_epoch: SystemTime::now(),
             mount_uid,
             mount_gid,
-        }
+        });
+        let pool = threadpool::Builder::new()
+            .num_threads(OPEN_POOL_THREADS)
+            .thread_name("accessfs-open".into())
+            .build();
+        AccessFs { inner, pool }
     }
+}
 
+impl Shared {
     fn attr_for(&self, ino: u64) -> Option<fuser::FileAttr> {
         let node = self.tree.get(ino)?;
         let attr = match &node.kind {
@@ -69,103 +89,11 @@ impl AccessFs {
         };
         Some(attr)
     }
-}
 
-/// Build error codes that fuser doesn't provide constants for (EROFS/ENOATTR, etc.) from libc.
-fn errno(code: i32) -> Errno {
-    Errno::from_i32(code)
-}
-
-impl fuser::Filesystem for AccessFs {
-    fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    fn lookup(&self, _req: &Request, parent: INodeNo, name: &std::ffi::OsStr, reply: ReplyEntry) {
-        // Any name not in the tree (including macOS noise like .DS_Store / ._*) returns ENOENT; never generates content.
-        let Some(name) = name.to_str() else {
-            reply.error(Errno::ENOENT);
-            return;
-        };
-        match self
-            .tree
-            .lookup_child(parent.0, name)
-            .and_then(|ino| self.attr_for(ino))
-        {
-            Some(attr) => reply.entry(&TTL, &attr, fuser::Generation(0)),
-            None => reply.error(Errno::ENOENT),
-        }
-    }
-
-    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        match self.attr_for(ino.0) {
-            Some(attr) => reply.attr(&TTL, &attr),
-            None => reply.error(Errno::ENOENT),
-        }
-    }
-
-    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
-        match self.tree.get(ino.0).map(|n| &n.kind) {
-            Some(NodeKind::Dir) => reply.opened(FileHandle(0), fuser::FopenFlags::empty()),
-            Some(_) => reply.error(Errno::ENOTDIR),
-            None => reply.error(Errno::ENOENT),
-        }
-    }
-
-    fn readdir(
-        &self,
-        _req: &Request,
-        ino: INodeNo,
-        _fh: FileHandle,
-        offset: u64,
-        mut reply: ReplyDirectory,
-    ) {
-        let Some(node) = self.tree.get(ino.0) else {
-            reply.error(Errno::ENOENT);
-            return;
-        };
-        if !matches!(node.kind, NodeKind::Dir) {
-            reply.error(Errno::ENOTDIR);
-            return;
-        }
-
-        // . and .. always come first, then child nodes. offset is the "next" cursor.
-        let mut entries: Vec<(u64, FileType, &str)> = vec![
-            (ino.0, FileType::Directory, "."),
-            (node.parent, FileType::Directory, ".."),
-        ];
-        for &child_ino in self.tree.children(ino.0) {
-            if let Some(child) = self.tree.get(child_ino) {
-                let kind = match child.kind {
-                    NodeKind::Dir => FileType::Directory,
-                    NodeKind::File(_) => FileType::RegularFile,
-                };
-                entries.push((child_ino, kind, child.name.as_str()));
-            }
-        }
-
-        for (i, (cino, kind, name)) in entries.iter().enumerate().skip(offset as usize) {
-            let next = (i + 1) as u64;
-            if reply.add(INodeNo(*cino), next, *kind, name) {
-                break; // buffer full
-            }
-        }
-        reply.ok();
-    }
-
-    fn releasedir(
-        &self,
-        _req: &Request,
-        _ino: INodeNo,
-        _fh: FileHandle,
-        _flags: OpenFlags,
-        reply: ReplyEmpty,
-    ) {
-        reply.ok();
-    }
-
-    fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        let Some(node) = self.tree.get(ino.0) else {
+    /// Runs on a pool thread: validation + identity + authorization + content generation,
+    /// then replies. May block on an authorization prompt without stalling the event loop.
+    fn handle_open(&self, ino: u64, flags: i32, uid: u32, gid: u32, pid: i32, reply: ReplyOpen) {
+        let Some(node) = self.tree.get(ino) else {
             reply.error(Errno::ENOENT);
             return;
         };
@@ -174,16 +102,14 @@ impl fuser::Filesystem for AccessFs {
             return;
         };
         // Read-only: reject any write open.
-        if flags.0 & libc::O_ACCMODE != libc::O_RDONLY {
+        if flags & libc::O_ACCMODE != libc::O_RDONLY {
             reply.error(errno(libc::EROFS));
             return;
         }
 
-        let (uid, gid, pid) = (req.uid(), req.gid(), req.pid() as i32);
         let identity = Arc::new(accessfs_platform::enrich(pid, uid, gid));
 
         // Authorization boundary: decide after resolving the identity, before generating content.
-        // Blocking, which matches the blocking semantics of FUSE open.
         let decision = self.authorizer.authorize(&AuthRequest {
             path: &file.virtual_path,
             operation: Operation::Read,
@@ -221,7 +147,7 @@ impl fuser::Filesystem for AccessFs {
             }
         };
 
-        let opened = self.snapshots.insert(ino.0, Arc::clone(&identity), bytes);
+        let opened = self.snapshots.insert(ino, Arc::clone(&identity), bytes);
         tracing::info!(
             path = %file.virtual_path,
             uid, pid,
@@ -253,6 +179,111 @@ impl fuser::Filesystem for AccessFs {
         };
         reply.opened(FileHandle(opened.fh), fopen);
     }
+}
+
+/// Build error codes that fuser doesn't provide constants for (EROFS/ENOATTR, etc.) from libc.
+fn errno(code: i32) -> Errno {
+    Errno::from_i32(code)
+}
+
+impl fuser::Filesystem for AccessFs {
+    fn init(&mut self, _req: &Request, _config: &mut KernelConfig) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &std::ffi::OsStr, reply: ReplyEntry) {
+        // Any name not in the tree (including macOS noise like .DS_Store / ._*) returns ENOENT; never generates content.
+        let Some(name) = name.to_str() else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        match self
+            .inner
+            .tree
+            .lookup_child(parent.0, name)
+            .and_then(|ino| self.inner.attr_for(ino))
+        {
+            Some(attr) => reply.entry(&TTL, &attr, fuser::Generation(0)),
+            None => reply.error(Errno::ENOENT),
+        }
+    }
+
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        match self.inner.attr_for(ino.0) {
+            Some(attr) => reply.attr(&TTL, &attr),
+            None => reply.error(Errno::ENOENT),
+        }
+    }
+
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        match self.inner.tree.get(ino.0).map(|n| &n.kind) {
+            Some(NodeKind::Dir) => reply.opened(FileHandle(0), fuser::FopenFlags::empty()),
+            Some(_) => reply.error(Errno::ENOTDIR),
+            None => reply.error(Errno::ENOENT),
+        }
+    }
+
+    fn readdir(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        mut reply: ReplyDirectory,
+    ) {
+        let Some(node) = self.inner.tree.get(ino.0) else {
+            reply.error(Errno::ENOENT);
+            return;
+        };
+        if !matches!(node.kind, NodeKind::Dir) {
+            reply.error(Errno::ENOTDIR);
+            return;
+        }
+
+        // . and .. always come first, then child nodes. offset is the "next" cursor.
+        let mut entries: Vec<(u64, FileType, &str)> = vec![
+            (ino.0, FileType::Directory, "."),
+            (node.parent, FileType::Directory, ".."),
+        ];
+        for &child_ino in self.inner.tree.children(ino.0) {
+            if let Some(child) = self.inner.tree.get(child_ino) {
+                let kind = match child.kind {
+                    NodeKind::Dir => FileType::Directory,
+                    NodeKind::File(_) => FileType::RegularFile,
+                };
+                entries.push((child_ino, kind, child.name.as_str()));
+            }
+        }
+
+        for (i, (cino, kind, name)) in entries.iter().enumerate().skip(offset as usize) {
+            let next = (i + 1) as u64;
+            if reply.add(INodeNo(*cino), next, *kind, name) {
+                break; // buffer full
+            }
+        }
+        reply.ok();
+    }
+
+    fn releasedir(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _flags: OpenFlags,
+        reply: ReplyEmpty,
+    ) {
+        reply.ok();
+    }
+
+    fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
+        // Dispatch to the pool so a blocking authorization prompt (or slow handler) never
+        // stalls the single-threaded event loop. The reply is Send and completed there.
+        let (uid, gid, pid) = (req.uid(), req.gid(), req.pid() as i32);
+        let shared = Arc::clone(&self.inner);
+        let (ino, flags) = (ino.0, flags.0);
+        self.pool
+            .execute(move || shared.handle_open(ino, flags, uid, gid, pid, reply));
+    }
 
     fn read(
         &self,
@@ -265,7 +296,7 @@ impl fuser::Filesystem for AccessFs {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
-        match self.snapshots.read_slice(fh.0, offset, size) {
+        match self.inner.snapshots.read_slice(fh.0, offset, size) {
             Some(slice) => reply.data(&slice),
             None => reply.error(Errno::EBADF),
         }
@@ -293,14 +324,15 @@ impl fuser::Filesystem for AccessFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        if let Some(info) = self.snapshots.remove(fh.0) {
+        if let Some(info) = self.inner.snapshots.remove(fh.0) {
             let path = self
+                .inner
                 .tree
                 .get(info.ino)
                 .map(|n| n.virtual_path())
                 .unwrap_or_default();
             tracing::debug!(path = %path, fh = fh.0, bytes = info.bytes_served, "close");
-            self.audit.log_close(
+            self.inner.audit.log_close(
                 &path,
                 fh.0,
                 info.duration.as_millis(),
@@ -347,12 +379,10 @@ impl fuser::Filesystem for AccessFs {
 /// Uses `spawn_mount2` (session runs on a background thread) plus a signal wait, rather than
 /// the blocking `mount2`: the latter has no chance to unmount when killed by a signal, leaving
 /// a zombie macFUSE mount at the mount point. `BackgroundSession` unmounts automatically on drop.
-pub fn mount(cfg: ResolvedConfig) -> anyhow::Result<()> {
+pub fn mount(cfg: ResolvedConfig, authorizer: Arc<dyn Authorizer>) -> anyhow::Result<()> {
     let audit = Arc::new(AuditLog::open(&cfg.audit_log)?);
     let mount_point = cfg.mount_path.clone();
     let config = mount_config(&cfg.volname);
-    // Initial step: monitor mode (allow everything, audit only). Later swapped for the agent's policy engine.
-    let authorizer: Arc<dyn Authorizer> = Arc::new(AllowAll);
     let fs = AccessFs::new(&cfg, audit, authorizer);
 
     tracing::info!(
