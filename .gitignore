@@ -1,5 +1,9 @@
 /target
 *.audit.jsonl
 
+# Swift Package Manager build artifacts
+.build/
+.swiftpm/
+
 # Local Claude Code settings (machine-specific, not for commit)
 .claude/settings.local.json
