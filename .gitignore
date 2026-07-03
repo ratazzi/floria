@@ -1,0 +1,5 @@
+/target
+*.audit.jsonl
+
+# Local Claude Code settings (machine-specific, not for commit)
+.claude/settings.local.json
