@@ -8,6 +8,7 @@ use serde::Deserialize;
 use crate::authz::Enforcement;
 use crate::error::{CoreError, Result};
 use crate::handler::ContentHandler;
+use crate::rules::{any_path_glob, compile_glob, exact_path_glob, Rule, RuleSet, SubjectMatch};
 
 /// Raw TOML structure, deserialized directly. Validation/resolution happens in [`Config::resolve`].
 #[derive(Debug, Deserialize)]
@@ -16,6 +17,31 @@ pub struct Config {
     pub agent: Option<AgentCfg>,
     #[serde(default, rename = "file")]
     pub files: Vec<FileCfg>,
+    #[serde(default, rename = "rule")]
+    pub rules: Vec<RuleCfg>,
+}
+
+/// Raw `[[rule]]` block. Subject facets are all optional and combined with AND.
+#[derive(Debug, Deserialize)]
+pub struct RuleCfg {
+    /// Stable id for auditing/UI. Defaults to `rule-<index>`.
+    pub id: Option<String>,
+    /// Higher priority is evaluated first. Defaults to 0 (same as per-file enforcement).
+    pub priority: Option<i32>,
+    /// Path glob this rule applies to, e.g. `env/*/prod.env`. Defaults to `**` (any path).
+    pub path: Option<String>,
+    /// Enforcement to apply on match: `"allow"`, `"deny"`, `"prompt"`, or `"touchid"`.
+    pub enforcement: String,
+    /// Defaults to true.
+    pub enabled: Option<bool>,
+    pub team_id: Option<String>,
+    pub bundle_id: Option<String>,
+    /// Glob over the reader's executable path.
+    pub exe: Option<String>,
+    /// Git repo root the reader runs from.
+    pub repo: Option<String>,
+    /// Prefix the reader's cwd must start with.
+    pub cwd_prefix: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +84,9 @@ pub struct ResolvedConfig {
     /// Path to the agent's Unix socket (default or config override).
     pub agent_socket: PathBuf,
     pub files: Vec<FileEntry>,
+    /// Policy rules, evaluated first-match by priority. Synthesized from `[[rule]]` blocks,
+    /// per-file `enforcement`, and a trailing catch-all default.
+    pub rules: RuleSet,
 }
 
 /// A resolved virtual file.
@@ -124,14 +153,85 @@ impl Config {
             files.push(entry);
         }
 
+        let rules = build_ruleset(self.rules, &files)?;
+
         Ok(ResolvedConfig {
             mount_path,
             volname,
             audit_log,
             agent_socket,
             files,
+            rules,
         })
     }
+}
+
+/// Assemble the rule set from three layers, most-authoritative first (ties broken by insertion order):
+/// explicit `[[rule]]` blocks, then per-file `enforcement` as exact-path rules at priority 0,
+/// then a single catch-all `allow` default at the lowest priority so the default is visible, not hidden.
+fn build_ruleset(rule_cfgs: Vec<RuleCfg>, files: &[FileEntry]) -> Result<RuleSet> {
+    let mut rules = Vec::with_capacity(rule_cfgs.len() + files.len() + 1);
+
+    for (idx, rc) in rule_cfgs.into_iter().enumerate() {
+        rules.push(resolve_rule(rc, idx)?);
+    }
+
+    for f in files {
+        rules.push(Rule {
+            id: format!("file:{}", f.path),
+            priority: 0,
+            subject: SubjectMatch::default(),
+            path_glob: exact_path_glob(&f.path),
+            enforcement: f.enforcement,
+            enabled: true,
+        });
+    }
+
+    rules.push(Rule {
+        id: "default".to_string(),
+        priority: i32::MIN,
+        subject: SubjectMatch::default(),
+        path_glob: any_path_glob(),
+        enforcement: Enforcement::Allow,
+        enabled: true,
+    });
+
+    Ok(RuleSet::new(rules))
+}
+
+fn resolve_rule(rc: RuleCfg, idx: usize) -> Result<Rule> {
+    let id = rc.id.unwrap_or_else(|| format!("rule-{idx}"));
+    let enforcement = Enforcement::parse(&rc.enforcement)
+        .ok_or_else(|| CoreError::config(format!("rule {id}: invalid enforcement {:?}", rc.enforcement)))?;
+    let path_glob = compile_glob(rc.path.as_deref().unwrap_or("**"))
+        .map_err(|e| CoreError::config(format!("rule {id}: invalid path glob: {e}")))?;
+    let exe_glob = match rc.exe {
+        Some(g) => Some(
+            compile_glob(&g)
+                .map_err(|e| CoreError::config(format!("rule {id}: invalid exe glob: {e}")))?,
+        ),
+        None => None,
+    };
+    let subject = SubjectMatch {
+        team_id: rc.team_id,
+        bundle_id: rc.bundle_id,
+        exe_glob,
+        repo: rc.repo.map(|p| tilde_str(&p)),
+        cwd_prefix: rc.cwd_prefix.map(|p| tilde_str(&p)),
+    };
+    Ok(Rule {
+        id,
+        priority: rc.priority.unwrap_or(0),
+        subject,
+        path_glob,
+        enforcement,
+        enabled: rc.enabled.unwrap_or(true),
+    })
+}
+
+/// Expand a leading `~` and return the path as a string (for repo/cwd_prefix facets).
+fn tilde_str(s: &str) -> String {
+    expand_tilde(Path::new(s)).to_string_lossy().into_owned()
 }
 
 fn resolve_file(fc: FileCfg, base_dir: &Path) -> Result<FileEntry> {
@@ -310,6 +410,7 @@ pub fn check_secure_perms(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::identity::ProcessIdentity;
 
     #[test]
     fn rejects_parent_traversal() {
@@ -363,6 +464,70 @@ mod tests {
             read: Some(vec!["/bin/echo".to_string(), "hi".to_string()]),
         };
         assert!(resolve_file(fc, Path::new(".")).is_err());
+    }
+
+    fn rule_cfg(id: &str, path: &str, enforcement: &str) -> RuleCfg {
+        RuleCfg {
+            id: Some(id.to_string()),
+            priority: None,
+            path: Some(path.to_string()),
+            enforcement: enforcement.to_string(),
+            enabled: None,
+            team_id: None,
+            bundle_id: None,
+            exe: None,
+            repo: None,
+            cwd_prefix: None,
+        }
+    }
+
+    #[test]
+    fn builds_ruleset_with_explicit_file_and_default_layers() {
+        let file = resolve_file(
+            FileCfg {
+                path: "env/demo/dev.env".to_string(),
+                mode: None,
+                ttl: None,
+                size: None,
+                enforcement: Some("prompt".to_string()),
+                content: Some("x".to_string()),
+                read: None,
+            },
+            Path::new("."),
+        )
+        .unwrap();
+
+        let rules = build_ruleset(
+            vec![rule_cfg("prod", "env/*/prod.env", "deny")],
+            std::slice::from_ref(&file),
+        )
+        .unwrap();
+
+        // explicit rule + one per-file rule + default catch-all
+        assert_eq!(rules.len(), 3);
+
+        let id = ProcessIdentity::bare(1, 501, 20);
+        // explicit deny rule wins for prod
+        assert_eq!(
+            rules.decide(&id, "env/svc/prod.env", None),
+            (Enforcement::Deny, Some("prod".to_string()))
+        );
+        // per-file prompt applies to dev.env
+        assert_eq!(
+            rules.decide(&id, "env/demo/dev.env", None),
+            (Enforcement::Prompt, Some("file:env/demo/dev.env".to_string()))
+        );
+        // anything else falls through to the default allow
+        assert_eq!(
+            rules.decide(&id, "demo/hello.txt", None),
+            (Enforcement::Allow, Some("default".to_string()))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_rule() {
+        assert!(build_ruleset(vec![rule_cfg("bad", "**", "yolo")], &[]).is_err());
+        assert!(build_ruleset(vec![rule_cfg("bad", "env/[", "deny")], &[]).is_err());
     }
 
     #[test]

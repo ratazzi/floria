@@ -12,6 +12,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 zeroize = { workspace = true }
 dashmap = { workspace = true }
+globset = { workspace = true }
 humantime = { workspace = true }
 wait-timeout = { workspace = true }
 sha2 = { workspace = true }

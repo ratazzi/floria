@@ -22,3 +22,33 @@ ttl  = "0s"
 size = 4096
 enforcement = "touchid"
 read = ["./scripts/render-env", "demo", "dev"]
+
+# Subject-aware rules. Evaluated first-match by descending priority; a per-file `enforcement`
+# above is an implicit rule at priority 0 with subject = any. A trailing `allow` catch-all is
+# always appended, so unmatched paths are allowed (monitor mode).
+#
+# Each rule matches a `path` glob AND a subject. Subject facets are all optional and AND together:
+#   team_id     code-signing team of a compiled/GUI app (stable across its helper processes)
+#   bundle_id   code-signing bundle id (finer than team)
+#   exe         glob over the reader's executable path (`*` does not cross `/`; use `**/foo`)
+#   repo        git checkout the reader runs from (use this for node/python/ruby interpreters)
+#   cwd_prefix  the reader's working directory must start with this
+#
+# [[rule]]
+# id = "prod-lockdown"
+# priority = 100
+# path = "env/*/prod.env"
+# enforcement = "deny"
+#
+# [[rule]]
+# id = "chrome-prompts"
+# path = "env/**"
+# enforcement = "prompt"
+# team_id = "EQHXZ8M8AV"        # Google Chrome and all its helpers
+#
+# [[rule]]
+# id = "this-project-node"
+# path = "env/**"
+# enforcement = "touchid"
+# repo = "~/workspace/floria"   # `node script.js` run from this checkout
+# exe = "**/node"
