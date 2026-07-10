@@ -10,11 +10,15 @@ use crate::error::{CoreError, Result};
 use crate::handler::ContentHandler;
 use crate::rules::{any_path_glob, compile_glob, exact_path_glob, Rule, RuleSet, SubjectMatch};
 
+/// Virtual directory under the mount where store-backed secrets are surfaced (`secrets/<id>`).
+pub const SECRETS_DIR: &str = "secrets";
+
 /// Raw TOML structure, deserialized directly. Validation/resolution happens in [`Config::resolve`].
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub mount: MountCfg,
     pub agent: Option<AgentCfg>,
+    pub store: Option<StoreCfg>,
     #[serde(default, rename = "file")]
     pub files: Vec<FileCfg>,
     #[serde(default, rename = "rule")]
@@ -58,6 +62,14 @@ pub struct AgentCfg {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct StoreCfg {
+    /// Root directory for encrypted secret blobs. Defaults to `~/.floria/store`.
+    pub root: Option<PathBuf>,
+    /// SSH private key used as the age identity. Defaults to `~/.ssh/id_ed25519`.
+    pub ssh_key: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct FileCfg {
     /// Virtual path relative to the mount point, e.g. `env/demo/dev.env`.
     pub path: String,
@@ -83,6 +95,10 @@ pub struct ResolvedConfig {
     pub audit_log: PathBuf,
     /// Path to the agent's Unix socket (default or config override).
     pub agent_socket: PathBuf,
+    /// Root directory for the encrypted secret store.
+    pub store_root: PathBuf,
+    /// SSH private key used as the store's age identity.
+    pub store_ssh_key: PathBuf,
     pub files: Vec<FileEntry>,
     /// Policy rules, evaluated first-match by priority. Synthesized from `[[rule]]` blocks,
     /// per-file `enforcement`, and a trailing catch-all default.
@@ -140,6 +156,16 @@ impl Config {
             .map(|p| expand_tilde(&p))
             .unwrap_or_else(default_agent_socket);
 
+        let store = self.store.unwrap_or(StoreCfg { root: None, ssh_key: None });
+        let store_root = store
+            .root
+            .map(|p| expand_tilde(&p))
+            .unwrap_or_else(default_store_root);
+        let store_ssh_key = store
+            .ssh_key
+            .map(|p| expand_tilde(&p))
+            .unwrap_or_else(default_ssh_key);
+
         let mut files = Vec::with_capacity(self.files.len());
         let mut seen = std::collections::HashSet::new();
         for fc in self.files {
@@ -160,6 +186,8 @@ impl Config {
             volname,
             audit_log,
             agent_socket,
+            store_root,
+            store_ssh_key,
             files,
             rules,
         })
@@ -186,6 +214,18 @@ fn build_ruleset(rule_cfgs: Vec<RuleCfg>, files: &[FileEntry]) -> Result<RuleSet
             enabled: true,
         });
     }
+
+    // Store-backed secrets are prompted by default (above the catch-all, below anything explicit),
+    // so protecting a file gates it even without a per-id rule. Tighten with an explicit `[[rule]]`.
+    rules.push(Rule {
+        id: "secrets-default".to_string(),
+        priority: i32::MIN + 1,
+        subject: SubjectMatch::default(),
+        path_glob: compile_glob(&format!("{SECRETS_DIR}/**"))
+            .expect("`secrets/**` is a valid glob"),
+        enforcement: Enforcement::Prompt,
+        enabled: true,
+    });
 
     rules.push(Rule {
         id: "default".to_string(),
@@ -369,6 +409,22 @@ fn default_agent_socket() -> PathBuf {
     base.join("Library/Application Support/floria/agent.sock")
 }
 
+/// Default secret store root: `~/.floria/store`.
+fn default_store_root() -> PathBuf {
+    let base = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join(".floria/store")
+}
+
+/// Default age identity: the user's SSH ed25519 key.
+fn default_ssh_key() -> PathBuf {
+    let base = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    base.join(".ssh/id_ed25519")
+}
+
 fn default_audit_path(mount_path: &Path) -> PathBuf {
     // Place the audit log next to the mount point, so it isn't written into the virtual volume itself.
     let name = mount_path
@@ -503,10 +559,16 @@ mod tests {
         )
         .unwrap();
 
-        // explicit rule + one per-file rule + default catch-all
-        assert_eq!(rules.len(), 3);
+        // explicit rule + one per-file rule + secrets-default + catch-all
+        assert_eq!(rules.len(), 4);
 
+        // any secrets/<id> path is prompted by the built-in rule
         let id = ProcessIdentity::bare(1, 501, 20);
+        assert_eq!(
+            rules.decide(&id, "secrets/abc-123", None),
+            (Enforcement::Prompt, Some("secrets-default".to_string()))
+        );
+
         // explicit deny rule wins for prod
         assert_eq!(
             rules.decide(&id, "env/svc/prod.env", None),
