@@ -1,6 +1,15 @@
 /target
 *.audit.jsonl
 
+# Never commit real secrets, keys, or encrypted store blobs
+.env
+.env.*
+.envrc
+*.age
+id_ed25519
+id_ed25519.pub
+id_*
+
 # Swift Package Manager build artifacts
 .build/
 .swiftpm/
