@@ -12,10 +12,12 @@ path = "src/main.rs"
 accessfs-core = { workspace = true }
 accessfs-agent = { workspace = true }
 accessfs-fs = { workspace = true }
+accessfs-store = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+zeroize = { workspace = true }
 
 [features]
 # Forwarded to fuser: typecheck-only on machines without macFUSE; do not enable for real mounts.

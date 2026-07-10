@@ -1,7 +1,11 @@
+use std::io::Write;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use accessfs_core::config::{Config, ResolvedConfig};
+use accessfs_store::{AgeDirStore, NewSecret, SecretId, SecretRecord, SecretStore, SshKeyProvider};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -33,6 +37,56 @@ enum Cmd {
         #[arg(short, long, default_value = "accessfs.toml")]
         config: PathBuf,
     },
+    /// Encrypt a file into the secret store (age-encrypted, keyed by the store's ssh key).
+    Protect {
+        /// File to protect.
+        path: PathBuf,
+        /// Replace the original with a symlink into the mount (`secrets/<id>`); readable once mounted.
+        #[arg(long)]
+        link: bool,
+        /// Delete the plaintext original after a successful encrypt (implied by --link).
+        #[arg(long)]
+        remove: bool,
+        /// If already protected, re-encrypt the current content in place (same id).
+        #[arg(long)]
+        force: bool,
+        #[arg(short, long, default_value = "accessfs.toml")]
+        config: PathBuf,
+    },
+    /// Decrypt a protected secret to stdout (or a file with --to). Accepts a source path or an id.
+    Reveal {
+        /// Original path of the protected file, or its store id.
+        target: String,
+        /// Reveal a specific version instead of the current head.
+        #[arg(long)]
+        version: Option<u32>,
+        /// Write the plaintext here instead of stdout (restores the original mode).
+        #[arg(long)]
+        to: Option<PathBuf>,
+        #[arg(short, long, default_value = "accessfs.toml")]
+        config: PathBuf,
+    },
+    /// Show the version history of a protected secret.
+    History {
+        /// Original path of the protected file, or its store id.
+        target: String,
+        #[arg(short, long, default_value = "accessfs.toml")]
+        config: PathBuf,
+    },
+    /// Roll back a protected secret's head to an earlier version (repoints; nothing is deleted).
+    Rollback {
+        /// Original path of the protected file, or its store id.
+        target: String,
+        /// Version to make current.
+        version: u32,
+        #[arg(short, long, default_value = "accessfs.toml")]
+        config: PathBuf,
+    },
+    /// List protected secrets.
+    List {
+        #[arg(short, long, default_value = "accessfs.toml")]
+        config: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -47,7 +101,184 @@ fn main() -> Result<()> {
         Cmd::Mount { config } => cmd_mount(&config),
         Cmd::Unmount { path, config } => cmd_unmount(path, &config),
         Cmd::Doctor { config } => cmd_doctor(&config),
+        Cmd::Protect { path, link, remove, force, config } => {
+            cmd_protect(&path, link, remove, force, &config)
+        }
+        Cmd::Reveal { target, version, to, config } => cmd_reveal(&target, version, to, &config),
+        Cmd::History { target, config } => cmd_history(&target, &config),
+        Cmd::Rollback { target, version, config } => cmd_rollback(&target, version, &config),
+        Cmd::List { config } => cmd_list(&config),
     }
+}
+
+/// Open the secret store from config. The private key passphrase, if any, comes from
+/// `FLORIA_KEY_PASSPHRASE` (dev convenience; interactive/Touch ID unlock is a later milestone).
+fn open_store(cfg: &ResolvedConfig) -> Result<AgeDirStore> {
+    let passphrase = std::env::var("FLORIA_KEY_PASSPHRASE")
+        .ok()
+        .map(zeroize::Zeroizing::new);
+    let keys = Arc::new(SshKeyProvider::new(cfg.store_ssh_key.clone(), passphrase));
+    let store = AgeDirStore::open(cfg.store_root.clone(), keys)
+        .with_context(|| format!("opening store at {}", cfg.store_root.display()))?;
+    Ok(store)
+}
+
+fn cmd_protect(path: &Path, link: bool, remove: bool, force: bool, config: &Path) -> Result<()> {
+    let cfg = load(config)?;
+    let store = open_store(&cfg)?;
+
+    // Refuse a symlink (very likely one we already created into the mount); don't recurse into it.
+    let lmeta = std::fs::symlink_metadata(path)
+        .with_context(|| format!("stat {}", path.display()))?;
+    if lmeta.file_type().is_symlink() {
+        anyhow::bail!("{} is a symlink (already linked?); refusing to protect it", path.display());
+    }
+    if !lmeta.is_file() {
+        anyhow::bail!("{} is not a regular file", path.display());
+    }
+    let abs = std::fs::canonicalize(path)
+        .with_context(|| format!("resolving {}", path.display()))?;
+    let plaintext = zeroize::Zeroizing::new(std::fs::read(&abs)?);
+    let mode = (lmeta.mode() & 0o7777) as u32;
+
+    // Import step: reuse the existing entry when already protected, so --link/--remove stay usable.
+    let id = match store.get_by_path(&abs)? {
+        Some(rec) if force => {
+            let v = store.append_version(&rec.id, &plaintext)?;
+            println!("updated {} → {} (saved version {v})", abs.display(), rec.id);
+            rec.id
+        }
+        Some(rec) => {
+            if rec.size != plaintext.len() as u64 {
+                anyhow::bail!(
+                    "{} changed since it was protected (id {}); re-run with --force to save a new version",
+                    abs.display(),
+                    rec.id
+                );
+            }
+            println!("already protected {} → {} (v{})", abs.display(), rec.id, rec.current_version);
+            rec.id
+        }
+        None => {
+            let id = store.put(NewSecret { source_path: abs.clone(), mode }, &plaintext)?;
+            println!("protected {} → {id}", abs.display());
+            println!("  stored at {}/{id}", cfg.store_root.display());
+            id
+        }
+    };
+
+    // Surface step: independent of whether we just imported or reused an existing entry.
+    if link {
+        let target = cfg
+            .mount_path
+            .join(accessfs_core::config::SECRETS_DIR)
+            .join(id.to_string());
+        replace_with_symlink(&abs, &target)?;
+        println!("  linked {} → {} (readable once mounted)", abs.display(), target.display());
+    } else if remove {
+        std::fs::remove_file(&abs)?;
+        println!("  removed plaintext original (restore: accessfs reveal {id} --to {})", abs.display());
+    } else {
+        println!("  original left in place; add --link or --remove to surface it");
+    }
+    Ok(())
+}
+
+/// Atomically replace the file at `at` with a symlink to `target` (symlink a temp sibling, rename over).
+fn replace_with_symlink(at: &Path, target: &Path) -> Result<()> {
+    let parent = at.parent().unwrap_or_else(|| Path::new("."));
+    let name = at.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = parent.join(format!(".{name}.floria-tmp"));
+    let _ = std::fs::remove_file(&tmp);
+    std::os::unix::fs::symlink(target, &tmp)
+        .with_context(|| format!("creating symlink {}", tmp.display()))?;
+    std::fs::rename(&tmp, at).with_context(|| format!("replacing {}", at.display()))?;
+    Ok(())
+}
+
+fn cmd_reveal(target: &str, version: Option<u32>, to: Option<PathBuf>, config: &Path) -> Result<()> {
+    let cfg = load(config)?;
+    let store = open_store(&cfg)?;
+    let record = resolve_target(&store, target)?;
+    let plaintext = match version {
+        Some(v) => store.get_version(&record.id, v)?,
+        None => store.get(&record.id)?,
+    };
+
+    match to {
+        Some(dest) => {
+            std::fs::write(&dest, &plaintext[..])
+                .with_context(|| format!("writing {}", dest.display()))?;
+            std::fs::set_permissions(
+                &dest,
+                std::os::unix::fs::PermissionsExt::from_mode(record.mode),
+            )?;
+            eprintln!("wrote {} bytes to {}", plaintext.len(), dest.display());
+        }
+        None => std::io::stdout().write_all(&plaintext[..])?,
+    }
+    Ok(())
+}
+
+fn cmd_history(target: &str, config: &Path) -> Result<()> {
+    let cfg = load(config)?;
+    let store = open_store(&cfg)?;
+    let record = resolve_target(&store, target)?;
+    println!("{}  {}", record.id, record.source_path.display());
+    for v in store.history(&record.id)? {
+        let head = if v.version == record.current_version { " (current)" } else { "" };
+        let note = v.note.map(|n| format!("  {n}")).unwrap_or_default();
+        println!("  v{}  {} bytes  {}{head}{note}", v.version, v.size, v.created);
+    }
+    Ok(())
+}
+
+fn cmd_rollback(target: &str, version: u32, config: &Path) -> Result<()> {
+    let cfg = load(config)?;
+    let store = open_store(&cfg)?;
+    let record = resolve_target(&store, target)?;
+    store.set_head(&record.id, version)?;
+    println!("{} → head is now v{version}", record.id);
+    Ok(())
+}
+
+fn cmd_list(config: &Path) -> Result<()> {
+    let cfg = load(config)?;
+    let store = open_store(&cfg)?;
+    let records = store.list()?;
+    if records.is_empty() {
+        println!("no protected secrets");
+        return Ok(());
+    }
+    for r in records {
+        println!(
+            "{}  {}  (v{}, {} bytes, mode {:04o}, {})",
+            r.id,
+            r.source_path.display(),
+            r.current_version,
+            r.size,
+            r.mode,
+            r.created
+        );
+    }
+    Ok(())
+}
+
+/// Resolve a reveal target that may be a store id or a source path.
+fn resolve_target(store: &AgeDirStore, target: &str) -> Result<SecretRecord> {
+    if let Ok(id) = target.parse::<SecretId>() {
+        if let Some(r) = store.list()?.into_iter().find(|r| r.id == id) {
+            return Ok(r);
+        }
+    }
+    let abs = std::fs::canonicalize(target).unwrap_or_else(|_| {
+        std::env::current_dir()
+            .map(|d| d.join(target))
+            .unwrap_or_else(|_| PathBuf::from(target))
+    });
+    store
+        .get_by_path(&abs)?
+        .with_context(|| format!("no protected secret for {target:?}"))
 }
 
 fn load(config: &Path) -> Result<ResolvedConfig> {
@@ -59,7 +290,8 @@ fn cmd_mount(config: &Path) -> Result<()> {
     std::fs::create_dir_all(&cfg.mount_path)
         .with_context(|| format!("creating mount point {}", cfg.mount_path.display()))?;
     let agent = accessfs_agent::SocketAgent::start(&cfg).context("starting agent socket")?;
-    accessfs_fs::mount(cfg, agent).context("mount failed")
+    let store: Arc<dyn SecretStore> = Arc::new(open_store(&cfg)?);
+    accessfs_fs::mount(cfg, agent, Some(store)).context("mount failed")
 }
 
 fn cmd_unmount(path: Option<PathBuf>, config: &Path) -> Result<()> {
