@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use accessfs_core::config::ResolvedConfig;
+use accessfs_core::config::{FileEntry, SECRETS_DIR};
 use accessfs_core::handler::ContentHandler;
 
 /// Root inode. FUSE convention: root = 1.
@@ -10,6 +10,11 @@ pub struct Tree {
     nodes: HashMap<u64, Node>,
     by_parent_name: HashMap<(u64, String), u64>,
     children: HashMap<u64, Vec<u64>>,
+    /// Inode of the always-present `secrets/` directory. Its children are resolved dynamically
+    /// against the store (not stored here), so `protect` is visible without remounting.
+    secrets_dir_ino: u64,
+    /// First inode not used by the static tree; the dynamic secrets namespace allocates from here.
+    next_ino: u64,
 }
 
 pub struct Node {
@@ -44,12 +49,15 @@ pub struct FileNode {
 }
 
 impl Tree {
-    /// Build the static inode tree from a resolved config. inodes are assigned sequentially and never reclaimed during the mount.
-    pub fn build(cfg: &ResolvedConfig) -> Self {
+    /// Build the static inode tree from the resolved virtual files (config files plus any
+    /// store-backed secrets). inodes are assigned sequentially and never reclaimed during the mount.
+    pub fn build(files: &[FileEntry]) -> Self {
         let mut tree = Tree {
             nodes: HashMap::new(),
             by_parent_name: HashMap::new(),
             children: HashMap::new(),
+            secrets_dir_ino: 0,
+            next_ino: 0,
         };
         tree.nodes.insert(
             ROOT_INO,
@@ -63,7 +71,7 @@ impl Tree {
         tree.children.insert(ROOT_INO, Vec::new());
 
         let mut next_ino = ROOT_INO + 1;
-        for entry in &cfg.files {
+        for entry in files {
             // Ensure each intermediate directory exists, level by level, to get the final parent directory's inode.
             let mut parent = ROOT_INO;
             let dirs = &entry.components[..entry.components.len() - 1];
@@ -79,9 +87,9 @@ impl Tree {
                 .clone();
             let (report_size, direct_io) = match (&entry.handler, entry.declared_size) {
                 (ContentHandler::Constant(bytes), _) => (bytes.len() as u64, false),
-                (ContentHandler::Script { .. }, Some(size)) => (size, true),
-                // The resolve stage already guarantees scripts have a size; fall back to 0.
-                (ContentHandler::Script { .. }, None) => (0, true),
+                // Script/secret files are dynamic: direct-io, size is the declared upper bound.
+                (_, Some(size)) => (size, true),
+                (_, None) => (0, true),
             };
 
             let ino = next_ino;
@@ -104,7 +112,23 @@ impl Tree {
             tree.children.entry(parent).or_default().push(ino);
         }
 
+        // Always expose a top-level `secrets/` directory; its children are resolved dynamically
+        // by the fs layer against the store, so newly protected files appear without a remount.
+        let secrets_dir_ino = tree.ensure_dir(ROOT_INO, SECRETS_DIR, &mut next_ino);
+        tree.secrets_dir_ino = secrets_dir_ino;
+        tree.next_ino = next_ino;
+
         tree
+    }
+
+    /// Inode of the `secrets/` directory.
+    pub fn secrets_dir_ino(&self) -> u64 {
+        self.secrets_dir_ino
+    }
+
+    /// First inode not used by the static tree (start of the dynamic secrets range).
+    pub fn next_ino(&self) -> u64 {
+        self.next_ino
     }
 
     /// Returns the inode for the `(parent, name)` directory, creating it if it doesn't exist.

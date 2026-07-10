@@ -7,8 +7,10 @@ license.workspace = true
 [dependencies]
 accessfs-core = { workspace = true }
 accessfs-platform = { workspace = true }
+accessfs-store = { workspace = true }
 fuser = { workspace = true }
 libc = { workspace = true }
+dashmap = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 ctrlc = { workspace = true }

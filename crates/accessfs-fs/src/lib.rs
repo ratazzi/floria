@@ -12,14 +12,17 @@
 mod reply;
 mod tree;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use accessfs_core::audit::AuditLog;
 use accessfs_core::authz::{AuthRequest, Authorizer, Operation};
-use accessfs_core::config::ResolvedConfig;
-use accessfs_core::handler::HandlerCtx;
+use accessfs_core::config::{ResolvedConfig, SECRETS_DIR};
+use accessfs_core::handler::{ContentHandler, HandlerCtx};
 use accessfs_core::snapshot::SnapshotTable;
+use accessfs_store::{SecretId, SecretStore};
+use dashmap::DashMap;
 use fuser::{
     AccessFlags, Errno, FileHandle, FileType, INodeNo, KernelConfig, OpenFlags, ReplyAttr,
     ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyXattr, Request,
@@ -33,6 +36,49 @@ use tree::{NodeKind, Tree};
 /// event loop and the fast callbacks never wait on them.
 const OPEN_POOL_THREADS: usize = 32;
 
+/// The dynamic `secrets/<id>` namespace: a live view over the store, resolved on every
+/// lookup/readdir/open so a freshly `protect`ed file appears without remounting. inodes are
+/// allocated lazily per secret id and stay stable for the mount's lifetime.
+struct SecretsNs {
+    store: Arc<dyn SecretStore>,
+    /// Inode of the `secrets/` directory whose children this namespace owns.
+    dir_ino: u64,
+    id_to_ino: DashMap<String, u64>,
+    ino_to_id: DashMap<u64, String>,
+    next_ino: AtomicU64,
+}
+
+impl SecretsNs {
+    fn new(store: Arc<dyn SecretStore>, dir_ino: u64, first_ino: u64) -> Self {
+        SecretsNs {
+            store,
+            dir_ino,
+            id_to_ino: DashMap::new(),
+            ino_to_id: DashMap::new(),
+            next_ino: AtomicU64::new(first_ino),
+        }
+    }
+
+    /// Get or allocate the stable inode for a secret id.
+    fn ino_for(&self, id: &str) -> u64 {
+        use dashmap::mapref::entry::Entry;
+        // The entry lock serializes concurrent allocations for the same id, so no double-assign.
+        match self.id_to_ino.entry(id.to_string()) {
+            Entry::Occupied(e) => *e.get(),
+            Entry::Vacant(e) => {
+                let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
+                self.ino_to_id.insert(ino, id.to_string());
+                e.insert(ino);
+                ino
+            }
+        }
+    }
+
+    fn id_for_ino(&self, ino: u64) -> Option<String> {
+        self.ino_to_id.get(&ino).map(|s| s.clone())
+    }
+}
+
 /// Shared, thread-movable filesystem state. Behind an `Arc` so open() work can run on a
 /// worker thread — fuser's event loop is single-threaded on macOS, so a blocking open()
 /// on the event-loop thread would freeze the whole mount.
@@ -42,6 +88,8 @@ struct Shared {
     audit: Arc<AuditLog>,
     /// Authorization decision boundary. Supplied by the agent (or AllowAll in monitor mode).
     authorizer: Arc<dyn Authorizer>,
+    /// Dynamic `secrets/<id>` namespace over the store; `None` if no store is configured.
+    secrets: Option<SecretsNs>,
     /// Stable timestamp used for all attributes (captured at mount time, never changes),
     /// so watchers don't trigger accidentally.
     mount_epoch: SystemTime,
@@ -58,14 +106,26 @@ pub struct AccessFs {
 }
 
 impl AccessFs {
-    pub fn new(cfg: &ResolvedConfig, audit: Arc<AuditLog>, authorizer: Arc<dyn Authorizer>) -> Self {
+    pub fn new(
+        cfg: &ResolvedConfig,
+        audit: Arc<AuditLog>,
+        authorizer: Arc<dyn Authorizer>,
+        store: Option<Arc<dyn SecretStore>>,
+    ) -> Self {
         // SAFETY: geteuid/getegid take no arguments, have no side effects, and always succeed.
         let (mount_uid, mount_gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+
+        // The static tree holds config files plus the permanent `secrets/` directory; the store's
+        // contents are resolved dynamically, so it allocates inodes from the tree's next free one.
+        let tree = Tree::build(&cfg.files);
+        let secrets = store.map(|s| SecretsNs::new(s, tree.secrets_dir_ino(), tree.next_ino()));
+
         let inner = Arc::new(Shared {
-            tree: Tree::build(cfg),
+            tree,
             snapshots: SnapshotTable::new(),
             audit,
             authorizer,
+            secrets,
             mount_epoch: SystemTime::now(),
             mount_uid,
             mount_gid,
@@ -90,16 +150,68 @@ impl Shared {
         Some(attr)
     }
 
+    /// Attr for a dynamic secret inode, reading current metadata from the store.
+    /// `None` if the secret no longer exists (e.g. deleted since it was looked up).
+    fn secret_attr(&self, ino: u64, id: &str) -> Option<fuser::FileAttr> {
+        let ns = self.secrets.as_ref()?;
+        let sid: SecretId = id.parse().ok()?;
+        let rec = ns.store.record(&sid).ok().flatten()?;
+        Some(file_attr(
+            ino,
+            rec.size,
+            rec.mode as u16,
+            self.mount_epoch,
+            self.mount_uid,
+            self.mount_gid,
+        ))
+    }
+
+    /// Resolve an inode to what `open()` should serve: a static config file, or a dynamic secret.
+    fn resolve_open_target(&self, ino: u64) -> Result<OpenTarget, Errno> {
+        if let Some(ns) = &self.secrets {
+            if let Some(id) = ns.id_for_ino(ino) {
+                let sid: SecretId = id.parse().map_err(|_| Errno::ENOENT)?;
+                // Confirm it still exists (may have been deleted since lookup).
+                ns.store
+                    .record(&sid)
+                    .map_err(|_| errno(libc::EIO))?
+                    .ok_or(Errno::ENOENT)?;
+                return Ok(OpenTarget {
+                    virtual_path: format!("{SECRETS_DIR}/{id}"),
+                    direct_io: true,
+                    kind: OpenKind::Secret(id),
+                });
+            }
+        }
+        let node = self.tree.get(ino).ok_or(Errno::ENOENT)?;
+        let NodeKind::File(file) = &node.kind else {
+            return Err(Errno::EISDIR);
+        };
+        Ok(OpenTarget {
+            virtual_path: file.virtual_path.clone(),
+            direct_io: file.direct_io,
+            kind: OpenKind::Handler(file.handler.clone()),
+        })
+    }
+
+    /// Decrypt a store-backed secret's bytes for a snapshot. Errors are stringified for logging;
+    /// the caller maps any failure to EIO.
+    fn decrypt_secret(&self, id: &str) -> std::result::Result<Vec<u8>, String> {
+        let ns = self.secrets.as_ref().ok_or("no secret store configured")?;
+        let sid: SecretId = id.parse().map_err(|_| format!("invalid secret id {id}"))?;
+        let plain = ns.store.get(&sid).map_err(|e| e.to_string())?;
+        Ok(plain.to_vec())
+    }
+
     /// Runs on a pool thread: validation + identity + authorization + content generation,
     /// then replies. May block on an authorization prompt without stalling the event loop.
     fn handle_open(&self, ino: u64, flags: i32, uid: u32, gid: u32, pid: i32, reply: ReplyOpen) {
-        let Some(node) = self.tree.get(ino) else {
-            reply.error(Errno::ENOENT);
-            return;
-        };
-        let NodeKind::File(file) = &node.kind else {
-            reply.error(Errno::EISDIR);
-            return;
+        let target = match self.resolve_open_target(ino) {
+            Ok(t) => t,
+            Err(e) => {
+                reply.error(e);
+                return;
+            }
         };
         // Read-only: reject any write open.
         if flags & libc::O_ACCMODE != libc::O_RDONLY {
@@ -111,19 +223,19 @@ impl Shared {
 
         // Authorization boundary: decide after resolving the identity, before generating content.
         let decision = self.authorizer.authorize(&AuthRequest {
-            path: &file.virtual_path,
+            path: &target.virtual_path,
             operation: Operation::Read,
             identity: &identity,
         });
         if !decision.is_allowed() {
             tracing::info!(
-                path = %file.virtual_path,
+                path = %target.virtual_path,
                 chain = %identity.chain_display(),
                 reason = %decision.reason,
                 "deny"
             );
             self.audit.log_denied(
-                &file.virtual_path,
+                &target.virtual_path,
                 &identity,
                 decision.rule_id.as_deref(),
                 &decision.reason,
@@ -132,24 +244,37 @@ impl Shared {
             return;
         }
 
-        // open boundary: generate a snapshot once.
-        let ctx = HandlerCtx {
-            virtual_path: file.virtual_path.clone(),
-            request_uid: uid,
-            request_pid: pid,
-        };
-        let bytes = match file.handler.generate(&ctx) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(path = %file.virtual_path, reader = %identity.chain_display(), "handler failed: {e}");
-                reply.error(errno(libc::EIO));
-                return;
+        // open boundary: produce the snapshot bytes once. Secrets decrypt through the store;
+        // other handlers generate their content inline.
+        let bytes = match &target.kind {
+            OpenKind::Secret(id) => match self.decrypt_secret(id) {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), "secret decrypt failed: {e}");
+                    reply.error(errno(libc::EIO));
+                    return;
+                }
+            },
+            OpenKind::Handler(handler) => {
+                let ctx = HandlerCtx {
+                    virtual_path: target.virtual_path.clone(),
+                    request_uid: uid,
+                    request_pid: pid,
+                };
+                match handler.generate(&ctx) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), "handler failed: {e}");
+                        reply.error(errno(libc::EIO));
+                        return;
+                    }
+                }
             }
         };
 
         let opened = self.snapshots.insert(ino, Arc::clone(&identity), bytes);
         tracing::info!(
-            path = %file.virtual_path,
+            path = %target.virtual_path,
             uid, pid,
             exe = ?identity.exe_path,
             chain = %identity.chain_display(),
@@ -160,7 +285,7 @@ impl Shared {
             "open"
         );
         self.audit.log_open(
-            &file.virtual_path,
+            &target.virtual_path,
             &identity,
             decision.decision_str(),
             decision.rule_id.as_deref(),
@@ -169,16 +294,28 @@ impl Shared {
             opened.size,
         );
 
-        // Dynamic (script) files use direct-io: the kernel won't truncate to attr size
+        // Dynamic (script/secret) files use direct-io: the kernel won't truncate to attr size
         // or cache across opens, so the fd returns the snapshot's real bytes and EOF.
         // Constant files take the default cached path (mmap-able).
-        let fopen = if file.direct_io {
+        let fopen = if target.direct_io {
             fuser::FopenFlags::FOPEN_DIRECT_IO
         } else {
             fuser::FopenFlags::empty()
         };
         reply.opened(FileHandle(opened.fh), fopen);
     }
+}
+
+/// What `open()` should serve for a resolved inode.
+struct OpenTarget {
+    virtual_path: String,
+    direct_io: bool,
+    kind: OpenKind,
+}
+
+enum OpenKind {
+    Handler(ContentHandler),
+    Secret(String),
 }
 
 /// Build error codes that fuser doesn't provide constants for (EROFS/ENOATTR, etc.) from libc.
@@ -197,6 +334,31 @@ impl fuser::Filesystem for AccessFs {
             reply.error(Errno::ENOENT);
             return;
         };
+        // Children of the secrets directory resolve dynamically against the store.
+        if let Some(ns) = &self.inner.secrets {
+            if parent.0 == ns.dir_ino {
+                match name
+                    .parse::<SecretId>()
+                    .ok()
+                    .and_then(|sid| ns.store.record(&sid).ok().flatten())
+                {
+                    Some(rec) => {
+                        let ino = ns.ino_for(name);
+                        let attr = file_attr(
+                            ino,
+                            rec.size,
+                            rec.mode as u16,
+                            self.inner.mount_epoch,
+                            self.inner.mount_uid,
+                            self.inner.mount_gid,
+                        );
+                        reply.entry(&TTL, &attr, fuser::Generation(0));
+                    }
+                    None => reply.error(Errno::ENOENT),
+                }
+                return;
+            }
+        }
         match self
             .inner
             .tree
@@ -209,6 +371,16 @@ impl fuser::Filesystem for AccessFs {
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        // A dynamic secret inode reads its attributes live from the store.
+        if let Some(ns) = &self.inner.secrets {
+            if let Some(id) = ns.id_for_ino(ino.0) {
+                match self.inner.secret_attr(ino.0, &id) {
+                    Some(attr) => reply.attr(&TTL, &attr),
+                    None => reply.error(Errno::ENOENT),
+                }
+                return;
+            }
+        }
         match self.inner.attr_for(ino.0) {
             Some(attr) => reply.attr(&TTL, &attr),
             None => reply.error(Errno::ENOENT),
@@ -238,6 +410,29 @@ impl fuser::Filesystem for AccessFs {
         if !matches!(node.kind, NodeKind::Dir) {
             reply.error(Errno::ENOTDIR);
             return;
+        }
+
+        // The secrets directory lists the store's current contents dynamically.
+        if let Some(ns) = &self.inner.secrets {
+            if ino.0 == ns.dir_ino {
+                let mut entries: Vec<(u64, FileType, String)> = vec![
+                    (ino.0, FileType::Directory, ".".to_string()),
+                    (node.parent, FileType::Directory, "..".to_string()),
+                ];
+                for r in ns.store.list().unwrap_or_default() {
+                    let id = r.id.to_string();
+                    let cino = ns.ino_for(&id);
+                    entries.push((cino, FileType::RegularFile, id));
+                }
+                for (i, (cino, kind, name)) in entries.iter().enumerate().skip(offset as usize) {
+                    let next = (i + 1) as u64;
+                    if reply.add(INodeNo(*cino), next, *kind, name.as_str()) {
+                        break;
+                    }
+                }
+                reply.ok();
+                return;
+            }
         }
 
         // . and .. always come first, then child nodes. offset is the "next" cursor.
@@ -330,6 +525,14 @@ impl fuser::Filesystem for AccessFs {
                 .tree
                 .get(info.ino)
                 .map(|n| n.virtual_path())
+                .filter(|p| !p.is_empty())
+                .or_else(|| {
+                    self.inner
+                        .secrets
+                        .as_ref()
+                        .and_then(|ns| ns.id_for_ino(info.ino))
+                        .map(|id| format!("{SECRETS_DIR}/{id}"))
+                })
                 .unwrap_or_default();
             tracing::debug!(path = %path, fh = fh.0, bytes = info.bytes_served, "close");
             self.inner.audit.log_close(
@@ -379,11 +582,15 @@ impl fuser::Filesystem for AccessFs {
 /// Uses `spawn_mount2` (session runs on a background thread) plus a signal wait, rather than
 /// the blocking `mount2`: the latter has no chance to unmount when killed by a signal, leaving
 /// a zombie macFUSE mount at the mount point. `BackgroundSession` unmounts automatically on drop.
-pub fn mount(cfg: ResolvedConfig, authorizer: Arc<dyn Authorizer>) -> anyhow::Result<()> {
+pub fn mount(
+    cfg: ResolvedConfig,
+    authorizer: Arc<dyn Authorizer>,
+    store: Option<Arc<dyn SecretStore>>,
+) -> anyhow::Result<()> {
     let audit = Arc::new(AuditLog::open(&cfg.audit_log)?);
     let mount_point = cfg.mount_path.clone();
     let config = mount_config(&cfg.volname);
-    let fs = AccessFs::new(&cfg, audit, authorizer);
+    let fs = AccessFs::new(&cfg, audit, authorizer, store);
 
     tracing::info!(
         mount = %mount_point.display(),
