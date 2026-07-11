@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use accessfs_core::authz::{AuthRequest, Authorizer, Decision, Enforcement};
+use accessfs_core::authz::{AuthRequest, Authorizer, Decision, Enforcement, Operation};
 use accessfs_core::config::ResolvedConfig;
 use accessfs_core::identity::ProcessIdentity;
 use accessfs_core::rules::{repo_root, RuleSet};
@@ -38,8 +38,10 @@ pub struct SocketAgent {
     server: Arc<SocketServer>,
     /// Policy rules, evaluated first-match by priority.
     rules: RuleSet,
-    /// (grant_key, path) -> grant expiry.
-    grants: DashMap<(String, String), Instant>,
+    /// (grant_key, path, operation) -> grant expiry. Operation is part of the key so a read
+    /// grant never authorizes a write (and vice versa) — approving "read .env" must not let
+    /// the same subject silently rewrite it within the TTL.
+    grants: DashMap<(String, String, Operation), Instant>,
 }
 
 impl SocketAgent {
@@ -64,7 +66,7 @@ impl SocketAgent {
         enforcement: Enforcement,
         grant_key: String,
     ) -> Decision {
-        let key = (grant_key, req.path.to_string());
+        let key = (grant_key, req.path.to_string(), req.operation);
 
         if self.grant_valid(&key) {
             return Decision::allow("cached grant").with_rule("grant");
@@ -99,7 +101,7 @@ impl SocketAgent {
     }
 
     /// True if a non-expired grant exists for `key`; expired grants are evicted.
-    fn grant_valid(&self, key: &(String, String)) -> bool {
+    fn grant_valid(&self, key: &(String, String, Operation)) -> bool {
         match self.grants.get(key) {
             Some(exp) if *exp > Instant::now() => true,
             Some(_) => {
@@ -115,7 +117,9 @@ impl Authorizer for SocketAgent {
     fn authorize(&self, req: &AuthRequest) -> Decision {
         // Derive the reader's git checkout once; both rule matching and grant keying use it.
         let repo = req.identity.cwd.as_deref().and_then(repo_root);
-        let (enforcement, rule_id) = self.rules.decide(req.identity, req.path, repo.as_deref());
+        let (enforcement, rule_id) =
+            self.rules
+                .decide(req.identity, req.path, repo.as_deref(), req.operation);
 
         let decision = match enforcement {
             Enforcement::Allow => attach(Decision::allow("allowed by rule"), rule_id),
@@ -183,5 +187,122 @@ fn grant_ttl(d: &crate::protocol::ClientDecision) -> Option<Duration> {
         Some("ttl") => Some(d.ttl_secs.map(Duration::from_secs).unwrap_or(DEFAULT_TTL)),
         Some("app_file") | Some("app_project") => Some(PERSISTENT_TTL),
         _ => None, // "once" or unspecified
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use accessfs_core::rules::{any_path_glob, Rule, RuleOps, SubjectMatch};
+
+    fn agent_with_rules(dir: &std::path::Path, rules: Vec<Rule>) -> SocketAgent {
+        let server = SocketServer::start(&dir.join("agent.sock")).unwrap();
+        SocketAgent {
+            server,
+            rules: RuleSet::new(rules),
+            grants: DashMap::new(),
+        }
+    }
+
+    /// Agent whose rules prompt for everything (both operations), with a live socket but no
+    /// app connected — any prompt fails closed, so only the grant cache can produce an allow.
+    fn prompt_only_agent(dir: &std::path::Path) -> SocketAgent {
+        agent_with_rules(
+            dir,
+            vec![Rule {
+                id: "prompt-all".into(),
+                priority: 0,
+                subject: SubjectMatch::default(),
+                path_glob: any_path_glob(),
+                ops: RuleOps::READ_WRITE,
+                enforcement: Enforcement::Prompt,
+                enabled: true,
+            }],
+        )
+    }
+
+    fn req<'a>(id: &'a ProcessIdentity, op: Operation) -> AuthRequest<'a> {
+        AuthRequest {
+            path: "secrets/test-id",
+            operation: op,
+            identity: id,
+        }
+    }
+
+    #[test]
+    fn read_grant_does_not_cover_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = prompt_only_agent(tmp.path());
+        let id = ProcessIdentity::bare(1234, 501, 20);
+
+        // Seed a read grant, as if the user had answered "allow reads for 10 min".
+        agent.grants.insert(
+            (
+                grant_key(&id, None),
+                "secrets/test-id".to_string(),
+                Operation::Read,
+            ),
+            Instant::now() + Duration::from_secs(600),
+        );
+
+        // Read hits the cache.
+        let d = agent.authorize(&req(&id, Operation::Read));
+        assert!(d.is_allowed());
+        assert_eq!(d.rule_id.as_deref(), Some("grant"));
+
+        // Write must NOT: it re-prompts, and with no app connected it fails closed.
+        let d = agent.authorize(&req(&id, Operation::Write));
+        assert!(!d.is_allowed());
+        assert_eq!(d.rule_id.as_deref(), Some("fail-closed"));
+    }
+
+    #[test]
+    fn read_only_allow_rule_does_not_cover_write() {
+        // A pre-write-era static config: broad allow with no operation declared.
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = agent_with_rules(
+            tmp.path(),
+            vec![Rule {
+                id: "legacy-allow".into(),
+                priority: 10,
+                subject: SubjectMatch::default(),
+                path_glob: any_path_glob(),
+                ops: RuleOps::READ, // what `operation = None` in config resolves to
+                enforcement: Enforcement::Allow,
+                enabled: true,
+            }],
+        );
+        let id = ProcessIdentity::bare(1234, 501, 20);
+
+        let d = agent.authorize(&req(&id, Operation::Read));
+        assert!(d.is_allowed());
+        assert_eq!(d.rule_id.as_deref(), Some("legacy-allow"));
+
+        // The same subject writing must not ride the read rule: nothing matches → fail closed.
+        let d = agent.authorize(&req(&id, Operation::Write));
+        assert!(!d.is_allowed());
+        assert_eq!(d.rule_id.as_deref(), Some("default-deny"));
+    }
+
+    #[test]
+    fn write_grant_does_not_cover_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = prompt_only_agent(tmp.path());
+        let id = ProcessIdentity::bare(1234, 501, 20);
+
+        agent.grants.insert(
+            (
+                grant_key(&id, None),
+                "secrets/test-id".to_string(),
+                Operation::Write,
+            ),
+            Instant::now() + Duration::from_secs(600),
+        );
+
+        let d = agent.authorize(&req(&id, Operation::Write));
+        assert!(d.is_allowed());
+
+        let d = agent.authorize(&req(&id, Operation::Read));
+        assert!(!d.is_allowed());
     }
 }

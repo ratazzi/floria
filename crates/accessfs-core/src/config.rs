@@ -8,7 +8,9 @@ use serde::Deserialize;
 use crate::authz::Enforcement;
 use crate::error::{CoreError, Result};
 use crate::handler::ContentHandler;
-use crate::rules::{any_path_glob, compile_glob, exact_path_glob, Rule, RuleSet, SubjectMatch};
+use crate::rules::{
+    any_path_glob, compile_glob, exact_path_glob, Rule, RuleOps, RuleSet, SubjectMatch,
+};
 
 /// Virtual directory under the mount where store-backed secrets are surfaced (`secrets/<id>`).
 pub const SECRETS_DIR: &str = "secrets";
@@ -36,6 +38,10 @@ pub struct RuleCfg {
     pub path: Option<String>,
     /// Enforcement to apply on match: `"allow"`, `"deny"`, `"prompt"`, or `"touchid"`.
     pub enforcement: String,
+    /// Which operations the rule matches: `"read"` (default), `"write"`, or `"readwrite"`.
+    /// Defaults to read so pre-write-era rules keep meaning "who may read what";
+    /// write access is always an explicit opt-in.
+    pub operation: Option<String>,
     /// Defaults to true.
     pub enabled: Option<bool>,
     pub team_id: Option<String>,
@@ -205,33 +211,40 @@ fn build_ruleset(rule_cfgs: Vec<RuleCfg>, files: &[FileEntry]) -> Result<RuleSet
     }
 
     for f in files {
+        // Config-defined files are read-only at the FS layer, so their rules only ever see reads.
         rules.push(Rule {
             id: format!("file:{}", f.path),
             priority: 0,
             subject: SubjectMatch::default(),
             path_glob: exact_path_glob(&f.path),
+            ops: RuleOps::READ,
             enforcement: f.enforcement,
             enabled: true,
         });
     }
 
     // Store-backed secrets are prompted by default (above the catch-all, below anything explicit),
-    // so protecting a file gates it even without a per-id rule. Tighten with an explicit `[[rule]]`.
+    // so protecting a file gates it even without a per-id rule. Read AND write: secrets are the
+    // one writable namespace, and both directions must be gated. Tighten with an explicit `[[rule]]`.
     rules.push(Rule {
         id: "secrets-default".to_string(),
         priority: i32::MIN + 1,
         subject: SubjectMatch::default(),
         path_glob: compile_glob(&format!("{SECRETS_DIR}/**"))
             .expect("`secrets/**` is a valid glob"),
+        ops: RuleOps::READ_WRITE,
         enforcement: Enforcement::Prompt,
         enabled: true,
     });
 
+    // Read-only catch-all: monitor-mode allow for reads. Writes deliberately never match it —
+    // a write that falls past every rule hits the engine's fail-closed default instead.
     rules.push(Rule {
         id: "default".to_string(),
         priority: i32::MIN,
         subject: SubjectMatch::default(),
         path_glob: any_path_glob(),
+        ops: RuleOps::READ,
         enforcement: Enforcement::Allow,
         enabled: true,
     });
@@ -259,11 +272,17 @@ fn resolve_rule(rc: RuleCfg, idx: usize) -> Result<Rule> {
         repo: rc.repo.map(|p| tilde_str(&p)),
         cwd_prefix: rc.cwd_prefix.map(|p| tilde_str(&p)),
     };
+    let ops = match rc.operation.as_deref() {
+        None => RuleOps::READ, // pre-write-era rules stay read-only; write is opt-in
+        Some(s) => RuleOps::parse(s)
+            .ok_or_else(|| CoreError::config(format!("rule {id}: invalid operation {s:?}")))?,
+    };
     Ok(Rule {
         id,
         priority: rc.priority.unwrap_or(0),
         subject,
         path_glob,
+        ops,
         enforcement,
         enabled: rc.enabled.unwrap_or(true),
     })
@@ -466,6 +485,7 @@ pub fn check_secure_perms(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::authz::Operation;
     use crate::identity::ProcessIdentity;
 
     #[test]
@@ -528,6 +548,7 @@ mod tests {
             priority: None,
             path: Some(path.to_string()),
             enforcement: enforcement.to_string(),
+            operation: None,
             enabled: None,
             team_id: None,
             bundle_id: None,
@@ -562,28 +583,58 @@ mod tests {
         // explicit rule + one per-file rule + secrets-default + catch-all
         assert_eq!(rules.len(), 4);
 
-        // any secrets/<id> path is prompted by the built-in rule
+        // any secrets/<id> path is prompted by the built-in rule — for reads AND writes
         let id = ProcessIdentity::bare(1, 501, 20);
         assert_eq!(
-            rules.decide(&id, "secrets/abc-123", None),
+            rules.decide(&id, "secrets/abc-123", None, Operation::Read),
+            (Enforcement::Prompt, Some("secrets-default".to_string()))
+        );
+        assert_eq!(
+            rules.decide(&id, "secrets/abc-123", None, Operation::Write),
             (Enforcement::Prompt, Some("secrets-default".to_string()))
         );
 
         // explicit deny rule wins for prod
         assert_eq!(
-            rules.decide(&id, "env/svc/prod.env", None),
+            rules.decide(&id, "env/svc/prod.env", None, Operation::Read),
             (Enforcement::Deny, Some("prod".to_string()))
         );
         // per-file prompt applies to dev.env
         assert_eq!(
-            rules.decide(&id, "env/demo/dev.env", None),
+            rules.decide(&id, "env/demo/dev.env", None, Operation::Read),
             (Enforcement::Prompt, Some("file:env/demo/dev.env".to_string()))
         );
-        // anything else falls through to the default allow
+        // reads on anything else fall through to the visible catch-all allow...
         assert_eq!(
-            rules.decide(&id, "demo/hello.txt", None),
+            rules.decide(&id, "demo/hello.txt", None, Operation::Read),
             (Enforcement::Allow, Some("default".to_string()))
         );
+        // ...but writes never ride the read catch-all: unmatched writes fail closed.
+        assert_eq!(
+            rules.decide(&id, "demo/hello.txt", None, Operation::Write),
+            (Enforcement::Deny, Some("default-deny".to_string()))
+        );
+    }
+
+    #[test]
+    fn rule_operation_parses_and_rejects_garbage() {
+        let mut rc = rule_cfg("w", "secrets/**", "allow");
+        rc.operation = Some("write".to_string());
+        let rules = build_ruleset(vec![rc], &[]).unwrap();
+        let id = ProcessIdentity::bare(1, 501, 20);
+        // write-only allow matches writes, not reads (reads fall to secrets-default prompt)
+        assert_eq!(
+            rules.decide(&id, "secrets/abc", None, Operation::Write),
+            (Enforcement::Allow, Some("w".to_string()))
+        );
+        assert_eq!(
+            rules.decide(&id, "secrets/abc", None, Operation::Read),
+            (Enforcement::Prompt, Some("secrets-default".to_string()))
+        );
+
+        let mut bad = rule_cfg("bad", "**", "allow");
+        bad.operation = Some("readwrite-ish".to_string());
+        assert!(build_ruleset(vec![bad], &[]).is_err());
     }
 
     #[test]

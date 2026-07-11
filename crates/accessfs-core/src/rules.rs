@@ -1,4 +1,4 @@
-//! Policy rule engine: `who (subject) × what (path) -> how (enforcement)`.
+//! Policy rule engine: `who (subject) × what (path) × how-accessed (operation) -> how (enforcement)`.
 //!
 //! Evaluation is **first-match by priority** (like pf/iptables): rules are ordered by
 //! descending priority and the first enabled rule whose subject *and* path both match wins.
@@ -13,8 +13,40 @@ use std::path::Path;
 
 use globset::{Glob, GlobMatcher};
 
-use crate::authz::Enforcement;
+use crate::authz::{Enforcement, Operation};
 use crate::identity::ProcessIdentity;
+
+/// Which operations a rule matches. Rules predate the writable mount and mean
+/// "who may *read* what"; keeping unstated rules read-only preserves exactly that — a
+/// read-era `allow` must never silently start covering writes. Write access is opt-in
+/// via an explicit `operation = "write"` / `"readwrite"` in the rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RuleOps {
+    pub read: bool,
+    pub write: bool,
+}
+
+impl RuleOps {
+    pub const READ: RuleOps = RuleOps { read: true, write: false };
+    pub const WRITE: RuleOps = RuleOps { read: false, write: true };
+    pub const READ_WRITE: RuleOps = RuleOps { read: true, write: true };
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "read" => Some(RuleOps::READ),
+            "write" => Some(RuleOps::WRITE),
+            "readwrite" => Some(RuleOps::READ_WRITE),
+            _ => None,
+        }
+    }
+
+    pub fn matches(&self, op: Operation) -> bool {
+        match op {
+            Operation::Read => self.read,
+            Operation::Write => self.write,
+        }
+    }
+}
 
 /// A compiled subject matcher. Every facet that is `Some` must match (AND). All `None` matches any reader.
 #[derive(Debug, Clone, Default)]
@@ -74,6 +106,8 @@ pub struct Rule {
     pub subject: SubjectMatch,
     /// Glob over the virtual path, e.g. `env/*/prod.env`.
     pub path_glob: GlobMatcher,
+    /// Which operations this rule applies to (config defaults to read-only).
+    pub ops: RuleOps,
     pub enforcement: Enforcement,
     pub enabled: bool,
 }
@@ -92,20 +126,27 @@ impl RuleSet {
         RuleSet { rules }
     }
 
-    /// Decide enforcement for `id` reading `path`. Returns the matched rule's enforcement and id.
-    /// Falls back to `Allow` with no rule id if nothing matches (config always appends a catch-all).
+    /// Decide enforcement for `id` performing `op` on `path`. Returns the matched rule's
+    /// enforcement and id. If nothing matches, **fail closed**: config appends a read
+    /// catch-all, so this is reachable only for operations no rule opted into — the visible
+    /// catch-all expresses monitor-mode allow, a hidden default must not.
     pub fn decide(
         &self,
         id: &ProcessIdentity,
         path: &str,
         repo: Option<&str>,
+        op: Operation,
     ) -> (Enforcement, Option<String>) {
         for r in &self.rules {
-            if r.enabled && r.path_glob.is_match(path) && r.subject.matches(id, repo) {
+            if r.enabled
+                && r.ops.matches(op)
+                && r.path_glob.is_match(path)
+                && r.subject.matches(id, repo)
+            {
                 return (r.enforcement, Some(r.id.clone()));
             }
         }
-        (Enforcement::Allow, None)
+        (Enforcement::Deny, Some("default-deny".to_string()))
     }
 
     pub fn len(&self) -> usize {
@@ -162,6 +203,7 @@ mod tests {
             priority,
             subject,
             path_glob: compile_glob(path).unwrap(),
+            ops: RuleOps::READ,
             enforcement: enf,
             enabled: true,
         }
@@ -174,11 +216,11 @@ mod tests {
             rule("high", 100, SubjectMatch::default(), "env/**", Enforcement::Deny),
         ]);
         let id = ident("/usr/bin/cat", None);
-        let (enf, matched) = set.decide(&id, "env/demo/dev.env", None);
+        let (enf, matched) = set.decide(&id, "env/demo/dev.env", None, Operation::Read);
         assert_eq!(enf, Enforcement::Deny);
         assert_eq!(matched.as_deref(), Some("high"));
         // A path outside the high rule falls through to the catch-all.
-        let (enf, matched) = set.decide(&id, "demo/hello.txt", None);
+        let (enf, matched) = set.decide(&id, "demo/hello.txt", None, Operation::Read);
         assert_eq!(enf, Enforcement::Allow);
         assert_eq!(matched.as_deref(), Some("low"));
     }
@@ -199,15 +241,15 @@ mod tests {
         )]);
 
         let chrome = ident("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", Some("EQHXZ8M8AV"));
-        assert_eq!(set.decide(&chrome, "env/x", None).0, Enforcement::Prompt);
+        assert_eq!(set.decide(&chrome, "env/x", None, Operation::Read).0, Enforcement::Prompt);
 
-        // Right team, wrong exe -> no match, falls back to default allow.
+        // Right team, wrong exe -> no match, falls to the fail-closed default.
         let other = ident("/usr/bin/curl", Some("EQHXZ8M8AV"));
-        assert_eq!(set.decide(&other, "env/x", None).0, Enforcement::Allow);
+        assert_eq!(set.decide(&other, "env/x", None, Operation::Read).0, Enforcement::Deny);
 
         // Right exe, wrong team -> no match.
         let unsigned = ident("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", None);
-        assert_eq!(set.decide(&unsigned, "env/x", None).0, Enforcement::Allow);
+        assert_eq!(set.decide(&unsigned, "env/x", None, Operation::Read).0, Enforcement::Deny);
     }
 
     #[test]
@@ -218,9 +260,9 @@ mod tests {
         };
         let set = RuleSet::new(vec![rule("proj", 10, subject, "**", Enforcement::TouchId)]);
         let node = ident("/usr/local/bin/node", Some("HX7739G8FX"));
-        assert_eq!(set.decide(&node, "env/x", Some("/Users/me/proj")).0, Enforcement::TouchId);
-        assert_eq!(set.decide(&node, "env/x", Some("/Users/me/other")).0, Enforcement::Allow);
-        assert_eq!(set.decide(&node, "env/x", None).0, Enforcement::Allow);
+        assert_eq!(set.decide(&node, "env/x", Some("/Users/me/proj"), Operation::Read).0, Enforcement::TouchId);
+        assert_eq!(set.decide(&node, "env/x", Some("/Users/me/other"), Operation::Read).0, Enforcement::Deny);
+        assert_eq!(set.decide(&node, "env/x", None, Operation::Read).0, Enforcement::Deny);
     }
 
     #[test]
@@ -228,6 +270,27 @@ mod tests {
         let mut r = rule("off", 100, SubjectMatch::default(), "**", Enforcement::Deny);
         r.enabled = false;
         let set = RuleSet::new(vec![r]);
-        assert_eq!(set.decide(&ident("/usr/bin/cat", None), "x", None).0, Enforcement::Allow);
+        let (enf, matched) = set.decide(&ident("/usr/bin/cat", None), "x", None, Operation::Read);
+        assert_eq!(enf, Enforcement::Deny);
+        assert_eq!(matched.as_deref(), Some("default-deny"), "must not match the disabled rule");
+    }
+
+    #[test]
+    fn read_era_rules_do_not_cover_writes() {
+        // A pre-write-era config: a broad allow with no operation declared (defaults to read).
+        let set = RuleSet::new(vec![rule("legacy-allow", 10, SubjectMatch::default(), "**", Enforcement::Allow)]);
+        let id = ident("/usr/bin/cat", None);
+        assert_eq!(set.decide(&id, "secrets/x", None, Operation::Read).0, Enforcement::Allow);
+        // The same subject writing must NOT ride the read rule: no match -> fail closed.
+        let (enf, matched) = set.decide(&id, "secrets/x", None, Operation::Write);
+        assert_eq!(enf, Enforcement::Deny);
+        assert_eq!(matched.as_deref(), Some("default-deny"));
+
+        // An explicit readwrite rule covers both.
+        let mut rw = rule("rw", 10, SubjectMatch::default(), "**", Enforcement::Prompt);
+        rw.ops = RuleOps::READ_WRITE;
+        let set = RuleSet::new(vec![rw]);
+        assert_eq!(set.decide(&id, "secrets/x", None, Operation::Write).0, Enforcement::Prompt);
+        assert_eq!(set.decide(&id, "secrets/x", None, Operation::Read).0, Enforcement::Prompt);
     }
 }

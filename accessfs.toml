@@ -24,10 +24,15 @@ enforcement = "touchid"
 read = ["./scripts/render-env", "demo", "dev"]
 
 # Subject-aware rules. Evaluated first-match by descending priority; a per-file `enforcement`
-# above is an implicit rule at priority 0 with subject = any. A trailing `allow` catch-all is
-# always appended, so unmatched paths are allowed (monitor mode).
+# above is an implicit rule at priority 0 with subject = any. A trailing read-only `allow`
+# catch-all is always appended, so unmatched *reads* are allowed (monitor mode).
 #
-# Each rule matches a `path` glob AND a subject. Subject facets are all optional and AND together:
+# Each rule matches a `path` glob AND a subject AND an operation. `operation` is `"read"`
+# (the default), `"write"`, or `"readwrite"` — write access never rides a read rule; it must
+# be opted into explicitly. Writes that match no rule are denied (fail-closed); store-backed
+# secrets are prompted for both read and write by a built-in default.
+#
+# Subject facets are all optional and AND together:
 #   team_id     code-signing team of a compiled/GUI app (stable across its helper processes)
 #   bundle_id   code-signing bundle id (finer than team)
 #   exe         glob over the reader's executable path (`*` does not cross `/`; use `**/foo`)
@@ -52,3 +57,10 @@ read = ["./scripts/render-env", "demo", "dev"]
 # enforcement = "touchid"
 # repo = "~/workspace/floria"   # `node script.js` run from this checkout
 # exe = "**/node"
+#
+# [[rule]]
+# id = "editor-writes"
+# path = "secrets/**"
+# operation = "readwrite"        # without this, the rule would cover reads only
+# enforcement = "prompt"
+# exe = "**/nvim"
