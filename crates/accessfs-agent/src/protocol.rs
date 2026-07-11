@@ -47,6 +47,8 @@ pub enum DaemonMsg<'a> {
     AccessEvent {
         ts: String,
         path: &'a str,
+        /// `read` or `write` — with a writable mount, "allowed" alone is ambiguous.
+        operation: &'a str,
         decision: &'a str,
         rule_id: Option<&'a str>,
         identity: IdentityView,
@@ -105,4 +107,48 @@ pub fn read_msg<R: Read, T: DeserializeOwned>(r: &mut R) -> io::Result<T> {
     let mut body = vec![0u8; len];
     r.read_exact(&mut body)?;
     serde_json::from_slice(&body).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Swift side decodes these by hand; assert the wire shape (tag + fields) so schema
+    /// drift between the two ends fails a test instead of silently dropping data.
+    #[test]
+    fn access_event_wire_shape_includes_operation() {
+        let id = ProcessIdentity::bare(42, 501, 20);
+        let msg = DaemonMsg::AccessEvent {
+            ts: "2026-07-11T00:00:00.000Z".to_string(),
+            path: "secrets/abc",
+            operation: "write",
+            decision: "allowed",
+            rule_id: Some("grant"),
+            identity: IdentityView::from_identity(&id),
+        };
+        let v: serde_json::Value = serde_json::from_slice(&serde_json::to_vec(&msg).unwrap()).unwrap();
+        assert_eq!(v["type"], "access_event");
+        assert_eq!(v["operation"], "write");
+        assert_eq!(v["decision"], "allowed");
+        assert_eq!(v["path"], "secrets/abc");
+        assert_eq!(v["rule_id"], "grant");
+        assert_eq!(v["identity"]["pid"], 42);
+    }
+
+    #[test]
+    fn prompt_wire_shape_includes_operation() {
+        let id = ProcessIdentity::bare(7, 501, 20);
+        let msg = DaemonMsg::Prompt {
+            req_id: 9,
+            path: "secrets/abc",
+            operation: "read",
+            enforcement: "prompt",
+            identity: IdentityView::from_identity(&id),
+        };
+        let v: serde_json::Value = serde_json::from_slice(&serde_json::to_vec(&msg).unwrap()).unwrap();
+        assert_eq!(v["type"], "prompt");
+        assert_eq!(v["req_id"], 9);
+        assert_eq!(v["operation"], "read");
+        assert_eq!(v["enforcement"], "prompt");
+    }
 }

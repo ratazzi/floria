@@ -134,6 +134,7 @@ impl Authorizer for SocketAgent {
         self.server.send_event(&DaemonMsg::AccessEvent {
             ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             path: req.path,
+            operation: req.operation.as_str(),
             decision: decision.decision_str(),
             rule_id: decision.rule_id.as_deref(),
             identity: IdentityView::from_identity(req.identity),

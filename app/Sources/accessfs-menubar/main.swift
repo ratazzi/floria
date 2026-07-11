@@ -31,7 +31,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func addRecent(_ ev: AccessEventMsg) {
         let exe = (ev.identity.exe as NSString?)?.lastPathComponent ?? "?"
-        recent.insert("\(ev.decision)  \(exe)  \(ev.path)", at: 0)
+        // Show the operation: an allowed *write* moved the secret's head, which the user
+        // must be able to tell apart from a read at a glance.
+        recent.insert("\(ev.decision) \(ev.operation)  \(exe)  \(ev.path)", at: 0)
         if recent.count > 20 { recent.removeLast() }
         rebuildMenu()
     }

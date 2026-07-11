@@ -25,6 +25,8 @@ struct PromptMsg: Decodable {
 struct AccessEventMsg: Decodable {
     let ts: String
     let path: String
+    /// "read" or "write" — with a writable mount, decision alone is ambiguous.
+    let operation: String
     let decision: String
     let rule_id: String?
     let identity: IdentityView
