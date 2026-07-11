@@ -17,16 +17,19 @@ pub struct AuthRequest<'a> {
     pub identity: &'a ProcessIdentity,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Operation {
     Read,
-    // Write is deferred to phase two
+    /// Opening for write (store-backed secrets only). Each committed close appends a new
+    /// immutable version to the store, so a write is never destructive.
+    Write,
 }
 
 impl Operation {
     pub fn as_str(&self) -> &'static str {
         match self {
             Operation::Read => "read",
+            Operation::Write => "write",
         }
     }
 }

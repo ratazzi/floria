@@ -12,5 +12,6 @@ pub mod handler;
 pub mod identity;
 pub mod rules;
 pub mod snapshot;
+pub mod writebuf;
 
 pub use error::{CoreError, Result};
