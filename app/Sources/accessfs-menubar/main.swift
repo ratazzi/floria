@@ -71,29 +71,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.addButton(withTitle: "Allow 10 min")
         alert.addButton(withTitle: "Deny")
 
+        // The modal alert steals focus from whatever the user was doing — often the very app
+        // whose open() is blocked on this answer. An accessory app has no window to hand focus
+        // back to, so AppKit leaves it nowhere; remember the frontmost app and give focus back
+        // once the decision (including the async Touch ID leg) is done.
+        let previous = NSWorkspace.shared.frontmostApplication
+        let refocus = {
+            guard let previous,
+                previous.processIdentifier != NSRunningApplication.current.processIdentifier
+            else { return }
+            _ = previous.activate(from: .current)
+        }
+
         NSApp.activate(ignoringOtherApps: true)
         switch alert.runModal() {
         case .alertFirstButtonReturn:
-            confirmAllow(p, scope: "once", ttl: nil)
+            confirmAllow(p, scope: "once", ttl: nil, then: refocus)
         case .alertSecondButtonReturn:
-            confirmAllow(p, scope: "ttl", ttl: 600)
+            confirmAllow(p, scope: "ttl", ttl: 600, then: refocus)
         default:
             send(deny: p)
+            refocus()
         }
     }
 
     /// Send an allow decision, first gating on Touch ID when the path requires it.
-    private func confirmAllow(_ p: PromptMsg, scope: String, ttl: UInt64?) {
+    /// `done` runs after the decision is fully settled (Touch ID included) — used to refocus.
+    private func confirmAllow(
+        _ p: PromptMsg, scope: String, ttl: UInt64?, then done: @escaping () -> Void
+    ) {
         let allow = { [weak self] in
             self?.client.send(
                 DecisionMsg(req_id: p.req_id, outcome: "allow", scope: scope, ttl_secs: ttl))
         }
         guard p.enforcement == "touchid" else {
             allow()
+            done()
             return
         }
         authenticateBiometric(reason: "allow access to \(p.path)") { [weak self] ok in
             if ok { allow() } else { self?.send(deny: p) }
+            done()
         }
     }
 

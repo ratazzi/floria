@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "accessfs-menubar",
-    platforms: [.macOS(.v13)],
+    platforms: [.macOS(.v14)],
     targets: [
         .executableTarget(
             name: "accessfs-menubar",
