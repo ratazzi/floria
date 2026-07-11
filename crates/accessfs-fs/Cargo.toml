@@ -16,6 +16,10 @@ anyhow = { workspace = true }
 ctrlc = { workspace = true }
 threadpool = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+zeroize = { workspace = true }
+
 [features]
 # Typecheck-only on machines without macFUSE: makes fuser skip its pkg-config probe.
 # Do NOT enable for an actual mount (the default feature probes macFUSE via libfuse2).

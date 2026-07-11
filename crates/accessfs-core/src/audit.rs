@@ -41,6 +41,7 @@ impl AuditLog {
     pub fn log_open(
         &self,
         path: &str,
+        operation: &'static str,
         identity: &ProcessIdentity,
         decision: &str,
         rule_id: Option<&str>,
@@ -52,7 +53,7 @@ impl AuditLog {
             ts: now_rfc3339(),
             event: "open",
             path,
-            operation: "read",
+            operation,
             decision,
             rule_id,
             request: RequestInfo {
@@ -71,6 +72,7 @@ impl AuditLog {
     pub fn log_denied(
         &self,
         path: &str,
+        operation: &'static str,
         identity: &ProcessIdentity,
         rule_id: Option<&str>,
         reason: &str,
@@ -79,7 +81,7 @@ impl AuditLog {
             ts: now_rfc3339(),
             event: "open",
             path,
-            operation: "read",
+            operation,
             decision: "denied",
             rule_id,
             reason,
@@ -89,6 +91,27 @@ impl AuditLog {
                 pid: identity.pid,
             },
             identity,
+        });
+    }
+
+    /// A committed write: a new immutable version appended to the store. Records only the
+    /// content hash and version number, never plaintext.
+    pub fn log_write_commit(
+        &self,
+        path: &str,
+        fh: u64,
+        version: u32,
+        content_version: &str,
+        size: u64,
+    ) {
+        self.write(&WriteCommitEvent {
+            ts: now_rfc3339(),
+            event: "write_commit",
+            path,
+            fh,
+            version,
+            content_version,
+            size,
         });
     }
 
@@ -152,6 +175,17 @@ struct DeniedEvent<'a> {
     reason: &'a str,
     request: RequestInfo,
     identity: &'a ProcessIdentity,
+}
+
+#[derive(Serialize)]
+struct WriteCommitEvent<'a> {
+    ts: String,
+    event: &'static str,
+    path: &'a str,
+    fh: u64,
+    version: u32,
+    content_version: &'a str,
+    size: u64,
 }
 
 #[derive(Serialize)]

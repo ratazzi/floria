@@ -1,5 +1,6 @@
 //! accessfs-fs: macFUSE backend. Exposes the virtual file tree from
-//! [`ResolvedConfig`] as a read-only FUSE volume.
+//! [`ResolvedConfig`] as a FUSE volume: config files are read-only, store-backed
+//! secrets are also writable (every committed close appends a store version).
 //!
 //! Key semantics (see the product brief):
 //! - `stat/readdir/getattr` never generate content, and attributes stay constant
@@ -8,6 +9,8 @@
 //!   and writes an audit record.
 //! - Repeated `read`s on the same fd return the same bytes; different fds get
 //!   independent snapshots.
+//! - A write-open on a secret buffers in memory and commits at flush/release as a
+//!   new immutable version — concurrent writers append, nobody destroys anything.
 
 mod reply;
 mod tree;
@@ -20,12 +23,14 @@ use accessfs_core::audit::AuditLog;
 use accessfs_core::authz::{AuthRequest, Authorizer, Operation};
 use accessfs_core::config::{ResolvedConfig, SECRETS_DIR};
 use accessfs_core::handler::{ContentHandler, HandlerCtx};
-use accessfs_core::snapshot::SnapshotTable;
+use accessfs_core::snapshot::{content_version_of, SnapshotTable};
+use accessfs_core::writebuf::{WriteBufTable, WriteErr};
 use accessfs_store::{SecretId, SecretStore};
 use dashmap::DashMap;
 use fuser::{
     AccessFlags, Errno, FileHandle, FileType, INodeNo, KernelConfig, OpenFlags, ReplyAttr,
-    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyXattr, Request,
+    ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite,
+    ReplyXattr, Request,
 };
 
 use reply::{dir_attr, file_attr, mount_config, TTL};
@@ -85,6 +90,9 @@ impl SecretsNs {
 struct Shared {
     tree: Tree,
     snapshots: SnapshotTable,
+    /// Per-open write buffers for store-backed secrets (fh >= WRITE_FH_BASE); committed as a
+    /// new store version on flush/release.
+    writes: WriteBufTable,
     audit: Arc<AuditLog>,
     /// Authorization decision boundary. Supplied by the agent (or AllowAll in monitor mode).
     authorizer: Arc<dyn Authorizer>,
@@ -123,6 +131,7 @@ impl AccessFs {
         let inner = Arc::new(Shared {
             tree,
             snapshots: SnapshotTable::new(),
+            writes: WriteBufTable::new(),
             audit,
             authorizer,
             secrets,
@@ -203,6 +212,56 @@ impl Shared {
         Ok(plain.to_vec())
     }
 
+    /// The virtual path of a dynamic secret inode, or `None` if it isn't one.
+    fn secret_path(&self, ino: u64) -> Option<String> {
+        self.secrets
+            .as_ref()
+            .and_then(|ns| ns.id_for_ino(ino))
+            .map(|id| format!("{SECRETS_DIR}/{id}"))
+    }
+
+    /// Commit a dirty write buffer: append it to the store as a new immutable version and move
+    /// the head. `Ok(false)` = buffer clean, nothing to commit. On failure the buffer is
+    /// re-marked dirty so a later flush (or the release fallback) retries.
+    ///
+    /// Serialized per fh via `commit_guard`: overlapping fsync/flush/release commits run one at
+    /// a time, each taking the buffer's *current* content, so the store head always ends at the
+    /// newest snapshot — an older one can never land after (and shadow) a newer one. release
+    /// runs through here too, so it inherently waits out any in-flight commit before teardown.
+    fn commit_write(&self, fh: u64) -> std::result::Result<bool, String> {
+        let Some(lock) = self.writes.commit_guard(fh) else {
+            return Ok(false); // fh already torn down
+        };
+        let _serialized = lock.lock().map_err(|_| "commit lock poisoned".to_string())?;
+        let Some(bytes) = self.writes.take_dirty(fh) else {
+            return Ok(false);
+        };
+        let result = (|| {
+            let ino = self.writes.ino_of(fh).ok_or("write fh vanished")?;
+            let ns = self.secrets.as_ref().ok_or("no secret store configured")?;
+            let id = ns.id_for_ino(ino).ok_or("not a secret inode")?;
+            let sid: SecretId = id.parse().map_err(|_| format!("invalid secret id {id}"))?;
+            let version = ns
+                .store
+                .append_version(&sid, &bytes)
+                .map_err(|e| e.to_string())?;
+            Ok::<_, String>((format!("{SECRETS_DIR}/{id}"), version))
+        })();
+        match result {
+            Ok((path, version)) => {
+                let content_version = content_version_of(&bytes);
+                tracing::info!(path = %path, fh, version, size = bytes.len(), "write commit");
+                self.audit
+                    .log_write_commit(&path, fh, version, &content_version, bytes.len() as u64);
+                Ok(true)
+            }
+            Err(e) => {
+                self.writes.mark_dirty(fh);
+                Err(e)
+            }
+        }
+    }
+
     /// Runs on a pool thread: validation + identity + authorization + content generation,
     /// then replies. May block on an authorization prompt without stalling the event loop.
     fn handle_open(&self, ino: u64, flags: i32, uid: u32, gid: u32, pid: i32, reply: ReplyOpen) {
@@ -213,34 +272,86 @@ impl Shared {
                 return;
             }
         };
-        // Read-only: reject any write open.
-        if flags & libc::O_ACCMODE != libc::O_RDONLY {
-            reply.error(errno(libc::EROFS));
-            return;
-        }
+        // Only store-backed secrets are writable (each committed close appends a version);
+        // everything else stays read-only.
+        let wants_write = flags & libc::O_ACCMODE != libc::O_RDONLY;
+        let write_id = match (&target.kind, wants_write) {
+            (OpenKind::Secret(id), true) => Some(id.clone()),
+            (_, true) => {
+                reply.error(errno(libc::EROFS));
+                return;
+            }
+            _ => None,
+        };
+        let operation = if wants_write { Operation::Write } else { Operation::Read };
 
         let identity = Arc::new(accessfs_platform::enrich(pid, uid, gid));
 
         // Authorization boundary: decide after resolving the identity, before generating content.
         let decision = self.authorizer.authorize(&AuthRequest {
             path: &target.virtual_path,
-            operation: Operation::Read,
+            operation,
             identity: &identity,
         });
         if !decision.is_allowed() {
             tracing::info!(
                 path = %target.virtual_path,
+                op = operation.as_str(),
                 chain = %identity.chain_display(),
                 reason = %decision.reason,
                 "deny"
             );
             self.audit.log_denied(
                 &target.virtual_path,
+                operation.as_str(),
                 &identity,
                 decision.rule_id.as_deref(),
                 &decision.reason,
             );
             reply.error(errno(libc::EACCES));
+            return;
+        }
+
+        if let Some(id) = write_id {
+            // Write session: seed the buffer with the decrypted head so partial writes and
+            // O_APPEND merge correctly; O_TRUNC starts empty. Mutations stay in memory until
+            // flush/release commits them as a new immutable version.
+            let initial = if flags & libc::O_TRUNC != 0 {
+                Vec::new()
+            } else {
+                match self.decrypt_secret(&id) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!(path = %target.virtual_path, writer = %identity.chain_display(), "secret decrypt failed: {e}");
+                        reply.error(errno(libc::EIO));
+                        return;
+                    }
+                }
+            };
+            let size = initial.len() as u64;
+            let fh = self.writes.insert(ino, Arc::clone(&identity), initial);
+            tracing::info!(
+                path = %target.virtual_path,
+                uid, pid,
+                chain = %identity.chain_display(),
+                decision = decision.decision_str(),
+                rule = decision.rule_id.as_deref().unwrap_or("-"),
+                fh,
+                "open for write"
+            );
+            // The written content isn't known yet; the commit is audited separately
+            // as a write_commit event carrying the new version's hash.
+            self.audit.log_open(
+                &target.virtual_path,
+                operation.as_str(),
+                &identity,
+                decision.decision_str(),
+                decision.rule_id.as_deref(),
+                "-",
+                fh,
+                size,
+            );
+            reply.opened(FileHandle(fh), fuser::FopenFlags::FOPEN_DIRECT_IO);
             return;
         }
 
@@ -286,6 +397,7 @@ impl Shared {
         );
         self.audit.log_open(
             &target.virtual_path,
+            operation.as_str(),
             &identity,
             decision.decision_str(),
             decision.rule_id.as_deref(),
@@ -321,6 +433,38 @@ enum OpenKind {
 /// Build error codes that fuser doesn't provide constants for (EROFS/ENOATTR, etc.) from libc.
 fn errno(code: i32) -> Errno {
     Errno::from_i32(code)
+}
+
+/// What to do with a `setattr` request.
+#[derive(Debug, PartialEq, Eq)]
+enum SetattrPlan {
+    /// Nothing we'd have to fake: truncate the write buffer if asked, then reply the attr.
+    Apply { truncate_to: Option<u64> },
+    /// Asks for a change this FS cannot make true — refuse (EPERM) instead of lying.
+    Refuse,
+}
+
+/// Classify a `setattr` request against what this FS can honestly do.
+/// - Ownership (chown) and BSD flags (chflags) never change, anywhere: always refused.
+/// - Size needs an open write fd to buffer into; a path truncate has none.
+/// - mode and every timestamp facet (atime/mtime/ctime/crtime/chgtime/bkuptime) are refused
+///   outside a write session; within one they are a *documented no-op* (saving editors call
+///   fchmod/futimes on the fd — the store keeps its own mode, attributes stay frozen).
+fn plan_setattr(
+    has_write_fh: bool,
+    size: Option<u64>,
+    wants_mode: bool,
+    wants_owner: bool,
+    wants_times: bool,
+    wants_flags: bool,
+) -> SetattrPlan {
+    if wants_owner || wants_flags {
+        return SetattrPlan::Refuse;
+    }
+    if !has_write_fh && (size.is_some() || wants_mode || wants_times) {
+        return SetattrPlan::Refuse;
+    }
+    SetattrPlan::Apply { truncate_to: size }
 }
 
 impl fuser::Filesystem for AccessFs {
@@ -370,12 +514,22 @@ impl fuser::Filesystem for AccessFs {
         }
     }
 
-    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
-        // A dynamic secret inode reads its attributes live from the store.
+    fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
+        // A dynamic secret inode reads its attributes live from the store; fstat on an open
+        // write fd sees the in-progress buffer's size instead of the committed head's.
         if let Some(ns) = &self.inner.secrets {
             if let Some(id) = ns.id_for_ino(ino.0) {
                 match self.inner.secret_attr(ino.0, &id) {
-                    Some(attr) => reply.attr(&TTL, &attr),
+                    Some(mut attr) => {
+                        if let Some(len) = fh
+                            .map(|f| f.0)
+                            .filter(|&f| self.inner.writes.owns(f))
+                            .and_then(|f| self.inner.writes.len(f))
+                        {
+                            attr.size = len;
+                        }
+                        reply.attr(&TTL, &attr)
+                    }
                     None => reply.error(Errno::ENOENT),
                 }
                 return;
@@ -491,21 +645,167 @@ impl fuser::Filesystem for AccessFs {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
-        match self.inner.snapshots.read_slice(fh.0, offset, size) {
+        // An O_RDWR writer reads back its own uncommitted buffer; read snapshots are immutable.
+        let slice = if self.inner.writes.owns(fh.0) {
+            self.inner.writes.read_slice(fh.0, offset, size)
+        } else {
+            self.inner.snapshots.read_slice(fh.0, offset, size)
+        };
+        match slice {
             Some(slice) => reply.data(&slice),
             None => reply.error(Errno::EBADF),
         }
+    }
+
+    fn write(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        offset: u64,
+        data: &[u8],
+        _write_flags: fuser::WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<fuser::LockOwner>,
+        reply: ReplyWrite,
+    ) {
+        // Pure memory mutation — runs inline on the event loop; the store isn't touched
+        // until flush/release commits.
+        match self.inner.writes.write_at(fh.0, offset, data) {
+            Ok(n) => reply.written(n),
+            Err(WriteErr::BadHandle) => reply.error(Errno::EBADF),
+            Err(WriteErr::TooBig) => reply.error(errno(libc::EFBIG)),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn setattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
+        ctime: Option<SystemTime>,
+        fh: Option<FileHandle>,
+        crtime: Option<SystemTime>,
+        chgtime: Option<SystemTime>,
+        bkuptime: Option<SystemTime>,
+        flags: Option<fuser::BsdFileFlags>,
+        reply: ReplyAttr,
+    ) {
+        let write_fh = fh.map(|f| f.0).filter(|&f| self.inner.writes.owns(f));
+        let wants_times = atime.is_some()
+            || mtime.is_some()
+            || ctime.is_some()
+            || crtime.is_some()
+            || chgtime.is_some()
+            || bkuptime.is_some();
+        let plan = plan_setattr(
+            write_fh.is_some(),
+            size,
+            mode.is_some(),
+            uid.is_some() || gid.is_some(),
+            wants_times,
+            flags.is_some(),
+        );
+        match plan {
+            SetattrPlan::Refuse => {
+                reply.error(errno(libc::EPERM));
+                return;
+            }
+            SetattrPlan::Apply {
+                truncate_to: Some(new_size),
+            } => {
+                // ftruncate, or the kernel's follow-up to O_TRUNC.
+                match self.inner.writes.truncate(write_fh.expect("plan requires write fh"), new_size)
+                {
+                    Ok(()) => {}
+                    Err(WriteErr::BadHandle) => {
+                        reply.error(Errno::EBADF);
+                        return;
+                    }
+                    Err(WriteErr::TooBig) => {
+                        reply.error(errno(libc::EFBIG));
+                        return;
+                    }
+                }
+            }
+            SetattrPlan::Apply { truncate_to: None } => {}
+        }
+        // Reply with the current attr, sized from the write buffer if one is open on this fd.
+        let mut attr = match self
+            .inner
+            .secrets
+            .as_ref()
+            .and_then(|ns| ns.id_for_ino(ino.0))
+            .and_then(|id| self.inner.secret_attr(ino.0, &id))
+            .or_else(|| self.inner.attr_for(ino.0))
+        {
+            Some(a) => a,
+            None => {
+                reply.error(Errno::ENOENT);
+                return;
+            }
+        };
+        if let Some(len) = write_fh.and_then(|f| self.inner.writes.len(f)) {
+            attr.size = len;
+        }
+        reply.attr(&TTL, &attr);
+    }
+
+    fn fsync(
+        &self,
+        _req: &Request,
+        _ino: INodeNo,
+        fh: FileHandle,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        // fsync is exactly our commit point: "make it durable now". Editors (vim/nvim) call it
+        // right after writing and before close — commit here so their durability assumption
+        // holds and an encrypt/store failure surfaces as their fsync error, not at close.
+        if self.inner.writes.owns(fh.0) {
+            let shared = Arc::clone(&self.inner);
+            self.pool.execute(move || match shared.commit_write(fh.0) {
+                Ok(_) => reply.ok(),
+                Err(e) => {
+                    tracing::warn!(fh = fh.0, "write commit failed: {e}");
+                    reply.error(errno(libc::EIO));
+                }
+            });
+            return;
+        }
+        // Read fds have nothing to sync.
+        reply.ok();
     }
 
     fn flush(
         &self,
         _req: &Request,
         _ino: INodeNo,
-        _fh: FileHandle,
+        fh: FileHandle,
         _lock_owner: fuser::LockOwner,
         reply: ReplyEmpty,
     ) {
-        // A read-only filesystem has nothing to flush; just return ok to avoid the default ENOSYS warning noise.
+        // flush maps to the writer's close(2) return value: commit the buffer here so a failed
+        // encrypt/store write surfaces as EIO to the writer. Commit does crypto + store I/O
+        // (may wait on the store lock), so it runs on the pool like open().
+        if self.inner.writes.owns(fh.0) {
+            let shared = Arc::clone(&self.inner);
+            self.pool.execute(move || match shared.commit_write(fh.0) {
+                Ok(_) => reply.ok(),
+                Err(e) => {
+                    tracing::warn!(fh = fh.0, "write commit failed: {e}");
+                    reply.error(errno(libc::EIO));
+                }
+            });
+            return;
+        }
+        // Nothing to flush for read fds; return ok to avoid the default ENOSYS warning noise.
         reply.ok();
     }
 
@@ -519,6 +819,30 @@ impl fuser::Filesystem for AccessFs {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
+        // Write fd: last-chance commit (flush normally already did it), then audit the close.
+        if self.inner.writes.owns(fh.0) {
+            let shared = Arc::clone(&self.inner);
+            self.pool.execute(move || {
+                let commit_err = shared.commit_write(fh.0).err();
+                if let Some(closed) = shared.writes.remove(fh.0) {
+                    let path = shared.secret_path(closed.ino).unwrap_or_default();
+                    if closed.dirty_bytes.is_some() {
+                        // Commit failed even at release; the fd is gone, the content is lost.
+                        tracing::error!(path = %path, fh = fh.0, "uncommitted write dropped at close");
+                    }
+                    tracing::debug!(path = %path, fh = fh.0, bytes = closed.size, "close (write)");
+                    shared.audit.log_close(
+                        &path,
+                        fh.0,
+                        closed.duration.as_millis(),
+                        closed.size,
+                        commit_err.as_deref(),
+                    );
+                }
+                reply.ok();
+            });
+            return;
+        }
         if let Some(info) = self.inner.snapshots.remove(fh.0) {
             let path = self
                 .inner
@@ -526,13 +850,7 @@ impl fuser::Filesystem for AccessFs {
                 .get(info.ino)
                 .map(|n| n.virtual_path())
                 .filter(|p| !p.is_empty())
-                .or_else(|| {
-                    self.inner
-                        .secrets
-                        .as_ref()
-                        .and_then(|ns| ns.id_for_ino(info.ino))
-                        .map(|id| format!("{SECRETS_DIR}/{id}"))
-                })
+                .or_else(|| self.inner.secret_path(info.ino))
                 .unwrap_or_default();
             tracing::debug!(path = %path, fh = fh.0, bytes = info.bytes_served, "close");
             self.inner.audit.log_close(
@@ -611,4 +929,168 @@ pub fn mount(
     tracing::info!(mount = %mount_point.display(), "unmounting");
     drop(session); // BackgroundSession unmounts on drop
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use accessfs_core::authz::AllowAll;
+    use accessfs_core::identity::ProcessIdentity;
+    use accessfs_store::{NewSecret, SecretRecord, StoreResult, VersionRecord};
+    use std::path::Path;
+    use std::sync::mpsc;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use zeroize::Zeroizing;
+
+    #[test]
+    fn plan_setattr_refuses_every_mutation_without_a_write_fd() {
+        use SetattrPlan::*;
+        // Each mutation facet alone — size, chmod, chown, any timestamp (incl. the macOS
+        // ctime/crtime/chgtime/bkuptime extensions), chflags — is refused, never faked.
+        assert_eq!(plan_setattr(false, Some(0), false, false, false, false), Refuse);
+        assert_eq!(plan_setattr(false, None, true, false, false, false), Refuse);
+        assert_eq!(plan_setattr(false, None, false, true, false, false), Refuse);
+        assert_eq!(plan_setattr(false, None, false, false, true, false), Refuse);
+        assert_eq!(plan_setattr(false, None, false, false, false, true), Refuse);
+        // A request that changes nothing is a harmless attr reply.
+        assert_eq!(
+            plan_setattr(false, None, false, false, false, false),
+            Apply { truncate_to: None }
+        );
+    }
+
+    #[test]
+    fn plan_setattr_write_session_scope() {
+        use SetattrPlan::*;
+        // ftruncate on the write fd mutates the buffer.
+        assert_eq!(
+            plan_setattr(true, Some(5), false, false, false, false),
+            Apply { truncate_to: Some(5) }
+        );
+        // fchmod/futimes from a saving editor: documented no-op.
+        assert_eq!(
+            plan_setattr(true, None, true, false, true, false),
+            Apply { truncate_to: None }
+        );
+        // chown and chflags are refused even within a write session.
+        assert_eq!(plan_setattr(true, None, false, true, false, false), Refuse);
+        assert_eq!(plan_setattr(true, None, false, false, false, true), Refuse);
+    }
+
+    /// Store double whose first `append_version` blocks until released, to force commit overlap.
+    struct FakeStore {
+        appended: Mutex<Vec<Vec<u8>>>,
+        entered_tx: mpsc::Sender<()>,
+        gate_rx: Mutex<Option<mpsc::Receiver<()>>>,
+    }
+
+    impl SecretStore for FakeStore {
+        fn append_version(&self, _id: &SecretId, plaintext: &[u8]) -> StoreResult<u32> {
+            let _ = self.entered_tx.send(());
+            if let Some(rx) = self.gate_rx.lock().unwrap().take() {
+                let _ = rx.recv(); // first append parks here until the test releases it
+            }
+            let mut v = self.appended.lock().unwrap();
+            v.push(plaintext.to_vec());
+            Ok(v.len() as u32)
+        }
+
+        fn put(&self, _meta: NewSecret, _plaintext: &[u8]) -> StoreResult<SecretId> {
+            unimplemented!()
+        }
+        fn get(&self, _id: &SecretId) -> StoreResult<Zeroizing<Vec<u8>>> {
+            unimplemented!()
+        }
+        fn get_version(&self, _id: &SecretId, _version: u32) -> StoreResult<Zeroizing<Vec<u8>>> {
+            unimplemented!()
+        }
+        fn history(&self, _id: &SecretId) -> StoreResult<Vec<VersionRecord>> {
+            unimplemented!()
+        }
+        fn set_head(&self, _id: &SecretId, _version: u32) -> StoreResult<()> {
+            unimplemented!()
+        }
+        fn record(&self, _id: &SecretId) -> StoreResult<Option<SecretRecord>> {
+            unimplemented!()
+        }
+        fn list(&self) -> StoreResult<Vec<SecretRecord>> {
+            unimplemented!()
+        }
+        fn get_by_path(&self, _source_path: &Path) -> StoreResult<Option<SecretRecord>> {
+            unimplemented!()
+        }
+        fn delete(&self, _id: &SecretId) -> StoreResult<()> {
+            unimplemented!()
+        }
+    }
+
+    fn shared_with_store(store: Arc<dyn SecretStore>, tmp: &Path) -> Arc<Shared> {
+        let tree = Tree::build(&[]);
+        let secrets = SecretsNs::new(store, tree.secrets_dir_ino(), tree.next_ino());
+        Arc::new(Shared {
+            tree,
+            snapshots: SnapshotTable::new(),
+            writes: WriteBufTable::new(),
+            audit: Arc::new(AuditLog::open(&tmp.join("audit.jsonl")).unwrap()),
+            authorizer: Arc::new(AllowAll),
+            secrets: Some(secrets),
+            mount_epoch: SystemTime::now(),
+            mount_uid: 501,
+            mount_gid: 20,
+        })
+    }
+
+    /// The P1 scenario: an older snapshot's commit is still in flight inside the store when a
+    /// newer snapshot is written and a second commit fires. The per-fh commit lock must order
+    /// them so the newest content lands last (and thus becomes the store head).
+    #[test]
+    fn overlapping_commits_are_serialized_newest_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (gate_tx, gate_rx) = mpsc::channel();
+        let store = Arc::new(FakeStore {
+            appended: Mutex::new(Vec::new()),
+            entered_tx,
+            gate_rx: Mutex::new(Some(gate_rx)),
+        });
+        let shared = shared_with_store(Arc::clone(&store) as Arc<dyn SecretStore>, tmp.path());
+
+        let id = "00000000-0000-0000-0000-000000000000";
+        let ino = shared.secrets.as_ref().unwrap().ino_for(id);
+        let fh = shared
+            .writes
+            .insert(ino, Arc::new(ProcessIdentity::bare(1, 501, 20)), Vec::new());
+        shared.writes.write_at(fh, 0, b"old").unwrap();
+
+        // A commits "old" and parks inside the store append.
+        let sa = Arc::clone(&shared);
+        let a = std::thread::spawn(move || sa.commit_write(fh).unwrap());
+        entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("A never reached the store");
+
+        // Newer content lands while A's commit is in flight; B fires a second commit.
+        shared.writes.write_at(fh, 0, b"newer").unwrap();
+        let sb = Arc::clone(&shared);
+        let b = std::thread::spawn(move || sb.commit_write(fh).unwrap());
+
+        // B must wait on the per-fh lock: nothing may reach the store while A is parked.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            store.appended.lock().unwrap().is_empty(),
+            "second commit overtook the in-flight one"
+        );
+
+        gate_tx.send(()).unwrap(); // release A
+        assert!(a.join().unwrap());
+        assert!(b.join().unwrap());
+
+        let versions = store.appended.lock().unwrap();
+        assert_eq!(
+            versions.as_slice(),
+            &[b"old".to_vec(), b"newer".to_vec()],
+            "newest snapshot must land last — it becomes the head"
+        );
+    }
 }

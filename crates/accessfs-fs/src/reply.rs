@@ -58,11 +58,12 @@ pub fn dir_attr(ino: u64, perm: u16, epoch: SystemTime, uid: u32, gid: u32) -> F
     }
 }
 
-/// Assemble the macFUSE mount options. Read-only, stable attributes, and suppression of macOS metadata probe noise.
+/// Assemble the macFUSE mount options. Stable attributes and suppression of macOS metadata
+/// probe noise. Not mounted RO: store-backed secrets are writable (each save appends a version);
+/// everything else rejects write-opens with EROFS in `open()`.
 pub fn mount_config(volname: &str) -> fuser::Config {
     let mut config = fuser::Config::default();
     config.mount_options = vec![
-        MountOption::RO,
         MountOption::NoAtime,
         // The kernel makes permission decisions from getattr's mode/owner; read-only single user is enough.
         MountOption::DefaultPermissions,

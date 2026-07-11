@@ -21,13 +21,22 @@ pub struct OpenState {
 
 impl OpenState {
     pub fn content_version(&self) -> String {
-        let mut s = String::from("sha256:");
-        for b in &self.content_hash {
-            use std::fmt::Write;
-            let _ = write!(s, "{b:02x}");
-        }
-        s
+        hash_to_version(&self.content_hash)
     }
+}
+
+/// The audit-facing content identifier for a byte string: `sha256:<hex>` (never plaintext).
+pub fn content_version_of(bytes: &[u8]) -> String {
+    hash_to_version(&Sha256::digest(bytes).into())
+}
+
+fn hash_to_version(hash: &[u8; 32]) -> String {
+    let mut s = String::from("sha256:");
+    for b in hash {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// `fh -> OpenState` table. Because fuser 0.17 callbacks take `&self`, an interior-mutable concurrent container is required.
