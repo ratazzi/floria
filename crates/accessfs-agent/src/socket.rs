@@ -8,7 +8,7 @@
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -29,11 +29,18 @@ pub enum PromptResult {
 }
 
 pub struct SocketServer {
-    /// Writable handle to the current app connection, if any.
-    conn: Mutex<Option<UnixStream>>,
+    /// Writable handle to the current app connection, if any, tagged with its generation so
+    /// a dying connection's cleanup never clears a newer one that already replaced it.
+    conn: Mutex<Option<Conn>>,
     /// Pending prompts awaiting a reply, keyed by request id.
     pending: DashMap<u64, mpsc::Sender<ClientDecision>>,
     next_req: AtomicU64,
+    conn_gen: AtomicU64,
+}
+
+struct Conn {
+    gen: u64,
+    stream: UnixStream,
 }
 
 impl SocketServer {
@@ -52,18 +59,23 @@ impl SocketServer {
             conn: Mutex::new(None),
             pending: DashMap::new(),
             next_req: AtomicU64::new(1),
+            conn_gen: AtomicU64::new(1),
         });
 
         let srv = Arc::clone(&server);
-        let sock_path = path.to_path_buf();
         std::thread::Builder::new()
             .name("accessfs-agent-accept".into())
-            .spawn(move || srv.accept_loop(listener, sock_path))?;
+            .spawn(move || srv.accept_loop(listener))?;
 
         Ok(server)
     }
 
-    fn accept_loop(&self, listener: UnixListener, _path: PathBuf) {
+    /// Accept connections forever, each served by its own reader thread. Accepting must never
+    /// block on serving: the app auto-reconnects, and its connect() succeeds via the listen
+    /// backlog immediately — if we sat in a read loop instead of accepting, the fresh
+    /// connection would hang unserved while prompts kept going to the dead one (writes into
+    /// a dead socket's buffer still succeed), silently swallowing them.
+    fn accept_loop(self: Arc<Self>, listener: UnixListener) {
         for stream in listener.incoming() {
             let stream = match stream {
                 Ok(s) => s,
@@ -76,17 +88,34 @@ impl SocketServer {
                 tracing::warn!("rejecting agent connection from a different uid");
                 continue;
             }
-            match stream.try_clone() {
-                Ok(writer) => *self.conn.lock().expect("conn poisoned") = Some(writer),
+            let writer = match stream.try_clone() {
+                Ok(w) => w,
                 Err(e) => {
                     tracing::warn!("clone stream failed: {e}");
                     continue;
                 }
+            };
+            let gen = self.conn_gen.fetch_add(1, Ordering::Relaxed);
+            *self.conn.lock().expect("conn poisoned") = Some(Conn { gen, stream: writer });
+            tracing::info!(gen, "menubar app connected");
+
+            let srv = Arc::clone(&self);
+            let spawned = std::thread::Builder::new()
+                .name("accessfs-agent-conn".into())
+                .spawn(move || {
+                    srv.read_loop(stream);
+                    // Clear the writer only if it is still ours — a newer connection may
+                    // have replaced it while we were serving.
+                    let mut guard = srv.conn.lock().expect("conn poisoned");
+                    if guard.as_ref().is_some_and(|c| c.gen == gen) {
+                        *guard = None;
+                    }
+                    tracing::info!(gen, "menubar app disconnected");
+                });
+            if let Err(e) = spawned {
+                tracing::warn!("spawn conn thread failed: {e}");
+                *self.conn.lock().expect("conn poisoned") = None;
             }
-            tracing::info!("menubar app connected");
-            self.read_loop(stream);
-            *self.conn.lock().expect("conn poisoned") = None;
-            tracing::info!("menubar app disconnected");
         }
     }
 
@@ -150,7 +179,7 @@ impl SocketServer {
         let Some(conn) = guard.as_mut() else {
             return false;
         };
-        if write_msg(conn, msg).is_err() {
+        if write_msg(&mut conn.stream, msg).is_err() {
             *guard = None;
             return false;
         }
@@ -166,4 +195,168 @@ fn same_uid(stream: &UnixStream) -> bool {
     let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
     // SAFETY: geteuid is always-safe.
     rc == 0 && uid == unsafe { libc::geteuid() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::IdentityView;
+    use accessfs_core::identity::ProcessIdentity;
+    use serde_json::{json, Value};
+    use std::path::PathBuf;
+    use std::time::Instant;
+
+    fn sock_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("accessfs-sock-test-{}-{tag}.sock", std::process::id()))
+    }
+
+    /// Connect a fake app and send the hello, like the real client does. A read timeout
+    /// bounds every blocking assertion so a regression fails instead of hanging the suite.
+    fn connect(path: &std::path::Path) -> UnixStream {
+        let s = UnixStream::connect(path).expect("connect");
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        write_msg(&mut &s, &json!({"type": "hello", "version": 1})).expect("hello");
+        s
+    }
+
+    fn current_gen(srv: &SocketServer) -> Option<u64> {
+        srv.conn.lock().unwrap().as_ref().map(|c| c.gen)
+    }
+
+    fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if cond() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    fn prompt_msg(req_id: u64) -> DaemonMsg<'static> {
+        let id = ProcessIdentity::bare(1, 501, 20);
+        DaemonMsg::Prompt {
+            req_id,
+            path: "secrets/x",
+            operation: "read",
+            enforcement: "prompt",
+            identity: IdentityView::from_identity(&id),
+        }
+    }
+
+    #[test]
+    fn prompt_without_app_is_noapp() {
+        let path = sock_path("noapp");
+        let srv = SocketServer::start(&path).unwrap();
+        assert!(matches!(
+            srv.prompt_and_wait(prompt_msg, Duration::from_millis(200)),
+            PromptResult::NoApp
+        ));
+        assert!(srv.pending.is_empty(), "pending must not leak on NoApp");
+    }
+
+    #[test]
+    fn decision_resolves_pending_prompt() {
+        let path = sock_path("roundtrip");
+        let srv = SocketServer::start(&path).unwrap();
+        let client = connect(&path);
+        wait_until(|| current_gen(&srv).is_some(), "app connected");
+
+        let waiter = {
+            let srv = Arc::clone(&srv);
+            std::thread::spawn(move || srv.prompt_and_wait(prompt_msg, Duration::from_secs(5)))
+        };
+
+        let prompt: Value = read_msg(&mut &client).unwrap();
+        assert_eq!(prompt["type"], "prompt");
+        let req_id = prompt["req_id"].as_u64().unwrap();
+        write_msg(
+            &mut &client,
+            &json!({"type": "decision", "req_id": req_id, "outcome": "allow", "scope": "ttl", "ttl_secs": 600}),
+        )
+        .unwrap();
+
+        match waiter.join().unwrap() {
+            PromptResult::Decision(d) => {
+                assert!(d.allow);
+                assert_eq!(d.scope.as_deref(), Some("ttl"));
+                assert_eq!(d.ttl_secs, Some(600));
+            }
+            _ => panic!("expected a decision"),
+        }
+        assert!(srv.pending.is_empty(), "pending must be drained after reply");
+    }
+
+    #[test]
+    fn silent_app_times_out_and_clears_pending() {
+        let path = sock_path("timeout");
+        let srv = SocketServer::start(&path).unwrap();
+        let _client = connect(&path);
+        wait_until(|| current_gen(&srv).is_some(), "app connected");
+
+        assert!(matches!(
+            srv.prompt_and_wait(prompt_msg, Duration::from_millis(100)),
+            PromptResult::Timeout
+        ));
+        assert!(srv.pending.is_empty(), "pending must not leak on timeout");
+    }
+
+    /// Regression: the app reconnecting while the old connection is still open. Before the
+    /// concurrent accept loop, the fresh connection sat unserved in the listen backlog and
+    /// prompts went into the dead connection — this is the intermittent "no alert" bug.
+    #[test]
+    fn prompts_go_to_the_newest_connection() {
+        let path = sock_path("reconnect");
+        let srv = SocketServer::start(&path).unwrap();
+        let old = connect(&path);
+        wait_until(|| current_gen(&srv).is_some(), "first connection served");
+        let first_gen = current_gen(&srv).unwrap();
+        let new = connect(&path);
+        wait_until(|| current_gen(&srv) != Some(first_gen), "reconnect served");
+
+        let waiter = {
+            let srv = Arc::clone(&srv);
+            std::thread::spawn(move || srv.prompt_and_wait(prompt_msg, Duration::from_secs(5)))
+        };
+
+        // The prompt must arrive on the NEW connection while the old one is still open.
+        let prompt: Value = read_msg(&mut &new).unwrap();
+        assert_eq!(prompt["type"], "prompt");
+        write_msg(
+            &mut &new,
+            &json!({"type": "decision", "req_id": prompt["req_id"], "outcome": "allow"}),
+        )
+        .unwrap();
+        assert!(matches!(
+            waiter.join().unwrap(),
+            PromptResult::Decision(d) if d.allow
+        ));
+        drop(old);
+    }
+
+
+    /// The old connection's reader thread exits after a newer one already replaced it; its
+    /// cleanup must not clear the newer connection (the generation tag guards this).
+    #[test]
+    fn stale_reader_exit_keeps_newer_connection() {
+        let path = sock_path("gen");
+        let srv = SocketServer::start(&path).unwrap();
+        let old = connect(&path);
+        wait_until(|| current_gen(&srv).is_some(), "first connection served");
+        let first_gen = current_gen(&srv).unwrap();
+        let new = connect(&path);
+        wait_until(|| current_gen(&srv) != Some(first_gen), "second connection served");
+        let second_gen = current_gen(&srv).unwrap();
+
+        drop(old);
+        // Give the old reader thread time to notice EOF and run its (no-op) cleanup.
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(current_gen(&srv), Some(second_gen), "newer connection was cleared");
+
+        // And it still works end to end.
+        srv.send_event(&json!({"type": "ping"}));
+        let ev: Value = read_msg(&mut &new).unwrap();
+        assert_eq!(ev["type"], "ping");
+    }
 }
