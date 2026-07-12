@@ -4,6 +4,13 @@ import SwiftUI
 struct MenuBarView: View {
     @Bindable var state: AppState
     @State private var searchText = ""
+    @State private var listContentHeight: CGFloat = 0
+
+    /// The list grows with its content and only scrolls past ~60% of the screen —
+    /// menubar dropdowns are expected to run tall rather than scroll early.
+    private var maxListHeight: CGFloat {
+        (NSScreen.main?.visibleFrame.height ?? 900) * 0.6
+    }
 
     private var filtered: [RecentAccess] {
         guard !searchText.isEmpty else { return state.recents }
@@ -31,9 +38,14 @@ struct MenuBarView: View {
         .frame(width: 360)
     }
 
+    // Plain VStack, not LazyVStack: the MenuBarExtra window sizes itself to the content's
+    // ideal height, and lazy content measures as zero before it has a viewport — the whole
+    // list collapses to nothing. The list is capped at 50 rows, eager layout is cheap.
+    // A ScrollView's own ideal height is unrelated to its content's, so the viewport is
+    // pinned to the measured content height (scrolling only past the cap).
     private var accessList: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 1) {
+            VStack(alignment: .leading, spacing: 1) {
                 SectionLabel(icon: "clock", title: "Recent Access")
                 ForEach(filtered) { ev in
                     AccessRow(ev: ev)
@@ -41,8 +53,11 @@ struct MenuBarView: View {
             }
             .padding(.horizontal, 6)
             .padding(.vertical, 6)
+            .onGeometryChange(for: CGFloat.self) { proxy in
+                proxy.size.height
+            } action: { listContentHeight = $0 }
         }
-        .frame(maxHeight: 380)
+        .frame(height: min(listContentHeight, maxListHeight))
     }
 
     private var emptyState: some View {
