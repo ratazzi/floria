@@ -8,6 +8,11 @@ let package = Package(
         .executableTarget(
             name: "accessfs-menubar",
             path: "Sources/accessfs-menubar"
-        )
+        ),
+        .testTarget(
+            name: "accessfs-menubar-tests",
+            dependencies: ["accessfs-menubar"],
+            path: "Tests/accessfs-menubar-tests"
+        ),
     ]
 )
