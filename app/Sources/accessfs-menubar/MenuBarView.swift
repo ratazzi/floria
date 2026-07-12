@@ -16,7 +16,8 @@ struct MenuBarView: View {
         guard !searchText.isEmpty else { return state.recents }
         let q = searchText
         return state.recents.filter {
-            $0.path.localizedCaseInsensitiveContains(q)
+            $0.shownPath.localizedCaseInsensitiveContains(q)
+                || $0.path.localizedCaseInsensitiveContains(q)
                 || $0.exe.localizedCaseInsensitiveContains(q)
                 || $0.operation.localizedCaseInsensitiveContains(q)
                 || $0.decision.localizedCaseInsensitiveContains(q)
@@ -156,7 +157,7 @@ private struct AccessRow: View {
                 Text(ev.exe)
                     .font(.callout)
                     .lineLimit(1)
-                Text(ev.path)
+                Text(ev.shownPath)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -172,7 +173,16 @@ private struct AccessRow: View {
         .background(hovered ? Color.primary.opacity(0.06) : Color.clear)
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .onHover { hovered = $0 }
-        .help("\(ev.path)\nrule: \(ev.ruleId ?? "-")\nchain: \(ev.chain)")
+        .help(tooltip)
+    }
+
+    /// Full detail for the hover tooltip: friendly path, mount path (when distinct), rule, chain.
+    private var tooltip: String {
+        var lines = [ev.shownPath]
+        if ev.display != nil { lines.append(ev.path) }
+        lines.append("rule: \(ev.ruleId ?? "-")")
+        lines.append("chain: \(ev.chain)")
+        return lines.joined(separator: "\n")
     }
 }
 

@@ -13,10 +13,12 @@ final class PromptPresenter {
     func show(_ p: PromptMsg, send: @escaping (DecisionMsg) -> Void) {
         Self.log.info("showing alert req_id=\(p.req_id) path=\(p.path)")
         let alert = NSAlert()
-        alert.messageText = "Allow \(p.operation) access to \(p.path)?"
+        let friendly = p.display.map { ($0 as NSString).abbreviatingWithTildeInPath }
+        alert.messageText = "Allow \(p.operation) access to \(friendly ?? p.path)?"
         let exe = (p.identity.exe as NSString?)?.lastPathComponent ?? "?"
         var info =
             "\(p.operation == "write" ? "Writer" : "Reader"): \(exe)\nChain: \(p.identity.chain)\nPID: \(p.identity.pid)   CWD: \(p.identity.cwd ?? "?")"
+        if friendly != nil { info += "\nMount path: \(p.path)" }
         if p.enforcement == "touchid" { info += "\n\nTouch ID required to allow." }
         alert.informativeText = info
         alert.addButton(withTitle: "Allow once")

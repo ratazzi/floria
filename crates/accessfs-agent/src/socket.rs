@@ -250,6 +250,7 @@ mod tests {
         DaemonMsg::Prompt {
             req_id,
             path: "secrets/x",
+            display: None,
             operation: "read",
             enforcement: "prompt",
             identity: IdentityView::from_identity(&id),

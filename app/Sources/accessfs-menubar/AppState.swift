@@ -6,6 +6,8 @@ struct RecentAccess: Identifiable {
     let id = UUID()
     let date: Date?
     let path: String
+    /// Tilde-abbreviated original source path, when the daemon knows one (secrets).
+    let display: String?
     let operation: String  // "read" | "write"
     let decision: String   // "allowed" | "denied"
     let exe: String
@@ -13,6 +15,9 @@ struct RecentAccess: Identifiable {
     let ruleId: String?
 
     var allowed: Bool { decision == "allowed" }
+
+    /// What the list shows: the friendly name over the opaque `secrets/<uuid>` path.
+    var shownPath: String { display ?? path }
 
     var time: String {
         guard let date else { return "" }
@@ -28,6 +33,7 @@ struct RecentAccess: Identifiable {
     init(_ ev: AccessEventMsg) {
         date = Self.iso.date(from: ev.ts)
         path = ev.path
+        display = ev.display.map { ($0 as NSString).abbreviatingWithTildeInPath }
         operation = ev.operation
         decision = ev.decision
         exe = (ev.identity.exe as NSString?)?.lastPathComponent ?? "?"

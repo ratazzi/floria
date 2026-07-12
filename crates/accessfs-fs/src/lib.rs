@@ -212,6 +212,14 @@ impl Shared {
         Ok(plain.to_vec())
     }
 
+    /// A secret's original source path from store metadata, for display purposes.
+    fn secret_display(&self, id: &str) -> Option<String> {
+        let ns = self.secrets.as_ref()?;
+        let sid: SecretId = id.parse().ok()?;
+        let record = ns.store.record(&sid).ok().flatten()?;
+        Some(record.source_path.display().to_string())
+    }
+
     /// The virtual path of a dynamic secret inode, or `None` if it isn't one.
     fn secret_path(&self, ino: u64) -> Option<String> {
         self.secrets
@@ -287,9 +295,17 @@ impl Shared {
 
         let identity = Arc::new(accessfs_platform::enrich(pid, uid, gid));
 
+        // A secret's original source path, for prompts/UI — `secrets/<uuid>` means nothing
+        // to the person deciding. Best-effort: on any store hiccup the uuid path stands.
+        let display = match &target.kind {
+            OpenKind::Secret(id) => self.secret_display(id),
+            _ => None,
+        };
+
         // Authorization boundary: decide after resolving the identity, before generating content.
         let decision = self.authorizer.authorize(&AuthRequest {
             path: &target.virtual_path,
+            display: display.as_deref(),
             operation,
             identity: &identity,
         });

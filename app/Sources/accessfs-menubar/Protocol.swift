@@ -17,6 +17,8 @@ struct IdentityView: Codable {
 struct PromptMsg: Decodable {
     let req_id: UInt64
     let path: String
+    /// Human-facing name (a secret's original source path); `path` stays the rule key.
+    let display: String?
     let operation: String
     let enforcement: String
     let identity: IdentityView
@@ -25,6 +27,8 @@ struct PromptMsg: Decodable {
 struct AccessEventMsg: Decodable {
     let ts: String
     let path: String
+    /// Human-facing name (a secret's original source path); `path` stays the rule key.
+    let display: String?
     /// "read" or "write" — with a writable mount, decision alone is ambiguous.
     let operation: String
     let decision: String

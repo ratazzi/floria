@@ -39,6 +39,8 @@ pub enum DaemonMsg<'a> {
     Prompt {
         req_id: u64,
         path: &'a str,
+        /// Human-facing name (a secret's original source path); `path` stays the rule key.
+        display: Option<&'a str>,
         operation: &'a str,
         enforcement: &'a str,
         identity: IdentityView,
@@ -47,6 +49,8 @@ pub enum DaemonMsg<'a> {
     AccessEvent {
         ts: String,
         path: &'a str,
+        /// Human-facing name (a secret's original source path); `path` stays the rule key.
+        display: Option<&'a str>,
         /// `read` or `write` — with a writable mount, "allowed" alone is ambiguous.
         operation: &'a str,
         decision: &'a str,
@@ -121,6 +125,7 @@ mod tests {
         let msg = DaemonMsg::AccessEvent {
             ts: "2026-07-11T00:00:00.000Z".to_string(),
             path: "secrets/abc",
+            display: Some("/Users/me/.env"),
             operation: "write",
             decision: "allowed",
             rule_id: Some("grant"),
@@ -128,6 +133,7 @@ mod tests {
         };
         let v: serde_json::Value = serde_json::from_slice(&serde_json::to_vec(&msg).unwrap()).unwrap();
         assert_eq!(v["type"], "access_event");
+        assert_eq!(v["display"], "/Users/me/.env");
         assert_eq!(v["operation"], "write");
         assert_eq!(v["decision"], "allowed");
         assert_eq!(v["path"], "secrets/abc");
@@ -141,12 +147,14 @@ mod tests {
         let msg = DaemonMsg::Prompt {
             req_id: 9,
             path: "secrets/abc",
+            display: None,
             operation: "read",
             enforcement: "prompt",
             identity: IdentityView::from_identity(&id),
         };
         let v: serde_json::Value = serde_json::from_slice(&serde_json::to_vec(&msg).unwrap()).unwrap();
         assert_eq!(v["type"], "prompt");
+        assert_eq!(v["display"], serde_json::Value::Null);
         assert_eq!(v["req_id"], 9);
         assert_eq!(v["operation"], "read");
         assert_eq!(v["enforcement"], "prompt");

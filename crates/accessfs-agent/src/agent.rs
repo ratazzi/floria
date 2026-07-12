@@ -76,6 +76,7 @@ impl SocketAgent {
             |req_id| DaemonMsg::Prompt {
                 req_id,
                 path: req.path,
+                display: req.display,
                 operation: req.operation.as_str(),
                 enforcement: enforcement.as_str(),
                 identity: IdentityView::from_identity(req.identity),
@@ -138,6 +139,7 @@ impl Authorizer for SocketAgent {
         self.server.send_event(&DaemonMsg::AccessEvent {
             ts: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             path: req.path,
+            display: req.display,
             operation: req.operation.as_str(),
             decision: decision.decision_str(),
             rule_id: decision.rule_id.as_deref(),
@@ -229,6 +231,7 @@ mod tests {
     fn req<'a>(id: &'a ProcessIdentity, op: Operation) -> AuthRequest<'a> {
         AuthRequest {
             path: "secrets/test-id",
+            display: None,
             operation: op,
             identity: id,
         }

@@ -12,6 +12,10 @@ use crate::identity::ProcessIdentity;
 pub struct AuthRequest<'a> {
     /// Virtual file path, e.g. `env/demo/dev.env`.
     pub path: &'a str,
+    /// Human-facing name for prompts and the recent-access UI — a store-backed secret's
+    /// original source path instead of its opaque `secrets/<uuid>`. Display only: rules,
+    /// grants, and audit all keep keying on the stable `path`.
+    pub display: Option<&'a str>,
     pub operation: Operation,
     /// Enriched identity of the reader.
     pub identity: &'a ProcessIdentity,
@@ -146,6 +150,7 @@ mod tests {
         let id = ProcessIdentity::bare(1, 501, 20);
         let d = AllowAll.authorize(&AuthRequest {
             path: "env/demo/dev.env",
+            display: None,
             operation: Operation::Read,
             identity: &id,
         });
