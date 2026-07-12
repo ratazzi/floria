@@ -28,6 +28,13 @@ pub enum PromptResult {
     Timeout,
 }
 
+/// Cap on a blocking write to the app. `send()` holds the connection mutex across the write:
+/// without a timeout, an app that stopped reading (paused, hung) would fill the socket buffer
+/// and block the sender forever — and since every `authorize()` streams an access event, all
+/// open-pool threads (and the accept loop) would pile up on that mutex, freezing the mount.
+/// On timeout the write errors and the connection is dropped (fail-closed / app reconnects).
+const SEND_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub struct SocketServer {
     /// Writable handle to the current app connection, if any, tagged with its generation so
     /// a dying connection's cleanup never clears a newer one that already replaced it.
@@ -95,6 +102,10 @@ impl SocketServer {
                     continue;
                 }
             };
+            if let Err(e) = writer.set_write_timeout(Some(SEND_TIMEOUT)) {
+                tracing::warn!("set write timeout failed: {e}");
+                continue;
+            }
             let gen = self.conn_gen.fetch_add(1, Ordering::Relaxed);
             *self.conn.lock().expect("conn poisoned") = Some(Conn { gen, stream: writer });
             tracing::info!(gen, "menubar app connected");
@@ -335,6 +346,36 @@ mod tests {
         drop(old);
     }
 
+    /// Regression: an app that stops reading must not hang `send()` forever — `send` holds
+    /// the conn mutex, so a stuck write would freeze every authorize (and the accept loop).
+    /// The write timeout must fail the send and drop the connection in bounded time.
+    #[test]
+    fn stalled_app_cannot_block_send_forever() {
+        let path = sock_path("stall");
+        let srv = SocketServer::start(&path).unwrap();
+        let client = connect(&path); // sends hello, then never reads
+        wait_until(|| current_gen(&srv).is_some(), "app connected");
+
+        // Overfill the socket buffer with frames the client never drains.
+        let pad = "x".repeat(256 * 1024);
+        let start = Instant::now();
+        for _ in 0..8 {
+            srv.send_event(&json!({"type": "ping", "pad": &pad}));
+            if current_gen(&srv).is_none() {
+                break;
+            }
+        }
+        assert!(
+            current_gen(&srv).is_none(),
+            "stalled connection was not dropped"
+        );
+        // 2 rounds of SEND_TIMEOUT per frame worst case, with slack.
+        assert!(
+            start.elapsed() < SEND_TIMEOUT * 4,
+            "send blocked far beyond the write timeout"
+        );
+        drop(client);
+    }
 
     /// The old connection's reader thread exits after a newer one already replaced it; its
     /// cleanup must not clear the newer connection (the generation tag guards this).
