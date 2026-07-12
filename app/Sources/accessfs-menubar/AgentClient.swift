@@ -1,11 +1,21 @@
 import Darwin
 import Foundation
+import os
 
 /// Persistent Unix-socket client to the daemon. Runs a background read loop and
 /// auto-reconnects. Callbacks fire on the read thread; the UI layer re-dispatches to main.
 final class AgentClient {
+    static let log = Logger(subsystem: "dev.floria.menubar", category: "socket")
+
     private let socketPath: String
+    /// Guarded by `writeLock`: the reconnect thread closes/replaces it while the main thread
+    /// may be sending a decision — an unguarded close would race a write onto a dead (or
+    /// kernel-reused) descriptor.
     private var fd: Int32 = -1
+    /// Serializes writes and fd lifecycle: decisions come from the main thread while hello
+    /// and close/reconnect come from the reconnect thread — interleaved bytes would corrupt
+    /// the frame stream.
+    private let writeLock = NSLock()
 
     var onPrompt: ((PromptMsg) -> Void)?
     var onAccessEvent: ((AccessEventMsg) -> Void)?
@@ -22,11 +32,15 @@ final class AgentClient {
     private func runForever() {
         while true {
             if connectOnce() {
+                Self.log.info("connected to daemon")
                 send(HelloMsg())
                 onStateChange?(true)
                 readLoop()
+                Self.log.warning("read loop ended, reconnecting")
                 onStateChange?(false)
+                writeLock.lock()
                 if fd >= 0 { close(fd); fd = -1 }
+                writeLock.unlock()
             }
             Thread.sleep(forTimeInterval: 1.0) // retry backoff
         }
@@ -53,7 +67,9 @@ final class AgentClient {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(f, $0, len) }
         }
         if rc != 0 { close(f); return false }
+        writeLock.lock()
         fd = f
+        writeLock.unlock()
         return true
     }
 
@@ -72,7 +88,12 @@ final class AgentClient {
         guard let env = try? JSONDecoder().decode(Envelope.self, from: body) else { return }
         switch env.type {
         case "prompt":
-            if let m = try? JSONDecoder().decode(PromptMsg.self, from: body) { onPrompt?(m) }
+            if let m = try? JSONDecoder().decode(PromptMsg.self, from: body) {
+                Self.log.info("prompt received req_id=\(m.req_id) path=\(m.path)")
+                onPrompt?(m)
+            } else {
+                Self.log.error("prompt decode failed")
+            }
         case "access_event":
             if let m = try? JSONDecoder().decode(AccessEventMsg.self, from: body) { onAccessEvent?(m) }
         default:
@@ -81,6 +102,8 @@ final class AgentClient {
     }
 
     func send<T: Encodable>(_ msg: T) {
+        writeLock.lock()
+        defer { writeLock.unlock() }
         guard fd >= 0, let body = try? JSONEncoder().encode(msg) else { return }
         var frame = Data(count: 4)
         let n = UInt32(body.count)
@@ -101,6 +124,9 @@ final class AgentClient {
             let n = buf.withUnsafeMutableBytes { raw in
                 read(fd, raw.baseAddress!.advanced(by: got), count - got)
             }
+            // A signal-interrupted read is not a dead connection; tearing the connection
+            // down here caused reconnect churn that could swallow in-flight prompts.
+            if n < 0 && errno == EINTR { continue }
             if n <= 0 { return nil }
             got += n
         }
@@ -113,6 +139,7 @@ final class AgentClient {
             var sent = 0
             while sent < raw.count {
                 let n = write(fd, base.advanced(by: sent), raw.count - sent)
+                if n < 0 && errno == EINTR { continue }
                 if n <= 0 { break }
                 sent += n
             }
