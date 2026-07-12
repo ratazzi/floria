@@ -102,10 +102,14 @@ impl SocketAgent {
 
     /// True if a non-expired grant exists for `key`; expired grants are evicted.
     fn grant_valid(&self, key: &(String, String, Operation)) -> bool {
-        match self.grants.get(key) {
-            Some(exp) if *exp > Instant::now() => true,
+        // Copy the expiry out so the shard Ref from `get` is dropped before `remove`:
+        // dashmap self-deadlocks on a same-shard remove while a Ref is still alive
+        // (a match on `get` keeps the Ref for the whole match).
+        let exp = self.grants.get(key).map(|r| *r);
+        match exp {
+            Some(exp) if exp > Instant::now() => true,
             Some(_) => {
-                drop(self.grants.remove(key));
+                self.grants.remove(key);
                 false
             }
             None => false,
@@ -283,6 +287,44 @@ mod tests {
         let d = agent.authorize(&req(&id, Operation::Write));
         assert!(!d.is_allowed());
         assert_eq!(d.rule_id.as_deref(), Some("default-deny"));
+    }
+
+    /// Regression: an EXPIRED grant used to deadlock `grant_valid` (dashmap remove while
+    /// the Ref from `get` was still alive), hanging the reader forever with no prompt.
+    /// Run authorize on a helper thread with a deadline so a regression fails the test
+    /// instead of hanging the suite.
+    #[test]
+    fn expired_grant_reprompts_instead_of_deadlocking() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = Arc::new(prompt_only_agent(tmp.path()));
+        let id = ProcessIdentity::bare(1234, 501, 20);
+        agent.grants.insert(
+            (
+                grant_key(&id, None),
+                "secrets/test-id".to_string(),
+                Operation::Read,
+            ),
+            Instant::now() - Duration::from_secs(1), // already expired
+        );
+
+        let handle = {
+            let agent = Arc::clone(&agent);
+            std::thread::spawn(move || {
+                let id = ProcessIdentity::bare(1234, 501, 20);
+                agent.authorize(&req(&id, Operation::Read)).is_allowed()
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_finished() {
+            assert!(
+                Instant::now() < deadline,
+                "authorize deadlocked on an expired grant"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // No app is connected, so the re-prompt fails closed — but it must RETURN.
+        assert!(!handle.join().unwrap());
+        assert!(agent.grants.is_empty(), "expired grant must be evicted");
     }
 
     #[test]
