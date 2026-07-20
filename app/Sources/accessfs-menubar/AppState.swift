@@ -56,7 +56,7 @@ struct RecentAccess: Identifiable {
 final class AppState {
     var connected = false
     var recents: [RecentAccess] = []
-    var workspace = WorkspaceStore.preview()
+    var workspace: WorkspaceStore
 
     @ObservationIgnored private var client: AgentClient!
     @ObservationIgnored private let prompter = PromptPresenter()
@@ -66,11 +66,21 @@ final class AppState {
     private static let maxRecents = 500
 
     init() {
-        let sock = (NSHomeDirectory() as NSString)
-            .appendingPathComponent("Library/Application Support/floria/agent.sock")
+        let supportDirectory = (NSHomeDirectory() as NSString)
+            .appendingPathComponent("Library/Application Support/floria")
+        let sock = (supportDirectory as NSString).appendingPathComponent("agent.sock")
+        let controlSock = (supportDirectory as NSString).appendingPathComponent("control.sock")
+        workspace = WorkspaceStore(controlClient: ControlClient(socketPath: controlSock))
+
         client = AgentClient(socketPath: sock)
         client.onStateChange = { [weak self] up in
-            DispatchQueue.main.async { self?.connected = up }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.connected = up
+                if up {
+                    Task { await self.workspace.reload() }
+                }
+            }
         }
         client.onAccessEvent = { [weak self] ev in
             DispatchQueue.main.async { self?.add(ev) }
@@ -82,6 +92,7 @@ final class AppState {
             }
         }
         client.start()
+        Task { await workspace.reload() }
 
         // Give the socket client one immediate connection attempt before taking ownership.
         // This preserves a manually started development daemon instead of racing it for the

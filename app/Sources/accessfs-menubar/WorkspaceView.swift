@@ -13,8 +13,10 @@ private enum WorkspaceSidebarSelection: Hashable {
 /// then inspect the concrete file/socket surfaces exposed to local processes.
 struct DashboardView: View {
     @Bindable var state: AppState
-    @State private var selection: WorkspaceSidebarSelection? = .project("floria-web")
+    @State private var selection: WorkspaceSidebarSelection? = .projects
     @State private var search = ""
+    @State private var showingNewProject = false
+    @State private var showingNewSharedSecret = false
 
     var body: some View {
         HStack(spacing: 0) {
@@ -32,6 +34,24 @@ struct DashboardView: View {
         .onChange(of: selection) {
             guard case .project(let id) = selection else { return }
             state.workspace.selectProject(id)
+        }
+        .sheet(isPresented: $showingNewProject) {
+            NewProjectSheet(store: state.workspace) { projectID in
+                selection = .project(projectID)
+            }
+        }
+        .sheet(isPresented: $showingNewSharedSecret) {
+            NewSharedSecretSheet(store: state.workspace)
+        }
+        .alert(
+            "Floria could not update the workspace",
+            isPresented: Binding(
+                get: { state.workspace.lastError != nil },
+                set: { if !$0 { state.workspace.lastError = nil } })
+        ) {
+            Button("OK") { state.workspace.lastError = nil }
+        } message: {
+            Text(state.workspace.lastError ?? "Unknown error")
         }
     }
 
@@ -52,7 +72,14 @@ struct DashboardView: View {
                     .stroke(Color.secondary.opacity(0.22), lineWidth: 1)
             }
 
-            Button { } label: {
+            Menu {
+                Button("New Project", systemImage: "folder.badge.plus") {
+                    showingNewProject = true
+                }
+                Button("New Shared Secret", systemImage: "key.fill") {
+                    showingNewSharedSecret = true
+                }
+            } label: {
                 Image(systemName: "plus")
                     .frame(width: 30, height: 30)
             }
@@ -182,19 +209,26 @@ struct DashboardView: View {
     private var detail: some View {
         switch selection {
         case .projects:
-            ProjectCatalogView(store: state.workspace, selection: $selection, search: search)
+            ProjectCatalogView(
+                store: state.workspace, selection: $selection, search: search,
+                addProject: { showingNewProject = true })
         case .project:
-            ProjectWorkspaceView(store: state.workspace, state: state)
+            if state.workspace.selectedProject != nil {
+                ProjectWorkspaceView(store: state.workspace, state: state)
+            } else {
+                ContentUnavailableView("Select a project", systemImage: "folder")
+            }
         case .sharedSecrets:
             ResourceCatalogView(
                 store: state.workspace, title: "Shared Secrets",
                 subtitle: "Reusable scalar values with a default environment key",
-                kinds: [.sharedSecret, .secret], search: search)
+                kinds: [.sharedSecret, .secret], search: search,
+                addResource: { showingNewSharedSecret = true })
         case .envFiles:
             ResourceCatalogView(
                 store: state.workspace, title: "Env Files",
                 subtitle: "Reusable groups of environment variables",
-                kinds: [.envFile], search: search)
+                kinds: [.envFile], search: search, addResource: nil)
         case .accessLog:
             AccessLogView(state: state)
         case nil:
@@ -247,16 +281,16 @@ private struct ProjectWorkspaceView: View {
         .sheet(isPresented: $showingAddBinding) {
             AddBindingSheet(store: store)
         }
-        .navigationTitle(store.selectedProject.name)
+        .navigationTitle(store.selectedProject?.name ?? "Project")
     }
 
     private var projectHeader: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(store.selectedProject.name)
+                    Text(store.selectedProject?.name ?? "Project")
                         .font(.title2.bold())
-                    Text(store.selectedProject.path)
+                    Text(store.selectedProject?.path ?? "")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
@@ -273,7 +307,7 @@ private struct ProjectWorkspaceView: View {
                     get: { store.selectedEnvironmentID },
                     set: { store.selectEnvironment($0) })
             ) {
-                ForEach(store.selectedProject.environments) { environment in
+                ForEach(store.selectedProject?.environments ?? []) { environment in
                     Text(environment.name).tag(environment.id)
                 }
             }
@@ -331,7 +365,7 @@ private struct BindingsPane: View {
                     title: "Shared across environments", bindings: store.commonBindings,
                     store: store)
                 BindingSection(
-                    title: "\(store.selectedEnvironment.name) only",
+                    title: "\(store.selectedEnvironment?.name ?? "Environment") only",
                     bindings: store.environmentBindings, store: store)
 
                 Button {
@@ -430,7 +464,7 @@ private struct BindingRow: View {
                 "",
                 isOn: Binding(
                     get: { binding.isEnabled },
-                    set: { _ in store.toggleBinding(binding.id) })
+                    set: { _ in Task { await store.toggleBinding(binding.id) } })
             )
             .toggleStyle(.switch)
             .labelsHidden()
@@ -507,8 +541,10 @@ private struct ProjectAccessPane: View {
 private struct SurfaceInspector: View {
     @Bindable var store: WorkspaceStore
 
+    @ViewBuilder
     var body: some View {
-        VStack(spacing: 0) {
+        if let surface = store.selectedSurface, let environment = store.selectedEnvironment {
+            VStack(spacing: 0) {
             VStack(alignment: .leading, spacing: 10) {
                 HStack {
                     Picker(
@@ -517,7 +553,7 @@ private struct SurfaceInspector: View {
                             get: { store.selectedSurfaceID },
                             set: { store.selectedSurfaceID = $0 })
                     ) {
-                        ForEach(store.selectedEnvironment.surfaces) { surface in
+                        ForEach(environment.surfaces) { surface in
                             Label(surface.name, systemImage: surface.kind.systemImage).tag(surface.id)
                         }
                     }
@@ -525,9 +561,9 @@ private struct SurfaceInspector: View {
                     .labelsHidden()
                     .font(.headline)
                     Spacer()
-                    SurfaceStatusBadge(status: store.selectedSurface.status)
+                    SurfaceStatusBadge(status: surface.status)
                 }
-                Text(store.selectedSurface.path)
+                Text(surface.path)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
@@ -537,7 +573,7 @@ private struct SurfaceInspector: View {
             .padding(20)
 
             Divider()
-            switch store.selectedSurface.kind {
+            switch surface.kind {
             case .dotenvFile:
                 DotenvSurfacePreview(store: store)
             case .unixSocket:
@@ -548,6 +584,11 @@ private struct SurfaceInspector: View {
             }
         }
         .background(Color.primary.opacity(0.018))
+        } else {
+            ContentUnavailableView("No output surface", systemImage: "doc.badge.plus")
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color.primary.opacity(0.018))
+        }
     }
 }
 
@@ -584,7 +625,7 @@ private struct SocketSurfacePreview: View {
     @Bindable var store: WorkspaceStore
 
     private var resource: WorkspaceResource? {
-        guard let resourceID = store.selectedSurface.resourceID else { return nil }
+        guard let resourceID = store.selectedSurface?.resourceID else { return nil }
         return store.resource(resourceID)
     }
 
@@ -593,7 +634,7 @@ private struct SocketSurfacePreview: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     InspectorSection(title: "Endpoint") {
-                        Text(store.selectedSurface.path)
+                        Text(store.selectedSurface?.path ?? "")
                             .font(.caption.monospaced())
                             .lineLimit(3)
                             .truncationMode(.middle)
@@ -690,6 +731,7 @@ private struct ProjectCatalogView: View {
     @Bindable var store: WorkspaceStore
     @Binding var selection: WorkspaceSidebarSelection?
     let search: String
+    let addProject: () -> Void
 
     private var filtered: [WorkspaceProject] {
         guard !search.isEmpty else { return store.projects }
@@ -701,11 +743,16 @@ private struct ProjectCatalogView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Projects").font(.title2.bold())
-                Text("Compose environments and surfaces for each local workspace")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Projects").font(.title2.bold())
+                    Text("Compose environments and surfaces for each local workspace")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Add Project", systemImage: "plus", action: addProject)
+                    .buttonStyle(.borderedProminent)
             }
             .padding(24)
 
@@ -737,6 +784,17 @@ private struct ProjectCatalogView: View {
                 .buttonStyle(.plain)
                 .padding(.vertical, 5)
             }
+            .overlay {
+                if filtered.isEmpty {
+                    if search.isEmpty {
+                        ContentUnavailableView(
+                            "No projects yet", systemImage: "folder.badge.plus",
+                            description: Text("Add a local directory to create its Development .env output."))
+                    } else {
+                        ContentUnavailableView.search(text: search)
+                    }
+                }
+            }
         }
         .navigationTitle("Projects")
     }
@@ -748,6 +806,7 @@ private struct ResourceCatalogView: View {
     let subtitle: String
     let kinds: Set<WorkspaceResourceKind>
     let search: String
+    let addResource: (() -> Void)?
 
     private var filtered: [WorkspaceResource] {
         store.resources.filter { resource in
@@ -760,9 +819,16 @@ private struct ResourceCatalogView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(title).font(.title2.bold())
-                Text(subtitle).font(.callout).foregroundStyle(.secondary)
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(title).font(.title2.bold())
+                    Text(subtitle).font(.callout).foregroundStyle(.secondary)
+                }
+                Spacer()
+                if let addResource {
+                    Button("Add Secret", systemImage: "plus", action: addResource)
+                        .buttonStyle(.borderedProminent)
+                }
             }
             .padding(24)
 
@@ -799,6 +865,9 @@ private struct AddBindingSheet: View {
     @Bindable var store: WorkspaceStore
     @Environment(\.dismiss) private var dismiss
     @State private var search = ""
+    @State private var target = WorkspaceBindingTarget.environment
+    @State private var isSaving = false
+    @State private var errorMessage: String?
 
     private var filtered: [WorkspaceResource] {
         guard !search.isEmpty else { return store.availableResources }
@@ -814,7 +883,9 @@ private struct AddBindingSheet: View {
             HStack {
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Add Binding").font(.title2.bold())
-                    Text("Add to \(store.selectedProject.name) · \(store.selectedEnvironment.name)")
+                    Text(
+                        "Add to \(store.selectedProject?.name ?? "Project") · \(store.selectedEnvironment?.name ?? "Environment")"
+                    )
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
@@ -823,6 +894,16 @@ private struct AddBindingSheet: View {
                     .keyboardShortcut(.defaultAction)
             }
             .padding(20)
+
+            Divider()
+            Picker("Scope", selection: $target) {
+                ForEach(WorkspaceBindingTarget.allCases, id: \.self) { target in
+                    Text(target.title).tag(target)
+                }
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
 
             Divider()
             List(filtered) { resource in
@@ -844,9 +925,19 @@ private struct AddBindingSheet: View {
                         }
                     }
                     Spacer()
-                    Button("Add") { store.addResource(resource.id) }
+                    Button("Add") {
+                        Task {
+                            isSaving = true
+                            defer { isSaving = false }
+                            do {
+                                try await store.addResource(resource.id, target: target)
+                            } catch {
+                                errorMessage = error.localizedDescription
+                            }
+                        }
+                    }
                         .buttonStyle(.bordered)
-                        .disabled(!conflicts.isEmpty)
+                        .disabled(!conflicts.isEmpty || isSaving)
                 }
                 .padding(.vertical, 5)
             }
@@ -858,11 +949,203 @@ private struct AddBindingSheet: View {
         }
         .searchable(text: $search, prompt: "Search secrets and env files")
         .frame(minWidth: 580, minHeight: 460)
+        .alert(
+            "Could not add binding",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } })
+        ) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
     }
 
     private func prospectiveConflicts(_ resource: WorkspaceResource) -> [String] {
         let current = Set(store.resolvedExports.map(\.key))
         return resource.exports.map(\.key).filter(current.contains).sorted()
+    }
+}
+
+private struct NewProjectSheet: View {
+    @Bindable var store: WorkspaceStore
+    let onCreated: (WorkspaceProject.ID) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+    @State private var path = ""
+    @State private var isSaving = false
+    @State private var errorMessage: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Add Project").font(.title2.bold())
+                Text("Floria creates a Development environment and a read-only .env link.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Project directory").font(.callout.weight(.medium))
+                HStack {
+                    TextField("Choose a local directory", text: $path)
+                        .textFieldStyle(.roundedBorder)
+                    Button("Choose…", action: chooseDirectory)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Name").font(.callout.weight(.medium))
+                TextField("Project name", text: $name)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            HStack {
+                Image(systemName: "info.circle")
+                Text("An existing .env file or symlink is never replaced.")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            Divider()
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Create Project") { createProject() }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isSaving || name.isEmpty || path.isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(width: 520)
+        .alert(
+            "Could not add project",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } })
+        ) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
+    }
+
+    private func chooseDirectory() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        if panel.runModal() == .OK, let url = panel.url {
+            path = url.path
+            if name.isEmpty { name = url.lastPathComponent }
+        }
+    }
+
+    private func createProject() {
+        Task {
+            isSaving = true
+            defer { isSaving = false }
+            do {
+                let projectID = try await store.createProject(name: name, path: path)
+                onCreated(projectID)
+                dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+}
+
+private struct NewSharedSecretSheet: View {
+    @Bindable var store: WorkspaceStore
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+    @State private var defaultKey = ""
+    @State private var value = ""
+    @State private var isSaving = false
+    @State private var errorMessage: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("New Shared Secret").font(.title2.bold())
+                Text("Create it once, then bind it into any project environment.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            field("Name") {
+                TextField("Cloudflare API Token", text: $name)
+                    .textFieldStyle(.roundedBorder)
+            }
+            field("Default environment key") {
+                TextField("CLOUDFLARE_API_TOKEN", text: $defaultKey)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.body.monospaced())
+            }
+            field("Secret value") {
+                SecureField("Value", text: $value)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            HStack {
+                Image(systemName: "lock.fill")
+                Text("The catalog stores only an encrypted-secret reference; previews stay masked.")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            Divider()
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Create Secret") { createSecret() }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isSaving || name.isEmpty || defaultKey.isEmpty || value.isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(width: 500)
+        .alert(
+            "Could not create secret",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } })
+        ) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
+    }
+
+    private func field<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text(title).font(.callout.weight(.medium))
+            content()
+        }
+    }
+
+    private func createSecret() {
+        Task {
+            isSaving = true
+            defer { isSaving = false }
+            let submittedValue = value
+            value = ""
+            do {
+                try await store.createSharedSecret(
+                    name: name, defaultEnvKey: defaultKey.uppercased(), value: submittedValue)
+                dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
     }
 }
 

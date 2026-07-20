@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import Observation
 
@@ -65,6 +66,40 @@ struct WorkspaceBinding: Identifiable, Hashable, Sendable {
     let resourceID: WorkspaceResource.ID
     var keyOverride: String?
     var isEnabled: Bool
+    let scope: WorkspaceBindingScope
+    let allowOverride: Bool
+    let position: Int64
+
+    init(
+        id: String, resourceID: WorkspaceResource.ID, keyOverride: String?, isEnabled: Bool,
+        scope: WorkspaceBindingScope = .environment(""), allowOverride: Bool = false,
+        position: Int64 = 0
+    ) {
+        self.id = id
+        self.resourceID = resourceID
+        self.keyOverride = keyOverride
+        self.isEnabled = isEnabled
+        self.scope = scope
+        self.allowOverride = allowOverride
+        self.position = position
+    }
+}
+
+enum WorkspaceBindingScope: Hashable, Sendable {
+    case common
+    case environment(WorkspaceEnvironment.ID)
+}
+
+enum WorkspaceBindingTarget: String, CaseIterable, Sendable {
+    case environment
+    case common
+
+    var title: String {
+        switch self {
+        case .environment: "This environment"
+        case .common: "All environments"
+        }
+    }
 }
 
 enum WorkspaceSurfaceKind: String, Sendable {
@@ -139,35 +174,42 @@ final class WorkspaceStore {
     var selectedProjectID: WorkspaceProject.ID
     var selectedEnvironmentID: WorkspaceEnvironment.ID
     var selectedSurfaceID: WorkspaceSurface.ID
+    var isLoading = false
+    var lastError: String?
+
+    @ObservationIgnored private let controlClient: ControlClient?
 
     init(
         projects: [WorkspaceProject], resources: [WorkspaceResource],
-        selectedProjectID: WorkspaceProject.ID
+        selectedProjectID: WorkspaceProject.ID = "", controlClient: ControlClient? = nil
     ) {
         self.projects = projects
         self.resources = resources
-        self.selectedProjectID = selectedProjectID
-        let project = projects.first(where: { $0.id == selectedProjectID }) ?? projects[0]
-        selectedEnvironmentID = project.environments[0].id
-        selectedSurfaceID = project.environments[0].surfaces[0].id
+        self.controlClient = controlClient
+        let project = projects.first(where: { $0.id == selectedProjectID }) ?? projects.first
+        self.selectedProjectID = project?.id ?? ""
+        selectedEnvironmentID = project?.environments.first?.id ?? ""
+        selectedSurfaceID = project?.environments.first?.surfaces.first?.id ?? ""
     }
 
-    var selectedProject: WorkspaceProject {
-        projects.first(where: { $0.id == selectedProjectID }) ?? projects[0]
+    convenience init(controlClient: ControlClient) {
+        self.init(projects: [], resources: [], controlClient: controlClient)
     }
 
-    var selectedEnvironment: WorkspaceEnvironment {
-        selectedProject.environments.first(where: { $0.id == selectedEnvironmentID })
-            ?? selectedProject.environments[0]
+    var selectedProject: WorkspaceProject? {
+        projects.first(where: { $0.id == selectedProjectID })
     }
 
-    var selectedSurface: WorkspaceSurface {
-        selectedEnvironment.surfaces.first(where: { $0.id == selectedSurfaceID })
-            ?? selectedEnvironment.surfaces[0]
+    var selectedEnvironment: WorkspaceEnvironment? {
+        selectedProject?.environments.first(where: { $0.id == selectedEnvironmentID })
     }
 
-    var commonBindings: [WorkspaceBinding] { selectedProject.commonBindings }
-    var environmentBindings: [WorkspaceBinding] { selectedEnvironment.bindings }
+    var selectedSurface: WorkspaceSurface? {
+        selectedEnvironment?.surfaces.first(where: { $0.id == selectedSurfaceID })
+    }
+
+    var commonBindings: [WorkspaceBinding] { selectedProject?.commonBindings ?? [] }
+    var environmentBindings: [WorkspaceBinding] { selectedEnvironment?.bindings ?? [] }
 
     var activeBindings: [WorkspaceBinding] {
         (commonBindings + environmentBindings).filter(\.isEnabled)
@@ -203,24 +245,152 @@ final class WorkspaceStore {
     }
 
     func selectProject(_ id: WorkspaceProject.ID) {
-        guard let project = projects.first(where: { $0.id == id }),
-            let environment = project.environments.first,
-            let surface = environment.surfaces.first
-        else { return }
+        guard let project = projects.first(where: { $0.id == id }) else { return }
         selectedProjectID = id
-        selectedEnvironmentID = environment.id
-        selectedSurfaceID = surface.id
+        selectedEnvironmentID = project.environments.first?.id ?? ""
+        selectedSurfaceID = project.environments.first?.surfaces.first?.id ?? ""
     }
 
     func selectEnvironment(_ id: WorkspaceEnvironment.ID) {
-        guard let environment = selectedProject.environments.first(where: { $0.id == id }),
-            let surface = environment.surfaces.first
-        else { return }
+        guard let environment = selectedProject?.environments.first(where: { $0.id == id }) else {
+            return
+        }
         selectedEnvironmentID = id
-        selectedSurfaceID = surface.id
+        selectedSurfaceID = environment.surfaces.first?.id ?? ""
     }
 
-    func toggleBinding(_ id: WorkspaceBinding.ID) {
+    func reload(reportErrors: Bool = false) async {
+        guard let controlClient else { return }
+        isLoading = true
+        defer { isLoading = false }
+        do {
+            apply(try await controlClient.snapshot())
+            lastError = nil
+        } catch {
+            if reportErrors { lastError = error.localizedDescription }
+        }
+    }
+
+    @discardableResult
+    func createProject(name: String, path: String) async throws -> WorkspaceProject.ID {
+        guard let controlClient else {
+            throw WorkspaceStoreError.controlUnavailable
+        }
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let path = (path as NSString).standardizingPath
+        guard !name.isEmpty else { throw WorkspaceStoreError.invalid("Project name is required") }
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory),
+            isDirectory.boolValue
+        else {
+            throw WorkspaceStoreError.invalid("Choose an existing project directory")
+        }
+        let dotenvPath = (path as NSString).appendingPathComponent(".env")
+        var fileInfo = stat()
+        let dotenvStatus = dotenvPath.withCString { lstat($0, &fileInfo) }
+        guard dotenvStatus != 0 else {
+            throw WorkspaceStoreError.invalid(
+                "\(dotenvPath) already exists. Floria will never replace it automatically.")
+        }
+        guard errno == ENOENT else {
+            throw WorkspaceStoreError.invalid("Floria could not inspect \(dotenvPath)")
+        }
+
+        let projectID = Self.newID("project")
+        let environmentID = Self.newID("environment")
+        let surfaceID = Self.newID("dotenv")
+        do {
+            try await controlClient.upsertProject(
+                CatalogProject(id: projectID, name: name, path: path))
+            try await controlClient.upsertEnvironment(
+                CatalogEnvironment(
+                    id: environmentID, projectID: projectID, name: "Development", position: 0))
+            try await controlClient.upsertSurface(
+                CatalogSurface(
+                    id: surfaceID, environmentID: environmentID, name: ".env",
+                    kind: "dotenv_file", path: dotenvPath, resourceID: nil, position: 0))
+            apply(try await controlClient.snapshot(), selectingProject: projectID)
+            lastError = nil
+            return projectID
+        } catch {
+            await reload()
+            throw error
+        }
+    }
+
+    @discardableResult
+    func createSharedSecret(name: String, defaultEnvKey: String, value: String) async throws
+        -> WorkspaceResource.ID
+    {
+        guard let controlClient else {
+            throw WorkspaceStoreError.controlUnavailable
+        }
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = defaultEnvKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { throw WorkspaceStoreError.invalid("Secret name is required") }
+        guard Self.isValidEnvKey(key) else {
+            throw WorkspaceStoreError.invalid(
+                "The default key must start with A-Z or _, followed by A-Z, 0-9, or _")
+        }
+        guard !value.isEmpty else { throw WorkspaceStoreError.invalid("Secret value is required") }
+
+        let resourceID = Self.newID("shared-secret")
+        try await controlClient.createSharedSecret(
+            resourceID: resourceID, name: name, defaultEnvKey: key, value: value)
+        apply(try await controlClient.snapshot())
+        lastError = nil
+        return resourceID
+    }
+
+    func toggleBinding(_ id: WorkspaceBinding.ID) async {
+        guard let binding = (commonBindings + environmentBindings).first(where: { $0.id == id })
+        else { return }
+        guard let controlClient, let project = selectedProject else {
+            toggleBindingLocally(id)
+            return
+        }
+
+        do {
+            try await controlClient.upsertBinding(
+                CatalogBinding(
+                    id: binding.id, projectID: project.id,
+                    scope: binding.scope.catalogScope,
+                    resourceID: binding.resourceID, keyOverride: binding.keyOverride,
+                    enabled: !binding.isEnabled, allowOverride: binding.allowOverride,
+                    position: binding.position))
+            apply(try await controlClient.snapshot())
+            lastError = nil
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    func addResource(
+        _ resourceID: WorkspaceResource.ID, target: WorkspaceBindingTarget = .environment
+    ) async throws {
+        guard availableResources.contains(where: { $0.id == resourceID }) else { return }
+        guard let controlClient else {
+            addResourceLocally(resourceID)
+            return
+        }
+        guard let project = selectedProject, let environment = selectedEnvironment else {
+            throw WorkspaceStoreError.invalid("Select a project environment first")
+        }
+
+        let scope: WorkspaceBindingScope =
+            target == .common ? .common : .environment(environment.id)
+        let position = Int64(
+            target == .common ? project.commonBindings.count : environment.bindings.count)
+        try await controlClient.upsertBinding(
+            CatalogBinding(
+                id: Self.newID("binding"), projectID: project.id, scope: scope.catalogScope,
+                resourceID: resourceID, keyOverride: nil, enabled: true,
+                allowOverride: false, position: position))
+        apply(try await controlClient.snapshot())
+        lastError = nil
+    }
+
+    private func toggleBindingLocally(_ id: WorkspaceBinding.ID) {
         guard let projectIndex = projects.firstIndex(where: { $0.id == selectedProjectID }) else {
             return
         }
@@ -238,7 +408,7 @@ final class WorkspaceStore {
         projects[projectIndex].environments[environmentIndex].bindings[bindingIndex].isEnabled.toggle()
     }
 
-    func addResource(_ resourceID: WorkspaceResource.ID) {
+    private func addResourceLocally(_ resourceID: WorkspaceResource.ID) {
         guard
             availableResources.contains(where: { $0.id == resourceID }),
             let projectIndex = projects.firstIndex(where: { $0.id == selectedProjectID }),
@@ -253,6 +423,160 @@ final class WorkspaceStore {
                 resourceID: resourceID,
                 keyOverride: nil,
                 isEnabled: true))
+    }
+
+    private func apply(_ snapshot: CatalogSnapshot, selectingProject: String? = nil) {
+        let previousProjectID = selectingProject ?? selectedProjectID
+        let previousEnvironmentID = selectedEnvironmentID
+        let previousSurfaceID = selectedSurfaceID
+        let projectUsage = Dictionary(grouping: snapshot.bindings, by: \.resourceID)
+            .mapValues { Set($0.map(\.projectID)).count }
+
+        resources = snapshot.resources.compactMap { resource in
+            guard
+                let kind = WorkspaceResourceKind(catalogValue: resource.kind),
+                let shape = WorkspaceValueShape(catalogValue: resource.shape)
+            else { return nil }
+            let preview: String
+            switch resource.source.type {
+            case "literal": preview = resource.source.value ?? ""
+            case "socket": preview = resource.source.endpoint ?? ""
+            default: preview = "••••••••••••"
+            }
+            return WorkspaceResource(
+                id: resource.id, name: resource.name, kind: kind, shape: shape,
+                exports: resource.exports.map {
+                    WorkspaceExport(key: $0.key, previewValue: preview, sensitive: $0.sensitive)
+                },
+                detail: resource.detail ?? resource.defaultEnvKey ?? kind.title,
+                usageCount: projectUsage[resource.id] ?? 0)
+        }
+
+        let bindings = Dictionary(grouping: snapshot.bindings, by: \.projectID)
+        let environments = Dictionary(grouping: snapshot.environments, by: \.projectID)
+        let surfaces = Dictionary(grouping: snapshot.surfaces, by: \.environmentID)
+        projects = snapshot.projects.map { project in
+            let projectBindings = bindings[project.id] ?? []
+            let common = projectBindings
+                .filter { $0.scope.type == "common" }
+                .sorted { $0.position < $1.position }
+                .map(WorkspaceBinding.init)
+            let projectEnvironments = (environments[project.id] ?? [])
+                .sorted { $0.position < $1.position }
+                .map { environment in
+                    let environmentBindings = projectBindings
+                        .filter { $0.scope.environmentID == environment.id }
+                        .sorted { $0.position < $1.position }
+                        .map(WorkspaceBinding.init)
+                    let environmentSurfaces = (surfaces[environment.id] ?? [])
+                        .sorted { $0.position < $1.position }
+                        .compactMap(WorkspaceSurface.init)
+                    return WorkspaceEnvironment(
+                        id: environment.id, name: environment.name,
+                        bindings: environmentBindings, surfaces: environmentSurfaces)
+                }
+            return WorkspaceProject(
+                id: project.id, name: project.name, path: project.path,
+                commonBindings: common, environments: projectEnvironments)
+        }
+
+        let selectedProject = projects.first(where: { $0.id == previousProjectID }) ?? projects.first
+        selectedProjectID = selectedProject?.id ?? ""
+        let selectedEnvironment = selectedProject?.environments.first(where: {
+            $0.id == previousEnvironmentID
+        }) ?? selectedProject?.environments.first
+        selectedEnvironmentID = selectedEnvironment?.id ?? ""
+        let selectedSurface = selectedEnvironment?.surfaces.first(where: {
+            $0.id == previousSurfaceID
+        }) ?? selectedEnvironment?.surfaces.first
+        selectedSurfaceID = selectedSurface?.id ?? ""
+    }
+
+    private static func newID(_ prefix: String) -> String {
+        "\(prefix)-\(UUID().uuidString.lowercased())"
+    }
+
+    private static func isValidEnvKey(_ key: String) -> Bool {
+        key.range(of: "^[A-Z_][A-Z0-9_]*$", options: .regularExpression) != nil
+    }
+}
+
+private extension WorkspaceBinding {
+    init(_ binding: CatalogBinding) {
+        let scope: WorkspaceBindingScope = binding.scope.type == "common"
+            ? .common : .environment(binding.scope.environmentID ?? "")
+        self.init(
+            id: binding.id, resourceID: binding.resourceID, keyOverride: binding.keyOverride,
+            isEnabled: binding.enabled, scope: scope, allowOverride: binding.allowOverride,
+            position: binding.position)
+    }
+}
+
+private extension WorkspaceBindingScope {
+    var catalogScope: CatalogBindingScope {
+        switch self {
+        case .common: .common
+        case .environment(let id): .environment(id)
+        }
+    }
+}
+
+private extension WorkspaceSurface {
+    init?(_ surface: CatalogSurface) {
+        guard let kind = WorkspaceSurfaceKind(catalogValue: surface.kind) else { return nil }
+        self.init(
+            id: surface.id, name: surface.name, kind: kind, path: surface.path,
+            status: kind == .unixSocket ? .listening : .linked,
+            resourceID: surface.resourceID)
+    }
+}
+
+private extension WorkspaceResourceKind {
+    init?(catalogValue: String) {
+        switch catalogValue {
+        case "shared_secret": self = .sharedSecret
+        case "secret": self = .secret
+        case "env_file": self = .envFile
+        case "literal": self = .literal
+        case "command": self = .command
+        case "ssh_agent": self = .sshAgent
+        default: return nil
+        }
+    }
+}
+
+private extension WorkspaceValueShape {
+    init?(catalogValue: String) {
+        switch catalogValue {
+        case "scalar": self = .scalar
+        case "key_value_set": self = .keyValueSet
+        case "bytes": self = .bytes
+        case "socket": self = .socket
+        default: return nil
+        }
+    }
+}
+
+private extension WorkspaceSurfaceKind {
+    init?(catalogValue: String) {
+        switch catalogValue {
+        case "dotenv_file": self = .dotenvFile
+        case "regular_file": self = .regularFile
+        case "unix_socket": self = .unixSocket
+        default: return nil
+        }
+    }
+}
+
+enum WorkspaceStoreError: LocalizedError {
+    case controlUnavailable
+    case invalid(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .controlUnavailable: "The daemon control service is unavailable"
+        case .invalid(let message): message
+        }
     }
 }
 
