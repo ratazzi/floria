@@ -26,13 +26,14 @@ struct FloriaMenuBarApp: App {
         // SwiftUI (search field, hover rows, ...) instead of an NSMenu.
         .menuBarExtraStyle(.window)
 
-        // Production stays quiet at login; `swift run` and preview bundles open the workspace
-        // immediately so the full UI can be developed without driving the menubar first.
+        // The daemon owns login-time startup. Launching the GUI is therefore an explicit user
+        // action and should present the workspace immediately; the menu bar remains available
+        // after the window is closed.
         Window("floria", id: "dashboard") {
             DashboardView(state: state)
         }
         .defaultSize(width: 1240, height: 760)
         .windowStyle(.hiddenTitleBar)
-        .defaultLaunchBehavior(DaemonManager.isProductionApp ? .suppressed : .presented)
+        .defaultLaunchBehavior(.presented)
     }
 }

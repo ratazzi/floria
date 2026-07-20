@@ -853,7 +853,13 @@ private struct ResourceCatalogView: View {
             }
             .overlay {
                 if filtered.isEmpty {
-                    ContentUnavailableView.search(text: search)
+                    if search.isEmpty {
+                        ContentUnavailableView(
+                            "No \(title.lowercased()) yet", systemImage: "tray",
+                            description: Text(subtitle))
+                    } else {
+                        ContentUnavailableView.search(text: search)
+                    }
                 }
             }
         }

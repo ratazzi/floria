@@ -58,6 +58,7 @@ pub enum ControlCommand {
         value: SecretValue,
     },
     SharedSecretRotate { resource_id: String, value: SecretValue },
+    ProjectCreate { project: Project, environment: Environment, surface: Surface },
     ProjectUpsert { project: Project },
     ProjectRemove { id: String },
     EnvironmentUpsert { environment: Environment },

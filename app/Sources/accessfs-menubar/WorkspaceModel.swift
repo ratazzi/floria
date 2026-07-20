@@ -300,13 +300,11 @@ final class WorkspaceStore {
         let environmentID = Self.newID("environment")
         let surfaceID = Self.newID("dotenv")
         do {
-            try await controlClient.upsertProject(
-                CatalogProject(id: projectID, name: name, path: path))
-            try await controlClient.upsertEnvironment(
-                CatalogEnvironment(
-                    id: environmentID, projectID: projectID, name: "Development", position: 0))
-            try await controlClient.upsertSurface(
-                CatalogSurface(
+            try await controlClient.createProject(
+                CatalogProject(id: projectID, name: name, path: path),
+                environment: CatalogEnvironment(
+                    id: environmentID, projectID: projectID, name: "Development", position: 0),
+                surface: CatalogSurface(
                     id: surfaceID, environmentID: environmentID, name: ".env",
                     kind: "dotenv_file", path: dotenvPath, resourceID: nil, position: 0))
             apply(try await controlClient.snapshot(), selectingProject: projectID)

@@ -94,13 +94,13 @@ final class AppState {
         client.start()
         Task { await workspace.reload() }
 
-        // Give the socket client one immediate connection attempt before taking ownership.
-        // This preserves a manually started development daemon instead of racing it for the
-        // socket and mount point. With no daemon, the packaged app installs its LaunchAgent.
+        // A packaged app always reconciles the LaunchAgent definition. DaemonManager makes
+        // the same bundle revision a no-op, while a newly installed bundle must replace an
+        // older but still-connectable daemon so new control-plane capabilities become live.
         if DaemonManager.isProductionApp {
             Task { @MainActor [weak self] in
                 try? await Task.sleep(nanoseconds: 500_000_000)
-                guard let self, !self.connected else { return }
+                guard let self else { return }
                 let manager = self.daemonManager
                 DispatchQueue.global(qos: .utility).async {
                     manager.ensureRunning()

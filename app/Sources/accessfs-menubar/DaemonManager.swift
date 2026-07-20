@@ -37,6 +37,10 @@ struct DaemonManager: Sendable {
             .appendingPathComponent("\(serviceLabel).plist")
     }
 
+    private var reconciliationLockURL: URL {
+        runtimeDirectory.appendingPathComponent("daemon-reconcile.lock")
+    }
+
     private var daemonURL: URL? {
         Bundle.main.url(forResource: "accessfs", withExtension: nil)
     }
@@ -51,14 +55,17 @@ struct DaemonManager: Sendable {
                 throw DaemonError.noBinary
             }
 
-            try prepareRuntimeFiles()
-            if isLoaded && installedDefinitionMatches(daemonPath: daemonURL.path) {
-                Self.log.info("daemon LaunchAgent already loaded")
-                return
-            }
+            try prepareRuntimeDirectory()
+            try withReconciliationLock {
+                try prepareRuntimeFiles()
+                if isLoaded && installedDefinitionMatches(daemonPath: daemonURL.path) {
+                    Self.log.info("daemon LaunchAgent already loaded")
+                    return
+                }
 
-            try install(daemonURL: daemonURL)
-            Self.log.info("daemon LaunchAgent installed and started")
+                try install(daemonURL: daemonURL)
+                Self.log.info("daemon LaunchAgent installed and started")
+            }
         } catch {
             Self.log.error("failed to start daemon: \(error.localizedDescription, privacy: .public)")
         }
@@ -76,6 +83,10 @@ struct DaemonManager: Sendable {
 
         _ = try? runLaunchctl(["enable", serviceTarget])
         _ = try? runLaunchctl(["bootout", serviceTarget])
+        // launchd terminates the old process without unwinding Rust's mount session. Explicitly
+        // detach the old macFUSE volume before bootstrapping the replacement, otherwise the new
+        // daemon sees the mount point as occupied and enters KeepAlive's restart loop.
+        _ = try? runDaemon(daemonURL, arguments: ["unmount", "--config", configURL.path])
 
         try plist.write(to: launchAgentURL, options: .atomic)
         try fileManager.setAttributes(
@@ -84,14 +95,9 @@ struct DaemonManager: Sendable {
     }
 
     private func prepareRuntimeFiles() throws {
-        let fileManager = FileManager.default
-        try fileManager.createDirectory(
-            at: runtimeDirectory,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700])
-        try fileManager.setAttributes(
-            [.posixPermissions: 0o700], ofItemAtPath: runtimeDirectory.path)
+        try prepareRuntimeDirectory()
 
+        let fileManager = FileManager.default
         if !fileManager.fileExists(atPath: configURL.path) {
             guard let bundledConfig = Bundle.main.url(forResource: "accessfs", withExtension: "toml") else {
                 throw DaemonError.missingResource("accessfs.toml")
@@ -117,6 +123,29 @@ struct DaemonManager: Sendable {
             try fileManager.setAttributes(
                 [.posixPermissions: 0o700], ofItemAtPath: handlerURL.path)
         }
+    }
+
+    private func prepareRuntimeDirectory() throws {
+        let fileManager = FileManager.default
+        try fileManager.createDirectory(
+            at: runtimeDirectory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700])
+        try fileManager.setAttributes(
+            [.posixPermissions: 0o700], ofItemAtPath: runtimeDirectory.path)
+    }
+
+    private func withReconciliationLock(_ body: () throws -> Void) throws {
+        let fd = open(reconciliationLockURL.path, O_CREAT | O_RDWR, mode_t(0o600))
+        guard fd >= 0 else {
+            throw DaemonError.systemCall("opening reconciliation lock", errno)
+        }
+        defer { close(fd) }
+        guard flock(fd, LOCK_EX) == 0 else {
+            throw DaemonError.systemCall("locking daemon reconciliation", errno)
+        }
+        defer { _ = flock(fd, LOCK_UN) }
+        try body()
     }
 
     private var bundleRevision: String {
@@ -182,8 +211,17 @@ struct DaemonManager: Sendable {
 
     @discardableResult
     private func runLaunchctl(_ arguments: [String]) throws -> String {
+        try runProcess(executableURL: URL(fileURLWithPath: "/bin/launchctl"), arguments: arguments)
+    }
+
+    @discardableResult
+    private func runDaemon(_ daemonURL: URL, arguments: [String]) throws -> String {
+        try runProcess(executableURL: daemonURL, arguments: arguments)
+    }
+
+    private func runProcess(executableURL: URL, arguments: [String]) throws -> String {
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+        process.executableURL = executableURL
         process.arguments = arguments
 
         let output = Pipe()
@@ -195,8 +233,8 @@ struct DaemonManager: Sendable {
         let data = output.fileHandleForReading.readDataToEndOfFile()
         let text = String(decoding: data, as: UTF8.self)
         guard process.terminationStatus == 0 else {
-            throw DaemonError.launchctlFailed(
-                arguments: arguments,
+            throw DaemonError.processFailed(
+                executable: executableURL.lastPathComponent, arguments: arguments,
                 status: process.terminationStatus,
                 output: text)
         }
@@ -206,7 +244,8 @@ struct DaemonManager: Sendable {
     enum DaemonError: LocalizedError {
         case noBinary
         case missingResource(String)
-        case launchctlFailed(arguments: [String], status: Int32, output: String)
+        case systemCall(String, Int32)
+        case processFailed(executable: String, arguments: [String], status: Int32, output: String)
 
         var errorDescription: String? {
             switch self {
@@ -214,8 +253,10 @@ struct DaemonManager: Sendable {
                 return "Rust daemon is missing from the app bundle"
             case .missingResource(let name):
                 return "Required app resource is missing: \(name)"
-            case .launchctlFailed(let arguments, let status, let output):
-                return "launchctl \(arguments.joined(separator: " ")) failed (\(status)): \(output)"
+            case .systemCall(let operation, let code):
+                return "\(operation) failed: \(String(cString: strerror(code)))"
+            case .processFailed(let executable, let arguments, let status, let output):
+                return "\(executable) \(arguments.joined(separator: " ")) failed (\(status)): \(output)"
             }
         }
     }

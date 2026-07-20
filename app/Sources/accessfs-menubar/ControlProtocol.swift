@@ -11,6 +11,11 @@ struct CatalogEnvironment: Codable, Sendable {
     let projectID: String
     let name: String
     let position: Int64
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, position
+        case projectID = "project_id"
+    }
 }
 
 struct CatalogExport: Codable, Sendable {
@@ -24,6 +29,11 @@ struct CatalogResourceSource: Codable, Sendable {
     let value: String?
     let argv: [String]?
     let endpoint: String?
+
+    enum CodingKeys: String, CodingKey {
+        case type, value, argv, endpoint
+        case secretID = "secret_id"
+    }
 }
 
 struct CatalogResource: Codable, Sendable {
@@ -35,11 +45,21 @@ struct CatalogResource: Codable, Sendable {
     let exports: [CatalogExport]
     let source: CatalogResourceSource
     let detail: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, kind, shape, exports, source, detail
+        case defaultEnvKey = "default_env_key"
+    }
 }
 
 struct CatalogBindingScope: Codable, Sendable {
     let type: String
     let environmentID: String?
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case environmentID = "environment_id"
+    }
 
     static let common = CatalogBindingScope(type: "common", environmentID: nil)
 
@@ -57,6 +77,14 @@ struct CatalogBinding: Codable, Sendable {
     let enabled: Bool
     let allowOverride: Bool
     let position: Int64
+
+    enum CodingKeys: String, CodingKey {
+        case id, scope, enabled, position
+        case projectID = "project_id"
+        case resourceID = "resource_id"
+        case keyOverride = "key_override"
+        case allowOverride = "allow_override"
+    }
 }
 
 struct CatalogSurface: Codable, Sendable {
@@ -67,6 +95,12 @@ struct CatalogSurface: Codable, Sendable {
     let path: String
     let resourceID: String?
     let position: Int64
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, kind, path, position
+        case environmentID = "environment_id"
+        case resourceID = "resource_id"
+    }
 }
 
 struct CatalogSnapshot: Codable, Sendable {
@@ -80,6 +114,7 @@ struct CatalogSnapshot: Codable, Sendable {
 enum ControlCommand: Sendable {
     case snapshot
     case sharedSecretCreate(resourceID: String, name: String, defaultEnvKey: String, value: String)
+    case projectCreate(CatalogProject, CatalogEnvironment, CatalogSurface)
     case projectUpsert(CatalogProject)
     case environmentUpsert(CatalogEnvironment)
     case bindingUpsert(CatalogBinding)
@@ -89,6 +124,7 @@ enum ControlCommand: Sendable {
         switch self {
         case .snapshot: "snapshot"
         case .sharedSecretCreate: "shared_secret_create"
+        case .projectCreate: "project_create"
         case .projectUpsert: "project_upsert"
         case .environmentUpsert: "environment_upsert"
         case .bindingUpsert: "binding_upsert"
@@ -107,6 +143,12 @@ enum ControlCommand: Sendable {
                     params: SharedSecretCreateParams(
                         resourceID: resourceID, name: name, defaultEnvKey: defaultEnvKey,
                         value: value)))
+        case .projectCreate(let project, let environment, let surface):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: ProjectCreateParams(
+                        project: project, environment: environment, surface: surface)))
         case .projectUpsert(let project):
             return try encoder.encode(
                 ControlRequest(
@@ -150,6 +192,11 @@ private struct SharedSecretCreateParams: Encodable {
 }
 
 private struct ProjectUpsertParams: Encodable { let project: CatalogProject }
+private struct ProjectCreateParams: Encodable {
+    let project: CatalogProject
+    let environment: CatalogEnvironment
+    let surface: CatalogSurface
+}
 private struct EnvironmentUpsertParams: Encodable { let environment: CatalogEnvironment }
 private struct BindingUpsertParams: Encodable { let binding: CatalogBinding }
 private struct SurfaceUpsertParams: Encodable { let surface: CatalogSurface }
@@ -169,6 +216,11 @@ struct ControlResponseEnvelope<Value: Decodable>: Decodable {
     let status: String
     let result: Result?
     let error: ErrorBody?
+
+    enum CodingKeys: String, CodingKey {
+        case status, result, error
+        case requestID = "request_id"
+    }
 }
 
 struct EmptyControlValue: Decodable {}

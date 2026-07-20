@@ -1,3 +1,6 @@
+[tools]
+rust = "1.97.1"
+
 [tasks.install-app]
 description = "Build Floria.app (Rust daemon + Swift UI) and install it in /Applications"
 run = '''

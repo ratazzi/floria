@@ -32,6 +32,12 @@ final class ControlClient: @unchecked Sendable {
         try await requestEmpty(.projectUpsert(project))
     }
 
+    func createProject(
+        _ project: CatalogProject, environment: CatalogEnvironment, surface: CatalogSurface
+    ) async throws {
+        try await requestEmpty(.projectCreate(project, environment, surface))
+    }
+
     func upsertEnvironment(_ environment: CatalogEnvironment) async throws {
         try await requestEmpty(.environmentUpsert(environment))
     }
@@ -64,7 +70,6 @@ final class ControlClient: @unchecked Sendable {
 
                     let responseBody = try exchange(requestBody)
                     let decoder = JSONDecoder()
-                    decoder.keyDecodingStrategy = .convertFromSnakeCase
                     let response = try decoder.decode(
                         ControlResponseEnvelope<Value>.self, from: responseBody)
                     guard response.requestID == requestID else {

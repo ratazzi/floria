@@ -143,6 +143,7 @@ fn mutates_catalog(command: &ControlCommand) -> bool {
     matches!(
         command,
         ControlCommand::ProjectUpsert { .. }
+            | ControlCommand::ProjectCreate { .. }
             | ControlCommand::ProjectRemove { .. }
             | ControlCommand::EnvironmentUpsert { .. }
             | ControlCommand::EnvironmentRemove { .. }
@@ -238,6 +239,9 @@ fn dispatch(
             resource_id,
             value,
         ),
+        ControlCommand::ProjectCreate { project, environment, surface } => {
+            create_project_workspace(catalog, project, environment, surface)
+        }
         ControlCommand::ProjectUpsert { project } => {
             catalog.upsert_project(&project)?;
             Ok(ControlResult::Empty)
@@ -278,6 +282,61 @@ fn dispatch(
             catalog.remove_surface(&id)?;
             Ok(ControlResult::Empty)
         }
+    }
+}
+
+fn create_project_workspace(
+    catalog: &Catalog,
+    project: accessfs_catalog::Project,
+    environment: accessfs_catalog::Environment,
+    surface: accessfs_catalog::Surface,
+) -> Result<ControlResult, DispatchError> {
+    if environment.project_id != project.id {
+        return Err(DispatchError::Validation(format!(
+            "environment project {:?} does not match project {:?}",
+            environment.project_id, project.id
+        )));
+    }
+    if surface.environment_id != environment.id {
+        return Err(DispatchError::Validation(format!(
+            "surface environment {:?} does not match environment {:?}",
+            surface.environment_id, environment.id
+        )));
+    }
+
+    let snapshot = catalog.snapshot()?;
+    for (kind, id, exists) in [
+        ("project", &project.id, snapshot.projects.iter().any(|item| item.id == project.id)),
+        (
+            "environment",
+            &environment.id,
+            snapshot.environments.iter().any(|item| item.id == environment.id),
+        ),
+        ("surface", &surface.id, snapshot.surfaces.iter().any(|item| item.id == surface.id)),
+    ] {
+        if exists {
+            return Err(DispatchError::Catalog(CatalogError::AlreadyExists {
+                kind,
+                id: id.clone(),
+            }));
+        }
+    }
+
+    catalog.upsert_project(&project)?;
+    if let Err(error) = catalog.upsert_environment(&environment) {
+        rollback_project_create(catalog, &project.id);
+        return Err(DispatchError::Catalog(error));
+    }
+    if let Err(error) = catalog.upsert_surface(&surface) {
+        rollback_project_create(catalog, &project.id);
+        return Err(DispatchError::Catalog(error));
+    }
+    Ok(ControlResult::Empty)
+}
+
+fn rollback_project_create(catalog: &Catalog, project_id: &str) {
+    if let Err(error) = catalog.remove_project(project_id) {
+        tracing::warn!(%project_id, %error, "rolling back project create failed");
     }
 }
 
@@ -367,7 +426,7 @@ fn same_uid(stream: &UnixStream) -> bool {
 mod tests {
     use super::*;
     use crate::client::ControlClient;
-    use accessfs_catalog::{Environment, Project};
+    use accessfs_catalog::{Environment, Project, Surface, SurfaceKind};
     use accessfs_store::{
         SecretOrigin, SecretRecord, StoreResult, VersionRecord,
     };
@@ -510,6 +569,95 @@ mod tests {
         };
         assert_eq!(snapshot.projects.len(), 1);
         assert_eq!(snapshot.environments.len(), 1);
+    }
+
+    #[test]
+    fn project_create_builds_workspace_with_one_observer_notification() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let socket = dir.path().join("control.sock");
+        let observer = Arc::new(SnapshotObserver {
+            notifications: AtomicUsize::new(0),
+            latest: Mutex::new(None),
+        });
+        let _server = ControlServer::start_observed(
+            &socket,
+            catalog.clone(),
+            Arc::clone(&observer) as Arc<dyn CatalogObserver>,
+        )
+        .unwrap();
+        let mut client = ControlClient::connect(&socket).unwrap();
+
+        client
+            .request(ControlCommand::ProjectCreate {
+                project: Project {
+                    id: "fixture-project".to_string(),
+                    name: "Fixture Project".to_string(),
+                    path: PathBuf::from("/fixture/project"),
+                },
+                environment: Environment {
+                    id: "fixture-development".to_string(),
+                    project_id: "fixture-project".to_string(),
+                    name: "Development".to_string(),
+                    position: 0,
+                },
+                surface: Surface {
+                    id: "fixture-dotenv".to_string(),
+                    environment_id: "fixture-development".to_string(),
+                    name: ".env".to_string(),
+                    kind: SurfaceKind::DotenvFile,
+                    path: PathBuf::from("/fixture/project/.env"),
+                    resource_id: None,
+                    position: 0,
+                },
+            })
+            .unwrap();
+
+        let snapshot = catalog.snapshot().unwrap();
+        assert_eq!(snapshot.projects.len(), 1);
+        assert_eq!(snapshot.environments.len(), 1);
+        assert_eq!(snapshot.surfaces.len(), 1);
+        assert_eq!(observer.notifications.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn project_create_rolls_back_when_surface_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let socket = dir.path().join("control.sock");
+        let _server = ControlServer::start(&socket, catalog.clone()).unwrap();
+        let mut client = ControlClient::connect(&socket).unwrap();
+
+        let error = client
+            .request(ControlCommand::ProjectCreate {
+                project: Project {
+                    id: "fixture-project".to_string(),
+                    name: "Fixture Project".to_string(),
+                    path: PathBuf::from("/fixture/project"),
+                },
+                environment: Environment {
+                    id: "fixture-development".to_string(),
+                    project_id: "fixture-project".to_string(),
+                    name: "Development".to_string(),
+                    position: 0,
+                },
+                surface: Surface {
+                    id: "fixture-dotenv".to_string(),
+                    environment_id: "fixture-development".to_string(),
+                    name: ".env".to_string(),
+                    kind: SurfaceKind::DotenvFile,
+                    path: PathBuf::from("/outside/.env"),
+                    resource_id: None,
+                    position: 0,
+                },
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("validation"));
+        let snapshot = catalog.snapshot().unwrap();
+        assert!(snapshot.projects.is_empty());
+        assert!(snapshot.environments.is_empty());
+        assert!(snapshot.surfaces.is_empty());
     }
 
     #[test]
