@@ -14,6 +14,8 @@ use crate::rules::{
 
 /// Virtual directory under the mount where store-backed secrets are surfaced (`secrets/<id>`).
 pub const SECRETS_DIR: &str = "secrets";
+/// Virtual directory containing catalog-backed rendered surfaces (`surfaces/<id>`).
+pub const SURFACES_DIR: &str = "surfaces";
 
 /// Raw TOML structure, deserialized directly. Validation/resolution happens in [`Config::resolve`].
 #[derive(Debug, Deserialize)]
@@ -204,7 +206,7 @@ impl Config {
 /// explicit `[[rule]]` blocks, then per-file `enforcement` as exact-path rules at priority 0,
 /// then a single catch-all `allow` default at the lowest priority so the default is visible, not hidden.
 fn build_ruleset(rule_cfgs: Vec<RuleCfg>, files: &[FileEntry]) -> Result<RuleSet> {
-    let mut rules = Vec::with_capacity(rule_cfgs.len() + files.len() + 1);
+    let mut rules = Vec::with_capacity(rule_cfgs.len() + files.len() + 2);
 
     for (idx, rc) in rule_cfgs.into_iter().enumerate() {
         rules.push(resolve_rule(rc, idx)?);
@@ -233,6 +235,19 @@ fn build_ruleset(rule_cfgs: Vec<RuleCfg>, files: &[FileEntry]) -> Result<RuleSet
         path_glob: compile_glob(&format!("{SECRETS_DIR}/**"))
             .expect("`secrets/**` is a valid glob"),
         ops: RuleOps::READ_WRITE,
+        enforcement: Enforcement::Prompt,
+        enabled: true,
+    });
+
+    // Rendered surfaces may contain several secrets. They are read-only, but must still prompt
+    // by default rather than inheriting the monitor-mode read allow below.
+    rules.push(Rule {
+        id: "surfaces-default".to_string(),
+        priority: i32::MIN + 1,
+        subject: SubjectMatch::default(),
+        path_glob: compile_glob(&format!("{SURFACES_DIR}/**"))
+            .expect("`surfaces/**` is a valid glob"),
+        ops: RuleOps::READ,
         enforcement: Enforcement::Prompt,
         enabled: true,
     });
@@ -580,8 +595,8 @@ mod tests {
         )
         .unwrap();
 
-        // explicit rule + one per-file rule + secrets-default + catch-all
-        assert_eq!(rules.len(), 4);
+        // explicit rule + one per-file rule + two protected namespaces + catch-all
+        assert_eq!(rules.len(), 5);
 
         // any secrets/<id> path is prompted by the built-in rule — for reads AND writes
         let id = ProcessIdentity::bare(1, 501, 20);
@@ -592,6 +607,16 @@ mod tests {
         assert_eq!(
             rules.decide(&id, "secrets/abc-123", None, Operation::Write),
             (Enforcement::Prompt, Some("secrets-default".to_string()))
+        );
+
+        // composed surfaces are also gated by default; they never accept writes
+        assert_eq!(
+            rules.decide(&id, "surfaces/fixture-dotenv", None, Operation::Read),
+            (Enforcement::Prompt, Some("surfaces-default".to_string()))
+        );
+        assert_eq!(
+            rules.decide(&id, "surfaces/fixture-dotenv", None, Operation::Write),
+            (Enforcement::Deny, Some("default-deny".to_string()))
         );
 
         // explicit deny rule wins for prod

@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use accessfs_catalog::{Catalog, SurfaceKind};
 use accessfs_core::audit::AuditLog;
 use accessfs_core::authz::{AuthRequest, Authorizer, Operation};
 use accessfs_core::config::{ResolvedConfig, SECRETS_DIR};
@@ -26,6 +27,7 @@ use accessfs_core::handler::{ContentHandler, HandlerCtx};
 use accessfs_core::snapshot::{content_version_of, SnapshotTable};
 use accessfs_core::writebuf::{WriteBufTable, WriteErr};
 use accessfs_store::{SecretId, SecretStore};
+use accessfs_surface::SurfaceResolver;
 use dashmap::DashMap;
 use fuser::{
     AccessFlags, Errno, FileHandle, FileType, INodeNo, KernelConfig, OpenFlags, ReplyAttr,
@@ -34,7 +36,7 @@ use fuser::{
 };
 
 use reply::{dir_attr, file_attr, mount_config, TTL};
-use tree::{NodeKind, Tree};
+use tree::{FileSource, NodeKind, SurfaceFileEntry, Tree};
 
 /// Worker threads for open() work. Each pending authorization prompt ties up one thread
 /// (bounded by the 30s prompt timeout); everything else keeps flowing because the fuser
@@ -98,6 +100,9 @@ struct Shared {
     authorizer: Arc<dyn Authorizer>,
     /// Dynamic `secrets/<id>` namespace over the store; `None` if no store is configured.
     secrets: Option<SecretsNs>,
+    /// Catalog-backed dotenv renderer. Surface inodes are frozen into `tree` at mount time;
+    /// values and secret versions are resolved only after authorization on each open.
+    surfaces: Option<SurfaceResolver>,
     /// Stable timestamp used for all attributes (captured at mount time, never changes),
     /// so watchers don't trigger accidentally.
     mount_epoch: SystemTime,
@@ -119,13 +124,37 @@ impl AccessFs {
         audit: Arc<AuditLog>,
         authorizer: Arc<dyn Authorizer>,
         store: Option<Arc<dyn SecretStore>>,
-    ) -> Self {
+        catalog: Option<Catalog>,
+    ) -> anyhow::Result<Self> {
         // SAFETY: geteuid/getegid take no arguments, have no side effects, and always succeed.
         let (mount_uid, mount_gid) = unsafe { (libc::geteuid(), libc::getegid()) };
 
-        // The static tree holds config files plus the permanent `secrets/` directory; the store's
-        // contents are resolved dynamically, so it allocates inodes from the tree's next free one.
-        let tree = Tree::build(&cfg.files);
+        let surface_files = match &catalog {
+            Some(catalog) => catalog
+                .snapshot()?
+                .surfaces
+                .into_iter()
+                .filter(|surface| surface.kind == SurfaceKind::DotenvFile)
+                .map(|surface| SurfaceFileEntry {
+                    surface_id: surface.id,
+                    display_path: surface.path.display().to_string(),
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+
+        // The static tree holds config and catalog surface files plus the permanent `secrets/`
+        // directory; raw store contents remain dynamic and allocate after the tree's last inode.
+        let tree = Tree::build(&cfg.files, &surface_files);
+        let surfaces = match (catalog, store.as_ref()) {
+            (Some(catalog), Some(store)) => {
+                Some(SurfaceResolver::new(catalog, Arc::clone(store)))
+            }
+            (Some(_), None) if !surface_files.is_empty() => {
+                anyhow::bail!("catalog contains dotenv surfaces but no secret store is configured")
+            }
+            _ => None,
+        };
         let secrets = store.map(|s| SecretsNs::new(s, tree.secrets_dir_ino(), tree.next_ino()));
 
         let inner = Arc::new(Shared {
@@ -135,6 +164,7 @@ impl AccessFs {
             audit,
             authorizer,
             secrets,
+            surfaces,
             mount_epoch: SystemTime::now(),
             mount_uid,
             mount_gid,
@@ -143,7 +173,7 @@ impl AccessFs {
             .num_threads(OPEN_POOL_THREADS)
             .thread_name("accessfs-open".into())
             .build();
-        AccessFs { inner, pool }
+        Ok(AccessFs { inner, pool })
     }
 }
 
@@ -187,6 +217,7 @@ impl Shared {
                     .ok_or(Errno::ENOENT)?;
                 return Ok(OpenTarget {
                     virtual_path: format!("{SECRETS_DIR}/{id}"),
+                    display: self.secret_display(&id),
                     direct_io: true,
                     kind: OpenKind::Secret(id),
                 });
@@ -198,8 +229,17 @@ impl Shared {
         };
         Ok(OpenTarget {
             virtual_path: file.virtual_path.clone(),
+            display: match &file.source {
+                FileSource::DotenvSurface { display_path, .. } => Some(display_path.clone()),
+                FileSource::Handler(_) => None,
+            },
             direct_io: file.direct_io,
-            kind: OpenKind::Handler(file.handler.clone()),
+            kind: match &file.source {
+                FileSource::Handler(handler) => OpenKind::Handler(handler.clone()),
+                FileSource::DotenvSurface { surface_id, .. } => {
+                    OpenKind::DotenvSurface(surface_id.clone())
+                }
+            },
         })
     }
 
@@ -295,17 +335,10 @@ impl Shared {
 
         let identity = Arc::new(accessfs_platform::enrich(pid, uid, gid));
 
-        // A secret's original source path, for prompts/UI — `secrets/<uuid>` means nothing
-        // to the person deciding. Best-effort: on any store hiccup the uuid path stands.
-        let display = match &target.kind {
-            OpenKind::Secret(id) => self.secret_display(id),
-            _ => None,
-        };
-
         // Authorization boundary: decide after resolving the identity, before generating content.
         let decision = self.authorizer.authorize(&AuthRequest {
             path: &target.virtual_path,
-            display: display.as_deref(),
+            display: target.display.as_deref(),
             operation,
             identity: &identity,
         });
@@ -397,6 +430,29 @@ impl Shared {
                     }
                 }
             }
+            OpenKind::DotenvSurface(surface_id) => {
+                let Some(resolver) = &self.surfaces else {
+                    tracing::warn!(path = %target.virtual_path, "surface resolver is unavailable");
+                    reply.error(errno(libc::EIO));
+                    return;
+                };
+                match resolver.render_dotenv_surface(surface_id) {
+                    Ok(snapshot) => {
+                        tracing::debug!(
+                            path = %target.virtual_path,
+                            resources = snapshot.versions.len(),
+                            exports = snapshot.exports.len(),
+                            "dotenv surface resolved"
+                        );
+                        snapshot.bytes
+                    }
+                    Err(error) => {
+                        tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), %error, "dotenv surface failed");
+                        reply.error(errno(libc::EIO));
+                        return;
+                    }
+                }
+            }
         };
 
         let opened = self.snapshots.insert(ino, Arc::clone(&identity), bytes);
@@ -437,6 +493,7 @@ impl Shared {
 /// What `open()` should serve for a resolved inode.
 struct OpenTarget {
     virtual_path: String,
+    display: Option<String>,
     direct_io: bool,
     kind: OpenKind,
 }
@@ -444,6 +501,7 @@ struct OpenTarget {
 enum OpenKind {
     Handler(ContentHandler),
     Secret(String),
+    DotenvSurface(String),
 }
 
 /// Build error codes that fuser doesn't provide constants for (EROFS/ENOATTR, etc.) from libc.
@@ -920,11 +978,12 @@ pub fn mount(
     cfg: ResolvedConfig,
     authorizer: Arc<dyn Authorizer>,
     store: Option<Arc<dyn SecretStore>>,
+    catalog: Option<Catalog>,
 ) -> anyhow::Result<()> {
     let audit = Arc::new(AuditLog::open(&cfg.audit_log)?);
     let mount_point = cfg.mount_path.clone();
     let config = mount_config(&cfg.volname);
-    let fs = AccessFs::new(&cfg, audit, authorizer, store);
+    let fs = AccessFs::new(&cfg, audit, authorizer, store, catalog)?;
 
     tracing::info!(
         mount = %mount_point.display(),
@@ -1042,7 +1101,7 @@ mod tests {
     }
 
     fn shared_with_store(store: Arc<dyn SecretStore>, tmp: &Path) -> Arc<Shared> {
-        let tree = Tree::build(&[]);
+        let tree = Tree::build(&[], &[]);
         let secrets = SecretsNs::new(store, tree.secrets_dir_ino(), tree.next_ino());
         Arc::new(Shared {
             tree,
@@ -1051,6 +1110,7 @@ mod tests {
             audit: Arc::new(AuditLog::open(&tmp.join("audit.jsonl")).unwrap()),
             authorizer: Arc::new(AllowAll),
             secrets: Some(secrets),
+            surfaces: None,
             mount_epoch: SystemTime::now(),
             mount_uid: 501,
             mount_gid: 20,

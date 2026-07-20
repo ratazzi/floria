@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
-use accessfs_core::config::{FileEntry, SECRETS_DIR};
+use accessfs_core::config::{FileEntry, SECRETS_DIR, SURFACES_DIR};
 use accessfs_core::handler::ContentHandler;
+use accessfs_surface::DOTENV_MAX_SIZE;
 
 /// Root inode. FUSE convention: root = 1.
 const ROOT_INO: u64 = 1;
@@ -40,7 +41,7 @@ pub enum NodeKind {
 }
 
 pub struct FileNode {
-    pub handler: ContentHandler,
+    pub source: FileSource,
     pub virtual_path: String,
     /// Stable size reported by getattr. Constant files = exact length; script files = declared upper bound.
     pub report_size: u64,
@@ -48,10 +49,23 @@ pub struct FileNode {
     pub direct_io: bool,
 }
 
+pub enum FileSource {
+    Handler(ContentHandler),
+    DotenvSurface {
+        surface_id: String,
+        display_path: String,
+    },
+}
+
+pub struct SurfaceFileEntry {
+    pub surface_id: String,
+    pub display_path: String,
+}
+
 impl Tree {
     /// Build the static inode tree from the resolved virtual files (config files plus any
     /// store-backed secrets). inodes are assigned sequentially and never reclaimed during the mount.
-    pub fn build(files: &[FileEntry]) -> Self {
+    pub fn build(files: &[FileEntry], surfaces: &[SurfaceFileEntry]) -> Self {
         let mut tree = Tree {
             nodes: HashMap::new(),
             by_parent_name: HashMap::new(),
@@ -101,7 +115,7 @@ impl Tree {
                     name: file_name.clone(),
                     mode: entry.mode,
                     kind: NodeKind::File(FileNode {
-                        handler: entry.handler.clone(),
+                        source: FileSource::Handler(entry.handler.clone()),
                         virtual_path: entry.path.clone(),
                         report_size,
                         direct_io,
@@ -110,6 +124,34 @@ impl Tree {
             );
             tree.by_parent_name.insert((parent, file_name), ino);
             tree.children.entry(parent).or_default().push(ino);
+        }
+
+        // Catalog surfaces get stable internal paths (`surfaces/<id>`). The project-facing
+        // `.env` is a symlink to this inode, so its target path never leaks into the FUSE tree.
+        let surfaces_dir_ino = tree.ensure_dir(ROOT_INO, SURFACES_DIR, &mut next_ino);
+        for surface in surfaces {
+            let ino = next_ino;
+            next_ino += 1;
+            tree.nodes.insert(
+                ino,
+                Node {
+                    parent: surfaces_dir_ino,
+                    name: surface.surface_id.clone(),
+                    mode: 0o400,
+                    kind: NodeKind::File(FileNode {
+                        source: FileSource::DotenvSurface {
+                            surface_id: surface.surface_id.clone(),
+                            display_path: surface.display_path.clone(),
+                        },
+                        virtual_path: format!("{SURFACES_DIR}/{}", surface.surface_id),
+                        report_size: DOTENV_MAX_SIZE as u64,
+                        direct_io: true,
+                    }),
+                },
+            );
+            tree.by_parent_name
+                .insert((surfaces_dir_ino, surface.surface_id.clone()), ino);
+            tree.children.entry(surfaces_dir_ino).or_default().push(ino);
         }
 
         // Always expose a top-level `secrets/` directory; its children are resolved dynamically
@@ -163,5 +205,32 @@ impl Tree {
 
     pub fn children(&self, ino: u64) -> &[u64] {
         self.children.get(&ino).map(Vec::as_slice).unwrap_or(&[])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn catalog_surface_gets_stable_read_only_inode() {
+        let tree = Tree::build(
+            &[],
+            &[SurfaceFileEntry {
+                surface_id: "fixture-dotenv".to_string(),
+                display_path: "/fixture/project/.env".to_string(),
+            }],
+        );
+        let dir = tree.lookup_child(ROOT_INO, SURFACES_DIR).unwrap();
+        let ino = tree.lookup_child(dir, "fixture-dotenv").unwrap();
+        let node = tree.get(ino).unwrap();
+        assert_eq!(node.mode, 0o400);
+        let NodeKind::File(file) = &node.kind else { panic!("expected file") };
+        assert!(file.direct_io);
+        assert_eq!(file.report_size, DOTENV_MAX_SIZE as u64);
+        assert!(matches!(
+            &file.source,
+            FileSource::DotenvSurface { surface_id, .. } if surface_id == "fixture-dotenv"
+        ));
     }
 }

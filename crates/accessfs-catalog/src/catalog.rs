@@ -68,7 +68,11 @@ impl Catalog {
     }
 
     pub fn snapshot(&self) -> CatalogResult<CatalogSnapshot> {
-        snapshot_from(&self.connection()?)
+        let mut conn = self.connection()?;
+        let tx = conn.transaction()?;
+        let snapshot = snapshot_from(&tx)?;
+        tx.commit()?;
+        Ok(snapshot)
     }
 
     pub fn upsert_project(&self, project: &Project) -> CatalogResult<()> {
@@ -295,7 +299,7 @@ impl Catalog {
         project_id: &str,
         environment_id: &str,
     ) -> CatalogResult<ResolvedEnvironment> {
-        resolve_snapshot(&self.snapshot()?, project_id, environment_id)
+        resolve_catalog_snapshot(&self.snapshot()?, project_id, environment_id)
     }
 
     fn connection(&self) -> CatalogResult<Connection> {
@@ -491,7 +495,7 @@ fn snapshot_from(conn: &Connection) -> CatalogResult<CatalogSnapshot> {
     Ok(CatalogSnapshot { projects, environments, resources, bindings, surfaces })
 }
 
-fn resolve_snapshot(
+pub fn resolve_catalog_snapshot(
     snapshot: &CatalogSnapshot,
     project_id: &str,
     environment_id: &str,
@@ -564,6 +568,7 @@ fn resolve_exports(
             let current_is_environment = matches!(binding.scope, BindingScope::Environment { .. });
             let resolved = ResolvedExport {
                 key: key.clone(),
+                source_key: export.key.clone(),
                 binding_id: binding.id.clone(),
                 resource_id: resource.id.clone(),
                 resource_name: resource.name.clone(),
@@ -608,7 +613,7 @@ fn validate_snapshot_conflicts(snapshot: &CatalogSnapshot) -> CatalogResult<()> 
             resolve_exports(snapshot, &project.id, None)?;
         } else {
             for environment in environments {
-                resolve_snapshot(snapshot, &project.id, &environment.id)?;
+                resolve_catalog_snapshot(snapshot, &project.id, &environment.id)?;
             }
         }
     }

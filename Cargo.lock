@@ -80,9 +80,11 @@ dependencies = [
 name = "accessfs-fs"
 version = "0.1.0"
 dependencies = [
+ "accessfs-catalog",
  "accessfs-core",
  "accessfs-platform",
  "accessfs-store",
+ "accessfs-surface",
  "anyhow",
  "ctrlc",
  "dashmap 6.2.1",
@@ -120,6 +122,17 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "accessfs-surface"
+version = "0.1.0"
+dependencies = [
+ "accessfs-catalog",
+ "accessfs-store",
+ "tempfile",
+ "thiserror 2.0.18",
  "zeroize",
 ]
 

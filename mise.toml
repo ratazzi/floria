@@ -49,3 +49,18 @@ fi
 
 echo "==> Installed: ${INSTALLED_APP}"
 '''
+
+[tasks.check-rust-fixtures]
+description = "Reject credential-shaped values from Rust sources and test fixtures"
+run = '''
+set -euo pipefail
+
+PATTERN='(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|A(KIA|SIA)[0-9A-Z]{16}|glpat-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|sk-[A-Za-z0-9_-]{16,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|-----BEGIN ([A-Z ]+)?PRIVATE KEY-----)'
+
+if rg --line-number --glob '*.rs' "$PATTERN" crates; then
+    echo "Credential-shaped value found in Rust source; use an obvious fixture placeholder instead."
+    exit 1
+fi
+
+echo "Rust fixtures contain no credential-shaped values"
+'''

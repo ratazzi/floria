@@ -320,12 +320,12 @@ fn cmd_mount(config: &Path) -> Result<()> {
     let control_path = support_dir.join("control.sock");
     let catalog = Catalog::open(&catalog_path)
         .with_context(|| format!("opening catalog at {}", catalog_path.display()))?;
-    let _control = ControlServer::start(&control_path, catalog)
+    let _control = ControlServer::start(&control_path, catalog.clone())
         .with_context(|| format!("starting control socket at {}", control_path.display()))?;
     tracing::info!(socket = %control_path.display(), "control socket listening");
     let agent = accessfs_agent::SocketAgent::start(&cfg).context("starting agent socket")?;
     let store: Arc<dyn SecretStore> = Arc::new(open_store(&cfg)?);
-    accessfs_fs::mount(cfg, agent, Some(store)).context("mount failed")
+    accessfs_fs::mount(cfg, agent, Some(store), Some(catalog)).context("mount failed")
 }
 
 fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> Result<()> {
