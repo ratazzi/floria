@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use thiserror::Error;
 
 pub type SurfaceResult<T> = Result<T, SurfaceError>;
@@ -30,4 +32,18 @@ pub enum SurfaceError {
 
     #[error("rendered dotenv exceeds {limit} bytes")]
     TooLarge { limit: usize },
+
+    #[error("invalid surface id for a filesystem entry: {0:?}")]
+    InvalidSurfaceId(String),
+
+    #[error("cannot link surface at {path}: {reason}; expected target {expected}")]
+    LinkConflict { path: PathBuf, expected: PathBuf, reason: String },
+
+    #[error("surface link I/O error while {operation} {path}: {source}")]
+    LinkIo {
+        operation: &'static str,
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }

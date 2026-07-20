@@ -5,6 +5,7 @@ use accessfs_catalog::{
     resolve_catalog_snapshot, Catalog, CatalogSnapshot, Resource, ResourceSource, SurfaceKind,
     ValueShape,
 };
+use accessfs_core::audit::AuditDependency;
 use accessfs_store::{SecretId, SecretStore};
 use zeroize::Zeroizing;
 
@@ -25,6 +26,29 @@ pub struct DotenvSnapshot {
     pub bytes: Vec<u8>,
     pub versions: Vec<FrozenResourceVersion>,
     pub exports: Vec<accessfs_catalog::ResolvedExport>,
+}
+
+impl DotenvSnapshot {
+    pub fn audit_dependencies(&self) -> Vec<AuditDependency> {
+        let versions: HashMap<&str, &FrozenResourceVersion> = self
+            .versions
+            .iter()
+            .map(|version| (version.resource_id.as_str(), version))
+            .collect();
+        self.exports
+            .iter()
+            .map(|export| {
+                let version = versions.get(export.resource_id.as_str()).copied();
+                AuditDependency {
+                    key: export.key.clone(),
+                    binding_id: export.binding_id.clone(),
+                    resource_id: export.resource_id.clone(),
+                    secret_id: version.map(|version| version.secret_id.clone()),
+                    version: version.map(|version| version.version),
+                }
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone)]
@@ -398,7 +422,7 @@ mod tests {
 
         let snapshot = resolver.render_dotenv_surface("fixture-dotenv").unwrap();
         assert_eq!(
-            String::from_utf8(snapshot.bytes).unwrap(),
+            std::str::from_utf8(&snapshot.bytes).unwrap(),
             "SERVICE_TOKEN=fixture-token-value\nAPI_HOST=http://127.0.0.1:8787\nLOG_LEVEL=debug\nAPP_ENV=development\n"
         );
         assert_eq!(
@@ -420,5 +444,10 @@ mod tests {
             store.requested_versions.lock().unwrap().as_slice(),
             &[(TOKEN_ID.to_string(), 2), (ENV_FILE_ID.to_string(), 1)]
         );
+        let dependencies = snapshot.audit_dependencies();
+        assert_eq!(dependencies[0].key, "SERVICE_TOKEN");
+        assert_eq!(dependencies[0].version, Some(2));
+        assert_eq!(dependencies.last().unwrap().resource_id, "fixture-mode");
+        assert_eq!(dependencies.last().unwrap().version, None);
     }
 }

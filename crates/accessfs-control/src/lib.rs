@@ -12,4 +12,4 @@ pub use protocol::{
     ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest, ControlResponse,
     ControlResult,
 };
-pub use server::ControlServer;
+pub use server::{CatalogObserver, ControlServer};

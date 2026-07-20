@@ -19,15 +19,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
-use accessfs_catalog::{Catalog, SurfaceKind};
+use accessfs_catalog::Catalog;
 use accessfs_core::audit::AuditLog;
 use accessfs_core::authz::{AuthRequest, Authorizer, Operation};
-use accessfs_core::config::{ResolvedConfig, SECRETS_DIR};
+use accessfs_core::config::{ResolvedConfig, SECRETS_DIR, SURFACES_DIR};
 use accessfs_core::handler::{ContentHandler, HandlerCtx};
 use accessfs_core::snapshot::{content_version_of, SnapshotTable};
 use accessfs_core::writebuf::{WriteBufTable, WriteErr};
 use accessfs_store::{SecretId, SecretStore};
-use accessfs_surface::SurfaceResolver;
+use accessfs_surface::{SurfaceRegistry, SurfaceResolver, DOTENV_MAX_SIZE};
 use dashmap::DashMap;
 use fuser::{
     AccessFlags, Errno, FileHandle, FileType, INodeNo, KernelConfig, OpenFlags, ReplyAttr,
@@ -36,7 +36,7 @@ use fuser::{
 };
 
 use reply::{dir_attr, file_attr, mount_config, TTL};
-use tree::{FileSource, NodeKind, SurfaceFileEntry, Tree};
+use tree::{NodeKind, Tree};
 
 /// Worker threads for open() work. Each pending authorization prompt ties up one thread
 /// (bounded by the 30s prompt timeout); everything else keeps flowing because the fuser
@@ -52,17 +52,17 @@ struct SecretsNs {
     dir_ino: u64,
     id_to_ino: DashMap<String, u64>,
     ino_to_id: DashMap<u64, String>,
-    next_ino: AtomicU64,
+    next_ino: Arc<AtomicU64>,
 }
 
 impl SecretsNs {
-    fn new(store: Arc<dyn SecretStore>, dir_ino: u64, first_ino: u64) -> Self {
+    fn new(store: Arc<dyn SecretStore>, dir_ino: u64, next_ino: Arc<AtomicU64>) -> Self {
         SecretsNs {
             store,
             dir_ino,
             id_to_ino: DashMap::new(),
             ino_to_id: DashMap::new(),
-            next_ino: AtomicU64::new(first_ino),
+            next_ino,
         }
     }
 
@@ -86,6 +86,56 @@ impl SecretsNs {
     }
 }
 
+/// Dynamic `surfaces/<id>` metadata. The registry is replaced by control-plane notifications;
+/// FUSE callbacks only clone in-memory metadata and never touch SQLite.
+struct SurfaceNs {
+    registry: Arc<SurfaceRegistry>,
+    resolver: SurfaceResolver,
+    dir_ino: u64,
+    id_to_ino: DashMap<String, u64>,
+    ino_to_id: DashMap<u64, String>,
+    next_ino: Arc<AtomicU64>,
+}
+
+impl SurfaceNs {
+    fn new(
+        registry: Arc<SurfaceRegistry>,
+        resolver: SurfaceResolver,
+        dir_ino: u64,
+        next_ino: Arc<AtomicU64>,
+    ) -> Self {
+        SurfaceNs {
+            registry,
+            resolver,
+            dir_ino,
+            id_to_ino: DashMap::new(),
+            ino_to_id: DashMap::new(),
+            next_ino,
+        }
+    }
+
+    fn ino_for(&self, id: &str) -> u64 {
+        use dashmap::mapref::entry::Entry;
+        match self.id_to_ino.entry(id.to_string()) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
+                self.ino_to_id.insert(ino, id.to_string());
+                entry.insert(ino);
+                ino
+            }
+        }
+    }
+
+    fn surface_for_ino(&self, ino: u64) -> Option<accessfs_catalog::Surface> {
+        self.id_for_ino(ino).and_then(|id| self.registry.get(&id))
+    }
+
+    fn id_for_ino(&self, ino: u64) -> Option<String> {
+        self.ino_to_id.get(&ino).map(|id| id.clone())
+    }
+}
+
 /// Shared, thread-movable filesystem state. Behind an `Arc` so open() work can run on a
 /// worker thread — fuser's event loop is single-threaded on macOS, so a blocking open()
 /// on the event-loop thread would freeze the whole mount.
@@ -100,9 +150,9 @@ struct Shared {
     authorizer: Arc<dyn Authorizer>,
     /// Dynamic `secrets/<id>` namespace over the store; `None` if no store is configured.
     secrets: Option<SecretsNs>,
-    /// Catalog-backed dotenv renderer. Surface inodes are frozen into `tree` at mount time;
-    /// values and secret versions are resolved only after authorization on each open.
-    surfaces: Option<SurfaceResolver>,
+    /// Live catalog-backed dotenv namespace. Metadata comes from an in-memory registry; values
+    /// and secret versions are resolved only after authorization on each open.
+    surfaces: Option<SurfaceNs>,
     /// Stable timestamp used for all attributes (captured at mount time, never changes),
     /// so watchers don't trigger accidentally.
     mount_epoch: SystemTime,
@@ -125,37 +175,37 @@ impl AccessFs {
         authorizer: Arc<dyn Authorizer>,
         store: Option<Arc<dyn SecretStore>>,
         catalog: Option<Catalog>,
+        surface_registry: Option<Arc<SurfaceRegistry>>,
     ) -> anyhow::Result<Self> {
         // SAFETY: geteuid/getegid take no arguments, have no side effects, and always succeed.
         let (mount_uid, mount_gid) = unsafe { (libc::geteuid(), libc::getegid()) };
 
-        let surface_files = match &catalog {
-            Some(catalog) => catalog
-                .snapshot()?
-                .surfaces
-                .into_iter()
-                .filter(|surface| surface.kind == SurfaceKind::DotenvFile)
-                .map(|surface| SurfaceFileEntry {
-                    surface_id: surface.id,
-                    display_path: surface.path.display().to_string(),
-                })
-                .collect(),
-            None => Vec::new(),
+        let surface_registry = match (surface_registry, catalog.as_ref()) {
+            (Some(registry), _) => Some(registry),
+            (None, Some(catalog)) => {
+                Some(Arc::new(SurfaceRegistry::from_snapshot(&catalog.snapshot()?)))
+            }
+            (None, None) => None,
         };
 
-        // The static tree holds config and catalog surface files plus the permanent `secrets/`
-        // directory; raw store contents remain dynamic and allocate after the tree's last inode.
-        let tree = Tree::build(&cfg.files, &surface_files);
-        let surfaces = match (catalog, store.as_ref()) {
-            (Some(catalog), Some(store)) => {
-                Some(SurfaceResolver::new(catalog, Arc::clone(store)))
-            }
-            (Some(_), None) if !surface_files.is_empty() => {
+        // The static tree only owns config files and the two namespace directories. Secret and
+        // surface children allocate from one shared inode sequence, so their numbers never clash.
+        let tree = Tree::build(&cfg.files);
+        let next_ino = Arc::new(AtomicU64::new(tree.next_ino()));
+        let surfaces = match (catalog, store.as_ref(), surface_registry) {
+            (Some(catalog), Some(store), Some(registry)) => Some(SurfaceNs::new(
+                registry,
+                SurfaceResolver::new(catalog, Arc::clone(store)),
+                tree.surfaces_dir_ino(),
+                Arc::clone(&next_ino),
+            )),
+            (Some(_), None, Some(registry)) if !registry.is_empty() => {
                 anyhow::bail!("catalog contains dotenv surfaces but no secret store is configured")
             }
             _ => None,
         };
-        let secrets = store.map(|s| SecretsNs::new(s, tree.secrets_dir_ino(), tree.next_ino()));
+        let secrets = store
+            .map(|store| SecretsNs::new(store, tree.secrets_dir_ino(), Arc::clone(&next_ino)));
 
         let inner = Arc::new(Shared {
             tree,
@@ -205,8 +255,29 @@ impl Shared {
         ))
     }
 
-    /// Resolve an inode to what `open()` should serve: a static config file, or a dynamic secret.
+    fn surface_attr(&self, ino: u64) -> fuser::FileAttr {
+        file_attr(
+            ino,
+            DOTENV_MAX_SIZE as u64,
+            0o400,
+            self.mount_epoch,
+            self.mount_uid,
+            self.mount_gid,
+        )
+    }
+
+    /// Resolve an inode to what `open()` should serve: a dynamic surface/secret or static file.
     fn resolve_open_target(&self, ino: u64) -> Result<OpenTarget, Errno> {
+        if let Some(ns) = &self.surfaces {
+            if let Some(surface) = ns.surface_for_ino(ino) {
+                return Ok(OpenTarget {
+                    virtual_path: format!("{SURFACES_DIR}/{}", surface.id),
+                    display: Some(surface.path.display().to_string()),
+                    direct_io: true,
+                    kind: OpenKind::DotenvSurface(surface.id),
+                });
+            }
+        }
         if let Some(ns) = &self.secrets {
             if let Some(id) = ns.id_for_ino(ino) {
                 let sid: SecretId = id.parse().map_err(|_| Errno::ENOENT)?;
@@ -229,17 +300,9 @@ impl Shared {
         };
         Ok(OpenTarget {
             virtual_path: file.virtual_path.clone(),
-            display: match &file.source {
-                FileSource::DotenvSurface { display_path, .. } => Some(display_path.clone()),
-                FileSource::Handler(_) => None,
-            },
+            display: None,
             direct_io: file.direct_io,
-            kind: match &file.source {
-                FileSource::Handler(handler) => OpenKind::Handler(handler.clone()),
-                FileSource::DotenvSurface { surface_id, .. } => {
-                    OpenKind::DotenvSurface(surface_id.clone())
-                }
-            },
+            kind: OpenKind::Handler(file.handler.clone()),
         })
     }
 
@@ -399,6 +462,7 @@ impl Shared {
                 "-",
                 fh,
                 size,
+                None,
             );
             reply.opened(FileHandle(fh), fuser::FopenFlags::FOPEN_DIRECT_IO);
             return;
@@ -406,9 +470,9 @@ impl Shared {
 
         // open boundary: produce the snapshot bytes once. Secrets decrypt through the store;
         // other handlers generate their content inline.
-        let bytes = match &target.kind {
+        let (bytes, dependencies) = match &target.kind {
             OpenKind::Secret(id) => match self.decrypt_secret(id) {
-                Ok(b) => b,
+                Ok(bytes) => (bytes, None),
                 Err(e) => {
                     tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), "secret decrypt failed: {e}");
                     reply.error(errno(libc::EIO));
@@ -422,7 +486,7 @@ impl Shared {
                     request_pid: pid,
                 };
                 match handler.generate(&ctx) {
-                    Ok(b) => b,
+                    Ok(bytes) => (bytes, None),
                     Err(e) => {
                         tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), "handler failed: {e}");
                         reply.error(errno(libc::EIO));
@@ -431,12 +495,12 @@ impl Shared {
                 }
             }
             OpenKind::DotenvSurface(surface_id) => {
-                let Some(resolver) = &self.surfaces else {
+                let Some(surfaces) = &self.surfaces else {
                     tracing::warn!(path = %target.virtual_path, "surface resolver is unavailable");
                     reply.error(errno(libc::EIO));
                     return;
                 };
-                match resolver.render_dotenv_surface(surface_id) {
+                match surfaces.resolver.render_dotenv_surface(surface_id) {
                     Ok(snapshot) => {
                         tracing::debug!(
                             path = %target.virtual_path,
@@ -444,7 +508,8 @@ impl Shared {
                             exports = snapshot.exports.len(),
                             "dotenv surface resolved"
                         );
-                        snapshot.bytes
+                        let dependencies = snapshot.audit_dependencies();
+                        (snapshot.bytes, Some(dependencies))
                     }
                     Err(error) => {
                         tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), %error, "dotenv surface failed");
@@ -476,6 +541,7 @@ impl Shared {
             &opened.content_version,
             opened.fh,
             opened.size,
+            dependencies.as_deref(),
         );
 
         // Dynamic (script/secret) files use direct-io: the kernel won't truncate to attr size
@@ -552,6 +618,20 @@ impl fuser::Filesystem for AccessFs {
             reply.error(Errno::ENOENT);
             return;
         };
+        // Surface children resolve from the control-plane-maintained in-memory registry.
+        if let Some(ns) = &self.inner.surfaces {
+            if parent.0 == ns.dir_ino {
+                match ns.registry.get(name) {
+                    Some(_) => {
+                        let ino = ns.ino_for(name);
+                        let attr = self.inner.surface_attr(ino);
+                        reply.entry(&TTL, &attr, fuser::Generation(0));
+                    }
+                    None => reply.error(Errno::ENOENT),
+                }
+                return;
+            }
+        }
         // Children of the secrets directory resolve dynamically against the store.
         if let Some(ns) = &self.inner.secrets {
             if parent.0 == ns.dir_ino {
@@ -589,6 +669,16 @@ impl fuser::Filesystem for AccessFs {
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
+        if let Some(ns) = &self.inner.surfaces {
+            if let Some(id) = ns.id_for_ino(ino.0) {
+                if ns.registry.get(&id).is_some() {
+                    reply.attr(&TTL, &self.inner.surface_attr(ino.0));
+                } else {
+                    reply.error(Errno::ENOENT);
+                }
+                return;
+            }
+        }
         // A dynamic secret inode reads its attributes live from the store; fstat on an open
         // write fd sees the in-progress buffer's size instead of the committed head's.
         if let Some(ns) = &self.inner.secrets {
@@ -638,6 +728,28 @@ impl fuser::Filesystem for AccessFs {
         if !matches!(node.kind, NodeKind::Dir) {
             reply.error(Errno::ENOTDIR);
             return;
+        }
+
+        if let Some(ns) = &self.inner.surfaces {
+            if ino.0 == ns.dir_ino {
+                let mut entries: Vec<(u64, FileType, String)> = vec![
+                    (ino.0, FileType::Directory, ".".to_string()),
+                    (node.parent, FileType::Directory, "..".to_string()),
+                ];
+                for surface in ns.registry.list() {
+                    let child_ino = ns.ino_for(&surface.id);
+                    entries.push((child_ino, FileType::RegularFile, surface.id));
+                }
+                for (index, (child_ino, kind, name)) in
+                    entries.iter().enumerate().skip(offset as usize)
+                {
+                    if reply.add(INodeNo(*child_ino), (index + 1) as u64, *kind, name.as_str()) {
+                        break;
+                    }
+                }
+                reply.ok();
+                return;
+            }
         }
 
         // The secrets directory lists the store's current contents dynamically.
@@ -979,11 +1091,12 @@ pub fn mount(
     authorizer: Arc<dyn Authorizer>,
     store: Option<Arc<dyn SecretStore>>,
     catalog: Option<Catalog>,
+    surface_registry: Option<Arc<SurfaceRegistry>>,
 ) -> anyhow::Result<()> {
     let audit = Arc::new(AuditLog::open(&cfg.audit_log)?);
     let mount_point = cfg.mount_path.clone();
     let config = mount_config(&cfg.volname);
-    let fs = AccessFs::new(&cfg, audit, authorizer, store, catalog)?;
+    let fs = AccessFs::new(&cfg, audit, authorizer, store, catalog, surface_registry)?;
 
     tracing::info!(
         mount = %mount_point.display(),
@@ -1009,6 +1122,7 @@ pub fn mount(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use accessfs_catalog::{CatalogSnapshot, Surface, SurfaceKind};
     use accessfs_core::authz::AllowAll;
     use accessfs_core::identity::ProcessIdentity;
     use accessfs_store::{NewSecret, SecretRecord, StoreResult, VersionRecord};
@@ -1051,6 +1165,68 @@ mod tests {
         // chown and chflags are refused even within a write session.
         assert_eq!(plan_setattr(true, None, false, true, false, false), Refuse);
         assert_eq!(plan_setattr(true, None, false, false, false, true), Refuse);
+    }
+
+    #[test]
+    fn live_surface_registry_adds_and_removes_without_inode_collisions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tree = Tree::build(&[]);
+        let next_ino = Arc::new(AtomicU64::new(tree.next_ino()));
+        let (entered_tx, _entered_rx) = mpsc::channel();
+        let (_gate_tx, gate_rx) = mpsc::channel();
+        let store = Arc::new(FakeStore {
+            appended: Mutex::new(Vec::new()),
+            entered_tx,
+            gate_rx: Mutex::new(Some(gate_rx)),
+        });
+        let secret_ns = SecretsNs::new(
+            Arc::clone(&store) as Arc<dyn SecretStore>,
+            tree.secrets_dir_ino(),
+            Arc::clone(&next_ino),
+        );
+        let surface = Surface {
+            id: "fixture-dotenv-a".to_string(),
+            environment_id: "fixture-development".to_string(),
+            name: ".env".to_string(),
+            kind: SurfaceKind::DotenvFile,
+            path: tmp.path().join("project/.env"),
+            resource_id: None,
+            position: 0,
+        };
+        let registry = Arc::new(SurfaceRegistry::from_snapshot(&CatalogSnapshot {
+            surfaces: vec![surface.clone()],
+            ..CatalogSnapshot::default()
+        }));
+        let catalog = Catalog::open(tmp.path().join("catalog.sqlite")).unwrap();
+        let surface_ns = SurfaceNs::new(
+            Arc::clone(&registry),
+            SurfaceResolver::new(catalog, store as Arc<dyn SecretStore>),
+            tree.surfaces_dir_ino(),
+            next_ino,
+        );
+
+        let secret_ino = secret_ns.ino_for("fixture-secret");
+        let first_surface_ino = surface_ns.ino_for(&surface.id);
+        assert_ne!(secret_ino, first_surface_ino);
+        assert_eq!(surface_ns.surface_for_ino(first_surface_ino), Some(surface));
+
+        let replacement = Surface {
+            id: "fixture-dotenv-b".to_string(),
+            environment_id: "fixture-development".to_string(),
+            name: ".env.local".to_string(),
+            kind: SurfaceKind::DotenvFile,
+            path: tmp.path().join("project/.env.local"),
+            resource_id: None,
+            position: 0,
+        };
+        registry.replace(&CatalogSnapshot {
+            surfaces: vec![replacement.clone()],
+            ..CatalogSnapshot::default()
+        });
+        assert!(surface_ns.surface_for_ino(first_surface_ino).is_none());
+        let replacement_ino = surface_ns.ino_for(&replacement.id);
+        assert_ne!(replacement_ino, first_surface_ino);
+        assert_eq!(surface_ns.surface_for_ino(replacement_ino), Some(replacement));
     }
 
     /// Store double whose first `append_version` blocks until released, to force commit overlap.
@@ -1101,8 +1277,9 @@ mod tests {
     }
 
     fn shared_with_store(store: Arc<dyn SecretStore>, tmp: &Path) -> Arc<Shared> {
-        let tree = Tree::build(&[], &[]);
-        let secrets = SecretsNs::new(store, tree.secrets_dir_ino(), tree.next_ino());
+        let tree = Tree::build(&[]);
+        let next_ino = Arc::new(AtomicU64::new(tree.next_ino()));
+        let secrets = SecretsNs::new(store, tree.secrets_dir_ino(), next_ino);
         Arc::new(Shared {
             tree,
             snapshots: SnapshotTable::new(),

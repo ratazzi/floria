@@ -5,7 +5,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use accessfs_catalog::{Catalog, CatalogResult};
+use accessfs_catalog::{Catalog, CatalogResult, CatalogSnapshot};
 
 use crate::protocol::{
     read_msg, write_msg, ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest,
@@ -16,10 +16,30 @@ pub struct ControlServer {
     socket_path: PathBuf,
 }
 
+pub trait CatalogObserver: Send + Sync + 'static {
+    fn catalog_changed(&self, snapshot: &CatalogSnapshot);
+}
+
 impl ControlServer {
     /// Start the catalog control socket. Each connection gets a dedicated request loop;
     /// authorization prompts continue to use the separate agent socket.
     pub fn start(path: &Path, catalog: Catalog) -> io::Result<Self> {
+        Self::start_inner(path, catalog, None)
+    }
+
+    pub fn start_observed(
+        path: &Path,
+        catalog: Catalog,
+        observer: Arc<dyn CatalogObserver>,
+    ) -> io::Result<Self> {
+        Self::start_inner(path, catalog, Some(observer))
+    }
+
+    fn start_inner(
+        path: &Path,
+        catalog: Catalog,
+        observer: Option<Arc<dyn CatalogObserver>>,
+    ) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -30,7 +50,7 @@ impl ControlServer {
         let catalog = Arc::new(catalog);
         std::thread::Builder::new()
             .name("accessfs-control-accept".to_string())
-            .spawn(move || accept_loop(listener, catalog))?;
+            .spawn(move || accept_loop(listener, catalog, observer))?;
 
         Ok(ControlServer { socket_path: path.to_path_buf() })
     }
@@ -40,7 +60,11 @@ impl ControlServer {
     }
 }
 
-fn accept_loop(listener: UnixListener, catalog: Arc<Catalog>) {
+fn accept_loop(
+    listener: UnixListener,
+    catalog: Arc<Catalog>,
+    observer: Option<Arc<dyn CatalogObserver>>,
+) {
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(stream) => stream,
@@ -54,16 +78,21 @@ fn accept_loop(listener: UnixListener, catalog: Arc<Catalog>) {
             continue;
         }
         let catalog = Arc::clone(&catalog);
+        let observer = observer.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("accessfs-control-conn".to_string())
-            .spawn(move || handle_connection(stream, catalog))
+            .spawn(move || handle_connection(stream, catalog, observer))
         {
             tracing::warn!(%error, "spawning control connection failed");
         }
     }
 }
 
-fn handle_connection(mut stream: UnixStream, catalog: Arc<Catalog>) {
+fn handle_connection(
+    mut stream: UnixStream,
+    catalog: Arc<Catalog>,
+    observer: Option<Arc<dyn CatalogObserver>>,
+) {
     loop {
         let request: ControlRequest = match read_msg(&mut stream) {
             Ok(request) => request,
@@ -73,8 +102,14 @@ fn handle_connection(mut stream: UnixStream, catalog: Arc<Catalog>) {
                 break;
             }
         };
+        let mutates_catalog = mutates_catalog(&request.command);
         let outcome = match dispatch(&catalog, request.command) {
-            Ok(result) => ControlOutcome::Ok { result },
+            Ok(result) => {
+                if mutates_catalog {
+                    notify_observer(&catalog, observer.as_deref());
+                }
+                ControlOutcome::Ok { result }
+            }
             Err(error) => {
                 ControlOutcome::Error { error: ControlErrorBody::from(&error) }
             }
@@ -86,6 +121,23 @@ fn handle_connection(mut stream: UnixStream, catalog: Arc<Catalog>) {
             tracing::warn!(%error, "writing control response failed");
             break;
         }
+    }
+}
+
+fn mutates_catalog(command: &ControlCommand) -> bool {
+    !matches!(
+        command,
+        ControlCommand::Ping
+            | ControlCommand::Snapshot
+            | ControlCommand::ResolveEnvironment { .. }
+    )
+}
+
+fn notify_observer(catalog: &Catalog, observer: Option<&dyn CatalogObserver>) {
+    let Some(observer) = observer else { return };
+    match catalog.snapshot() {
+        Ok(snapshot) => observer.catalog_changed(&snapshot),
+        Err(error) => tracing::warn!(%error, "loading catalog snapshot for observer failed"),
     }
 }
 
@@ -158,6 +210,20 @@ mod tests {
     use crate::client::ControlClient;
     use accessfs_catalog::{Environment, Project};
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    struct SnapshotObserver {
+        notifications: AtomicUsize,
+        latest: Mutex<Option<CatalogSnapshot>>,
+    }
+
+    impl CatalogObserver for SnapshotObserver {
+        fn catalog_changed(&self, snapshot: &CatalogSnapshot) {
+            self.notifications.fetch_add(1, Ordering::Relaxed);
+            *self.latest.lock().unwrap() = Some(snapshot.clone());
+        }
+    }
 
     #[test]
     fn client_can_mutate_and_snapshot_catalog_over_separate_socket() {
@@ -231,5 +297,40 @@ mod tests {
             ControlOutcome::Error { error } => assert_eq!(error.code, "validation"),
             ControlOutcome::Ok { .. } => panic!("expected validation error"),
         }
+    }
+
+    #[test]
+    fn successful_mutation_refreshes_observer_but_queries_do_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let socket = dir.path().join("control.sock");
+        let observer = Arc::new(SnapshotObserver {
+            notifications: AtomicUsize::new(0),
+            latest: Mutex::new(None),
+        });
+        let _server = ControlServer::start_observed(
+            &socket,
+            catalog,
+            Arc::clone(&observer) as Arc<dyn CatalogObserver>,
+        )
+        .unwrap();
+        let mut client = ControlClient::connect(&socket).unwrap();
+
+        client.request(ControlCommand::Ping).unwrap();
+        assert_eq!(observer.notifications.load(Ordering::Relaxed), 0);
+        client
+            .request(ControlCommand::ProjectUpsert {
+                project: Project {
+                    id: "fixture-project".to_string(),
+                    name: "Fixture Project".to_string(),
+                    path: PathBuf::from("/fixture/project"),
+                },
+            })
+            .unwrap();
+        assert_eq!(observer.notifications.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            observer.latest.lock().unwrap().as_ref().unwrap().projects[0].id,
+            "fixture-project"
+        );
     }
 }

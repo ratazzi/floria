@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use accessfs_core::config::{FileEntry, SECRETS_DIR, SURFACES_DIR};
 use accessfs_core::handler::ContentHandler;
-use accessfs_surface::DOTENV_MAX_SIZE;
 
 /// Root inode. FUSE convention: root = 1.
 const ROOT_INO: u64 = 1;
@@ -14,7 +13,10 @@ pub struct Tree {
     /// Inode of the always-present `secrets/` directory. Its children are resolved dynamically
     /// against the store (not stored here), so `protect` is visible without remounting.
     secrets_dir_ino: u64,
-    /// First inode not used by the static tree; the dynamic secrets namespace allocates from here.
+    /// Inode of the always-present catalog surface directory. Its children come from the
+    /// in-memory surface registry maintained by the control plane.
+    surfaces_dir_ino: u64,
+    /// First inode not used by the static tree; dynamic namespaces allocate from here.
     next_ino: u64,
 }
 
@@ -41,7 +43,7 @@ pub enum NodeKind {
 }
 
 pub struct FileNode {
-    pub source: FileSource,
+    pub handler: ContentHandler,
     pub virtual_path: String,
     /// Stable size reported by getattr. Constant files = exact length; script files = declared upper bound.
     pub report_size: u64,
@@ -49,28 +51,16 @@ pub struct FileNode {
     pub direct_io: bool,
 }
 
-pub enum FileSource {
-    Handler(ContentHandler),
-    DotenvSurface {
-        surface_id: String,
-        display_path: String,
-    },
-}
-
-pub struct SurfaceFileEntry {
-    pub surface_id: String,
-    pub display_path: String,
-}
-
 impl Tree {
     /// Build the static inode tree from the resolved virtual files (config files plus any
     /// store-backed secrets). inodes are assigned sequentially and never reclaimed during the mount.
-    pub fn build(files: &[FileEntry], surfaces: &[SurfaceFileEntry]) -> Self {
+    pub fn build(files: &[FileEntry]) -> Self {
         let mut tree = Tree {
             nodes: HashMap::new(),
             by_parent_name: HashMap::new(),
             children: HashMap::new(),
             secrets_dir_ino: 0,
+            surfaces_dir_ino: 0,
             next_ino: 0,
         };
         tree.nodes.insert(
@@ -115,7 +105,7 @@ impl Tree {
                     name: file_name.clone(),
                     mode: entry.mode,
                     kind: NodeKind::File(FileNode {
-                        source: FileSource::Handler(entry.handler.clone()),
+                        handler: entry.handler.clone(),
                         virtual_path: entry.path.clone(),
                         report_size,
                         direct_io,
@@ -126,33 +116,9 @@ impl Tree {
             tree.children.entry(parent).or_default().push(ino);
         }
 
-        // Catalog surfaces get stable internal paths (`surfaces/<id>`). The project-facing
-        // `.env` is a symlink to this inode, so its target path never leaks into the FUSE tree.
+        // Surface children are supplied by the live in-memory registry in the fs layer.
         let surfaces_dir_ino = tree.ensure_dir(ROOT_INO, SURFACES_DIR, &mut next_ino);
-        for surface in surfaces {
-            let ino = next_ino;
-            next_ino += 1;
-            tree.nodes.insert(
-                ino,
-                Node {
-                    parent: surfaces_dir_ino,
-                    name: surface.surface_id.clone(),
-                    mode: 0o400,
-                    kind: NodeKind::File(FileNode {
-                        source: FileSource::DotenvSurface {
-                            surface_id: surface.surface_id.clone(),
-                            display_path: surface.display_path.clone(),
-                        },
-                        virtual_path: format!("{SURFACES_DIR}/{}", surface.surface_id),
-                        report_size: DOTENV_MAX_SIZE as u64,
-                        direct_io: true,
-                    }),
-                },
-            );
-            tree.by_parent_name
-                .insert((surfaces_dir_ino, surface.surface_id.clone()), ino);
-            tree.children.entry(surfaces_dir_ino).or_default().push(ino);
-        }
+        tree.surfaces_dir_ino = surfaces_dir_ino;
 
         // Always expose a top-level `secrets/` directory; its children are resolved dynamically
         // by the fs layer against the store, so newly protected files appear without a remount.
@@ -166,6 +132,10 @@ impl Tree {
     /// Inode of the `secrets/` directory.
     pub fn secrets_dir_ino(&self) -> u64 {
         self.secrets_dir_ino
+    }
+
+    pub fn surfaces_dir_ino(&self) -> u64 {
+        self.surfaces_dir_ino
     }
 
     /// First inode not used by the static tree (start of the dynamic secrets range).
@@ -213,24 +183,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_surface_gets_stable_read_only_inode() {
-        let tree = Tree::build(
-            &[],
-            &[SurfaceFileEntry {
-                surface_id: "fixture-dotenv".to_string(),
-                display_path: "/fixture/project/.env".to_string(),
-            }],
+    fn dynamic_namespaces_have_stable_directories() {
+        let tree = Tree::build(&[]);
+        assert_eq!(
+            tree.lookup_child(ROOT_INO, SURFACES_DIR),
+            Some(tree.surfaces_dir_ino())
         );
-        let dir = tree.lookup_child(ROOT_INO, SURFACES_DIR).unwrap();
-        let ino = tree.lookup_child(dir, "fixture-dotenv").unwrap();
-        let node = tree.get(ino).unwrap();
-        assert_eq!(node.mode, 0o400);
-        let NodeKind::File(file) = &node.kind else { panic!("expected file") };
-        assert!(file.direct_io);
-        assert_eq!(file.report_size, DOTENV_MAX_SIZE as u64);
-        assert!(matches!(
-            &file.source,
-            FileSource::DotenvSurface { surface_id, .. } if surface_id == "fixture-dotenv"
-        ));
+        assert_eq!(
+            tree.lookup_child(ROOT_INO, SECRETS_DIR),
+            Some(tree.secrets_dir_ino())
+        );
+        assert_ne!(tree.surfaces_dir_ino(), tree.secrets_dir_ino());
     }
 }

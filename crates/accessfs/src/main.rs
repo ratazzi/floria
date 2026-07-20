@@ -4,10 +4,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use accessfs_catalog::Catalog;
-use accessfs_control::{ControlClient, ControlCommand, ControlResult, ControlServer};
+use accessfs_catalog::{Catalog, CatalogSnapshot, SurfaceKind};
+use accessfs_control::{
+    CatalogObserver, ControlClient, ControlCommand, ControlResult, ControlServer,
+};
 use accessfs_core::config::{Config, ResolvedConfig};
 use accessfs_store::{AgeDirStore, NewSecret, SecretId, SecretRecord, SecretStore, SshKeyProvider};
+use accessfs_surface::{
+    ensure_dotenv_surface_link, SurfaceLinkState, SurfaceRegistry,
+};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -320,12 +325,65 @@ fn cmd_mount(config: &Path) -> Result<()> {
     let control_path = support_dir.join("control.sock");
     let catalog = Catalog::open(&catalog_path)
         .with_context(|| format!("opening catalog at {}", catalog_path.display()))?;
-    let _control = ControlServer::start(&control_path, catalog.clone())
+    let snapshot = catalog.snapshot().context("loading initial surface registry")?;
+    let surface_registry = Arc::new(SurfaceRegistry::from_snapshot(&snapshot));
+    reconcile_dotenv_links(&snapshot, &cfg.mount_path);
+    let observer: Arc<dyn CatalogObserver> = Arc::new(RuntimeCatalogObserver {
+        surface_registry: Arc::clone(&surface_registry),
+        mount_path: cfg.mount_path.clone(),
+    });
+    let _control = ControlServer::start_observed(&control_path, catalog.clone(), observer)
         .with_context(|| format!("starting control socket at {}", control_path.display()))?;
     tracing::info!(socket = %control_path.display(), "control socket listening");
     let agent = accessfs_agent::SocketAgent::start(&cfg).context("starting agent socket")?;
     let store: Arc<dyn SecretStore> = Arc::new(open_store(&cfg)?);
-    accessfs_fs::mount(cfg, agent, Some(store), Some(catalog)).context("mount failed")
+    accessfs_fs::mount(
+        cfg,
+        agent,
+        Some(store),
+        Some(catalog),
+        Some(surface_registry),
+    )
+    .context("mount failed")
+}
+
+struct RuntimeCatalogObserver {
+    surface_registry: Arc<SurfaceRegistry>,
+    mount_path: PathBuf,
+}
+
+impl CatalogObserver for RuntimeCatalogObserver {
+    fn catalog_changed(&self, snapshot: &CatalogSnapshot) {
+        self.surface_registry.replace(snapshot);
+        reconcile_dotenv_links(snapshot, &self.mount_path);
+    }
+}
+
+fn reconcile_dotenv_links(snapshot: &CatalogSnapshot, mount_path: &Path) {
+    for surface in snapshot
+        .surfaces
+        .iter()
+        .filter(|surface| surface.kind == SurfaceKind::DotenvFile)
+    {
+        match ensure_dotenv_surface_link(surface, mount_path) {
+            Ok(SurfaceLinkState::Created) => tracing::info!(
+                surface = %surface.id,
+                path = %surface.path.display(),
+                "created project surface link"
+            ),
+            Ok(SurfaceLinkState::Ready) => tracing::debug!(
+                surface = %surface.id,
+                path = %surface.path.display(),
+                "project surface link is ready"
+            ),
+            Err(error) => tracing::warn!(
+                surface = %surface.id,
+                path = %surface.path.display(),
+                %error,
+                "project surface link needs attention"
+            ),
+        }
+    }
 }
 
 fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> Result<()> {

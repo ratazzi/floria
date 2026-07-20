@@ -13,6 +13,19 @@ pub struct AuditLog {
     writer: Mutex<BufWriter<std::fs::File>>,
 }
 
+/// Metadata-only provenance for one rendered surface export. Secret ids and immutable version
+/// numbers are safe to audit; plaintext values never enter this structure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AuditDependency {
+    pub key: String,
+    pub binding_id: String,
+    pub resource_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<u32>,
+}
+
 impl AuditLog {
     pub fn open(path: &Path) -> Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
@@ -48,6 +61,7 @@ impl AuditLog {
         content_version: &str,
         fh: u64,
         size: u64,
+        dependencies: Option<&[AuditDependency]>,
     ) {
         self.write(&OpenEvent {
             ts: now_rfc3339(),
@@ -65,6 +79,7 @@ impl AuditLog {
             content_version,
             fh,
             size,
+            dependencies,
         });
     }
 
@@ -161,6 +176,8 @@ struct OpenEvent<'a> {
     content_version: &'a str,
     fh: u64,
     size: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dependencies: Option<&'a [AuditDependency]>,
 }
 
 #[derive(Serialize)]
@@ -197,4 +214,38 @@ struct CloseEvent<'a> {
     duration_ms: u128,
     bytes_served: u64,
     error: Option<&'a str>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn surface_audit_records_version_provenance_without_plaintext() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let audit = AuditLog::open(&path).unwrap();
+        audit.log_open(
+            "surfaces/fixture-dotenv",
+            "read",
+            &ProcessIdentity::bare(42, 501, 20),
+            "allowed",
+            Some("surfaces-default"),
+            "sha256:fixture-content-hash",
+            7,
+            32,
+            Some(&[AuditDependency {
+                key: "SERVICE_TOKEN".to_string(),
+                binding_id: "fixture-binding".to_string(),
+                resource_id: "fixture-resource".to_string(),
+                secret_id: Some("00000000-0000-0000-0000-000000000001".to_string()),
+                version: Some(3),
+            }]),
+        );
+
+        let line = std::fs::read_to_string(path).unwrap();
+        assert!(line.contains("fixture-resource"));
+        assert!(line.contains("\"version\":3"));
+        assert!(!line.contains("fixture-secret-value"));
+    }
 }

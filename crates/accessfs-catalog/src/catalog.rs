@@ -246,6 +246,21 @@ impl Catalog {
         validate_surface(surface)?;
         let conn = self.connection()?;
         require_exists(&conn, "environments", &surface.environment_id, "environment")?;
+        let project_path = PathBuf::from(conn.query_row(
+            "SELECT projects.path
+             FROM environments
+             JOIN projects ON projects.id = environments.project_id
+             WHERE environments.id = ?1",
+            [&surface.environment_id],
+            |row| row.get::<_, String>(0),
+        )?);
+        if surface.path == project_path || !surface.path.starts_with(&project_path) {
+            return Err(CatalogError::Validation(format!(
+                "surface path {} must be inside project directory {}",
+                surface.path.display(),
+                project_path.display()
+            )));
+        }
         if let Some(resource_id) = &surface.resource_id {
             require_exists(&conn, "resources", resource_id, "resource")?;
             if surface.kind == SurfaceKind::UnixSocket {
@@ -623,7 +638,7 @@ fn validate_snapshot_conflicts(snapshot: &CatalogSnapshot) -> CatalogResult<()> 
 fn validate_project(project: &Project) -> CatalogResult<()> {
     require_id(&project.id, "project id")?;
     require_name(&project.name, "project name")?;
-    require_absolute_path(&project.path, "project path")
+    require_normalized_absolute_path(&project.path, "project path")
 }
 
 fn validate_environment(environment: &Environment) -> CatalogResult<()> {
@@ -739,9 +754,10 @@ fn validate_binding(binding: &Binding) -> CatalogResult<()> {
 
 fn validate_surface(surface: &Surface) -> CatalogResult<()> {
     require_id(&surface.id, "surface id")?;
+    require_path_component(&surface.id, "surface id")?;
     require_id(&surface.environment_id, "surface environment id")?;
     require_name(&surface.name, "surface name")?;
-    require_absolute_path(&surface.path, "surface path")
+    require_normalized_absolute_path(&surface.path, "surface path")
 }
 
 fn require_id(value: &str, label: &str) -> CatalogResult<()> {
@@ -786,6 +802,37 @@ fn require_absolute_path(path: &Path, label: &str) -> CatalogResult<()> {
         Err(CatalogError::Validation(format!(
             "{label} must be absolute: {}",
             path.display()
+        )))
+    }
+}
+
+fn require_normalized_absolute_path(path: &Path, label: &str) -> CatalogResult<()> {
+    require_absolute_path(path, label)?;
+    if path.components().any(|component| {
+        matches!(component, std::path::Component::CurDir | std::path::Component::ParentDir)
+    }) {
+        return Err(CatalogError::Validation(format!(
+            "{label} cannot contain . or .. components: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn require_path_component(value: &str, label: &str) -> CatalogResult<()> {
+    let mut components = Path::new(value).components();
+    let is_one_component = matches!(
+        components.next(),
+        Some(std::path::Component::Normal(component)) if component == value
+    ) && components.next().is_none();
+    let has_safe_chars = value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'));
+    if is_one_component && has_safe_chars {
+        Ok(())
+    } else {
+        Err(CatalogError::Validation(format!(
+            "{label} must be one filesystem-safe component: {value:?}"
         )))
     }
 }
@@ -921,6 +968,40 @@ mod tests {
         assert_eq!(snapshot.surfaces.len(), 1);
         let json = serde_json::to_string(&snapshot).unwrap();
         assert!(!json.contains("plaintext"));
+    }
+
+    #[test]
+    fn surface_path_must_stay_inside_its_project() {
+        let (_dir, catalog) = catalog();
+        let error = catalog
+            .upsert_surface(&Surface {
+                id: "fixture-dotenv".to_string(),
+                environment_id: "development".to_string(),
+                name: ".env".to_string(),
+                kind: SurfaceKind::DotenvFile,
+                path: PathBuf::from("/workspace/other/.env"),
+                resource_id: None,
+                position: 0,
+            })
+            .unwrap_err();
+        assert!(matches!(error, CatalogError::Validation(_)));
+    }
+
+    #[test]
+    fn surface_id_must_be_one_safe_path_component() {
+        let (_dir, catalog) = catalog();
+        let error = catalog
+            .upsert_surface(&Surface {
+                id: "../fixture-dotenv".to_string(),
+                environment_id: "development".to_string(),
+                name: ".env".to_string(),
+                kind: SurfaceKind::DotenvFile,
+                path: PathBuf::from("/workspace/floria/.env"),
+                resource_id: None,
+                position: 0,
+            })
+            .unwrap_err();
+        assert!(matches!(error, CatalogError::Validation(_)));
     }
 
     #[test]
