@@ -25,5 +25,13 @@ struct FloriaMenuBarApp: App {
         // `.window` turns the dropdown into a real anchored window that hosts arbitrary
         // SwiftUI (search field, hover rows, ...) instead of an NSMenu.
         .menuBarExtraStyle(.window)
+
+        // Full dashboard: sidebar grouped by client/file + a sortable access table.
+        // Suppressed at launch — a menubar app must not open a window on login.
+        Window("floria", id: "dashboard") {
+            DashboardView(state: state)
+        }
+        .defaultSize(width: 920, height: 560)
+        .defaultLaunchBehavior(.suppressed)
     }
 }

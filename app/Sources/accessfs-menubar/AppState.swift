@@ -11,6 +11,8 @@ struct RecentAccess: Identifiable {
     let operation: String  // "read" | "write"
     let decision: String   // "allowed" | "denied"
     let exe: String
+    /// Full executable path (icon lookup in the dashboard).
+    let exePath: String?
     let chain: String
     let ruleId: String?
 
@@ -37,6 +39,7 @@ struct RecentAccess: Identifiable {
         operation = ev.operation
         decision = ev.decision
         exe = (ev.identity.exe as NSString?)?.lastPathComponent ?? "?"
+        exePath = ev.identity.exe
         chain = ev.identity.chain
         ruleId = ev.rule_id
     }
@@ -57,7 +60,8 @@ final class AppState {
     @ObservationIgnored private var client: AgentClient!
     @ObservationIgnored private let prompter = PromptPresenter()
 
-    private static let maxRecents = 50
+    // Sized for the dashboard table; the dropdown only ever renders a screenful.
+    private static let maxRecents = 500
 
     init() {
         let sock = (NSHomeDirectory() as NSString)

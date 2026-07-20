@@ -189,6 +189,7 @@ private struct AccessRow: View {
 /// Footer actions styled as menu items with hover highlight and shortcut hints.
 private struct MenuBarFooter: View {
     @Bindable var state: AppState
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         VStack(spacing: 1) {
@@ -205,6 +206,12 @@ private struct MenuBarFooter: View {
             .padding(.horizontal, 10)
             .padding(.top, 2)
             .padding(.bottom, 4)
+            MenuItemButton(title: "Open Dashboard", icon: "rectangle.grid.2x2", shortcut: "D") {
+                openWindow(id: "dashboard")
+                // An accessory app doesn't come frontmost on openWindow by itself.
+                NSApp.activate(ignoringOtherApps: true)
+            }
+            .keyboardShortcut("d")
             MenuItemButton(title: "Clear Recent", icon: "trash", shortcut: "K") {
                 state.clearRecents()
             }
