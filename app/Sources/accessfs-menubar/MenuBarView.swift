@@ -206,7 +206,7 @@ private struct MenuBarFooter: View {
             .padding(.horizontal, 10)
             .padding(.top, 2)
             .padding(.bottom, 4)
-            MenuItemButton(title: "Open Dashboard", icon: "rectangle.grid.2x2", shortcut: "D") {
+            MenuItemButton(title: "Open Workspace", icon: "rectangle.grid.2x2", shortcut: "D") {
                 openWindow(id: "dashboard")
                 // An accessory app doesn't come frontmost on openWindow by itself.
                 NSApp.activate(ignoringOtherApps: true)

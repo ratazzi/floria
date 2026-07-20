@@ -1,9 +1,8 @@
 import AppKit
 import SwiftUI
 
-/// Full-window dashboard: a sidebar grouping the access feed by client (process) or by
-/// file, and a table of recent access — the dropdown's information at desk-work scale.
-struct DashboardView: View {
+/// Full access-log browser retained as a top-level destination in the workspace dashboard.
+struct AccessLogView: View {
     @Bindable var state: AppState
     @State private var grouping: Grouping = .client
     @State private var selection: SidebarFilter? = SidebarFilter.all

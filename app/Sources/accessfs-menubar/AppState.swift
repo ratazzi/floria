@@ -56,9 +56,11 @@ struct RecentAccess: Identifiable {
 final class AppState {
     var connected = false
     var recents: [RecentAccess] = []
+    var workspace = WorkspaceStore.preview()
 
     @ObservationIgnored private var client: AgentClient!
     @ObservationIgnored private let prompter = PromptPresenter()
+    @ObservationIgnored private let daemonManager = DaemonManager()
 
     // Sized for the dashboard table; the dropdown only ever renders a screenful.
     private static let maxRecents = 500
@@ -80,6 +82,20 @@ final class AppState {
             }
         }
         client.start()
+
+        // Give the socket client one immediate connection attempt before taking ownership.
+        // This preserves a manually started development daemon instead of racing it for the
+        // socket and mount point. With no daemon, the packaged app installs its LaunchAgent.
+        if DaemonManager.isProductionApp {
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                guard let self, !self.connected else { return }
+                let manager = self.daemonManager
+                DispatchQueue.global(qos: .utility).async {
+                    manager.ensureRunning()
+                }
+            }
+        }
     }
 
     func clearRecents() {
