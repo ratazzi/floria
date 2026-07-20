@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
+use accessfs_catalog::Catalog;
+use accessfs_control::{ControlClient, ControlCommand, ControlResult, ControlServer};
 use accessfs_core::config::{Config, ResolvedConfig};
 use accessfs_store::{AgeDirStore, NewSecret, SecretId, SecretRecord, SecretStore, SshKeyProvider};
 use anyhow::{Context, Result};
@@ -87,6 +89,29 @@ enum Cmd {
         #[arg(short, long, default_value = "accessfs.toml")]
         config: PathBuf,
     },
+    /// Query the daemon's catalog control plane.
+    Control {
+        #[command(subcommand)]
+        command: ControlCmd,
+        /// Override the derived control socket path.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+        #[arg(short, long, default_value = "accessfs.toml")]
+        config: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ControlCmd {
+    /// Check that the daemon control socket and catalog schema are available.
+    Ping,
+    /// Print the complete metadata catalog as JSON (never secret plaintext).
+    Snapshot,
+    /// Resolve environment keys and provenance without decrypting values.
+    Resolve {
+        project_id: String,
+        environment_id: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -108,6 +133,7 @@ fn main() -> Result<()> {
         Cmd::History { target, config } => cmd_history(&target, &config),
         Cmd::Rollback { target, version, config } => cmd_rollback(&target, version, &config),
         Cmd::List { config } => cmd_list(&config),
+        Cmd::Control { command, socket, config } => cmd_control(command, socket, &config),
     }
 }
 
@@ -289,9 +315,53 @@ fn cmd_mount(config: &Path) -> Result<()> {
     let cfg = load(config)?;
     std::fs::create_dir_all(&cfg.mount_path)
         .with_context(|| format!("creating mount point {}", cfg.mount_path.display()))?;
+    let support_dir = support_dir(&cfg)?;
+    let catalog_path = support_dir.join("catalog.sqlite");
+    let control_path = support_dir.join("control.sock");
+    let catalog = Catalog::open(&catalog_path)
+        .with_context(|| format!("opening catalog at {}", catalog_path.display()))?;
+    let _control = ControlServer::start(&control_path, catalog)
+        .with_context(|| format!("starting control socket at {}", control_path.display()))?;
+    tracing::info!(socket = %control_path.display(), "control socket listening");
     let agent = accessfs_agent::SocketAgent::start(&cfg).context("starting agent socket")?;
     let store: Arc<dyn SecretStore> = Arc::new(open_store(&cfg)?);
     accessfs_fs::mount(cfg, agent, Some(store)).context("mount failed")
+}
+
+fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> Result<()> {
+    let cfg = load(config)?;
+    let socket = match socket {
+        Some(socket) => socket,
+        None => support_dir(&cfg)?.join("control.sock"),
+    };
+    let mut client = ControlClient::connect(&socket)
+        .with_context(|| format!("connecting to control socket {}", socket.display()))?;
+    let command = match command {
+        ControlCmd::Ping => ControlCommand::Ping,
+        ControlCmd::Snapshot => ControlCommand::Snapshot,
+        ControlCmd::Resolve { project_id, environment_id } => {
+            ControlCommand::ResolveEnvironment { project_id, environment_id }
+        }
+    };
+    match client.request(command)? {
+        ControlResult::Pong { schema_version } => {
+            println!("daemon ready; catalog schema v{schema_version}");
+        }
+        ControlResult::Snapshot(snapshot) => {
+            println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        }
+        ControlResult::ResolvedEnvironment(resolved) => {
+            println!("{}", serde_json::to_string_pretty(&resolved)?);
+        }
+        ControlResult::Empty => anyhow::bail!("daemon returned an empty control response"),
+    }
+    Ok(())
+}
+
+fn support_dir(cfg: &ResolvedConfig) -> Result<&Path> {
+    cfg.agent_socket.parent().with_context(|| {
+        format!("agent socket has no parent directory: {}", cfg.agent_socket.display())
+    })
 }
 
 fn cmd_unmount(path: Option<PathBuf>, config: &Path) -> Result<()> {

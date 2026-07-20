@@ -13,8 +13,11 @@ accessfs-core = { workspace = true }
 accessfs-agent = { workspace = true }
 accessfs-fs = { workspace = true }
 accessfs-store = { workspace = true }
+accessfs-catalog = { workspace = true }
+accessfs-control = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 zeroize = { workspace = true }

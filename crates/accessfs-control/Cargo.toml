@@ -1,0 +1,15 @@
+[package]
+name = "accessfs-control"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+accessfs-catalog = { workspace = true }
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

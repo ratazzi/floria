@@ -1,0 +1,136 @@
+use std::io::{self, Read, Write};
+
+use accessfs_catalog::{
+    Binding, CatalogError, CatalogSnapshot, Environment, Project, ResolvedEnvironment, Resource,
+    Surface,
+};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+
+const MAX_MSG: usize = 8 << 20;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlRequest {
+    pub request_id: u64,
+    #[serde(flatten)]
+    pub command: ControlCommand,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "method", content = "params", rename_all = "snake_case")]
+pub enum ControlCommand {
+    Ping,
+    Snapshot,
+    ResolveEnvironment { project_id: String, environment_id: String },
+    ProjectUpsert { project: Project },
+    ProjectRemove { id: String },
+    EnvironmentUpsert { environment: Environment },
+    EnvironmentRemove { id: String },
+    ResourceUpsert { resource: Resource },
+    ResourceRemove { id: String },
+    BindingUpsert { binding: Binding },
+    BindingRemove { id: String },
+    SurfaceUpsert { surface: Surface },
+    SurfaceRemove { id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlResponse {
+    pub request_id: u64,
+    #[serde(flatten)]
+    pub outcome: ControlOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum ControlOutcome {
+    Ok { result: ControlResult },
+    Error { error: ControlErrorBody },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum ControlResult {
+    Pong { schema_version: i64 },
+    Snapshot(CatalogSnapshot),
+    ResolvedEnvironment(ResolvedEnvironment),
+    Empty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlErrorBody {
+    pub code: String,
+    pub message: String,
+}
+
+impl From<&CatalogError> for ControlErrorBody {
+    fn from(error: &CatalogError) -> Self {
+        let code = match error {
+            CatalogError::Io { .. } => "io",
+            CatalogError::Database(_) => "database",
+            CatalogError::Encoding(_) => "encoding",
+            CatalogError::Validation(_) => "validation",
+            CatalogError::NotFound(_) => "not_found",
+            CatalogError::Conflict { .. } => "conflict",
+            CatalogError::UnsupportedSchema { .. } => "unsupported_schema",
+        };
+        ControlErrorBody { code: code.to_string(), message: error.to_string() }
+    }
+}
+
+pub(crate) fn write_msg<W: Write>(writer: &mut W, value: &impl Serialize) -> io::Result<()> {
+    let body = serde_json::to_vec(value)?;
+    let len = u32::try_from(body.len())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "control message too large"))?;
+    writer.write_all(&len.to_be_bytes())?;
+    writer.write_all(&body)?;
+    writer.flush()
+}
+
+pub(crate) fn read_msg<R: Read, T: DeserializeOwned>(reader: &mut R) -> io::Result<T> {
+    let mut len = [0u8; 4];
+    reader.read_exact(&mut len)?;
+    let len = u32::from_be_bytes(len) as usize;
+    if len > MAX_MSG {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "control frame too large"));
+    }
+    let mut body = vec![0u8; len];
+    reader.read_exact(&mut body)?;
+    serde_json::from_slice(&body).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_wire_shape_is_stable_for_swift_client() {
+        let request = ControlRequest {
+            request_id: 7,
+            command: ControlCommand::ResolveEnvironment {
+                project_id: "floria".to_string(),
+                environment_id: "development".to_string(),
+            },
+        };
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["request_id"], 7);
+        assert_eq!(value["method"], "resolve_environment");
+        assert_eq!(value["params"]["project_id"], "floria");
+        assert_eq!(value["params"]["environment_id"], "development");
+    }
+
+    #[test]
+    fn response_error_has_machine_readable_code() {
+        let error = CatalogError::Conflict {
+            key: "TOKEN".to_string(),
+            binding_ids: vec!["a".to_string(), "b".to_string()],
+        };
+        let response = ControlResponse {
+            request_id: 3,
+            outcome: ControlOutcome::Error { error: (&error).into() },
+        };
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["status"], "error");
+        assert_eq!(value["error"]["code"], "conflict");
+    }
+}
