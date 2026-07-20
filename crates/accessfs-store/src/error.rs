@@ -22,6 +22,9 @@ pub enum StoreError {
     #[error("crypto error: {0}")]
     Crypto(String),
 
+    #[error("invalid secret metadata: {0}")]
+    Invalid(String),
+
     #[error("corrupt store entry {id}: {reason}")]
     Corrupt { id: String, reason: String },
 }

@@ -11,6 +11,7 @@ mod error;
 pub use catalog::{resolve_catalog_snapshot, Catalog};
 pub use domain::{
     Binding, BindingScope, CatalogSnapshot, Environment, ExportSpec, Project, ResolvedEnvironment,
-    ResolvedExport, Resource, ResourceKind, ResourceSource, Surface, SurfaceKind, ValueShape,
+    ResolvedExport, Resource, ResourceBindingUsage, ResourceKind, ResourceSource, ResourceUsage,
+    Surface, SurfaceKind, ValueShape,
 };
 pub use error::{CatalogError, CatalogResult};

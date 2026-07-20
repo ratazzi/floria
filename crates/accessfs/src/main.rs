@@ -117,6 +117,8 @@ enum ControlCmd {
         project_id: String,
         environment_id: String,
     },
+    /// Show every binding and surface affected by a resource.
+    Usage { resource_id: String },
 }
 
 fn main() -> Result<()> {
@@ -191,7 +193,7 @@ fn cmd_protect(path: &Path, link: bool, remove: bool, force: bool, config: &Path
             rec.id
         }
         None => {
-            let id = store.put(NewSecret { source_path: abs.clone(), mode }, &plaintext)?;
+            let id = store.put(NewSecret::file(abs.clone(), mode), &plaintext)?;
             println!("protected {} → {id}", abs.display());
             println!("  stored at {}/{id}", cfg.store_root.display());
             id
@@ -255,7 +257,7 @@ fn cmd_history(target: &str, config: &Path) -> Result<()> {
     let cfg = load(config)?;
     let store = open_store(&cfg)?;
     let record = resolve_target(&store, target)?;
-    println!("{}  {}", record.id, record.source_path.display());
+    println!("{}  {}", record.id, record.display_name());
     for v in store.history(&record.id)? {
         let head = if v.version == record.current_version { " (current)" } else { "" };
         let note = v.note.map(|n| format!("  {n}")).unwrap_or_default();
@@ -285,7 +287,7 @@ fn cmd_list(config: &Path) -> Result<()> {
         println!(
             "{}  {}  (v{}, {} bytes, mode {:04o}, {})",
             r.id,
-            r.source_path.display(),
+            r.display_name(),
             r.current_version,
             r.size,
             r.mode,
@@ -332,11 +334,16 @@ fn cmd_mount(config: &Path) -> Result<()> {
         surface_registry: Arc::clone(&surface_registry),
         mount_path: cfg.mount_path.clone(),
     });
-    let _control = ControlServer::start_observed(&control_path, catalog.clone(), observer)
+    let store: Arc<dyn SecretStore> = Arc::new(open_store(&cfg)?);
+    let _control = ControlServer::start_runtime(
+        &control_path,
+        catalog.clone(),
+        Arc::clone(&store),
+        observer,
+    )
         .with_context(|| format!("starting control socket at {}", control_path.display()))?;
     tracing::info!(socket = %control_path.display(), "control socket listening");
     let agent = accessfs_agent::SocketAgent::start(&cfg).context("starting agent socket")?;
-    let store: Arc<dyn SecretStore> = Arc::new(open_store(&cfg)?);
     accessfs_fs::mount(
         cfg,
         agent,
@@ -400,6 +407,7 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
         ControlCmd::Resolve { project_id, environment_id } => {
             ControlCommand::ResolveEnvironment { project_id, environment_id }
         }
+        ControlCmd::Usage { resource_id } => ControlCommand::ResourceUsage { resource_id },
     };
     match client.request(command)? {
         ControlResult::Pong { schema_version } => {
@@ -410,6 +418,15 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
         }
         ControlResult::ResolvedEnvironment(resolved) => {
             println!("{}", serde_json::to_string_pretty(&resolved)?);
+        }
+        ControlResult::ResourceUsage(usage) => {
+            println!("{}", serde_json::to_string_pretty(&usage)?);
+        }
+        ControlResult::SharedSecretCreated { resource, version } => {
+            println!("created shared secret resource {} at version {version}", resource.id);
+        }
+        ControlResult::SharedSecretRotated { resource_id, version } => {
+            println!("rotated shared secret resource {resource_id} to version {version}");
         }
         ControlResult::Empty => anyhow::bail!("daemon returned an empty control response"),
     }

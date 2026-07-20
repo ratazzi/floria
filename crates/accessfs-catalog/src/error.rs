@@ -25,10 +25,22 @@ pub enum CatalogError {
     #[error("catalog object not found: {0}")]
     NotFound(String),
 
+    #[error("catalog {kind} already exists: {id}")]
+    AlreadyExists { kind: &'static str, id: String },
+
     #[error("environment key {key:?} conflicts between bindings {binding_ids:?}")]
     Conflict {
         key: String,
         binding_ids: Vec<String>,
+    },
+
+    #[error(
+        "resource {resource_id:?} is still used by bindings {binding_ids:?} and surfaces {surface_ids:?}"
+    )]
+    ResourceInUse {
+        resource_id: String,
+        binding_ids: Vec<String>,
+        surface_ids: Vec<String>,
     },
 
     #[error("catalog schema version {found} is not supported (expected {expected})")]

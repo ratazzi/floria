@@ -235,7 +235,7 @@ mod tests {
     use accessfs_catalog::{
         Binding, BindingScope, Environment, ExportSpec, Project, ResourceKind, Surface,
     };
-    use accessfs_store::{NewSecret, SecretRecord, StoreResult, VersionRecord};
+    use accessfs_store::{NewSecret, SecretOrigin, SecretRecord, StoreResult, VersionRecord};
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
@@ -278,7 +278,9 @@ mod tests {
         fn record(&self, id: &SecretId) -> StoreResult<Option<SecretRecord>> {
             Ok(self.entries.get(id.as_str()).map(|(head, versions)| SecretRecord {
                 id: id.clone(),
-                source_path: PathBuf::from("/fixture/source"),
+                origin: SecretOrigin::File {
+                    source_path: PathBuf::from("/fixture/source"),
+                },
                 mode: 0o600,
                 size: versions[(*head - 1) as usize].len() as u64,
                 created: "fixture-time".to_string(),

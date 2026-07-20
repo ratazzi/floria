@@ -320,7 +320,7 @@ impl Shared {
         let ns = self.secrets.as_ref()?;
         let sid: SecretId = id.parse().ok()?;
         let record = ns.store.record(&sid).ok().flatten()?;
-        Some(record.source_path.display().to_string())
+        Some(record.display_name())
     }
 
     /// The virtual path of a dynamic secret inode, or `None` if it isn't one.

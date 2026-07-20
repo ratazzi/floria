@@ -10,6 +10,6 @@ mod server;
 pub use client::ControlClient;
 pub use protocol::{
     ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest, ControlResponse,
-    ControlResult,
+    ControlResult, SecretValue,
 };
 pub use server::{CatalogObserver, ControlServer};

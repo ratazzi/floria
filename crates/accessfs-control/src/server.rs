@@ -5,7 +5,11 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use accessfs_catalog::{Catalog, CatalogResult, CatalogSnapshot};
+use accessfs_catalog::{
+    Catalog, CatalogError, CatalogSnapshot, ExportSpec, Resource, ResourceKind, ResourceSource,
+    ValueShape,
+};
+use accessfs_store::{NewSecret, SecretId, SecretStore, StoreError};
 
 use crate::protocol::{
     read_msg, write_msg, ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest,
@@ -24,7 +28,7 @@ impl ControlServer {
     /// Start the catalog control socket. Each connection gets a dedicated request loop;
     /// authorization prompts continue to use the separate agent socket.
     pub fn start(path: &Path, catalog: Catalog) -> io::Result<Self> {
-        Self::start_inner(path, catalog, None)
+        Self::start_inner(path, catalog, None, None)
     }
 
     pub fn start_observed(
@@ -32,12 +36,22 @@ impl ControlServer {
         catalog: Catalog,
         observer: Arc<dyn CatalogObserver>,
     ) -> io::Result<Self> {
-        Self::start_inner(path, catalog, Some(observer))
+        Self::start_inner(path, catalog, None, Some(observer))
+    }
+
+    pub fn start_runtime(
+        path: &Path,
+        catalog: Catalog,
+        store: Arc<dyn SecretStore>,
+        observer: Arc<dyn CatalogObserver>,
+    ) -> io::Result<Self> {
+        Self::start_inner(path, catalog, Some(store), Some(observer))
     }
 
     fn start_inner(
         path: &Path,
         catalog: Catalog,
+        store: Option<Arc<dyn SecretStore>>,
         observer: Option<Arc<dyn CatalogObserver>>,
     ) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
@@ -50,7 +64,7 @@ impl ControlServer {
         let catalog = Arc::new(catalog);
         std::thread::Builder::new()
             .name("accessfs-control-accept".to_string())
-            .spawn(move || accept_loop(listener, catalog, observer))?;
+            .spawn(move || accept_loop(listener, catalog, store, observer))?;
 
         Ok(ControlServer { socket_path: path.to_path_buf() })
     }
@@ -63,6 +77,7 @@ impl ControlServer {
 fn accept_loop(
     listener: UnixListener,
     catalog: Arc<Catalog>,
+    store: Option<Arc<dyn SecretStore>>,
     observer: Option<Arc<dyn CatalogObserver>>,
 ) {
     for stream in listener.incoming() {
@@ -78,10 +93,11 @@ fn accept_loop(
             continue;
         }
         let catalog = Arc::clone(&catalog);
+        let store = store.clone();
         let observer = observer.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("accessfs-control-conn".to_string())
-            .spawn(move || handle_connection(stream, catalog, observer))
+            .spawn(move || handle_connection(stream, catalog, store, observer))
         {
             tracing::warn!(%error, "spawning control connection failed");
         }
@@ -91,6 +107,7 @@ fn accept_loop(
 fn handle_connection(
     mut stream: UnixStream,
     catalog: Arc<Catalog>,
+    store: Option<Arc<dyn SecretStore>>,
     observer: Option<Arc<dyn CatalogObserver>>,
 ) {
     loop {
@@ -103,16 +120,14 @@ fn handle_connection(
             }
         };
         let mutates_catalog = mutates_catalog(&request.command);
-        let outcome = match dispatch(&catalog, request.command) {
+        let outcome = match dispatch(&catalog, store.as_deref(), request.command) {
             Ok(result) => {
                 if mutates_catalog {
                     notify_observer(&catalog, observer.as_deref());
                 }
                 ControlOutcome::Ok { result }
             }
-            Err(error) => {
-                ControlOutcome::Error { error: ControlErrorBody::from(&error) }
-            }
+            Err(error) => ControlOutcome::Error { error: error.body() },
         };
         if let Err(error) = write_msg(
             &mut stream,
@@ -125,11 +140,19 @@ fn handle_connection(
 }
 
 fn mutates_catalog(command: &ControlCommand) -> bool {
-    !matches!(
+    matches!(
         command,
-        ControlCommand::Ping
-            | ControlCommand::Snapshot
-            | ControlCommand::ResolveEnvironment { .. }
+        ControlCommand::ProjectUpsert { .. }
+            | ControlCommand::ProjectRemove { .. }
+            | ControlCommand::EnvironmentUpsert { .. }
+            | ControlCommand::EnvironmentRemove { .. }
+            | ControlCommand::ResourceUpsert { .. }
+            | ControlCommand::ResourceRemove { .. }
+            | ControlCommand::BindingUpsert { .. }
+            | ControlCommand::BindingRemove { .. }
+            | ControlCommand::SurfaceUpsert { .. }
+            | ControlCommand::SurfaceRemove { .. }
+            | ControlCommand::SharedSecretCreate { .. }
     )
 }
 
@@ -141,7 +164,48 @@ fn notify_observer(catalog: &Catalog, observer: Option<&dyn CatalogObserver>) {
     }
 }
 
-fn dispatch(catalog: &Catalog, command: ControlCommand) -> CatalogResult<ControlResult> {
+#[derive(Debug)]
+enum DispatchError {
+    Catalog(CatalogError),
+    Store(StoreError),
+    Validation(String),
+    StoreUnavailable,
+}
+
+impl DispatchError {
+    fn body(&self) -> ControlErrorBody {
+        match self {
+            DispatchError::Catalog(error) => ControlErrorBody::from(error),
+            DispatchError::Store(error) => ControlErrorBody::from(error),
+            DispatchError::Validation(message) => ControlErrorBody {
+                code: "validation".to_string(),
+                message: message.clone(),
+            },
+            DispatchError::StoreUnavailable => ControlErrorBody {
+                code: "secret_store_unavailable".to_string(),
+                message: "secret store is unavailable on this control server".to_string(),
+            },
+        }
+    }
+}
+
+impl From<CatalogError> for DispatchError {
+    fn from(error: CatalogError) -> Self {
+        DispatchError::Catalog(error)
+    }
+}
+
+impl From<StoreError> for DispatchError {
+    fn from(error: StoreError) -> Self {
+        DispatchError::Store(error)
+    }
+}
+
+fn dispatch(
+    catalog: &Catalog,
+    store: Option<&dyn SecretStore>,
+    command: ControlCommand,
+) -> Result<ControlResult, DispatchError> {
     match command {
         ControlCommand::Ping => {
             Ok(ControlResult::Pong { schema_version: catalog.schema_version() })
@@ -151,6 +215,28 @@ fn dispatch(catalog: &Catalog, command: ControlCommand) -> CatalogResult<Control
             ControlResult::ResolvedEnvironment(
                 catalog.resolve_environment(&project_id, &environment_id)?,
             ),
+        ),
+        ControlCommand::ResourceUsage { resource_id } => {
+            Ok(ControlResult::ResourceUsage(catalog.resource_usage(&resource_id)?))
+        }
+        ControlCommand::SharedSecretCreate {
+            resource_id,
+            name,
+            default_env_key,
+            value,
+        } => create_shared_secret(
+            catalog,
+            store.ok_or(DispatchError::StoreUnavailable)?,
+            resource_id,
+            name,
+            default_env_key,
+            value,
+        ),
+        ControlCommand::SharedSecretRotate { resource_id, value } => rotate_shared_secret(
+            catalog,
+            store.ok_or(DispatchError::StoreUnavailable)?,
+            resource_id,
+            value,
         ),
         ControlCommand::ProjectUpsert { project } => {
             catalog.upsert_project(&project)?;
@@ -195,6 +281,79 @@ fn dispatch(catalog: &Catalog, command: ControlCommand) -> CatalogResult<Control
     }
 }
 
+fn create_shared_secret(
+    catalog: &Catalog,
+    store: &dyn SecretStore,
+    resource_id: String,
+    name: String,
+    default_env_key: String,
+    value: crate::protocol::SecretValue,
+) -> Result<ControlResult, DispatchError> {
+    if value.as_bytes().is_empty() {
+        return Err(DispatchError::Validation(
+            "shared secret value cannot be empty".to_string(),
+        ));
+    }
+    let mut resource = Resource {
+        id: resource_id,
+        name,
+        kind: ResourceKind::SharedSecret,
+        shape: ValueShape::Scalar,
+        default_env_key: Some(default_env_key.clone()),
+        exports: vec![ExportSpec { key: default_env_key, sensitive: true }],
+        source: ResourceSource::SecretRef { secret_id: "pending-secret-id".to_string() },
+        detail: None,
+    };
+    catalog.validate_resource(&resource)?;
+    match catalog.resource(&resource.id) {
+        Ok(_) => {
+            return Err(DispatchError::Catalog(CatalogError::AlreadyExists {
+                kind: "resource",
+                id: resource.id.clone(),
+            }))
+        }
+        Err(CatalogError::NotFound(_)) => {}
+        Err(error) => return Err(DispatchError::Catalog(error)),
+    }
+
+    let secret_id = store.put(NewSecret::managed(resource.name.clone()), value.as_bytes())?;
+    resource.source = ResourceSource::SecretRef { secret_id: secret_id.to_string() };
+    if let Err(error) = catalog.create_resource(&resource) {
+        if let Err(cleanup_error) = store.delete(&secret_id) {
+            tracing::warn!(%secret_id, %cleanup_error, "cleaning up unreferenced shared secret failed");
+        }
+        return Err(DispatchError::Catalog(error));
+    }
+    Ok(ControlResult::SharedSecretCreated { resource, version: 1 })
+}
+
+fn rotate_shared_secret(
+    catalog: &Catalog,
+    store: &dyn SecretStore,
+    resource_id: String,
+    value: crate::protocol::SecretValue,
+) -> Result<ControlResult, DispatchError> {
+    if value.as_bytes().is_empty() {
+        return Err(DispatchError::Validation(
+            "shared secret value cannot be empty".to_string(),
+        ));
+    }
+    let resource = catalog.resource(&resource_id)?;
+    if resource.kind != ResourceKind::SharedSecret {
+        return Err(DispatchError::Validation(format!(
+            "resource {resource_id:?} is not a shared secret"
+        )));
+    }
+    let ResourceSource::SecretRef { secret_id } = resource.source else {
+        return Err(DispatchError::Validation(format!(
+            "resource {resource_id:?} does not reference a stored secret"
+        )));
+    };
+    let secret_id: SecretId = secret_id.parse()?;
+    let version = store.append_version(&secret_id, value.as_bytes())?;
+    Ok(ControlResult::SharedSecretRotated { resource_id, version })
+}
+
 fn same_uid(stream: &UnixStream) -> bool {
     let mut uid: libc::uid_t = 0;
     let mut gid: libc::gid_t = 0;
@@ -209,9 +368,92 @@ mod tests {
     use super::*;
     use crate::client::ControlClient;
     use accessfs_catalog::{Environment, Project};
+    use accessfs_store::{
+        SecretOrigin, SecretRecord, StoreResult, VersionRecord,
+    };
+    use std::collections::HashMap;
     use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use zeroize::Zeroizing;
+
+    const FIXTURE_SECRET_ID: &str = "00000000-0000-0000-0000-000000000101";
+
+    struct FixtureStore {
+        entries: Mutex<HashMap<String, Vec<Vec<u8>>>>,
+    }
+
+    impl FixtureStore {
+        fn new() -> Self {
+            FixtureStore { entries: Mutex::new(HashMap::new()) }
+        }
+    }
+
+    impl SecretStore for FixtureStore {
+        fn put(&self, meta: NewSecret, plaintext: &[u8]) -> StoreResult<SecretId> {
+            assert_eq!(
+                meta.origin,
+                SecretOrigin::Managed { label: "Fixture Shared Secret".to_string() }
+            );
+            let id: SecretId = FIXTURE_SECRET_ID.parse().unwrap();
+            self.entries
+                .lock()
+                .unwrap()
+                .insert(id.to_string(), vec![plaintext.to_vec()]);
+            Ok(id)
+        }
+
+        fn get(&self, id: &SecretId) -> StoreResult<Zeroizing<Vec<u8>>> {
+            let entries = self.entries.lock().unwrap();
+            Ok(Zeroizing::new(entries[id.as_str()].last().unwrap().clone()))
+        }
+
+        fn get_version(&self, id: &SecretId, version: u32) -> StoreResult<Zeroizing<Vec<u8>>> {
+            let entries = self.entries.lock().unwrap();
+            Ok(Zeroizing::new(entries[id.as_str()][(version - 1) as usize].clone()))
+        }
+
+        fn append_version(&self, id: &SecretId, plaintext: &[u8]) -> StoreResult<u32> {
+            let mut entries = self.entries.lock().unwrap();
+            let versions = entries.get_mut(id.as_str()).unwrap();
+            versions.push(plaintext.to_vec());
+            Ok(versions.len() as u32)
+        }
+
+        fn history(&self, _id: &SecretId) -> StoreResult<Vec<VersionRecord>> {
+            unimplemented!()
+        }
+
+        fn set_head(&self, _id: &SecretId, _version: u32) -> StoreResult<()> {
+            unimplemented!()
+        }
+
+        fn record(&self, id: &SecretId) -> StoreResult<Option<SecretRecord>> {
+            let entries = self.entries.lock().unwrap();
+            Ok(entries.get(id.as_str()).map(|versions| SecretRecord {
+                id: id.clone(),
+                origin: SecretOrigin::Managed { label: "Fixture Shared Secret".to_string() },
+                mode: 0o600,
+                size: versions.last().unwrap().len() as u64,
+                created: "fixture-time".to_string(),
+                current_version: versions.len() as u32,
+            }))
+        }
+
+        fn list(&self) -> StoreResult<Vec<SecretRecord>> {
+            unimplemented!()
+        }
+
+        fn get_by_path(&self, _source_path: &Path) -> StoreResult<Option<SecretRecord>> {
+            Ok(None)
+        }
+
+        fn delete(&self, id: &SecretId) -> StoreResult<()> {
+            self.entries.lock().unwrap().remove(id.as_str());
+            Ok(())
+        }
+    }
 
     struct SnapshotObserver {
         notifications: AtomicUsize,
@@ -332,5 +574,63 @@ mod tests {
             observer.latest.lock().unwrap().as_ref().unwrap().projects[0].id,
             "fixture-project"
         );
+    }
+
+    #[test]
+    fn shared_secret_create_and_rotate_over_ipc_only_store_reference_in_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let socket = dir.path().join("control.sock");
+        let store = Arc::new(FixtureStore::new());
+        let observer: Arc<dyn CatalogObserver> = Arc::new(SnapshotObserver {
+            notifications: AtomicUsize::new(0),
+            latest: Mutex::new(None),
+        });
+        let _server = ControlServer::start_runtime(
+            &socket,
+            catalog.clone(),
+            Arc::clone(&store) as Arc<dyn SecretStore>,
+            observer,
+        )
+        .unwrap();
+        let mut client = ControlClient::connect(&socket).unwrap();
+
+        let created = client
+            .request(ControlCommand::SharedSecretCreate {
+                resource_id: "fixture-shared-secret".to_string(),
+                name: "Fixture Shared Secret".to_string(),
+                default_env_key: "FIXTURE_TOKEN".to_string(),
+                value: crate::protocol::SecretValue::new("fixture-value-one"),
+            })
+            .unwrap();
+        assert!(matches!(
+            created,
+            ControlResult::SharedSecretCreated { version: 1, .. }
+        ));
+        let resource = catalog.resource("fixture-shared-secret").unwrap();
+        assert_eq!(
+            resource.source,
+            ResourceSource::SecretRef { secret_id: FIXTURE_SECRET_ID.to_string() }
+        );
+        assert!(!serde_json::to_string(&catalog.snapshot().unwrap())
+            .unwrap()
+            .contains("fixture-value-one"));
+
+        let rotated = client
+            .request(ControlCommand::SharedSecretRotate {
+                resource_id: "fixture-shared-secret".to_string(),
+                value: crate::protocol::SecretValue::new("fixture-value-two"),
+            })
+            .unwrap();
+        assert_eq!(
+            rotated,
+            ControlResult::SharedSecretRotated {
+                resource_id: "fixture-shared-secret".to_string(),
+                version: 2,
+            }
+        );
+        let secret_id: SecretId = FIXTURE_SECRET_ID.parse().unwrap();
+        assert_eq!(store.get_version(&secret_id, 1).unwrap().as_slice(), b"fixture-value-one");
+        assert_eq!(store.get_version(&secret_id, 2).unwrap().as_slice(), b"fixture-value-two");
     }
 }

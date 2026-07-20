@@ -212,3 +212,19 @@ pub struct ResolvedEnvironment {
     pub environment_id: String,
     pub exports: Vec<ResolvedExport>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceBindingUsage {
+    pub binding_id: String,
+    pub project_id: String,
+    pub scope: BindingScope,
+    pub environment_ids: Vec<String>,
+    pub surface_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceUsage {
+    pub resource_id: String,
+    pub bindings: Vec<ResourceBindingUsage>,
+    pub direct_surface_ids: Vec<String>,
+}

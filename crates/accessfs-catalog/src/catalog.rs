@@ -7,7 +7,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::domain::{
     Binding, BindingScope, CatalogSnapshot, Environment, Project, ResolvedEnvironment,
-    ResolvedExport, Resource, ResourceKind, ResourceSource, Surface, SurfaceKind, ValueShape,
+    ResolvedExport, Resource, ResourceBindingUsage, ResourceKind, ResourceSource, ResourceUsage,
+    Surface, SurfaceKind, ValueShape,
 };
 use crate::error::{CatalogError, CatalogResult};
 
@@ -159,9 +160,112 @@ impl Catalog {
         Ok(())
     }
 
+    pub fn validate_resource(&self, resource: &Resource) -> CatalogResult<()> {
+        validate_resource(resource)
+    }
+
+    pub fn create_resource(&self, resource: &Resource) -> CatalogResult<()> {
+        validate_resource(resource)?;
+        let mut conn = self.connection()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let exists = tx
+            .query_row("SELECT 1 FROM resources WHERE id = ?1", [&resource.id], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if exists {
+            return Err(CatalogError::AlreadyExists {
+                kind: "resource",
+                id: resource.id.clone(),
+            });
+        }
+        tx.execute(
+            "INSERT INTO resources
+                (id, name, kind, shape, default_env_key, exports_json, source_json, detail)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                resource.id,
+                resource.name,
+                resource.kind.as_str(),
+                resource.shape.as_str(),
+                resource.default_env_key,
+                serde_json::to_string(&resource.exports)?,
+                serde_json::to_string(&resource.source)?,
+                resource.detail,
+            ],
+        )?;
+        validate_snapshot_conflicts(&snapshot_from(&tx)?)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn remove_resource(&self, id: &str) -> CatalogResult<()> {
         require_id(id, "resource id")?;
+        let usage = self.resource_usage(id)?;
+        let binding_ids = usage
+            .bindings
+            .iter()
+            .map(|binding| binding.binding_id.clone())
+            .collect::<Vec<_>>();
+        if !binding_ids.is_empty() || !usage.direct_surface_ids.is_empty() {
+            return Err(CatalogError::ResourceInUse {
+                resource_id: id.to_string(),
+                binding_ids,
+                surface_ids: usage.direct_surface_ids,
+            });
+        }
         remove_one(&self.connection()?, "resources", id, "resource")
+    }
+
+    pub fn resource(&self, id: &str) -> CatalogResult<Resource> {
+        require_id(id, "resource id")?;
+        self.snapshot()?
+            .resources
+            .into_iter()
+            .find(|resource| resource.id == id)
+            .ok_or_else(|| CatalogError::NotFound(format!("resource {id}")))
+    }
+
+    pub fn resource_usage(&self, id: &str) -> CatalogResult<ResourceUsage> {
+        require_id(id, "resource id")?;
+        let snapshot = self.snapshot()?;
+        if !snapshot.resources.iter().any(|resource| resource.id == id) {
+            return Err(CatalogError::NotFound(format!("resource {id}")));
+        }
+        let mut bindings = Vec::new();
+        for binding in snapshot.bindings.iter().filter(|binding| binding.resource_id == id) {
+            let environment_ids = match &binding.scope {
+                BindingScope::Common => snapshot
+                    .environments
+                    .iter()
+                    .filter(|environment| environment.project_id == binding.project_id)
+                    .map(|environment| environment.id.clone())
+                    .collect::<Vec<_>>(),
+                BindingScope::Environment { environment_id } => vec![environment_id.clone()],
+            };
+            let surface_ids = snapshot
+                .surfaces
+                .iter()
+                .filter(|surface| {
+                    surface.kind == SurfaceKind::DotenvFile
+                        && environment_ids.contains(&surface.environment_id)
+                })
+                .map(|surface| surface.id.clone())
+                .collect();
+            bindings.push(ResourceBindingUsage {
+                binding_id: binding.id.clone(),
+                project_id: binding.project_id.clone(),
+                scope: binding.scope.clone(),
+                environment_ids,
+                surface_ids,
+            });
+        }
+        let direct_surface_ids = snapshot
+            .surfaces
+            .iter()
+            .filter(|surface| surface.resource_id.as_deref() == Some(id))
+            .map(|surface| surface.id.clone())
+            .collect();
+        Ok(ResourceUsage { resource_id: id.to_string(), bindings, direct_surface_ids })
     }
 
     pub fn upsert_binding(&self, binding: &Binding) -> CatalogResult<()> {
@@ -968,6 +1072,69 @@ mod tests {
         assert_eq!(snapshot.surfaces.len(), 1);
         let json = serde_json::to_string(&snapshot).unwrap();
         assert!(!json.contains("plaintext"));
+    }
+
+    #[test]
+    fn create_resource_refuses_to_replace_existing_metadata() {
+        let (_dir, catalog) = catalog();
+        let resource = scalar_resource("fixture-shared", "FIXTURE_TOKEN");
+        catalog.create_resource(&resource).unwrap();
+        let mut replacement = resource.clone();
+        replacement.name = "Replacement".to_string();
+
+        assert!(matches!(
+            catalog.create_resource(&replacement),
+            Err(CatalogError::AlreadyExists { kind: "resource", .. })
+        ));
+        assert_eq!(catalog.resource(&resource.id).unwrap().name, resource.name);
+    }
+
+    #[test]
+    fn resource_usage_expands_common_binding_to_affected_surfaces() {
+        let (_dir, catalog) = catalog();
+        catalog
+            .upsert_environment(&Environment {
+                id: "staging".to_string(),
+                project_id: "floria".to_string(),
+                name: "Staging".to_string(),
+                position: 1,
+            })
+            .unwrap();
+        let resource = scalar_resource("fixture-shared", "FIXTURE_TOKEN");
+        catalog.create_resource(&resource).unwrap();
+        catalog
+            .upsert_binding(&binding("fixture-common", &resource.id, BindingScope::Common))
+            .unwrap();
+        for (id, environment_id, path) in [
+            ("fixture-dev-env", "development", "/workspace/floria/.env"),
+            ("fixture-stage-env", "staging", "/workspace/floria/.env.staging"),
+        ] {
+            catalog
+                .upsert_surface(&Surface {
+                    id: id.to_string(),
+                    environment_id: environment_id.to_string(),
+                    name: ".env".to_string(),
+                    kind: SurfaceKind::DotenvFile,
+                    path: PathBuf::from(path),
+                    resource_id: None,
+                    position: 0,
+                })
+                .unwrap();
+        }
+
+        let usage = catalog.resource_usage(&resource.id).unwrap();
+        assert_eq!(usage.bindings.len(), 1);
+        assert_eq!(usage.bindings[0].environment_ids, vec!["development", "staging"]);
+        assert_eq!(
+            usage.bindings[0].surface_ids,
+            vec!["fixture-dev-env", "fixture-stage-env"]
+        );
+        assert!(usage.direct_surface_ids.is_empty());
+        assert!(matches!(
+            catalog.remove_resource(&resource.id),
+            Err(CatalogError::ResourceInUse { binding_ids, .. })
+                if binding_ids == vec!["fixture-common"]
+        ));
     }
 
     #[test]

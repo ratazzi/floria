@@ -17,9 +17,9 @@ use zeroize::Zeroizing;
 use crate::error::{StoreError, StoreResult};
 use crate::keys::KeyProvider;
 
-/// On-disk layout version, stamped into every `meta.toml`. Bump on breaking layout changes so an
-/// old (or newer) entry fails with an explicit "migrate" message instead of a random parse error.
-const STORE_FORMAT: u32 = 1;
+/// Current on-disk layout. Format 2 adds managed (non-file) origins; format 1 file entries remain
+/// readable and are updated in place without rewriting their origin metadata.
+const STORE_FORMAT: u32 = 2;
 
 /// Stable secret identifier (a v4 UUID string). Immutable for the life of an entry.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -50,20 +50,34 @@ impl std::str::FromStr for SecretId {
     }
 }
 
-/// What the caller knows about a secret when protecting it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SecretOrigin {
+    File { source_path: PathBuf },
+    Managed { label: String },
+}
+
+/// What the caller knows about a secret when creating it.
 #[derive(Debug, Clone)]
 pub struct NewSecret {
-    /// Absolute path the secret came from (recorded for re-linking/audit; not the key).
-    pub source_path: PathBuf,
-    /// Original file mode, preserved so the surfaced file can match it.
+    pub origin: SecretOrigin,
     pub mode: u32,
+}
+
+impl NewSecret {
+    pub fn file(source_path: PathBuf, mode: u32) -> Self {
+        NewSecret { origin: SecretOrigin::File { source_path }, mode }
+    }
+
+    pub fn managed(label: impl Into<String>) -> Self {
+        NewSecret { origin: SecretOrigin::Managed { label: label.into() }, mode: 0o600 }
+    }
 }
 
 /// A stored secret's metadata (no plaintext), reflecting the current head version.
 #[derive(Debug, Clone)]
 pub struct SecretRecord {
     pub id: SecretId,
-    pub source_path: PathBuf,
+    pub origin: SecretOrigin,
     pub mode: u32,
     /// Size of the head version.
     pub size: u64,
@@ -71,6 +85,22 @@ pub struct SecretRecord {
     pub created: String,
     /// Head version number.
     pub current_version: u32,
+}
+
+impl SecretRecord {
+    pub fn source_path(&self) -> Option<&Path> {
+        match &self.origin {
+            SecretOrigin::File { source_path } => Some(source_path),
+            SecretOrigin::Managed { .. } => None,
+        }
+    }
+
+    pub fn display_name(&self) -> String {
+        match &self.origin {
+            SecretOrigin::File { source_path } => source_path.display().to_string(),
+            SecretOrigin::Managed { label } => label.clone(),
+        }
+    }
 }
 
 /// One immutable version of a secret (no plaintext).
@@ -114,7 +144,10 @@ struct MetaFile {
     #[serde(default)]
     format: u32,
     id: String,
-    source_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_label: Option<String>,
     mode: u32,
     created: String,
     current_version: u32,
@@ -194,14 +227,24 @@ impl AgeDirStore {
             id: id.to_string(),
             reason: format!("meta.toml: {e}"),
         })?;
-        if meta.format != STORE_FORMAT {
+        if !matches!(meta.format, 1 | STORE_FORMAT) {
             return Err(StoreError::Corrupt {
                 id: id.to_string(),
                 reason: format!(
-                    "store format {} but this build expects {}; migrate or delete the entry",
+                    "store format {} but this build supports 1 through {}; migrate or delete the entry",
                     meta.format, STORE_FORMAT
                 ),
             });
+        }
+        match (&meta.source_path, &meta.managed_label) {
+            (Some(_), None) => {}
+            (None, Some(label)) if !label.trim().is_empty() && meta.format >= 2 => {}
+            _ => {
+                return Err(StoreError::Corrupt {
+                    id: id.to_string(),
+                    reason: "meta.toml must contain exactly one valid secret origin".to_string(),
+                })
+            }
         }
         Ok(meta)
     }
@@ -311,6 +354,22 @@ impl AgeDirStore {
 
 impl SecretStore for AgeDirStore {
     fn put(&self, meta: NewSecret, plaintext: &[u8]) -> StoreResult<SecretId> {
+        let mode = meta.mode;
+        let (source_path, managed_label) = match meta.origin {
+            SecretOrigin::File { source_path } if source_path.is_absolute() => {
+                (Some(source_path.to_string_lossy().into_owned()), None)
+            }
+            SecretOrigin::File { source_path } => {
+                return Err(StoreError::Invalid(format!(
+                    "file secret source path must be absolute: {}",
+                    source_path.display()
+                )))
+            }
+            SecretOrigin::Managed { label } if !label.trim().is_empty() => (None, Some(label)),
+            SecretOrigin::Managed { .. } => {
+                return Err(StoreError::Invalid("managed secret label cannot be empty".to_string()))
+            }
+        };
         let _lock = self.lock_exclusive()?;
         let id = SecretId::generate();
         let vdir = self.versions_dir(&id);
@@ -319,15 +378,15 @@ impl SecretStore for AgeDirStore {
             .mode(0o700)
             .create(&vdir)
             .map_err(|e| StoreError::io(&vdir, e))?;
-
         self.write_version(&id, 1, plaintext, None)?;
         self.write_meta(
             &id,
             &MetaFile {
                 format: STORE_FORMAT,
                 id: id.to_string(),
-                source_path: meta.source_path.to_string_lossy().into_owned(),
-                mode: meta.mode,
+                source_path,
+                managed_label,
+                mode,
                 created: now_rfc3339(),
                 current_version: 1,
             },
@@ -405,9 +464,16 @@ impl SecretStore for AgeDirStore {
             Err(e) => return Err(e),
         };
         let vm = self.read_version_meta(id, meta.current_version)?;
+        let origin = match (meta.source_path, meta.managed_label) {
+            (Some(source_path), None) => {
+                SecretOrigin::File { source_path: PathBuf::from(source_path) }
+            }
+            (None, Some(label)) => SecretOrigin::Managed { label },
+            _ => unreachable!("read_meta validates exactly one origin"),
+        };
         Ok(Some(SecretRecord {
             id: id.clone(),
-            source_path: PathBuf::from(meta.source_path),
+            origin,
             mode: meta.mode,
             size: vm.size,
             created: meta.created,
@@ -437,7 +503,7 @@ impl SecretStore for AgeDirStore {
                 out.push(rec);
             }
         }
-        out.sort_by(|a, b| a.source_path.cmp(&b.source_path));
+        out.sort_by_key(SecretRecord::display_name);
         Ok(out)
     }
 
@@ -446,7 +512,11 @@ impl SecretStore for AgeDirStore {
         Ok(self
             .list()?
             .into_iter()
-            .find(|r| r.source_path.to_string_lossy() == target))
+            .find(|record| {
+                record
+                    .source_path()
+                    .is_some_and(|path| path.to_string_lossy() == target)
+            }))
     }
 
     fn delete(&self, id: &SecretId) -> StoreResult<()> {
@@ -516,10 +586,7 @@ mod tests {
         let secret = b"EXAMPLE_CONFIG=placeholder-value-one\n";
         let id = s
             .put(
-                NewSecret {
-                    source_path: PathBuf::from("/Users/me/proj/.env"),
-                    mode: 0o600,
-                },
+                NewSecret::file(PathBuf::from("/Users/me/proj/.env"), 0o600),
                 secret,
             )
             .unwrap();
@@ -536,7 +603,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(tmp.path().to_path_buf());
         let id = s
-            .put(NewSecret { source_path: PathBuf::from("/p/.env"), mode: 0o600 }, b"v1")
+            .put(NewSecret::file(PathBuf::from("/p/.env"), 0o600), b"v1")
             .unwrap();
 
         assert_eq!(s.append_version(&id, b"v2-longer").unwrap(), 2);
@@ -562,7 +629,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(tmp.path().to_path_buf());
         let id = s
-            .put(NewSecret { source_path: PathBuf::from("/p/.env"), mode: 0o600 }, b"first")
+            .put(NewSecret::file(PathBuf::from("/p/.env"), 0o600), b"first")
             .unwrap();
         s.append_version(&id, b"second").unwrap();
 
@@ -583,8 +650,8 @@ mod tests {
     fn list_and_get_by_path() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(tmp.path().to_path_buf());
-        s.put(NewSecret { source_path: PathBuf::from("/a/.env"), mode: 0o600 }, b"A=1").unwrap();
-        s.put(NewSecret { source_path: PathBuf::from("/b/.env"), mode: 0o600 }, b"B=2").unwrap();
+        s.put(NewSecret::file(PathBuf::from("/a/.env"), 0o600), b"A=1").unwrap();
+        s.put(NewSecret::file(PathBuf::from("/b/.env"), 0o600), b"B=2").unwrap();
 
         let all = s.list().unwrap();
         assert_eq!(all.len(), 2);
@@ -595,11 +662,31 @@ mod tests {
     }
 
     #[test]
+    fn managed_secret_has_a_label_without_a_fake_source_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path().to_path_buf());
+        let id = s
+            .put(NewSecret::managed("Fixture Shared Secret"), b"fixture-managed-value")
+            .unwrap();
+
+        let record = s.record(&id).unwrap().unwrap();
+        assert_eq!(
+            record.origin,
+            SecretOrigin::Managed { label: "Fixture Shared Secret".to_string() }
+        );
+        assert!(record.source_path().is_none());
+        assert_eq!(s.get(&id).unwrap().as_slice(), b"fixture-managed-value");
+        let meta = std::fs::read_to_string(s.entry_dir(&id).join("meta.toml")).unwrap();
+        assert!(meta.contains("managed_label = \"Fixture Shared Secret\""));
+        assert!(!meta.contains("fixture-managed-value"));
+    }
+
+    #[test]
     fn delete_removes_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(tmp.path().to_path_buf());
         let id = s
-            .put(NewSecret { source_path: PathBuf::from("/x/.env"), mode: 0o600 }, b"X=1")
+            .put(NewSecret::file(PathBuf::from("/x/.env"), 0o600), b"X=1")
             .unwrap();
         s.delete(&id).unwrap();
         assert!(matches!(s.get(&id), Err(StoreError::NotFound(_))));
@@ -611,18 +698,37 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(tmp.path().to_path_buf());
         let id = s
-            .put(NewSecret { source_path: PathBuf::from("/x/.env"), mode: 0o600 }, b"X=1")
+            .put(NewSecret::file(PathBuf::from("/x/.env"), 0o600), b"X=1")
             .unwrap();
 
         // Simulate an entry written by a different (older/newer) layout.
         let meta_path = tmp.path().join(id.as_str()).join("meta.toml");
         let text = std::fs::read_to_string(&meta_path).unwrap();
-        std::fs::write(&meta_path, text.replace("format = 1", "format = 99")).unwrap();
+        std::fs::write(&meta_path, text.replace("format = 2", "format = 99")).unwrap();
 
         match s.get(&id) {
             Err(StoreError::Corrupt { reason, .. }) => assert!(reason.contains("format 99")),
             other => panic!("expected Corrupt, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn legacy_file_origin_metadata_remains_readable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path().to_path_buf());
+        let id = s
+            .put(NewSecret::file(PathBuf::from("/fixture/project/.env"), 0o600), b"fixture-v1")
+            .unwrap();
+        let meta_path = tmp.path().join(id.as_str()).join("meta.toml");
+        let text = std::fs::read_to_string(&meta_path).unwrap();
+        std::fs::write(&meta_path, text.replace("format = 2", "format = 1")).unwrap();
+
+        assert_eq!(s.get(&id).unwrap().as_slice(), b"fixture-v1");
+        assert_eq!(s.append_version(&id, b"fixture-v2").unwrap(), 2);
+        assert_eq!(
+            s.record(&id).unwrap().unwrap().source_path(),
+            Some(Path::new("/fixture/project/.env"))
+        );
     }
 
     #[test]
@@ -655,7 +761,7 @@ mod tests {
         let s = AgeDirStore::open(tmp.path().join("store"), keys).unwrap();
         let secret = b"EXAMPLE_CONFIG=placeholder-value-two\n";
         let id = s
-            .put(NewSecret { source_path: PathBuf::from("/p/.env"), mode: 0o600 }, secret)
+            .put(NewSecret::file(PathBuf::from("/p/.env"), 0o600), secret)
             .unwrap();
         assert_eq!(s.get(&id).unwrap().as_slice(), secret);
     }

@@ -51,11 +51,13 @@ name = "accessfs-control"
 version = "0.1.0"
 dependencies = [
  "accessfs-catalog",
+ "accessfs-store",
  "libc",
  "serde",
  "serde_json",
  "tempfile",
  "tracing",
+ "zeroize",
 ]
 
 [[package]]

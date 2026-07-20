@@ -10,4 +10,6 @@ mod store;
 
 pub use error::{StoreError, StoreResult};
 pub use keys::{KeyProvider, SshKeyProvider};
-pub use store::{AgeDirStore, NewSecret, SecretId, SecretRecord, SecretStore, VersionRecord};
+pub use store::{
+    AgeDirStore, NewSecret, SecretId, SecretOrigin, SecretRecord, SecretStore, VersionRecord,
+};
