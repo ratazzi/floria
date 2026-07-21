@@ -4,14 +4,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use accessfs_catalog::{Catalog, CatalogSnapshot, SurfaceKind};
+use accessfs_catalog::{Catalog, CatalogSnapshot, Surface, SurfaceKind};
 use accessfs_control::{
     CatalogObserver, ControlClient, ControlCommand, ControlResult, ControlServer,
 };
 use accessfs_core::config::{Config, ResolvedConfig};
 use accessfs_store::{AgeDirStore, NewSecret, SecretId, SecretRecord, SecretStore, SshKeyProvider};
 use accessfs_surface::{
-    ensure_file_surface_link, SurfaceLinkState, SurfaceRegistry,
+    ensure_file_surface_link, remove_file_surface_link, SurfaceLinkRemoval, SurfaceLinkState,
+    SurfaceRegistry,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -361,8 +362,46 @@ struct RuntimeCatalogObserver {
 
 impl CatalogObserver for RuntimeCatalogObserver {
     fn catalog_changed(&self, snapshot: &CatalogSnapshot) {
+        let previous = self
+            .surface_registry
+            .list()
+            .into_iter()
+            .map(|registered| registered.surface)
+            .collect::<Vec<_>>();
+        cleanup_removed_file_links(&previous, snapshot, &self.mount_path);
         self.surface_registry.replace(snapshot);
         reconcile_file_links(snapshot, &self.mount_path);
+    }
+}
+
+fn cleanup_removed_file_links(
+    previous: &[Surface],
+    snapshot: &CatalogSnapshot,
+    mount_path: &Path,
+) {
+    for surface in previous {
+        let still_present = snapshot.surfaces.iter().any(|current| {
+            current.id == surface.id
+                && current.path == surface.path
+                && matches!(current.kind, SurfaceKind::DotenvFile | SurfaceKind::EnvFileDirect)
+        });
+        if still_present {
+            continue;
+        }
+        match remove_file_surface_link(surface, mount_path) {
+            Ok(SurfaceLinkRemoval::Removed) => tracing::info!(
+                surface = %surface.id,
+                path = %surface.path.display(),
+                "removed project surface link"
+            ),
+            Ok(SurfaceLinkRemoval::Missing | SurfaceLinkRemoval::Preserved) => {}
+            Err(error) => tracing::warn!(
+                surface = %surface.id,
+                path = %surface.path.display(),
+                %error,
+                "removed surface link needs attention"
+            ),
+        }
     }
 }
 

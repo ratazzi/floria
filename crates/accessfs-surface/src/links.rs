@@ -13,6 +13,13 @@ pub enum SurfaceLinkState {
     Ready,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceLinkRemoval {
+    Missing,
+    Removed,
+    Preserved,
+}
+
 /// Ensure that a project-facing file path is a symlink to its mounted surface inode.
 /// Existing files and links with a different target are never replaced.
 pub fn ensure_file_surface_link(
@@ -39,6 +46,49 @@ pub fn ensure_file_surface_link(
             source,
         }),
     }
+}
+
+/// Remove a project-facing link only when it still points to this exact mounted surface.
+/// A real file or a link owned by something else is always preserved.
+pub fn remove_file_surface_link(
+    surface: &Surface,
+    mount_path: &Path,
+) -> SurfaceResult<SurfaceLinkRemoval> {
+    if !matches!(surface.kind, SurfaceKind::DotenvFile | SurfaceKind::EnvFileDirect) {
+        return Ok(SurfaceLinkRemoval::Preserved);
+    }
+    validate_surface_id(&surface.id)?;
+    let expected = mount_path.join(SURFACES_DIR).join(&surface.id);
+    let metadata = match std::fs::symlink_metadata(&surface.path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(SurfaceLinkRemoval::Missing);
+        }
+        Err(source) => {
+            return Err(SurfaceError::LinkIo {
+                operation: "inspecting before removal",
+                path: surface.path.clone(),
+                source,
+            });
+        }
+    };
+    if !metadata.file_type().is_symlink() {
+        return Ok(SurfaceLinkRemoval::Preserved);
+    }
+    let actual = std::fs::read_link(&surface.path).map_err(|source| SurfaceError::LinkIo {
+        operation: "reading before removal",
+        path: surface.path.clone(),
+        source,
+    })?;
+    if actual != expected {
+        return Ok(SurfaceLinkRemoval::Preserved);
+    }
+    std::fs::remove_file(&surface.path).map_err(|source| SurfaceError::LinkIo {
+        operation: "removing",
+        path: surface.path.clone(),
+        source,
+    })?;
+    Ok(SurfaceLinkRemoval::Removed)
 }
 
 fn validate_surface_id(id: &str) -> SurfaceResult<()> {
@@ -183,5 +233,35 @@ mod tests {
             Err(SurfaceError::InvalidSurfaceId(_))
         ));
         assert!(!surface.path.exists());
+    }
+
+    #[test]
+    fn removal_only_unlinks_the_exact_managed_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let surface = fixture_surface(project.join(".env"));
+        let mount = dir.path().join("mount");
+
+        assert_eq!(
+            remove_file_surface_link(&surface, &mount).unwrap(),
+            SurfaceLinkRemoval::Missing
+        );
+        ensure_file_surface_link(&surface, &mount).unwrap();
+        assert_eq!(
+            remove_file_surface_link(&surface, &mount).unwrap(),
+            SurfaceLinkRemoval::Removed
+        );
+        assert!(!surface.path.exists());
+
+        symlink("/fixture/owned-elsewhere", &surface.path).unwrap();
+        assert_eq!(
+            remove_file_surface_link(&surface, &mount).unwrap(),
+            SurfaceLinkRemoval::Preserved
+        );
+        assert_eq!(
+            std::fs::read_link(&surface.path).unwrap(),
+            PathBuf::from("/fixture/owned-elsewhere")
+        );
     }
 }
