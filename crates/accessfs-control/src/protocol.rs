@@ -2,7 +2,7 @@ use std::io::{self, Read, Write};
 
 use accessfs_catalog::{
     Binding, CatalogError, CatalogSnapshot, Environment, Project, ResolvedEnvironment, Resource,
-    ResourceUsage, Surface,
+    ResourceCodec, ResourceUsage, Surface,
 };
 use accessfs_store::StoreError;
 use serde::de::DeserializeOwned;
@@ -62,7 +62,12 @@ pub enum ControlCommand {
         value: SecretValue,
     },
     SharedSecretRotate { resource_id: String, value: SecretValue },
-    EnvFileCreate { resource_id: String, name: String, value: SecretValue },
+    EnvFileCreate {
+        resource_id: String,
+        name: String,
+        codec: ResourceCodec,
+        value: SecretValue,
+    },
     ProjectCreate { project: Project, environment: Environment, surface: Surface },
     ProjectUpsert { project: Project },
     ProjectRemove { id: String },
@@ -194,6 +199,24 @@ mod tests {
         let value = serde_json::to_value(response).unwrap();
         assert_eq!(value["status"], "error");
         assert_eq!(value["error"]["code"], "conflict");
+    }
+
+    #[test]
+    fn env_file_create_carries_the_explicit_codec() {
+        let request = ControlRequest {
+            request_id: 8,
+            command: ControlCommand::EnvFileCreate {
+                resource_id: "fixture-ini".to_string(),
+                name: "Fixture INI".to_string(),
+                codec: ResourceCodec::Ini,
+                value: SecretValue::new("[fixture]\nREGION=fixture-region\n"),
+            },
+        };
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["method"], "env_file_create");
+        assert_eq!(value["params"]["codec"], "ini");
+        assert_eq!(value["params"]["resource_id"], "fixture-ini");
     }
 
     #[test]

@@ -497,6 +497,7 @@ mod tests {
     const ENV_FILE_ID: &str = "00000000-0000-0000-0000-000000000002";
     const LINE_ONE_ID: &str = "00000000-0000-0000-0000-000000000003";
     const LINE_TWO_ID: &str = "00000000-0000-0000-0000-000000000004";
+    const INI_FILE_ID: &str = "00000000-0000-0000-0000-000000000005";
 
     struct FixtureStore {
         entries: Mutex<HashMap<String, (u32, Vec<Vec<u8>>)>>,
@@ -522,6 +523,13 @@ mod tests {
                     (
                         LINE_TWO_ID.to_string(),
                         (1, vec![b"db-two.fixture.invalid|5432|app|fixture-user|fixture-pass-two".to_vec()]),
+                    ),
+                    (
+                        INI_FILE_ID.to_string(),
+                        (
+                            1,
+                            vec![b"[fixture-development]\nREGION=fixture-region-one\nOUTPUT=fixture-json\n[fixture-staging]\nREGION=fixture-region-two\nOUTPUT=fixture-text\n".to_vec()],
+                        ),
                     ),
                 ])),
                 requested_versions: Mutex::new(Vec::new()),
@@ -793,6 +801,91 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, SurfaceError::ResourceEntriesChanged { .. }));
         assert_eq!(resolver.read_direct_env_file("fixture-direct-env").unwrap().version, 2);
+    }
+
+    #[test]
+    fn selected_ini_section_entries_feed_dotenv_without_exposing_other_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = fixture_catalog(&dir.path().join("catalog.sqlite"));
+        add_resource(
+            &catalog,
+            Resource {
+                id: "fixture-ini-file".to_string(),
+                name: "Fixture INI File".to_string(),
+                kind: ResourceKind::EnvFile,
+                shape: ValueShape::KeyValueSet,
+                codec: ResourceCodec::Ini,
+                default_env_key: None,
+                entries: vec![
+                    EntrySpec {
+                        address: "sections/fixture-development/keys/REGION".to_string(),
+                        label: "[fixture-development] REGION".to_string(),
+                        key: Some("REGION".to_string()),
+                        sensitive: true,
+                    },
+                    EntrySpec {
+                        address: "sections/fixture-development/keys/OUTPUT".to_string(),
+                        label: "[fixture-development] OUTPUT".to_string(),
+                        key: Some("OUTPUT".to_string()),
+                        sensitive: true,
+                    },
+                    EntrySpec {
+                        address: "sections/fixture-staging/keys/REGION".to_string(),
+                        label: "[fixture-staging] REGION".to_string(),
+                        key: Some("REGION".to_string()),
+                        sensitive: true,
+                    },
+                    EntrySpec {
+                        address: "sections/fixture-staging/keys/OUTPUT".to_string(),
+                        label: "[fixture-staging] OUTPUT".to_string(),
+                        key: Some("OUTPUT".to_string()),
+                        sensitive: true,
+                    },
+                ],
+                source: ResourceSource::SecretRef { secret_id: INI_FILE_ID.to_string() },
+                detail: None,
+            },
+        );
+        catalog
+            .upsert_binding(&Binding {
+                id: "fixture-ini-binding".to_string(),
+                project_id: "fixture-project".to_string(),
+                scope: BindingScope::Environment {
+                    environment_id: "fixture-development".to_string(),
+                },
+                resource_id: "fixture-ini-file".to_string(),
+                selection: EntrySelection::Entries {
+                    addresses: vec![
+                        "sections/fixture-staging/keys/REGION".to_string(),
+                        "sections/fixture-staging/keys/OUTPUT".to_string(),
+                    ],
+                },
+                key_override: None,
+                enabled: true,
+                allow_override: false,
+                position: 3,
+            })
+            .unwrap();
+        catalog
+            .upsert_surface(&Surface {
+                id: "fixture-ini-dotenv".to_string(),
+                environment_id: "fixture-development".to_string(),
+                name: ".env.staging-profile".to_string(),
+                kind: SurfaceKind::DotenvFile,
+                path: PathBuf::from("/fixture/project/.env.staging-profile"),
+                input: SurfaceInput::Bindings {
+                    binding_ids: vec!["fixture-ini-binding".to_string()],
+                },
+                position: 2,
+            })
+            .unwrap();
+
+        let store = Arc::new(FixtureStore::new());
+        let resolver = SurfaceResolver::new(catalog, Arc::clone(&store) as Arc<dyn SecretStore>);
+        let snapshot = resolver.render_dotenv_surface("fixture-ini-dotenv").unwrap();
+
+        assert_eq!(snapshot.bytes, b"REGION=fixture-region-two\nOUTPUT=fixture-text\n");
+        assert!(!std::str::from_utf8(&snapshot.bytes).unwrap().contains("fixture-region-one"));
     }
 
     #[test]

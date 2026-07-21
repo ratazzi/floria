@@ -7,6 +7,7 @@ use zeroize::Zeroizing;
 
 use crate::dotenv::parse_dotenv;
 use crate::error::{SurfaceError, SurfaceResult};
+use crate::ini::parse_ini;
 use crate::lines::render_lines_refs;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +20,7 @@ pub struct CodecCapabilities {
 #[derive(Debug)]
 pub struct DecodedEntry {
     pub address: String,
+    pub section: Option<String>,
     pub key: Option<String>,
     pub value: Zeroizing<String>,
 }
@@ -46,6 +48,7 @@ impl Codec for OpaqueCodec {
             .map_err(|_| SurfaceError::InvalidUtf8 { resource_id: resource_id.to_string() })?;
         Ok(vec![DecodedEntry {
             address: "value".to_string(),
+            section: None,
             key: None,
             value: Zeroizing::new(value.to_string()),
         }])
@@ -74,6 +77,38 @@ impl Codec for DotenvCodec {
                 .into_iter()
                 .map(|entry| DecodedEntry {
                     address: format!("keys/{}", entry.key),
+                    section: None,
+                    key: Some(entry.key),
+                    value: entry.value,
+                })
+                .collect()
+        })
+    }
+}
+
+struct IniCodec;
+
+impl Codec for IniCodec {
+    fn capabilities(&self) -> CodecCapabilities {
+        CodecCapabilities {
+            raw_writeback: false,
+            preserves_entry_order: true,
+            hierarchical_addresses: true,
+        }
+    }
+
+    fn decode(&self, resource_id: &str, bytes: &[u8]) -> SurfaceResult<Vec<DecodedEntry>> {
+        if bytes.len() > crate::ini::INI_MAX_SIZE {
+            return Err(SurfaceError::TooLarge { limit: crate::ini::INI_MAX_SIZE });
+        }
+        let text = std::str::from_utf8(bytes)
+            .map_err(|_| SurfaceError::InvalidUtf8 { resource_id: resource_id.to_string() })?;
+        parse_ini(text).map(|entries| {
+            entries
+                .into_iter()
+                .map(|entry| DecodedEntry {
+                    address: entry.address,
+                    section: entry.section,
                     key: Some(entry.key),
                     value: entry.value,
                 })
@@ -84,11 +119,13 @@ impl Codec for DotenvCodec {
 
 static OPAQUE_CODEC: OpaqueCodec = OpaqueCodec;
 static DOTENV_CODEC: DotenvCodec = DotenvCodec;
+static INI_CODEC: IniCodec = IniCodec;
 
 fn adapter(codec: ResourceCodec) -> &'static dyn Codec {
     match codec {
         ResourceCodec::Opaque => &OPAQUE_CODEC,
         ResourceCodec::Dotenv => &DOTENV_CODEC,
+        ResourceCodec::Ini => &INI_CODEC,
     }
 }
 

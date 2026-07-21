@@ -62,6 +62,7 @@ final class ControlProtocolTests: XCTestCase {
         encoder.keyEncodingStrategy = .convertToSnakeCase
         let data = try ControlCommand.envFileCreate(
             resourceID: "fixture-env-file", name: "Fixture Env File",
+            codec: "dotenv",
             value: "API_HOST=http://127.0.0.1:8787\nLOG_LEVEL=debug\n"
         ).requestData(requestID: 12, encoder: encoder)
         let value = try XCTUnwrap(
@@ -71,6 +72,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(value["method"] as? String, "env_file_create")
         XCTAssertEqual(params["resource_id"] as? String, "fixture-env-file")
         XCTAssertEqual(params["name"] as? String, "Fixture Env File")
+        XCTAssertEqual(params["codec"] as? String, "dotenv")
         XCTAssertEqual(
             params["value"] as? String,
             "API_HOST=http://127.0.0.1:8787\nLOG_LEVEL=debug\n")

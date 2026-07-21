@@ -3,6 +3,7 @@
 mod codec;
 mod dotenv;
 mod error;
+mod ini;
 mod links;
 mod lines;
 mod registry;
@@ -14,6 +15,7 @@ pub use codec::{
 };
 pub use dotenv::{parse_dotenv, render_dotenv, ParsedDotenvEntry, DOTENV_MAX_SIZE};
 pub use error::{SurfaceError, SurfaceResult};
+pub use ini::{parse_ini, ParsedIniEntry, INI_MAX_SIZE};
 pub use links::{
     ensure_file_surface_link, remove_file_surface_link, SurfaceLinkRemoval, SurfaceLinkState,
 };

@@ -90,6 +90,7 @@ impl ValueShape {
 pub enum ResourceCodec {
     Opaque,
     Dotenv,
+    Ini,
 }
 
 impl ResourceCodec {
@@ -97,6 +98,7 @@ impl ResourceCodec {
         match self {
             ResourceCodec::Opaque => "opaque",
             ResourceCodec::Dotenv => "dotenv",
+            ResourceCodec::Ini => "ini",
         }
     }
 
@@ -104,6 +106,7 @@ impl ResourceCodec {
         match value {
             "opaque" => Some(ResourceCodec::Opaque),
             "dotenv" => Some(ResourceCodec::Dotenv),
+            "ini" => Some(ResourceCodec::Ini),
             _ => None,
         }
     }

@@ -27,6 +27,9 @@ pub enum SurfaceError {
     #[error("dotenv parse error on line {line}: {reason}")]
     DotenvParse { line: usize, reason: String },
 
+    #[error("INI parse error on line {line}: {reason}")]
+    IniParse { line: usize, reason: String },
+
     #[error("resolved resource {resource_id:?} is missing key {key:?}")]
     MissingKey { resource_id: String, key: String },
 

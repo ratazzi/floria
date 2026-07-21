@@ -42,6 +42,7 @@ enum WorkspaceValueShape: String, Sendable {
 enum WorkspaceResourceCodec: String, Sendable {
     case opaque
     case dotenv
+    case ini
 }
 
 struct WorkspaceExport: Identifiable, Hashable, Sendable {
@@ -396,16 +397,22 @@ final class WorkspaceStore {
         let entries = resource.entries.filter { selected.contains($0.address) }
         switch kind {
         case .dotenvFile:
-            guard resource.codec == (resource.shape == .keyValueSet ? .dotenv : .opaque)
-            else { return false }
             if resource.shape == .scalar {
+                guard resource.codec == .opaque else { return false }
                 guard resource.kind == .sharedSecret || resource.kind == .secret
                     || resource.kind == .literal
                 else { return false }
-                return entries.allSatisfy { (binding.keyOverride ?? $0.key) != nil }
+                return entries.allSatisfy { entry in
+                    guard let key = binding.keyOverride ?? entry.key else { return false }
+                    return Self.isValidEnvKey(key)
+                }
             }
+            guard resource.codec == .dotenv || resource.codec == .ini else { return false }
             return resource.kind == .envFile && resource.shape == .keyValueSet
-                && entries.allSatisfy { $0.key != nil }
+                && entries.allSatisfy { entry in
+                    guard let key = entry.key else { return false }
+                    return Self.isValidEnvKey(key)
+                }
         case .linesFile:
             return resource.shape == .scalar && resource.codec == .opaque
                 && (resource.kind == .sharedSecret || resource.kind == .secret
@@ -518,18 +525,24 @@ final class WorkspaceStore {
     }
 
     @discardableResult
-    func createEnvFile(name: String, value: String) async throws -> WorkspaceResource.ID {
+    func createEnvFile(
+        name: String, codec: WorkspaceResourceCodec, value: String
+    ) async throws -> WorkspaceResource.ID {
         guard let controlClient else {
             throw WorkspaceStoreError.controlUnavailable
         }
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { throw WorkspaceStoreError.invalid("Env file name is required") }
         guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            throw WorkspaceStoreError.invalid("Enter at least one KEY=VALUE line")
+            throw WorkspaceStoreError.invalid("Enter at least one file entry")
+        }
+        guard codec == .dotenv || codec == .ini else {
+            throw WorkspaceStoreError.invalid("Choose dotenv or INI format")
         }
 
         let resourceID = Self.newID("env-file")
-        try await controlClient.createEnvFile(resourceID: resourceID, name: name, value: value)
+        try await controlClient.createEnvFile(
+            resourceID: resourceID, name: name, codec: codec, value: value)
         apply(try await controlClient.snapshot())
         lastError = nil
         return resourceID
@@ -980,7 +993,7 @@ final class WorkspaceStore {
         "\(prefix)-\(UUID().uuidString.lowercased())"
     }
 
-    private static func isValidEnvKey(_ key: String) -> Bool {
+    static func isValidEnvKey(_ key: String) -> Bool {
         key.range(of: "^[A-Z_][A-Z0-9_]*$", options: .regularExpression) != nil
     }
 }

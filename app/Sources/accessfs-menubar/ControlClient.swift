@@ -28,9 +28,11 @@ final class ControlClient: @unchecked Sendable {
             expecting: "shared_secret_created", as: SharedSecretCreated.self)
     }
 
-    func createEnvFile(resourceID: String, name: String, value: String) async throws {
+    func createEnvFile(
+        resourceID: String, name: String, codec: WorkspaceResourceCodec, value: String
+    ) async throws {
         let _: EnvFileCreated? = try await request(
-            .envFileCreate(resourceID: resourceID, name: name, value: value),
+            .envFileCreate(resourceID: resourceID, name: name, codec: codec.rawValue, value: value),
             expecting: "env_file_created", as: EnvFileCreated.self)
     }
 

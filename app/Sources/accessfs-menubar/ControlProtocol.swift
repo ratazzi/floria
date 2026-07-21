@@ -148,7 +148,7 @@ struct CatalogSnapshot: Codable, Sendable {
 enum ControlCommand: Sendable {
     case snapshot
     case sharedSecretCreate(resourceID: String, name: String, defaultEnvKey: String?, value: String)
-    case envFileCreate(resourceID: String, name: String, value: String)
+    case envFileCreate(resourceID: String, name: String, codec: String, value: String)
     case projectCreate(CatalogProject, CatalogEnvironment, CatalogSurface)
     case projectUpsert(CatalogProject)
     case projectRemove(String)
@@ -187,12 +187,12 @@ enum ControlCommand: Sendable {
                     params: SharedSecretCreateParams(
                         resourceID: resourceID, name: name, defaultEnvKey: defaultEnvKey,
                         value: value)))
-        case .envFileCreate(let resourceID, let name, let value):
+        case .envFileCreate(let resourceID, let name, let codec, let value):
             return try encoder.encode(
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: EnvFileCreateParams(
-                        resourceID: resourceID, name: name, value: value)))
+                        resourceID: resourceID, name: name, codec: codec, value: value)))
         case .projectCreate(let project, let environment, let surface):
             return try encoder.encode(
                 ControlRequest(
@@ -249,6 +249,7 @@ private struct SharedSecretCreateParams: Encodable {
 private struct EnvFileCreateParams: Encodable {
     let resourceID: String
     let name: String
+    let codec: String
     let value: String
 }
 

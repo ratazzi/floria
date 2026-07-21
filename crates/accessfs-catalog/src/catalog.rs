@@ -950,7 +950,7 @@ fn validate_composed_surface_member(
                     ResourceSource::SecretRef { .. } | ResourceSource::Literal { .. }
                 ) | (
                     ValueShape::KeyValueSet,
-                    ResourceCodec::Dotenv,
+                    ResourceCodec::Dotenv | ResourceCodec::Ini,
                     ResourceSource::SecretRef { .. }
                 )
             );
@@ -959,6 +959,11 @@ fn validate_composed_surface_member(
                     resource.shape != ValueShape::Scalar && entry.key.is_none()
                         || resource.shape == ValueShape::Scalar
                             && binding.key_override.as_ref().or(entry.key.as_ref()).is_none()
+                        || binding
+                            .key_override
+                            .as_ref()
+                            .or(entry.key.as_ref())
+                            .is_some_and(|key| require_env_key(key).is_err())
                 })
             {
                 return Err(CatalogError::Validation(format!(
@@ -1011,7 +1016,11 @@ fn validate_resource(resource: &Resource) -> CatalogResult<()> {
         require_entry_address(&entry.address)?;
         require_name(&entry.label, "resource entry label")?;
         if let Some(key) = &entry.key {
-            require_env_key(key)?;
+            if resource.codec == ResourceCodec::Ini {
+                require_name(key, "INI entry key")?;
+            } else {
+                require_env_key(key)?;
+            }
         }
         if !addresses.insert(&entry.address) {
             return Err(CatalogError::Validation(format!(
@@ -1055,7 +1064,10 @@ fn validate_resource(resource: &Resource) -> CatalogResult<()> {
             ValueShape::Scalar | ValueShape::Bytes | ValueShape::Socket,
             ResourceCodec::Opaque,
         )
-        | (ValueShape::KeyValueSet, ResourceCodec::Dotenv) => {}
+        | (
+            ValueShape::KeyValueSet,
+            ResourceCodec::Dotenv | ResourceCodec::Ini,
+        ) => {}
         _ => {
             return Err(CatalogError::Validation(format!(
                 "resource shape {:?} is incompatible with codec {:?}",
@@ -1459,6 +1471,51 @@ mod tests {
         assert_eq!(resolved.exports.len(), 1);
         assert_eq!(resolved.exports[0].key, "LOG_LEVEL");
         assert_eq!(resolved.exports[0].source_key, "keys/LOG_LEVEL");
+    }
+
+    #[test]
+    fn ini_keys_are_generic_until_selected_for_a_dotenv_projection() {
+        let (_dir, catalog) = catalog();
+        let resource = Resource {
+            id: "fixture-ini".to_string(),
+            name: "Fixture INI".to_string(),
+            kind: ResourceKind::EnvFile,
+            shape: ValueShape::KeyValueSet,
+            codec: ResourceCodec::Ini,
+            default_env_key: None,
+            entries: vec![EntrySpec {
+                address: "sections/fixture/keys/credential-process".to_string(),
+                label: "[fixture] credential-process".to_string(),
+                key: Some("credential-process".to_string()),
+                sensitive: true,
+            }],
+            source: ResourceSource::SecretRef { secret_id: "fixture-ini-secret".to_string() },
+            detail: None,
+        };
+        catalog.upsert_resource(&resource).unwrap();
+        catalog
+            .upsert_binding(&binding(
+                "fixture-ini-binding",
+                &resource.id,
+                BindingScope::Environment { environment_id: "development".to_string() },
+            ))
+            .unwrap();
+
+        let error = catalog
+            .upsert_surface(&Surface {
+                id: "fixture-dotenv".to_string(),
+                environment_id: "development".to_string(),
+                name: ".env".to_string(),
+                kind: SurfaceKind::DotenvFile,
+                path: PathBuf::from("/workspace/floria/.env"),
+                input: SurfaceInput::Bindings {
+                    binding_ids: vec!["fixture-ini-binding".to_string()],
+                },
+                position: 0,
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, CatalogError::Validation(message) if message.contains("cannot feed dotenv")));
     }
 
     #[test]

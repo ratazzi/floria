@@ -10,7 +10,7 @@ use accessfs_catalog::{
     ResourceSource, ValueShape,
 };
 use accessfs_store::{NewSecret, SecretId, SecretStore, StoreError};
-use accessfs_surface::{decode_source, validate_secret_bytes, DOTENV_MAX_SIZE};
+use accessfs_surface::{decode_source, validate_secret_bytes};
 
 use crate::protocol::{
     read_msg, write_msg, ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest,
@@ -241,11 +241,12 @@ fn dispatch(
             resource_id,
             value,
         ),
-        ControlCommand::EnvFileCreate { resource_id, name, value } => create_env_file(
+        ControlCommand::EnvFileCreate { resource_id, name, codec, value } => create_env_file(
             catalog,
             store.ok_or(DispatchError::StoreUnavailable)?,
             resource_id,
             name,
+            codec,
             value,
         ),
         ControlCommand::ProjectCreate { project, environment, surface } => {
@@ -489,18 +490,19 @@ fn create_env_file(
     store: &dyn SecretStore,
     resource_id: String,
     name: String,
+    codec: ResourceCodec,
     value: crate::protocol::SecretValue,
 ) -> Result<ControlResult, DispatchError> {
-    if value.as_bytes().len() > DOTENV_MAX_SIZE {
+    if !matches!(codec, ResourceCodec::Dotenv | ResourceCodec::Ini) {
         return Err(DispatchError::Validation(format!(
-            "env file exceeds {DOTENV_MAX_SIZE} bytes"
+            "env file codec {codec:?} is not supported"
         )));
     }
-    let values = decode_source(ResourceCodec::Dotenv, &resource_id, value.as_bytes())
+    let values = decode_source(codec, &resource_id, value.as_bytes())
         .map_err(|error| DispatchError::Validation(error.to_string()))?;
     if values.is_empty() {
         return Err(DispatchError::Validation(
-            "env file must contain at least one KEY=VALUE entry".to_string(),
+            "env file must contain at least one entry".to_string(),
         ));
     }
     let mut resource = Resource {
@@ -508,13 +510,17 @@ fn create_env_file(
         name,
         kind: ResourceKind::EnvFile,
         shape: ValueShape::KeyValueSet,
-        codec: ResourceCodec::Dotenv,
+        codec,
         default_env_key: None,
         entries: values
             .into_iter()
             .map(|entry| EntrySpec {
                 address: entry.address,
-                label: entry.key.clone().unwrap_or_else(|| "Value".to_string()),
+                label: match (&entry.section, &entry.key) {
+                    (Some(section), Some(key)) => format!("[{section}] {key}"),
+                    (_, Some(key)) => key.clone(),
+                    _ => "Value".to_string(),
+                },
                 key: entry.key,
                 sensitive: true,
             })
@@ -591,6 +597,7 @@ mod tests {
                         label.as_str(),
                         "Fixture Shared Secret"
                             | "Fixture Env File"
+                            | "Fixture INI File"
                     )
             ));
             let id: SecretId = FIXTURE_SECRET_ID.parse().unwrap();
@@ -943,6 +950,7 @@ mod tests {
             .request(ControlCommand::EnvFileCreate {
                 resource_id: "fixture-env-file".to_string(),
                 name: "Fixture Env File".to_string(),
+                codec: ResourceCodec::Dotenv,
                 value: crate::protocol::SecretValue::new(
                     "API_HOST=http://127.0.0.1:8787\nLOG_LEVEL=debug\n",
                 ),
@@ -953,6 +961,7 @@ mod tests {
         };
         assert_eq!(version, 1);
         assert_eq!(resource.kind, ResourceKind::EnvFile);
+        assert_eq!(resource.codec, ResourceCodec::Dotenv);
         assert_eq!(
             resource.entries.iter().filter_map(|entry| entry.key.as_deref()).collect::<Vec<_>>(),
             vec!["API_HOST", "LOG_LEVEL"]
@@ -968,6 +977,55 @@ mod tests {
         let encoded = serde_json::to_string(&catalog.snapshot().unwrap()).unwrap();
         assert!(!encoded.contains("127.0.0.1"));
         assert!(!encoded.contains("LOG_LEVEL=debug"));
+    }
+
+    #[test]
+    fn ini_env_file_create_exposes_ordered_section_entries_without_storing_values_in_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let socket = dir.path().join("control.sock");
+        let store = Arc::new(FixtureStore::new());
+        let observer: Arc<dyn CatalogObserver> = Arc::new(SnapshotObserver {
+            notifications: AtomicUsize::new(0),
+            latest: Mutex::new(None),
+        });
+        let _server = ControlServer::start_runtime(
+            &socket,
+            catalog.clone(),
+            Arc::clone(&store) as Arc<dyn SecretStore>,
+            observer,
+        )
+        .unwrap();
+        let mut client = ControlClient::connect(&socket).unwrap();
+
+        let created = client
+            .request(ControlCommand::EnvFileCreate {
+                resource_id: "fixture-ini-file".to_string(),
+                name: "Fixture INI File".to_string(),
+                codec: ResourceCodec::Ini,
+                value: crate::protocol::SecretValue::new(
+                    "[fixture-one]\nregion=fixture-region\noutput=fixture-output\n[fixture-two]\nregion=fixture-region-two\n",
+                ),
+            })
+            .unwrap();
+        let ControlResult::EnvFileCreated { resource, version } = created else {
+            panic!("expected env file creation result");
+        };
+
+        assert_eq!(version, 1);
+        assert_eq!(resource.codec, ResourceCodec::Ini);
+        assert_eq!(
+            resource.entries.iter().map(|entry| entry.address.as_str()).collect::<Vec<_>>(),
+            vec![
+                "sections/fixture-one/keys/region",
+                "sections/fixture-one/keys/output",
+                "sections/fixture-two/keys/region",
+            ]
+        );
+        assert_eq!(resource.entries[0].label, "[fixture-one] region");
+        let encoded = serde_json::to_string(&catalog.snapshot().unwrap()).unwrap();
+        assert!(!encoded.contains("fixture-region-two"));
+        assert!(!encoded.contains("fixture-output"));
     }
 
 }

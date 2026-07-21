@@ -1348,6 +1348,13 @@ private struct ResourceCatalogView: View {
 }
 
 private struct AddBindingSheet: View {
+    private struct IniEntryGroup: Identifiable {
+        let id: String
+        let sectionID: String
+        let label: String
+        var entries: [WorkspaceEntry]
+    }
+
     @Bindable var store: WorkspaceStore
     @Environment(\.dismiss) private var dismiss
     @State private var search = ""
@@ -1454,18 +1461,65 @@ private struct AddBindingSheet: View {
 
                     if resource.entries.count > 1 {
                         VStack(alignment: .leading, spacing: 6) {
-                            Text("Include entries in source order")
+                            Text(
+                                resource.codec == .ini
+                                    ? "Include sections or entries in source order"
+                                    : "Include entries in source order"
+                            )
                                 .font(.caption.weight(.semibold))
                                 .foregroundStyle(.secondary)
-                            ForEach(resource.entries) { entry in
-                                Toggle(
-                                    entry.label,
-                                    isOn: Binding(
-                                        get: { selectedAddressSet(for: resource).contains(entry.address) },
-                                        set: { setEntry(entry.address, selected: $0, in: resource) })
-                                )
-                                .toggleStyle(.checkbox)
-                                .font(.callout)
+                            if resource.codec == .ini {
+                                ForEach(iniEntryGroups(for: resource)) { group in
+                                    Toggle(
+                                        group.label,
+                                        isOn: Binding(
+                                            get: {
+                                                let selected = selectedAddressSet(for: resource)
+                                                return group.entries.allSatisfy {
+                                                    selected.contains($0.address)
+                                                }
+                                            },
+                                            set: {
+                                                setEntries(
+                                                    group.entries, selected: $0, in: resource)
+                                            })
+                                    )
+                                    .toggleStyle(.checkbox)
+                                    .font(.callout.weight(.semibold))
+                                    ForEach(group.entries) { entry in
+                                        Toggle(
+                                            entry.key ?? entry.label,
+                                            isOn: Binding(
+                                                get: {
+                                                    selectedAddressSet(for: resource)
+                                                        .contains(entry.address)
+                                                },
+                                                set: {
+                                                    setEntry(
+                                                        entry.address, selected: $0, in: resource)
+                                                })
+                                        )
+                                        .toggleStyle(.checkbox)
+                                        .font(.callout)
+                                        .padding(.leading, 18)
+                                    }
+                                }
+                            } else {
+                                ForEach(resource.entries) { entry in
+                                    Toggle(
+                                        entry.label,
+                                        isOn: Binding(
+                                            get: {
+                                                selectedAddressSet(for: resource)
+                                                    .contains(entry.address)
+                                            },
+                                            set: {
+                                                setEntry(entry.address, selected: $0, in: resource)
+                                            })
+                                    )
+                                    .toggleStyle(.checkbox)
+                                    .font(.callout)
+                                }
                             }
                         }
                         .padding(.leading, 46)
@@ -1536,6 +1590,50 @@ private struct AddBindingSheet: View {
         var addresses = selectedAddressSet(for: resource)
         if selected { addresses.insert(address) } else { addresses.remove(address) }
         selectedEntries[resource.id] = addresses
+    }
+
+    private func setEntries(
+        _ entries: [WorkspaceEntry], selected: Bool, in resource: WorkspaceResource
+    ) {
+        var addresses = selectedAddressSet(for: resource)
+        for entry in entries {
+            if selected { addresses.insert(entry.address) } else { addresses.remove(entry.address) }
+        }
+        selectedEntries[resource.id] = addresses
+    }
+
+    private func iniEntryGroups(for resource: WorkspaceResource) -> [IniEntryGroup] {
+        var groups: [IniEntryGroup] = []
+        for entry in resource.entries {
+            let identity = iniSectionIdentity(for: entry.address)
+            if let index = groups.indices.last, groups[index].sectionID == identity.id {
+                groups[index].entries.append(entry)
+            } else {
+                groups.append(
+                    IniEntryGroup(
+                        id: "\(identity.id)#\(groups.count)", sectionID: identity.id,
+                        label: identity.label, entries: [entry]))
+            }
+        }
+        return groups
+    }
+
+    private func iniSectionIdentity(for address: String) -> (id: String, label: String) {
+        if address.hasPrefix("root/keys/") {
+            return ("root", "Root")
+        }
+        let prefix = "sections/"
+        guard address.hasPrefix(prefix) else {
+            return (address, "Other")
+        }
+        let contentStart = address.index(address.startIndex, offsetBy: prefix.count)
+        guard let keys = address.range(of: "/keys/", range: contentStart..<address.endIndex) else {
+            return (address, "Other")
+        }
+        let encoded = String(address[contentStart..<keys.lowerBound])
+        let decoded = encoded.replacingOccurrences(of: "~1", with: "/")
+            .replacingOccurrences(of: "~0", with: "~")
+        return (String(address[..<keys.lowerBound]), decoded)
     }
 }
 
@@ -1729,6 +1827,7 @@ private struct NewEnvFileSheet: View {
 
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
+    @State private var codec = WorkspaceResourceCodec.dotenv
     @State private var value = ""
     @State private var isSaving = false
     @State private var errorMessage: String?
@@ -1738,7 +1837,7 @@ private struct NewEnvFileSheet: View {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("New Env File").font(.title2.bold())
-                    Text("Store one dotenv document, then bind it or expose it as an editable file.")
+                    Text("Store one structured document, then select entries for project outputs.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
@@ -1752,8 +1851,15 @@ private struct NewEnvFileSheet: View {
                     .textFieldStyle(.roundedBorder)
             }
 
+            Picker("Format", selection: $codec) {
+                Text("Dotenv").tag(WorkspaceResourceCodec.dotenv)
+                Text("INI").tag(WorkspaceResourceCodec.ini)
+            }
+            .pickerStyle(.segmented)
+
             VStack(alignment: .leading, spacing: 7) {
-                Text("Dotenv content").font(.callout.weight(.medium))
+                Text(codec == .ini ? "INI content" : "Dotenv content")
+                    .font(.callout.weight(.medium))
                 TextEditor(text: $value)
                     .font(.body.monospaced())
                     .scrollContentBackground(.hidden)
@@ -1766,7 +1872,11 @@ private struct NewEnvFileSheet: View {
                     }
                     .overlay(alignment: .topLeading) {
                         if value.isEmpty {
-                            Text("API_HOST=http://127.0.0.1:8787\nLOG_LEVEL=debug")
+                            Text(
+                                codec == .ini
+                                    ? "[development]\nREGION=fixture-region\nOUTPUT=json"
+                                    : "API_HOST=http://127.0.0.1:8787\nLOG_LEVEL=debug"
+                            )
                                 .font(.body.monospaced())
                                 .foregroundStyle(.tertiary)
                                 .padding(13)
@@ -1778,7 +1888,7 @@ private struct NewEnvFileSheet: View {
 
             HStack {
                 Image(systemName: "lock.fill")
-                Text("Values are encrypted in the store; only KEY metadata appears in the catalog.")
+                Text("Values are encrypted in the store; only section and key metadata appears in the catalog.")
             }
             .font(.caption)
             .foregroundStyle(.secondary)
@@ -1817,6 +1927,9 @@ private struct NewEnvFileSheet: View {
             do {
                 value = try String(contentsOf: url, encoding: .utf8)
                 if name.isEmpty { name = url.lastPathComponent }
+                if ["ini", "cfg", "conf"].contains(url.pathExtension.lowercased()) {
+                    codec = .ini
+                }
             } catch {
                 errorMessage = "Could not read \(url.path): \(error.localizedDescription)"
             }
@@ -1830,7 +1943,7 @@ private struct NewEnvFileSheet: View {
             let submittedValue = value
             value = ""
             do {
-                try await store.createEnvFile(name: name, value: submittedValue)
+                try await store.createEnvFile(name: name, codec: codec, value: submittedValue)
                 dismiss()
             } catch {
                 errorMessage = error.localizedDescription
