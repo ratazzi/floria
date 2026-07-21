@@ -8,6 +8,9 @@ mod resolver;
 
 pub use dotenv::{parse_dotenv, render_dotenv, DOTENV_MAX_SIZE};
 pub use error::{SurfaceError, SurfaceResult};
-pub use links::{ensure_dotenv_surface_link, SurfaceLinkState};
-pub use registry::SurfaceRegistry;
-pub use resolver::{DotenvSnapshot, FrozenResourceVersion, SurfaceResolver};
+pub use links::{ensure_file_surface_link, SurfaceLinkState};
+pub use registry::{RegisteredSurface, SurfaceBacking, SurfaceRegistry};
+pub use resolver::{
+    DirectEnvFileCommit, DirectEnvFileSnapshot, DotenvSnapshot, FrozenResourceVersion,
+    SurfaceResolver,
+};

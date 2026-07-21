@@ -365,24 +365,42 @@ impl Catalog {
                 project_path.display()
             )));
         }
+        if surface.kind == SurfaceKind::DotenvFile && surface.resource_id.is_some() {
+            return Err(CatalogError::Validation(
+                "dotenv_file surfaces compose bindings and cannot reference one resource"
+                    .to_string(),
+            ));
+        }
         if let Some(resource_id) = &surface.resource_id {
             require_exists(&conn, "resources", resource_id, "resource")?;
-            if surface.kind == SurfaceKind::UnixSocket {
-                let shape: String = conn.query_row(
-                    "SELECT shape FROM resources WHERE id = ?1",
+            if matches!(surface.kind, SurfaceKind::UnixSocket | SurfaceKind::EnvFileDirect) {
+                let (kind, shape): (String, String) = conn.query_row(
+                    "SELECT kind, shape FROM resources WHERE id = ?1",
                     [resource_id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )?;
-                if shape != ValueShape::Socket.as_str() {
-                    return Err(CatalogError::Validation(
-                        "unix_socket surfaces require a socket resource".to_string(),
-                    ));
+                match surface.kind {
+                    SurfaceKind::UnixSocket if shape != ValueShape::Socket.as_str() => {
+                        return Err(CatalogError::Validation(
+                            "unix_socket surfaces require a socket resource".to_string(),
+                        ));
+                    }
+                    SurfaceKind::EnvFileDirect
+                        if kind != ResourceKind::EnvFile.as_str()
+                            || shape != ValueShape::KeyValueSet.as_str() =>
+                    {
+                        return Err(CatalogError::Validation(
+                            "env_file_direct surfaces require an env_file resource".to_string(),
+                        ));
+                    }
+                    _ => {}
                 }
             }
-        } else if surface.kind == SurfaceKind::UnixSocket {
-            return Err(CatalogError::Validation(
-                "unix_socket surfaces require resource_id".to_string(),
-            ));
+        } else if matches!(surface.kind, SurfaceKind::UnixSocket | SurfaceKind::EnvFileDirect) {
+            return Err(CatalogError::Validation(format!(
+                "{} surfaces require resource_id",
+                surface.kind.as_str()
+            )));
         }
 
         conn.execute(
@@ -722,6 +740,7 @@ fn resolve_exports(
 }
 
 fn validate_snapshot_conflicts(snapshot: &CatalogSnapshot) -> CatalogResult<()> {
+    validate_surface_resource_links(snapshot)?;
     for project in &snapshot.projects {
         let environments: Vec<&Environment> = snapshot
             .environments
@@ -734,6 +753,63 @@ fn validate_snapshot_conflicts(snapshot: &CatalogSnapshot) -> CatalogResult<()> 
             for environment in environments {
                 resolve_catalog_snapshot(snapshot, &project.id, &environment.id)?;
             }
+        }
+    }
+    Ok(())
+}
+
+fn validate_surface_resource_links(snapshot: &CatalogSnapshot) -> CatalogResult<()> {
+    let resources: HashMap<&str, &Resource> = snapshot
+        .resources
+        .iter()
+        .map(|resource| (resource.id.as_str(), resource))
+        .collect();
+    for surface in &snapshot.surfaces {
+        match surface.kind {
+            SurfaceKind::DotenvFile if surface.resource_id.is_some() => {
+                return Err(CatalogError::Validation(format!(
+                    "dotenv_file surface {:?} cannot reference one resource",
+                    surface.id
+                )));
+            }
+            SurfaceKind::EnvFileDirect => {
+                let resource_id = surface.resource_id.as_deref().ok_or_else(|| {
+                    CatalogError::Validation(format!(
+                        "env_file_direct surface {:?} requires resource_id",
+                        surface.id
+                    ))
+                })?;
+                let resource = resources.get(resource_id).ok_or_else(|| {
+                    CatalogError::NotFound(format!("resource {resource_id}"))
+                })?;
+                if resource.kind != ResourceKind::EnvFile
+                    || resource.shape != ValueShape::KeyValueSet
+                    || !matches!(resource.source, ResourceSource::SecretRef { .. })
+                {
+                    return Err(CatalogError::Validation(format!(
+                        "env_file_direct surface {:?} requires an env_file resource",
+                        surface.id
+                    )));
+                }
+            }
+            SurfaceKind::UnixSocket => {
+                let resource_id = surface.resource_id.as_deref().ok_or_else(|| {
+                    CatalogError::Validation(format!(
+                        "unix_socket surface {:?} requires resource_id",
+                        surface.id
+                    ))
+                })?;
+                let resource = resources.get(resource_id).ok_or_else(|| {
+                    CatalogError::NotFound(format!("resource {resource_id}"))
+                })?;
+                if resource.shape != ValueShape::Socket {
+                    return Err(CatalogError::Validation(format!(
+                        "unix_socket surface {:?} requires a socket resource",
+                        surface.id
+                    )));
+                }
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -1023,6 +1099,22 @@ mod tests {
         }
     }
 
+    fn env_file_resource(id: &str) -> Resource {
+        Resource {
+            id: id.to_string(),
+            name: id.to_string(),
+            kind: ResourceKind::EnvFile,
+            shape: ValueShape::KeyValueSet,
+            default_env_key: None,
+            exports: vec![
+                ExportSpec { key: "API_HOST".to_string(), sensitive: true },
+                ExportSpec { key: "LOG_LEVEL".to_string(), sensitive: true },
+            ],
+            source: ResourceSource::SecretRef { secret_id: format!("secret-{id}") },
+            detail: None,
+        }
+    }
+
     fn binding(id: &str, resource_id: &str, scope: BindingScope) -> Binding {
         Binding {
             id: id.to_string(),
@@ -1169,6 +1261,64 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(error, CatalogError::Validation(_)));
+    }
+
+    #[test]
+    fn direct_env_file_surface_requires_and_protects_its_env_file_resource() {
+        let (_dir, catalog) = catalog();
+        let resource = env_file_resource("fixture-env-file");
+        catalog.upsert_resource(&resource).unwrap();
+        catalog
+            .upsert_surface(&Surface {
+                id: "fixture-direct-env".to_string(),
+                environment_id: "development".to_string(),
+                name: ".env.local".to_string(),
+                kind: SurfaceKind::EnvFileDirect,
+                path: PathBuf::from("/workspace/floria/.env.local"),
+                resource_id: Some(resource.id.clone()),
+                position: 1,
+            })
+            .unwrap();
+
+        let usage = catalog.resource_usage(&resource.id).unwrap();
+        assert_eq!(usage.direct_surface_ids, vec!["fixture-direct-env"]);
+
+        let mut incompatible = resource.clone();
+        incompatible.kind = ResourceKind::Command;
+        incompatible.source = ResourceSource::Command { argv: vec!["fixture-command".to_string()] };
+        assert!(matches!(
+            catalog.upsert_resource(&incompatible),
+            Err(CatalogError::Validation(_))
+        ));
+        assert_eq!(catalog.resource(&resource.id).unwrap(), resource);
+    }
+
+    #[test]
+    fn direct_env_file_surface_rejects_missing_or_scalar_resource() {
+        let (_dir, catalog) = catalog();
+        let missing = Surface {
+            id: "fixture-direct-env".to_string(),
+            environment_id: "development".to_string(),
+            name: ".env.local".to_string(),
+            kind: SurfaceKind::EnvFileDirect,
+            path: PathBuf::from("/workspace/floria/.env.local"),
+            resource_id: None,
+            position: 1,
+        };
+        assert!(matches!(
+            catalog.upsert_surface(&missing),
+            Err(CatalogError::Validation(_))
+        ));
+
+        let scalar = scalar_resource("fixture-scalar", "FIXTURE_TOKEN");
+        catalog.upsert_resource(&scalar).unwrap();
+        assert!(matches!(
+            catalog.upsert_surface(&Surface {
+                resource_id: Some(scalar.id),
+                ..missing
+            }),
+            Err(CatalogError::Validation(_))
+        ));
     }
 
     #[test]

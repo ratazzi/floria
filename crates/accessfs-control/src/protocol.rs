@@ -58,6 +58,7 @@ pub enum ControlCommand {
         value: SecretValue,
     },
     SharedSecretRotate { resource_id: String, value: SecretValue },
+    EnvFileCreate { resource_id: String, name: String, value: SecretValue },
     ProjectCreate { project: Project, environment: Environment, surface: Surface },
     ProjectUpsert { project: Project },
     ProjectRemove { id: String },
@@ -94,6 +95,7 @@ pub enum ControlResult {
     ResourceUsage(ResourceUsage),
     SharedSecretCreated { resource: Resource, version: u32 },
     SharedSecretRotated { resource_id: String, version: u32 },
+    EnvFileCreated { resource: Resource, version: u32 },
     Empty,
 }
 

@@ -11,7 +11,7 @@ use accessfs_control::{
 use accessfs_core::config::{Config, ResolvedConfig};
 use accessfs_store::{AgeDirStore, NewSecret, SecretId, SecretRecord, SecretStore, SshKeyProvider};
 use accessfs_surface::{
-    ensure_dotenv_surface_link, SurfaceLinkState, SurfaceRegistry,
+    ensure_file_surface_link, SurfaceLinkState, SurfaceRegistry,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -329,7 +329,7 @@ fn cmd_mount(config: &Path) -> Result<()> {
         .with_context(|| format!("opening catalog at {}", catalog_path.display()))?;
     let snapshot = catalog.snapshot().context("loading initial surface registry")?;
     let surface_registry = Arc::new(SurfaceRegistry::from_snapshot(&snapshot));
-    reconcile_dotenv_links(&snapshot, &cfg.mount_path);
+    reconcile_file_links(&snapshot, &cfg.mount_path);
     let observer: Arc<dyn CatalogObserver> = Arc::new(RuntimeCatalogObserver {
         surface_registry: Arc::clone(&surface_registry),
         mount_path: cfg.mount_path.clone(),
@@ -362,17 +362,19 @@ struct RuntimeCatalogObserver {
 impl CatalogObserver for RuntimeCatalogObserver {
     fn catalog_changed(&self, snapshot: &CatalogSnapshot) {
         self.surface_registry.replace(snapshot);
-        reconcile_dotenv_links(snapshot, &self.mount_path);
+        reconcile_file_links(snapshot, &self.mount_path);
     }
 }
 
-fn reconcile_dotenv_links(snapshot: &CatalogSnapshot, mount_path: &Path) {
+fn reconcile_file_links(snapshot: &CatalogSnapshot, mount_path: &Path) {
     for surface in snapshot
         .surfaces
         .iter()
-        .filter(|surface| surface.kind == SurfaceKind::DotenvFile)
+        .filter(|surface| {
+            matches!(surface.kind, SurfaceKind::DotenvFile | SurfaceKind::EnvFileDirect)
+        })
     {
-        match ensure_dotenv_surface_link(surface, mount_path) {
+        match ensure_file_surface_link(surface, mount_path) {
             Ok(SurfaceLinkState::Created) => tracing::info!(
                 surface = %surface.id,
                 path = %surface.path.display(),
@@ -427,6 +429,9 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
         }
         ControlResult::SharedSecretRotated { resource_id, version } => {
             println!("rotated shared secret resource {resource_id} to version {version}");
+        }
+        ControlResult::EnvFileCreated { resource, version } => {
+            println!("created env file resource {} at version {version}", resource.id);
         }
         ControlResult::Empty => anyhow::bail!("daemon returned an empty control response"),
     }

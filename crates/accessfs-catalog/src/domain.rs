@@ -148,6 +148,7 @@ fn enabled_by_default() -> bool {
 #[serde(rename_all = "snake_case")]
 pub enum SurfaceKind {
     DotenvFile,
+    EnvFileDirect,
     RegularFile,
     UnixSocket,
 }
@@ -156,6 +157,7 @@ impl SurfaceKind {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             SurfaceKind::DotenvFile => "dotenv_file",
+            SurfaceKind::EnvFileDirect => "env_file_direct",
             SurfaceKind::RegularFile => "regular_file",
             SurfaceKind::UnixSocket => "unix_socket",
         }
@@ -164,6 +166,7 @@ impl SurfaceKind {
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "dotenv_file" => Some(SurfaceKind::DotenvFile),
+            "env_file_direct" => Some(SurfaceKind::EnvFileDirect),
             "regular_file" => Some(SurfaceKind::RegularFile),
             "unix_socket" => Some(SurfaceKind::UnixSocket),
             _ => None,

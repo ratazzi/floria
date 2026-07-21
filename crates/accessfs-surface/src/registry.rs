@@ -1,25 +1,37 @@
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 
-use accessfs_catalog::{CatalogSnapshot, Surface, SurfaceKind};
+use accessfs_catalog::{CatalogSnapshot, ResourceSource, Surface, SurfaceKind};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SurfaceBacking {
+    DotenvComposed,
+    EnvFileDirect { resource_id: String, secret_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredSurface {
+    pub surface: Surface,
+    pub backing: SurfaceBacking,
+}
 
 /// In-memory metadata used by fast FUSE callbacks. Control-plane mutations replace this view,
 /// so lookup/readdir/getattr never need to query SQLite or resolve secret values.
 pub struct SurfaceRegistry {
-    surfaces: RwLock<BTreeMap<String, Surface>>,
+    surfaces: RwLock<BTreeMap<String, RegisteredSurface>>,
 }
 
 impl SurfaceRegistry {
     pub fn from_snapshot(snapshot: &CatalogSnapshot) -> Self {
-        SurfaceRegistry { surfaces: RwLock::new(dotenv_surfaces(snapshot)) }
+        SurfaceRegistry { surfaces: RwLock::new(file_surfaces(snapshot)) }
     }
 
     pub fn replace(&self, snapshot: &CatalogSnapshot) {
         *self.surfaces.write().unwrap_or_else(|poisoned| poisoned.into_inner()) =
-            dotenv_surfaces(snapshot);
+            file_surfaces(snapshot);
     }
 
-    pub fn get(&self, id: &str) -> Option<Surface> {
+    pub fn get(&self, id: &str) -> Option<RegisteredSurface> {
         self.surfaces
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -27,7 +39,7 @@ impl SurfaceRegistry {
             .cloned()
     }
 
-    pub fn list(&self) -> Vec<Surface> {
+    pub fn list(&self) -> Vec<RegisteredSurface> {
         self.surfaces
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -44,18 +56,41 @@ impl SurfaceRegistry {
     }
 }
 
-fn dotenv_surfaces(snapshot: &CatalogSnapshot) -> BTreeMap<String, Surface> {
+fn file_surfaces(snapshot: &CatalogSnapshot) -> BTreeMap<String, RegisteredSurface> {
     snapshot
         .surfaces
         .iter()
-        .filter(|surface| surface.kind == SurfaceKind::DotenvFile)
-        .map(|surface| (surface.id.clone(), surface.clone()))
+        .filter_map(|surface| {
+            let backing = match surface.kind {
+                SurfaceKind::DotenvFile => SurfaceBacking::DotenvComposed,
+                SurfaceKind::EnvFileDirect => {
+                    let resource_id = surface.resource_id.as_ref()?;
+                    let resource = snapshot
+                        .resources
+                        .iter()
+                        .find(|resource| resource.id == *resource_id)?;
+                    let ResourceSource::SecretRef { secret_id } = &resource.source else {
+                        return None;
+                    };
+                    SurfaceBacking::EnvFileDirect {
+                        resource_id: resource_id.clone(),
+                        secret_id: secret_id.clone(),
+                    }
+                }
+                _ => return None,
+            };
+            Some((
+                surface.id.clone(),
+                RegisteredSurface { surface: surface.clone(), backing },
+            ))
+        })
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use accessfs_catalog::{ExportSpec, Resource, ResourceKind, ValueShape};
     use std::path::PathBuf;
 
     fn surface(id: &str, kind: SurfaceKind) -> Surface {
@@ -71,25 +106,49 @@ mod tests {
     }
 
     #[test]
-    fn replacement_is_sorted_and_only_keeps_dotenv_surfaces() {
+    fn replacement_is_sorted_and_only_keeps_file_surfaces() {
+        let direct = Surface {
+            resource_id: Some("fixture-env-resource".to_string()),
+            ..surface("fixture-direct", SurfaceKind::EnvFileDirect)
+        };
+        let env_resource = Resource {
+            id: "fixture-env-resource".to_string(),
+            name: "Fixture Env File".to_string(),
+            kind: ResourceKind::EnvFile,
+            shape: ValueShape::KeyValueSet,
+            default_env_key: None,
+            exports: vec![ExportSpec { key: "FIXTURE".to_string(), sensitive: true }],
+            source: ResourceSource::SecretRef { secret_id: "fixture-secret".to_string() },
+            detail: None,
+        };
         let registry = SurfaceRegistry::from_snapshot(&CatalogSnapshot {
             surfaces: vec![
                 surface("fixture-b", SurfaceKind::DotenvFile),
                 surface("fixture-socket", SurfaceKind::UnixSocket),
                 surface("fixture-a", SurfaceKind::DotenvFile),
+                direct,
             ],
+            resources: vec![env_resource],
             ..CatalogSnapshot::default()
         });
         assert_eq!(
-            registry.list().into_iter().map(|surface| surface.id).collect::<Vec<_>>(),
-            vec!["fixture-a", "fixture-b"]
+            registry
+                .list()
+                .into_iter()
+                .map(|registered| registered.surface.id)
+                .collect::<Vec<_>>(),
+            vec!["fixture-a", "fixture-b", "fixture-direct"]
         );
+        assert!(matches!(
+            registry.get("fixture-direct").unwrap().backing,
+            SurfaceBacking::EnvFileDirect { .. }
+        ));
 
         registry.replace(&CatalogSnapshot {
             surfaces: vec![surface("fixture-c", SurfaceKind::DotenvFile)],
             ..CatalogSnapshot::default()
         });
         assert!(registry.get("fixture-a").is_none());
-        assert_eq!(registry.get("fixture-c").unwrap().id, "fixture-c");
+        assert_eq!(registry.get("fixture-c").unwrap().surface.id, "fixture-c");
     }
 }

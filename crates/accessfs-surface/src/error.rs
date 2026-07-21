@@ -30,6 +30,15 @@ pub enum SurfaceError {
     #[error("resolved resource {resource_id:?} is missing key {key:?}")]
     MissingKey { resource_id: String, key: String },
 
+    #[error(
+        "env file resource {resource_id:?} keys changed; expected {expected:?}, found {actual:?}"
+    )]
+    EnvFileKeysChanged {
+        resource_id: String,
+        expected: Vec<String>,
+        actual: Vec<String>,
+    },
+
     #[error("rendered dotenv exceeds {limit} bytes")]
     TooLarge { limit: usize },
 

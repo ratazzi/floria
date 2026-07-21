@@ -13,13 +13,13 @@ pub enum SurfaceLinkState {
     Ready,
 }
 
-/// Ensure that a project-facing dotenv path is a symlink to its mounted surface inode.
+/// Ensure that a project-facing file path is a symlink to its mounted surface inode.
 /// Existing files and links with a different target are never replaced.
-pub fn ensure_dotenv_surface_link(
+pub fn ensure_file_surface_link(
     surface: &Surface,
     mount_path: &Path,
 ) -> SurfaceResult<SurfaceLinkState> {
-    if surface.kind != SurfaceKind::DotenvFile {
+    if !matches!(surface.kind, SurfaceKind::DotenvFile | SurfaceKind::EnvFileDirect) {
         return Err(SurfaceError::UnsupportedSurface {
             surface_id: surface.id.clone(),
             kind: format!("{:?}", surface.kind),
@@ -136,12 +136,12 @@ mod tests {
         let expected = mount.join(SURFACES_DIR).join("fixture-dotenv");
 
         assert_eq!(
-            ensure_dotenv_surface_link(&surface, &mount).unwrap(),
+            ensure_file_surface_link(&surface, &mount).unwrap(),
             SurfaceLinkState::Created
         );
         assert_eq!(std::fs::read_link(&surface.path).unwrap(), expected);
         assert_eq!(
-            ensure_dotenv_surface_link(&surface, &mount).unwrap(),
+            ensure_file_surface_link(&surface, &mount).unwrap(),
             SurfaceLinkState::Ready
         );
     }
@@ -156,7 +156,7 @@ mod tests {
 
         std::fs::write(&surface.path, b"FIXTURE=local\n").unwrap();
         assert!(matches!(
-            ensure_dotenv_surface_link(&surface, &mount),
+            ensure_file_surface_link(&surface, &mount),
             Err(SurfaceError::LinkConflict { .. })
         ));
         assert_eq!(std::fs::read(&surface.path).unwrap(), b"FIXTURE=local\n");
@@ -164,7 +164,7 @@ mod tests {
         std::fs::remove_file(&surface.path).unwrap();
         symlink("/fixture/different-target", &surface.path).unwrap();
         assert!(matches!(
-            ensure_dotenv_surface_link(&surface, &mount),
+            ensure_file_surface_link(&surface, &mount),
             Err(SurfaceError::LinkConflict { .. })
         ));
         assert_eq!(
@@ -179,7 +179,7 @@ mod tests {
         let mut surface = fixture_surface(dir.path().join(".env"));
         surface.id = "../fixture-dotenv".to_string();
         assert!(matches!(
-            ensure_dotenv_surface_link(&surface, dir.path()),
+            ensure_file_surface_link(&surface, dir.path()),
             Err(SurfaceError::InvalidSurfaceId(_))
         ));
         assert!(!surface.path.exists());

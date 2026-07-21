@@ -52,6 +52,7 @@ version = "0.1.0"
 dependencies = [
  "accessfs-catalog",
  "accessfs-store",
+ "accessfs-surface",
  "libc",
  "serde",
  "serde_json",

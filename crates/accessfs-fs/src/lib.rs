@@ -27,7 +27,10 @@ use accessfs_core::handler::{ContentHandler, HandlerCtx};
 use accessfs_core::snapshot::{content_version_of, SnapshotTable};
 use accessfs_core::writebuf::{WriteBufTable, WriteErr};
 use accessfs_store::{SecretId, SecretStore};
-use accessfs_surface::{SurfaceRegistry, SurfaceResolver, DOTENV_MAX_SIZE};
+use accessfs_surface::{
+    RegisteredSurface, SurfaceBacking, SurfaceError, SurfaceRegistry, SurfaceResolver,
+    DOTENV_MAX_SIZE,
+};
 use dashmap::DashMap;
 use fuser::{
     AccessFlags, Errno, FileHandle, FileType, INodeNo, KernelConfig, OpenFlags, ReplyAttr,
@@ -127,7 +130,7 @@ impl SurfaceNs {
         }
     }
 
-    fn surface_for_ino(&self, ino: u64) -> Option<accessfs_catalog::Surface> {
+    fn surface_for_ino(&self, ino: u64) -> Option<RegisteredSurface> {
         self.id_for_ino(ino).and_then(|id| self.registry.get(&id))
     }
 
@@ -255,26 +258,42 @@ impl Shared {
         ))
     }
 
-    fn surface_attr(&self, ino: u64) -> fuser::FileAttr {
-        file_attr(
+    fn surface_attr(&self, ino: u64, registered: &RegisteredSurface) -> Option<fuser::FileAttr> {
+        let (size, mode) = match &registered.backing {
+            SurfaceBacking::DotenvComposed => (DOTENV_MAX_SIZE as u64, 0o400),
+            SurfaceBacking::EnvFileDirect { secret_id, .. } => {
+                let ns = self.secrets.as_ref()?;
+                let id: SecretId = secret_id.parse().ok()?;
+                let record = ns.store.record(&id).ok().flatten()?;
+                (record.size, record.mode as u16)
+            }
+        };
+        Some(file_attr(
             ino,
-            DOTENV_MAX_SIZE as u64,
-            0o400,
+            size,
+            mode,
             self.mount_epoch,
             self.mount_uid,
             self.mount_gid,
-        )
+        ))
     }
 
     /// Resolve an inode to what `open()` should serve: a dynamic surface/secret or static file.
     fn resolve_open_target(&self, ino: u64) -> Result<OpenTarget, Errno> {
         if let Some(ns) = &self.surfaces {
-            if let Some(surface) = ns.surface_for_ino(ino) {
+            if let Some(registered) = ns.surface_for_ino(ino) {
+                let surface = registered.surface;
+                let kind = match registered.backing {
+                    SurfaceBacking::DotenvComposed => OpenKind::DotenvSurface(surface.id.clone()),
+                    SurfaceBacking::EnvFileDirect { .. } => {
+                        OpenKind::DirectEnvFileSurface(surface.id.clone())
+                    }
+                };
                 return Ok(OpenTarget {
                     virtual_path: format!("{SURFACES_DIR}/{}", surface.id),
                     display: Some(surface.path.display().to_string()),
                     direct_io: true,
-                    kind: OpenKind::DotenvSurface(surface.id),
+                    kind,
                 });
             }
         }
@@ -331,6 +350,17 @@ impl Shared {
             .map(|id| format!("{SECRETS_DIR}/{id}"))
     }
 
+    fn surface_path(&self, ino: u64) -> Option<String> {
+        self.surfaces
+            .as_ref()
+            .and_then(|ns| ns.id_for_ino(ino))
+            .map(|id| format!("{SURFACES_DIR}/{id}"))
+    }
+
+    fn dynamic_path(&self, ino: u64) -> Option<String> {
+        self.surface_path(ino).or_else(|| self.secret_path(ino))
+    }
+
     /// Commit a dirty write buffer: append it to the store as a new immutable version and move
     /// the head. `Ok(false)` = buffer clean, nothing to commit. On failure the buffer is
     /// re-marked dirty so a later flush (or the release fallback) retries.
@@ -339,24 +369,41 @@ impl Shared {
     /// a time, each taking the buffer's *current* content, so the store head always ends at the
     /// newest snapshot — an older one can never land after (and shadow) a newer one. release
     /// runs through here too, so it inherently waits out any in-flight commit before teardown.
-    fn commit_write(&self, fh: u64) -> std::result::Result<bool, String> {
+    fn commit_write(&self, fh: u64) -> std::result::Result<bool, CommitFailure> {
         let Some(lock) = self.writes.commit_guard(fh) else {
             return Ok(false); // fh already torn down
         };
-        let _serialized = lock.lock().map_err(|_| "commit lock poisoned".to_string())?;
+        let _serialized = lock.lock().map_err(|_| CommitFailure::io("commit lock poisoned"))?;
         let Some(bytes) = self.writes.take_dirty(fh) else {
             return Ok(false);
         };
         let result = (|| {
-            let ino = self.writes.ino_of(fh).ok_or("write fh vanished")?;
-            let ns = self.secrets.as_ref().ok_or("no secret store configured")?;
-            let id = ns.id_for_ino(ino).ok_or("not a secret inode")?;
-            let sid: SecretId = id.parse().map_err(|_| format!("invalid secret id {id}"))?;
-            let version = ns
-                .store
-                .append_version(&sid, &bytes)
-                .map_err(|e| e.to_string())?;
-            Ok::<_, String>((format!("{SECRETS_DIR}/{id}"), version))
+            let ino = self.writes.ino_of(fh).ok_or_else(|| CommitFailure::io("write fh vanished"))?;
+            if let Some(ns) = &self.secrets {
+                if let Some(id) = ns.id_for_ino(ino) {
+                    let sid: SecretId = id
+                        .parse()
+                        .map_err(|_| CommitFailure::io(format!("invalid secret id {id}")))?;
+                    let version = ns
+                        .store
+                        .append_version(&sid, &bytes)
+                        .map_err(|error| CommitFailure::io(error.to_string()))?;
+                    return Ok((format!("{SECRETS_DIR}/{id}"), version));
+                }
+            }
+            if let Some(ns) = &self.surfaces {
+                if let Some(registered) = ns.surface_for_ino(ino) {
+                    if matches!(registered.backing, SurfaceBacking::EnvFileDirect { .. }) {
+                        let surface_id = registered.surface.id;
+                        let committed = ns
+                            .resolver
+                            .commit_direct_env_file(&surface_id, &bytes)
+                            .map_err(CommitFailure::surface)?;
+                        return Ok((format!("{SURFACES_DIR}/{surface_id}"), committed.version));
+                    }
+                }
+            }
+            Err(CommitFailure::io("write inode has no writable backing"))
         })();
         match result {
             Ok((path, version)) => {
@@ -366,9 +413,9 @@ impl Shared {
                     .log_write_commit(&path, fh, version, &content_version, bytes.len() as u64);
                 Ok(true)
             }
-            Err(e) => {
+            Err(error) => {
                 self.writes.mark_dirty(fh);
-                Err(e)
+                Err(error)
             }
         }
     }
@@ -383,11 +430,14 @@ impl Shared {
                 return;
             }
         };
-        // Only store-backed secrets are writable (each committed close appends a version);
-        // everything else stays read-only.
+        // Store-backed secrets and direct EnvFile surfaces are writable. Composed surfaces and
+        // generated handlers stay read-only.
         let wants_write = flags & libc::O_ACCMODE != libc::O_RDONLY;
-        let write_id = match (&target.kind, wants_write) {
-            (OpenKind::Secret(id), true) => Some(id.clone()),
+        let write_target = match (&target.kind, wants_write) {
+            (OpenKind::Secret(id), true) => Some(WriteOpenTarget::Secret(id.clone())),
+            (OpenKind::DirectEnvFileSurface(surface_id), true) => {
+                Some(WriteOpenTarget::DirectEnvFile(surface_id.clone()))
+            }
             (_, true) => {
                 reply.error(errno(libc::EROFS));
                 return;
@@ -424,17 +474,31 @@ impl Shared {
             return;
         }
 
-        if let Some(id) = write_id {
+        if let Some(write_target) = write_target {
             // Write session: seed the buffer with the decrypted head so partial writes and
             // O_APPEND merge correctly; O_TRUNC starts empty. Mutations stay in memory until
             // flush/release commits them as a new immutable version.
             let initial = if flags & libc::O_TRUNC != 0 {
                 Vec::new()
             } else {
-                match self.decrypt_secret(&id) {
+                let result = match write_target {
+                    WriteOpenTarget::Secret(ref id) => self.decrypt_secret(id),
+                    WriteOpenTarget::DirectEnvFile(ref surface_id) => self
+                        .surfaces
+                        .as_ref()
+                        .ok_or_else(|| "surface resolver is unavailable".to_string())
+                        .and_then(|surfaces| {
+                            surfaces
+                                .resolver
+                                .read_direct_env_file(surface_id)
+                                .map(|snapshot| snapshot.bytes)
+                                .map_err(|error| error.to_string())
+                        }),
+                };
+                match result {
                     Ok(b) => b,
                     Err(e) => {
-                        tracing::warn!(path = %target.virtual_path, writer = %identity.chain_display(), "secret decrypt failed: {e}");
+                        tracing::warn!(path = %target.virtual_path, writer = %identity.chain_display(), "write seed failed: {e}");
                         reply.error(errno(libc::EIO));
                         return;
                     }
@@ -442,6 +506,12 @@ impl Shared {
             };
             let size = initial.len() as u64;
             let fh = self.writes.insert(ino, Arc::clone(&identity), initial);
+            if flags & libc::O_TRUNC != 0 {
+                // Opening with O_TRUNC is itself a mutation even when the caller writes no
+                // bytes afterwards; mark the empty buffer dirty so close cannot silently keep
+                // the previous head.
+                let _ = self.writes.truncate(fh, 0);
+            }
             tracing::info!(
                 path = %target.virtual_path,
                 uid, pid,
@@ -518,6 +588,24 @@ impl Shared {
                     }
                 }
             }
+            OpenKind::DirectEnvFileSurface(surface_id) => {
+                let Some(surfaces) = &self.surfaces else {
+                    tracing::warn!(path = %target.virtual_path, "surface resolver is unavailable");
+                    reply.error(errno(libc::EIO));
+                    return;
+                };
+                match surfaces.resolver.read_direct_env_file(surface_id) {
+                    Ok(snapshot) => {
+                        let dependencies = snapshot.audit_dependencies(surface_id);
+                        (snapshot.bytes, Some(dependencies))
+                    }
+                    Err(error) => {
+                        tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), %error, "direct env file surface failed");
+                        reply.error(errno(libc::EIO));
+                        return;
+                    }
+                }
+            }
         };
 
         let opened = self.snapshots.insert(ino, Arc::clone(&identity), bytes);
@@ -568,6 +656,41 @@ enum OpenKind {
     Handler(ContentHandler),
     Secret(String),
     DotenvSurface(String),
+    DirectEnvFileSurface(String),
+}
+
+enum WriteOpenTarget {
+    Secret(String),
+    DirectEnvFile(String),
+}
+
+#[derive(Debug)]
+struct CommitFailure {
+    errno: Errno,
+    message: String,
+}
+
+impl CommitFailure {
+    fn io(message: impl Into<String>) -> Self {
+        CommitFailure { errno: errno(libc::EIO), message: message.into() }
+    }
+
+    fn surface(error: SurfaceError) -> Self {
+        let code = match &error {
+            SurfaceError::TooLarge { .. } => libc::EFBIG,
+            SurfaceError::InvalidUtf8 { .. }
+            | SurfaceError::DotenvParse { .. }
+            | SurfaceError::EnvFileKeysChanged { .. } => libc::EINVAL,
+            _ => libc::EIO,
+        };
+        CommitFailure { errno: errno(code), message: error.to_string() }
+    }
+}
+
+impl std::fmt::Display for CommitFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
 }
 
 /// Build error codes that fuser doesn't provide constants for (EROFS/ENOATTR, etc.) from libc.
@@ -622,10 +745,12 @@ impl fuser::Filesystem for AccessFs {
         if let Some(ns) = &self.inner.surfaces {
             if parent.0 == ns.dir_ino {
                 match ns.registry.get(name) {
-                    Some(_) => {
+                    Some(registered) => {
                         let ino = ns.ino_for(name);
-                        let attr = self.inner.surface_attr(ino);
-                        reply.entry(&TTL, &attr, fuser::Generation(0));
+                        match self.inner.surface_attr(ino, &registered) {
+                            Some(attr) => reply.entry(&TTL, &attr, fuser::Generation(0)),
+                            None => reply.error(Errno::ENOENT),
+                        }
                     }
                     None => reply.error(Errno::ENOENT),
                 }
@@ -671,10 +796,22 @@ impl fuser::Filesystem for AccessFs {
     fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
         if let Some(ns) = &self.inner.surfaces {
             if let Some(id) = ns.id_for_ino(ino.0) {
-                if ns.registry.get(&id).is_some() {
-                    reply.attr(&TTL, &self.inner.surface_attr(ino.0));
-                } else {
-                    reply.error(Errno::ENOENT);
+                match ns
+                    .registry
+                    .get(&id)
+                    .and_then(|registered| self.inner.surface_attr(ino.0, &registered))
+                {
+                    Some(mut attr) => {
+                        if let Some(len) = fh
+                            .map(|file| file.0)
+                            .filter(|&file| self.inner.writes.owns(file))
+                            .and_then(|file| self.inner.writes.len(file))
+                        {
+                            attr.size = len;
+                        }
+                        reply.attr(&TTL, &attr)
+                    }
+                    None => reply.error(Errno::ENOENT),
                 }
                 return;
             }
@@ -736,9 +873,9 @@ impl fuser::Filesystem for AccessFs {
                     (ino.0, FileType::Directory, ".".to_string()),
                     (node.parent, FileType::Directory, "..".to_string()),
                 ];
-                for surface in ns.registry.list() {
-                    let child_ino = ns.ino_for(&surface.id);
-                    entries.push((child_ino, FileType::RegularFile, surface.id));
+                for registered in ns.registry.list() {
+                    let child_ino = ns.ino_for(&registered.surface.id);
+                    entries.push((child_ino, FileType::RegularFile, registered.surface.id));
                 }
                 for (index, (child_ino, kind, name)) in
                     entries.iter().enumerate().skip(offset as usize)
@@ -925,10 +1062,17 @@ impl fuser::Filesystem for AccessFs {
         // Reply with the current attr, sized from the write buffer if one is open on this fd.
         let mut attr = match self
             .inner
-            .secrets
+            .surfaces
             .as_ref()
-            .and_then(|ns| ns.id_for_ino(ino.0))
-            .and_then(|id| self.inner.secret_attr(ino.0, &id))
+            .and_then(|ns| ns.surface_for_ino(ino.0))
+            .and_then(|registered| self.inner.surface_attr(ino.0, &registered))
+            .or_else(|| {
+                self.inner
+                    .secrets
+                    .as_ref()
+                    .and_then(|ns| ns.id_for_ino(ino.0))
+                    .and_then(|id| self.inner.secret_attr(ino.0, &id))
+            })
             .or_else(|| self.inner.attr_for(ino.0))
         {
             Some(a) => a,
@@ -960,7 +1104,7 @@ impl fuser::Filesystem for AccessFs {
                 Ok(_) => reply.ok(),
                 Err(e) => {
                     tracing::warn!(fh = fh.0, "write commit failed: {e}");
-                    reply.error(errno(libc::EIO));
+                    reply.error(e.errno);
                 }
             });
             return;
@@ -986,7 +1130,7 @@ impl fuser::Filesystem for AccessFs {
                 Ok(_) => reply.ok(),
                 Err(e) => {
                     tracing::warn!(fh = fh.0, "write commit failed: {e}");
-                    reply.error(errno(libc::EIO));
+                    reply.error(e.errno);
                 }
             });
             return;
@@ -1011,7 +1155,7 @@ impl fuser::Filesystem for AccessFs {
             self.pool.execute(move || {
                 let commit_err = shared.commit_write(fh.0).err();
                 if let Some(closed) = shared.writes.remove(fh.0) {
-                    let path = shared.secret_path(closed.ino).unwrap_or_default();
+                    let path = shared.dynamic_path(closed.ino).unwrap_or_default();
                     if closed.dirty_bytes.is_some() {
                         // Commit failed even at release; the fd is gone, the content is lost.
                         tracing::error!(path = %path, fh = fh.0, "uncommitted write dropped at close");
@@ -1022,7 +1166,7 @@ impl fuser::Filesystem for AccessFs {
                         fh.0,
                         closed.duration.as_millis(),
                         closed.size,
-                        commit_err.as_deref(),
+                        commit_err.as_ref().map(|error| error.message.as_str()),
                     );
                 }
                 reply.ok();
@@ -1036,7 +1180,7 @@ impl fuser::Filesystem for AccessFs {
                 .get(info.ino)
                 .map(|n| n.virtual_path())
                 .filter(|p| !p.is_empty())
-                .or_else(|| self.inner.secret_path(info.ino))
+                .or_else(|| self.inner.dynamic_path(info.ino))
                 .unwrap_or_default();
             tracing::debug!(path = %path, fh = fh.0, bytes = info.bytes_served, "close");
             self.inner.audit.log_close(
@@ -1208,7 +1352,10 @@ mod tests {
         let secret_ino = secret_ns.ino_for("fixture-secret");
         let first_surface_ino = surface_ns.ino_for(&surface.id);
         assert_ne!(secret_ino, first_surface_ino);
-        assert_eq!(surface_ns.surface_for_ino(first_surface_ino), Some(surface));
+        assert_eq!(
+            surface_ns.surface_for_ino(first_surface_ino).map(|registered| registered.surface),
+            Some(surface)
+        );
 
         let replacement = Surface {
             id: "fixture-dotenv-b".to_string(),
@@ -1226,7 +1373,10 @@ mod tests {
         assert!(surface_ns.surface_for_ino(first_surface_ino).is_none());
         let replacement_ino = surface_ns.ino_for(&replacement.id);
         assert_ne!(replacement_ino, first_surface_ino);
-        assert_eq!(surface_ns.surface_for_ino(replacement_ino), Some(replacement));
+        assert_eq!(
+            surface_ns.surface_for_ino(replacement_ino).map(|registered| registered.surface),
+            Some(replacement)
+        );
     }
 
     /// Store double whose first `append_version` blocks until released, to force commit overlap.

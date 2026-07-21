@@ -10,6 +10,7 @@ use accessfs_catalog::{
     ValueShape,
 };
 use accessfs_store::{NewSecret, SecretId, SecretStore, StoreError};
+use accessfs_surface::{parse_dotenv, DOTENV_MAX_SIZE};
 
 use crate::protocol::{
     read_msg, write_msg, ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest,
@@ -154,6 +155,7 @@ fn mutates_catalog(command: &ControlCommand) -> bool {
             | ControlCommand::SurfaceUpsert { .. }
             | ControlCommand::SurfaceRemove { .. }
             | ControlCommand::SharedSecretCreate { .. }
+            | ControlCommand::EnvFileCreate { .. }
     )
 }
 
@@ -237,6 +239,13 @@ fn dispatch(
             catalog,
             store.ok_or(DispatchError::StoreUnavailable)?,
             resource_id,
+            value,
+        ),
+        ControlCommand::EnvFileCreate { resource_id, name, value } => create_env_file(
+            catalog,
+            store.ok_or(DispatchError::StoreUnavailable)?,
+            resource_id,
+            name,
             value,
         ),
         ControlCommand::ProjectCreate { project, environment, surface } => {
@@ -413,6 +422,63 @@ fn rotate_shared_secret(
     Ok(ControlResult::SharedSecretRotated { resource_id, version })
 }
 
+fn create_env_file(
+    catalog: &Catalog,
+    store: &dyn SecretStore,
+    resource_id: String,
+    name: String,
+    value: crate::protocol::SecretValue,
+) -> Result<ControlResult, DispatchError> {
+    if value.as_bytes().len() > DOTENV_MAX_SIZE {
+        return Err(DispatchError::Validation(format!(
+            "env file exceeds {DOTENV_MAX_SIZE} bytes"
+        )));
+    }
+    let text = std::str::from_utf8(value.as_bytes())
+        .map_err(|_| DispatchError::Validation("env file must be UTF-8".to_string()))?;
+    let values = parse_dotenv(text)
+        .map_err(|error| DispatchError::Validation(error.to_string()))?;
+    if values.is_empty() {
+        return Err(DispatchError::Validation(
+            "env file must contain at least one KEY=VALUE entry".to_string(),
+        ));
+    }
+    let mut resource = Resource {
+        id: resource_id,
+        name,
+        kind: ResourceKind::EnvFile,
+        shape: ValueShape::KeyValueSet,
+        default_env_key: None,
+        exports: values
+            .into_keys()
+            .map(|key| ExportSpec { key, sensitive: true })
+            .collect(),
+        source: ResourceSource::SecretRef { secret_id: "pending-secret-id".to_string() },
+        detail: None,
+    };
+    catalog.validate_resource(&resource)?;
+    match catalog.resource(&resource.id) {
+        Ok(_) => {
+            return Err(DispatchError::Catalog(CatalogError::AlreadyExists {
+                kind: "resource",
+                id: resource.id.clone(),
+            }));
+        }
+        Err(CatalogError::NotFound(_)) => {}
+        Err(error) => return Err(DispatchError::Catalog(error)),
+    }
+
+    let secret_id = store.put(NewSecret::managed(resource.name.clone()), value.as_bytes())?;
+    resource.source = ResourceSource::SecretRef { secret_id: secret_id.to_string() };
+    if let Err(error) = catalog.create_resource(&resource) {
+        if let Err(cleanup_error) = store.delete(&secret_id) {
+            tracing::warn!(%secret_id, %cleanup_error, "cleaning up unreferenced env file failed");
+        }
+        return Err(DispatchError::Catalog(error));
+    }
+    Ok(ControlResult::EnvFileCreated { resource, version: 1 })
+}
+
 fn same_uid(stream: &UnixStream) -> bool {
     let mut uid: libc::uid_t = 0;
     let mut gid: libc::gid_t = 0;
@@ -451,10 +517,11 @@ mod tests {
 
     impl SecretStore for FixtureStore {
         fn put(&self, meta: NewSecret, plaintext: &[u8]) -> StoreResult<SecretId> {
-            assert_eq!(
+            assert!(matches!(
                 meta.origin,
-                SecretOrigin::Managed { label: "Fixture Shared Secret".to_string() }
-            );
+                SecretOrigin::Managed { ref label }
+                    if matches!(label.as_str(), "Fixture Shared Secret" | "Fixture Env File")
+            ));
             let id: SecretId = FIXTURE_SECRET_ID.parse().unwrap();
             self.entries
                 .lock()
@@ -780,5 +847,55 @@ mod tests {
         let secret_id: SecretId = FIXTURE_SECRET_ID.parse().unwrap();
         assert_eq!(store.get_version(&secret_id, 1).unwrap().as_slice(), b"fixture-value-one");
         assert_eq!(store.get_version(&secret_id, 2).unwrap().as_slice(), b"fixture-value-two");
+    }
+
+    #[test]
+    fn env_file_create_parses_keys_and_only_stores_a_reference_in_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let socket = dir.path().join("control.sock");
+        let store = Arc::new(FixtureStore::new());
+        let observer: Arc<dyn CatalogObserver> = Arc::new(SnapshotObserver {
+            notifications: AtomicUsize::new(0),
+            latest: Mutex::new(None),
+        });
+        let _server = ControlServer::start_runtime(
+            &socket,
+            catalog.clone(),
+            Arc::clone(&store) as Arc<dyn SecretStore>,
+            observer,
+        )
+        .unwrap();
+        let mut client = ControlClient::connect(&socket).unwrap();
+
+        let created = client
+            .request(ControlCommand::EnvFileCreate {
+                resource_id: "fixture-env-file".to_string(),
+                name: "Fixture Env File".to_string(),
+                value: crate::protocol::SecretValue::new(
+                    "API_HOST=http://127.0.0.1:8787\nLOG_LEVEL=debug\n",
+                ),
+            })
+            .unwrap();
+        let ControlResult::EnvFileCreated { resource, version } = created else {
+            panic!("expected env file creation result");
+        };
+        assert_eq!(version, 1);
+        assert_eq!(resource.kind, ResourceKind::EnvFile);
+        assert_eq!(
+            resource.exports.iter().map(|export| export.key.as_str()).collect::<Vec<_>>(),
+            vec!["API_HOST", "LOG_LEVEL"]
+        );
+        let ResourceSource::SecretRef { secret_id } = resource.source else {
+            panic!("expected a store reference");
+        };
+        let id: SecretId = secret_id.parse().unwrap();
+        assert_eq!(
+            store.get(&id).unwrap().as_slice(),
+            b"API_HOST=http://127.0.0.1:8787\nLOG_LEVEL=debug\n"
+        );
+        let encoded = serde_json::to_string(&catalog.snapshot().unwrap()).unwrap();
+        assert!(!encoded.contains("127.0.0.1"));
+        assert!(!encoded.contains("LOG_LEVEL=debug"));
     }
 }
