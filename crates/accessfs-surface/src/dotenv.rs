@@ -1,4 +1,6 @@
-use std::collections::BTreeMap;
+use std::collections::HashMap;
+
+use zeroize::Zeroizing;
 
 use crate::error::{SurfaceError, SurfaceResult};
 
@@ -7,8 +9,15 @@ pub const DOTENV_MAX_SIZE: usize = 1 << 20;
 /// Parse the deliberately small, deterministic dotenv subset accepted for EnvFile resources.
 /// It supports blank/comment lines, optional `export`, unquoted values, and single/double quotes.
 /// Multiline quoted values are rejected; renderers emit escaped newlines instead.
-pub fn parse_dotenv(input: &str) -> SurfaceResult<BTreeMap<String, String>> {
-    let mut values = BTreeMap::new();
+#[derive(Debug)]
+pub struct ParsedDotenvEntry {
+    pub key: String,
+    pub value: Zeroizing<String>,
+}
+
+pub fn parse_dotenv(input: &str) -> SurfaceResult<Vec<ParsedDotenvEntry>> {
+    let mut first_lines = HashMap::new();
+    let mut values = Vec::new();
     for (index, raw_line) in input.lines().enumerate() {
         let line_number = index + 1;
         let mut line = raw_line.trim();
@@ -29,13 +38,16 @@ pub fn parse_dotenv(input: &str) -> SurfaceResult<BTreeMap<String, String>> {
                 reason: format!("invalid environment key {key:?}"),
             });
         }
-        let value = parse_value(raw_value.trim_start(), line_number)?;
-        if values.insert(key.to_string(), value).is_some() {
+        if let Some(first_line) = first_lines.insert(key.to_string(), line_number) {
             return Err(SurfaceError::DotenvParse {
                 line: line_number,
-                reason: format!("duplicate environment key {key:?}"),
+                reason: format!(
+                    "duplicate environment key {key:?} (first declared on line {first_line}); remove one declaration before importing"
+                ),
             });
         }
+        let value = Zeroizing::new(parse_value(raw_value.trim_start(), line_number)?);
+        values.push(ParsedDotenvEntry { key: key.to_string(), value });
     }
     Ok(values)
 }
@@ -182,16 +194,21 @@ mod tests {
             "# fixture only\nexport API_HOST=http://127.0.0.1:8787\nMODE='local dev'\nNOTE=hello # comment\nESCAPED=\"line\\nfixture\"\n",
         )
         .unwrap();
-        assert_eq!(values["API_HOST"], "http://127.0.0.1:8787");
-        assert_eq!(values["MODE"], "local dev");
-        assert_eq!(values["NOTE"], "hello");
-        assert_eq!(values["ESCAPED"], "line\nfixture");
+        assert_eq!(
+            values.iter().map(|entry| entry.key.as_str()).collect::<Vec<_>>(),
+            vec!["API_HOST", "MODE", "NOTE", "ESCAPED"]
+        );
+        assert_eq!(values[0].value.as_str(), "http://127.0.0.1:8787");
+        assert_eq!(values[1].value.as_str(), "local dev");
+        assert_eq!(values[2].value.as_str(), "hello");
+        assert_eq!(values[3].value.as_str(), "line\nfixture");
     }
 
     #[test]
     fn duplicate_key_is_rejected() {
         let error = parse_dotenv("FIXTURE=one\nFIXTURE=two\n").unwrap_err();
         assert!(matches!(error, SurfaceError::DotenvParse { line: 2, .. }));
+        assert!(error.to_string().contains("remove one declaration before importing"));
     }
 
     #[test]

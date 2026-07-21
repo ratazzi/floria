@@ -6,11 +6,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use accessfs_catalog::{
-    Catalog, CatalogError, CatalogSnapshot, EntrySpec, Resource, ResourceKind,
+    Catalog, CatalogError, CatalogSnapshot, EntrySpec, Resource, ResourceCodec, ResourceKind,
     ResourceSource, ValueShape,
 };
 use accessfs_store::{NewSecret, SecretId, SecretStore, StoreError};
-use accessfs_surface::{parse_dotenv, DOTENV_MAX_SIZE};
+use accessfs_surface::{decode_source, validate_secret_bytes, DOTENV_MAX_SIZE};
 
 use crate::protocol::{
     read_msg, write_msg, ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest,
@@ -268,6 +268,8 @@ fn dispatch(
             Ok(ControlResult::Empty)
         }
         ControlCommand::ResourceUpsert { resource } => {
+            catalog.validate_resource(&resource)?;
+            validate_resource_value(catalog, store, &resource)?;
             catalog.upsert_resource(&resource)?;
             Ok(ControlResult::Empty)
         }
@@ -276,6 +278,13 @@ fn dispatch(
             Ok(ControlResult::Empty)
         }
         ControlCommand::BindingUpsert { binding } => {
+            let mut snapshot = catalog.snapshot()?;
+            if let Some(existing) = snapshot.bindings.iter_mut().find(|item| item.id == binding.id) {
+                *existing = binding.clone();
+            } else {
+                snapshot.bindings.push(binding.clone());
+            }
+            validate_snapshot_values(&snapshot, store)?;
             catalog.upsert_binding(&binding)?;
             Ok(ControlResult::Empty)
         }
@@ -284,6 +293,13 @@ fn dispatch(
             Ok(ControlResult::Empty)
         }
         ControlCommand::SurfaceUpsert { surface } => {
+            let mut snapshot = catalog.snapshot()?;
+            if let Some(existing) = snapshot.surfaces.iter_mut().find(|item| item.id == surface.id) {
+                *existing = surface.clone();
+            } else {
+                snapshot.surfaces.push(surface.clone());
+            }
+            validate_snapshot_values(&snapshot, store)?;
             catalog.upsert_surface(&surface)?;
             Ok(ControlResult::Empty)
         }
@@ -368,6 +384,7 @@ fn create_shared_secret(
         name,
         kind: ResourceKind::SharedSecret,
         shape: ValueShape::Scalar,
+        codec: ResourceCodec::Opaque,
         default_env_key: default_env_key.clone(),
         entries: vec![EntrySpec {
             address: "value".to_string(),
@@ -401,6 +418,42 @@ fn create_shared_secret(
     Ok(ControlResult::SharedSecretCreated { resource, version: 1 })
 }
 
+fn validate_resource_value(
+    catalog: &Catalog,
+    store: Option<&dyn SecretStore>,
+    resource: &Resource,
+) -> Result<(), DispatchError> {
+    let (Some(_), ResourceSource::SecretRef { .. }) = (store, &resource.source) else {
+        return Ok(());
+    };
+    let mut snapshot = catalog.snapshot()?;
+    if let Some(existing) = snapshot.resources.iter_mut().find(|item| item.id == resource.id) {
+        *existing = resource.clone();
+    } else {
+        snapshot.resources.push(resource.clone());
+    }
+    validate_snapshot_values(&snapshot, store)
+}
+
+fn validate_snapshot_values(
+    snapshot: &CatalogSnapshot,
+    store: Option<&dyn SecretStore>,
+) -> Result<(), DispatchError> {
+    let Some(store) = store else { return Ok(()) };
+    let mut validated = std::collections::HashSet::new();
+    for resource in &snapshot.resources {
+        let ResourceSource::SecretRef { secret_id } = &resource.source else { continue };
+        if !validated.insert(secret_id) {
+            continue;
+        }
+        let id: SecretId = secret_id.parse()?;
+        let plaintext = store.get(&id)?;
+        validate_secret_bytes(snapshot, id.as_str(), &plaintext)
+            .map_err(|error| DispatchError::Validation(error.to_string()))?;
+    }
+    Ok(())
+}
+
 fn rotate_shared_secret(
     catalog: &Catalog,
     store: &dyn SecretStore,
@@ -424,6 +477,9 @@ fn rotate_shared_secret(
         )));
     };
     let secret_id: SecretId = secret_id.parse()?;
+    let snapshot = catalog.snapshot()?;
+    validate_secret_bytes(&snapshot, secret_id.as_str(), value.as_bytes())
+        .map_err(|error| DispatchError::Validation(error.to_string()))?;
     let version = store.append_version(&secret_id, value.as_bytes())?;
     Ok(ControlResult::SharedSecretRotated { resource_id, version })
 }
@@ -440,28 +496,26 @@ fn create_env_file(
             "env file exceeds {DOTENV_MAX_SIZE} bytes"
         )));
     }
-    let text = std::str::from_utf8(value.as_bytes())
-        .map_err(|_| DispatchError::Validation("env file must be UTF-8".to_string()))?;
-    let values = parse_dotenv(text)
+    let values = decode_source(ResourceCodec::Dotenv, &resource_id, value.as_bytes())
         .map_err(|error| DispatchError::Validation(error.to_string()))?;
     if values.is_empty() {
         return Err(DispatchError::Validation(
             "env file must contain at least one KEY=VALUE entry".to_string(),
         ));
     }
-    let keys = values.into_keys().collect::<Vec<_>>();
     let mut resource = Resource {
         id: resource_id,
         name,
         kind: ResourceKind::EnvFile,
         shape: ValueShape::KeyValueSet,
+        codec: ResourceCodec::Dotenv,
         default_env_key: None,
-        entries: keys
+        entries: values
             .into_iter()
-            .map(|key| EntrySpec {
-                address: format!("keys/{key}"),
-                label: key.clone(),
-                key: Some(key),
+            .map(|entry| EntrySpec {
+                address: entry.address,
+                label: entry.key.clone().unwrap_or_else(|| "Value".to_string()),
+                key: entry.key,
                 sensitive: true,
             })
             .collect(),
@@ -503,6 +557,7 @@ fn same_uid(stream: &UnixStream) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use accessfs_catalog::SurfaceInput;
     use crate::client::ControlClient;
     use accessfs_catalog::{Environment, Project, Surface, SurfaceKind};
     use accessfs_store::{
@@ -623,7 +678,7 @@ mod tests {
         let mut client = ControlClient::connect(&socket).unwrap();
         assert_eq!(
             client.request(ControlCommand::Ping).unwrap(),
-            ControlResult::Pong { schema_version: 3 }
+            ControlResult::Pong { schema_version: 4 }
         );
         client
             .request(ControlCommand::ProjectUpsert {
@@ -690,7 +745,7 @@ mod tests {
                     name: ".env".to_string(),
                     kind: SurfaceKind::DotenvFile,
                     path: PathBuf::from("/fixture/project/.env"),
-                    resource_id: None,
+                    input: SurfaceInput::Bindings { binding_ids: Vec::new() },
                     position: 0,
                 },
             })
@@ -730,7 +785,7 @@ mod tests {
                     name: ".env".to_string(),
                     kind: SurfaceKind::DotenvFile,
                     path: PathBuf::from("/outside/.env"),
-                    resource_id: None,
+                    input: SurfaceInput::Bindings { binding_ids: Vec::new() },
                     position: 0,
                 },
             })

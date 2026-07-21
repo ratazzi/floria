@@ -84,6 +84,31 @@ impl ValueShape {
     }
 }
 
+/// Grammar used to decode a Resource's opaque source bytes into addressed entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceCodec {
+    Opaque,
+    Dotenv,
+}
+
+impl ResourceCodec {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ResourceCodec::Opaque => "opaque",
+            ResourceCodec::Dotenv => "dotenv",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "opaque" => Some(ResourceCodec::Opaque),
+            "dotenv" => Some(ResourceCodec::Dotenv),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntrySpec {
     pub address: String,
@@ -118,6 +143,7 @@ pub struct Resource {
     pub name: String,
     pub kind: ResourceKind,
     pub shape: ValueShape,
+    pub codec: ResourceCodec,
     #[serde(default)]
     pub default_env_key: Option<String>,
     #[serde(default)]
@@ -191,14 +217,20 @@ impl SurfaceKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SurfaceInput {
+    Bindings { binding_ids: Vec<String> },
+    Resource { resource_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Surface {
     pub id: String,
     pub environment_id: String,
     pub name: String,
     pub kind: SurfaceKind,
     pub path: PathBuf,
-    #[serde(default)]
-    pub resource_id: Option<String>,
+    pub input: SurfaceInput,
     #[serde(default)]
     pub position: i64,
 }

@@ -11,8 +11,8 @@ use accessfs_control::{
 use accessfs_core::config::{Config, ResolvedConfig};
 use accessfs_store::{AgeDirStore, NewSecret, SecretId, SecretRecord, SecretStore, SshKeyProvider};
 use accessfs_surface::{
-    ensure_file_surface_link, remove_file_surface_link, SurfaceLinkRemoval, SurfaceLinkState,
-    SurfaceRegistry,
+    ensure_file_surface_link, remove_file_surface_link, validate_secret_bytes, SurfaceLinkRemoval,
+    SurfaceLinkState, SurfaceRegistry,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -178,6 +178,7 @@ fn cmd_protect(path: &Path, link: bool, remove: bool, force: bool, config: &Path
     // Import step: reuse the existing entry when already protected, so --link/--remove stay usable.
     let id = match store.get_by_path(&abs)? {
         Some(rec) if force => {
+            validate_catalog_secret_bytes(&cfg, &rec.id, &plaintext)?;
             let v = store.append_version(&rec.id, &plaintext)?;
             println!("updated {} → {} (saved version {v})", abs.display(), rec.id);
             rec.id
@@ -271,9 +272,27 @@ fn cmd_rollback(target: &str, version: u32, config: &Path) -> Result<()> {
     let cfg = load(config)?;
     let store = open_store(&cfg)?;
     let record = resolve_target(&store, target)?;
+    let plaintext = store.get_version(&record.id, version)?;
+    validate_catalog_secret_bytes(&cfg, &record.id, &plaintext)?;
     store.set_head(&record.id, version)?;
     println!("{} → head is now v{version}", record.id);
     Ok(())
+}
+
+fn validate_catalog_secret_bytes(
+    cfg: &ResolvedConfig,
+    secret_id: &SecretId,
+    bytes: &[u8],
+) -> Result<()> {
+    let catalog_path = support_dir(cfg)?.join("catalog.sqlite");
+    if !catalog_path.exists() {
+        return Ok(());
+    }
+    let catalog = Catalog::open(&catalog_path)
+        .with_context(|| format!("opening catalog at {}", catalog_path.display()))?;
+    let snapshot = catalog.snapshot().context("loading catalog for secret validation")?;
+    validate_secret_bytes(&snapshot, secret_id.as_str(), bytes)
+        .with_context(|| format!("validating replacement bytes for secret {secret_id}"))
 }
 
 fn cmd_list(config: &Path) -> Result<()> {

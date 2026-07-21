@@ -8,10 +8,10 @@ mod catalog;
 mod domain;
 mod error;
 
-pub use catalog::{resolve_catalog_snapshot, Catalog};
+pub use catalog::{resolve_catalog_snapshot, resolve_catalog_surface, Catalog};
 pub use domain::{
     Binding, BindingScope, CatalogSnapshot, EntrySelection, EntrySpec, Environment,
-    Project, ResolvedEnvironment, ResolvedExport, Resource, ResourceBindingUsage, ResourceKind,
-    ResourceSource, ResourceUsage, Surface, SurfaceKind, ValueShape,
+    Project, ResolvedEnvironment, ResolvedExport, Resource, ResourceBindingUsage, ResourceCodec,
+    ResourceKind, ResourceSource, ResourceUsage, Surface, SurfaceInput, SurfaceKind, ValueShape,
 };
 pub use error::{CatalogError, CatalogResult};

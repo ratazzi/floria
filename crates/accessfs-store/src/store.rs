@@ -46,7 +46,7 @@ impl std::str::FromStr for SecretId {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         uuid::Uuid::parse_str(s)
             .map(|u| SecretId(u.to_string()))
-            .map_err(|_| StoreError::NotFound(s.to_string()))
+            .map_err(|_| StoreError::Invalid(format!("invalid secret id {s:?}")))
     }
 }
 
@@ -577,6 +577,14 @@ mod tests {
     fn store(root: PathBuf) -> AgeDirStore {
         let keys = Arc::new(X25519Keys(age::x25519::Identity::generate()));
         AgeDirStore::open(root, keys).unwrap()
+    }
+
+    #[test]
+    fn malformed_secret_id_is_invalid_not_missing() {
+        assert!(matches!(
+            "not-a-secret-id".parse::<SecretId>(),
+            Err(StoreError::Invalid(message)) if message.contains("invalid secret id")
+        ));
     }
 
     #[test]

@@ -168,6 +168,7 @@ fn link_conflict(path: &Path, expected: &Path, reason: impl Into<String>) -> Sur
 #[cfg(test)]
 mod tests {
     use super::*;
+    use accessfs_catalog::SurfaceInput;
     use std::path::PathBuf;
 
     fn fixture_surface(path: PathBuf) -> Surface {
@@ -177,7 +178,7 @@ mod tests {
             name: ".env".to_string(),
             kind: SurfaceKind::DotenvFile,
             path,
-            resource_id: None,
+            input: SurfaceInput::Bindings { binding_ids: Vec::new() },
             position: 0,
         }
     }

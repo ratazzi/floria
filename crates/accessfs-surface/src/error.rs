@@ -18,7 +18,7 @@ pub enum SurfaceError {
     #[error("surface {surface_id:?} has unsupported kind {kind}")]
     UnsupportedSurface { surface_id: String, kind: String },
 
-    #[error("resource {resource_id:?} is incompatible with dotenv: {reason}")]
+    #[error("resource {resource_id:?} is incompatible with the target surface: {reason}")]
     IncompatibleResource { resource_id: String, reason: String },
 
     #[error("resource {resource_id:?} value is not UTF-8")]
@@ -31,9 +31,9 @@ pub enum SurfaceError {
     MissingKey { resource_id: String, key: String },
 
     #[error(
-        "env file resource {resource_id:?} keys changed; expected {expected:?}, found {actual:?}"
+        "resource {resource_id:?} entries changed; expected {expected:?}, found {actual:?}"
     )]
-    EnvFileKeysChanged {
+    ResourceEntriesChanged {
         resource_id: String,
         expected: Vec<String>,
         actual: Vec<String>,

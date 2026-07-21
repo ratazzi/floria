@@ -7,12 +7,12 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::domain::{
     Binding, BindingScope, CatalogSnapshot, EntrySelection, Environment, Project,
-    ResolvedEnvironment, ResolvedExport, Resource, ResourceBindingUsage, ResourceKind,
-    ResourceSource, ResourceUsage, Surface, SurfaceKind, ValueShape,
+    ResolvedEnvironment, ResolvedExport, Resource, ResourceBindingUsage, ResourceCodec,
+    ResourceKind, ResourceSource, ResourceUsage, Surface, SurfaceInput, SurfaceKind, ValueShape,
 };
 use crate::error::{CatalogError, CatalogResult};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Debug, Clone)]
 pub struct Catalog {
@@ -138,10 +138,11 @@ impl Catalog {
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO resources
-                (id, name, kind, shape, default_env_key, entries_json, source_json, detail)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                (id, name, kind, shape, codec, default_env_key, entries_json, source_json, detail)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(id) DO UPDATE SET name = excluded.name, kind = excluded.kind,
-                 shape = excluded.shape, default_env_key = excluded.default_env_key,
+                 shape = excluded.shape, codec = excluded.codec,
+                 default_env_key = excluded.default_env_key,
                  entries_json = excluded.entries_json,
                  source_json = excluded.source_json, detail = excluded.detail,
                  updated_at = CURRENT_TIMESTAMP",
@@ -150,6 +151,7 @@ impl Catalog {
                 resource.name,
                 resource.kind.as_str(),
                 resource.shape.as_str(),
+                resource.codec.as_str(),
                 resource.default_env_key,
                 serde_json::to_string(&resource.entries)?,
                 serde_json::to_string(&resource.source)?,
@@ -181,13 +183,14 @@ impl Catalog {
         }
         tx.execute(
             "INSERT INTO resources
-                (id, name, kind, shape, default_env_key, entries_json, source_json, detail)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (id, name, kind, shape, codec, default_env_key, entries_json, source_json, detail)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 resource.id,
                 resource.name,
                 resource.kind.as_str(),
                 resource.shape.as_str(),
+                resource.codec.as_str(),
                 resource.default_env_key,
                 serde_json::to_string(&resource.entries)?,
                 serde_json::to_string(&resource.source)?,
@@ -247,8 +250,12 @@ impl Catalog {
                 .surfaces
                 .iter()
                 .filter(|surface| {
-                    surface.kind == SurfaceKind::DotenvFile
-                        && environment_ids.contains(&surface.environment_id)
+                    environment_ids.contains(&surface.environment_id)
+                        && matches!(
+                            &surface.input,
+                            SurfaceInput::Bindings { binding_ids }
+                                if binding_ids.contains(&binding.id)
+                        )
                 })
                 .map(|surface| surface.id.clone())
                 .collect();
@@ -263,7 +270,12 @@ impl Catalog {
         let direct_surface_ids = snapshot
             .surfaces
             .iter()
-            .filter(|surface| surface.resource_id.as_deref() == Some(id))
+            .filter(|surface| {
+                matches!(
+                    &surface.input,
+                    SurfaceInput::Resource { resource_id } if resource_id == id
+                )
+            })
             .map(|surface| surface.id.clone())
             .collect();
         Ok(ResourceUsage { resource_id: id.to_string(), bindings, direct_surface_ids })
@@ -346,14 +358,41 @@ impl Catalog {
 
     pub fn remove_binding(&self, id: &str) -> CatalogResult<()> {
         require_id(id, "binding id")?;
-        remove_one(&self.connection()?, "bindings", id, "binding")
+        let mut conn = self.connection()?;
+        let tx = conn.transaction()?;
+        let snapshot = snapshot_from(&tx)?;
+        if !snapshot.bindings.iter().any(|binding| binding.id == id) {
+            return Err(CatalogError::NotFound(format!("binding {id}")));
+        }
+        for surface in &snapshot.surfaces {
+            let SurfaceInput::Bindings { binding_ids } = &surface.input else { continue };
+            if !binding_ids.iter().any(|binding_id| binding_id == id) {
+                continue;
+            }
+            let input = SurfaceInput::Bindings {
+                binding_ids: binding_ids
+                    .iter()
+                    .filter(|binding_id| binding_id.as_str() != id)
+                    .cloned()
+                    .collect(),
+            };
+            tx.execute(
+                "UPDATE surfaces SET input_json = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+                params![surface.id, serde_json::to_string(&input)?],
+            )?;
+        }
+        tx.execute("DELETE FROM bindings WHERE id = ?1", [id])?;
+        validate_snapshot_conflicts(&snapshot_from(&tx)?)?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn upsert_surface(&self, surface: &Surface) -> CatalogResult<()> {
         validate_surface(surface)?;
-        let conn = self.connection()?;
-        require_exists(&conn, "environments", &surface.environment_id, "environment")?;
-        let project_path = PathBuf::from(conn.query_row(
+        let mut conn = self.connection()?;
+        let tx = conn.transaction()?;
+        require_exists(&tx, "environments", &surface.environment_id, "environment")?;
+        let project_path = PathBuf::from(tx.query_row(
             "SELECT projects.path
              FROM environments
              JOIN projects ON projects.id = environments.project_id
@@ -368,51 +407,13 @@ impl Catalog {
                 project_path.display()
             )));
         }
-        if surface.kind == SurfaceKind::DotenvFile && surface.resource_id.is_some() {
-            return Err(CatalogError::Validation(
-                "dotenv_file surfaces compose bindings and cannot reference one resource"
-                    .to_string(),
-            ));
-        }
-        if let Some(resource_id) = &surface.resource_id {
-            require_exists(&conn, "resources", resource_id, "resource")?;
-            if matches!(surface.kind, SurfaceKind::UnixSocket | SurfaceKind::EnvFileDirect) {
-                let (kind, shape): (String, String) = conn.query_row(
-                    "SELECT kind, shape FROM resources WHERE id = ?1",
-                    [resource_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )?;
-                match surface.kind {
-                    SurfaceKind::UnixSocket if shape != ValueShape::Socket.as_str() => {
-                        return Err(CatalogError::Validation(
-                            "unix_socket surfaces require a socket resource".to_string(),
-                        ));
-                    }
-                    SurfaceKind::EnvFileDirect
-                        if kind != ResourceKind::EnvFile.as_str()
-                            || shape != ValueShape::KeyValueSet.as_str() =>
-                    {
-                        return Err(CatalogError::Validation(
-                            "env_file_direct surfaces require an env_file resource".to_string(),
-                        ));
-                    }
-                    _ => {}
-                }
-            }
-        } else if matches!(surface.kind, SurfaceKind::UnixSocket | SurfaceKind::EnvFileDirect) {
-            return Err(CatalogError::Validation(format!(
-                "{} surfaces require resource_id",
-                surface.kind.as_str()
-            )));
-        }
-
-        conn.execute(
+        tx.execute(
             "INSERT INTO surfaces
-                (id, environment_id, name, kind, path, resource_id, position)
+                (id, environment_id, name, kind, path, input_json, position)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(id) DO UPDATE SET environment_id = excluded.environment_id,
                  name = excluded.name, kind = excluded.kind, path = excluded.path,
-                 resource_id = excluded.resource_id, position = excluded.position,
+                 input_json = excluded.input_json, position = excluded.position,
                  updated_at = CURRENT_TIMESTAMP",
             params![
                 surface.id,
@@ -420,10 +421,12 @@ impl Catalog {
                 surface.name,
                 surface.kind.as_str(),
                 path_string(&surface.path),
-                surface.resource_id,
+                serde_json::to_string(&surface.input)?,
                 surface.position,
             ],
         )?;
+        validate_snapshot_conflicts(&snapshot_from(&tx)?)?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -489,6 +492,7 @@ fn migrate(conn: &mut Connection) -> CatalogResult<()> {
             name TEXT NOT NULL,
             kind TEXT NOT NULL,
             shape TEXT NOT NULL,
+            codec TEXT NOT NULL,
             default_env_key TEXT,
             entries_json TEXT NOT NULL,
             source_json TEXT NOT NULL,
@@ -519,13 +523,13 @@ fn migrate(conn: &mut Connection) -> CatalogResult<()> {
             name TEXT NOT NULL,
             kind TEXT NOT NULL,
             path TEXT NOT NULL,
-            resource_id TEXT REFERENCES resources(id) ON DELETE RESTRICT,
+            input_json TEXT NOT NULL,
             position INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         CREATE INDEX surfaces_environment_idx ON surfaces(environment_id, position);
-        PRAGMA user_version = 3;",
+        PRAGMA user_version = 4;",
     )?;
     tx.commit()?;
     Ok(())
@@ -564,21 +568,23 @@ fn snapshot_from(conn: &Connection) -> CatalogResult<CatalogSnapshot> {
 
     let resources = {
         let mut stmt = conn.prepare(
-            "SELECT id, name, kind, shape, default_env_key, entries_json, source_json, detail
+            "SELECT id, name, kind, shape, codec, default_env_key, entries_json, source_json, detail
              FROM resources ORDER BY name, id",
         )?;
         let values = stmt.query_map([], |row| {
             let kind: String = row.get(2)?;
             let shape: String = row.get(3)?;
+            let codec: String = row.get(4)?;
             Ok(Resource {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 kind: ResourceKind::parse(&kind).ok_or_else(|| invalid_value(2, kind))?,
                 shape: ValueShape::parse(&shape).ok_or_else(|| invalid_value(3, shape))?,
-                default_env_key: row.get(4)?,
-                entries: decode_json(5, &row.get::<_, String>(5)?)?,
-                source: decode_json(6, &row.get::<_, String>(6)?)?,
-                detail: row.get(7)?,
+                codec: ResourceCodec::parse(&codec).ok_or_else(|| invalid_value(4, codec))?,
+                default_env_key: row.get(5)?,
+                entries: decode_json(6, &row.get::<_, String>(6)?)?,
+                source: decode_json(7, &row.get::<_, String>(7)?)?,
+                detail: row.get(8)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -615,7 +621,7 @@ fn snapshot_from(conn: &Connection) -> CatalogResult<CatalogSnapshot> {
 
     let surfaces = {
         let mut stmt = conn.prepare(
-            "SELECT id, environment_id, name, kind, path, resource_id, position
+            "SELECT id, environment_id, name, kind, path, input_json, position
              FROM surfaces ORDER BY environment_id, position, name, id",
         )?;
         let values = stmt.query_map([], |row| {
@@ -626,7 +632,7 @@ fn snapshot_from(conn: &Connection) -> CatalogResult<CatalogSnapshot> {
                 name: row.get(2)?,
                 kind: SurfaceKind::parse(&kind).ok_or_else(|| invalid_value(3, kind))?,
                 path: PathBuf::from(row.get::<_, String>(4)?),
-                resource_id: row.get(5)?,
+                input: decode_json(5, &row.get::<_, String>(5)?)?,
                 position: row.get(6)?,
             })
         })?
@@ -659,14 +665,48 @@ pub fn resolve_catalog_snapshot(
     Ok(ResolvedEnvironment {
         project_id: project_id.to_string(),
         environment_id: environment_id.to_string(),
-        exports: resolve_exports(snapshot, project_id, Some(environment_id))?,
+        exports: resolve_exports(snapshot, project_id, Some(environment_id), None)?,
     })
+}
+
+pub fn resolve_catalog_surface(
+    snapshot: &CatalogSnapshot,
+    surface_id: &str,
+) -> CatalogResult<Vec<ResolvedExport>> {
+    let surface = snapshot
+        .surfaces
+        .iter()
+        .find(|surface| surface.id == surface_id)
+        .ok_or_else(|| CatalogError::NotFound(format!("surface {surface_id}")))?;
+    if surface.kind != SurfaceKind::DotenvFile {
+        return Err(CatalogError::Validation(format!(
+            "surface {surface_id:?} is not a dotenv projection"
+        )));
+    }
+    let environment = snapshot
+        .environments
+        .iter()
+        .find(|environment| environment.id == surface.environment_id)
+        .ok_or_else(|| CatalogError::NotFound(format!("environment {}", surface.environment_id)))?;
+    let SurfaceInput::Bindings { binding_ids } = &surface.input else {
+        return Err(CatalogError::Validation(format!(
+            "dotenv surface {surface_id:?} requires binding input"
+        )));
+    };
+    let included = binding_ids.iter().map(String::as_str).collect::<HashSet<_>>();
+    resolve_exports(
+        snapshot,
+        &environment.project_id,
+        Some(&environment.id),
+        Some(&included),
+    )
 }
 
 fn resolve_exports(
     snapshot: &CatalogSnapshot,
     project_id: &str,
     environment_id: Option<&str>,
+    included: Option<&HashSet<&str>>,
 ) -> CatalogResult<Vec<ResolvedExport>> {
     let resources: HashMap<&str, &Resource> = snapshot
         .resources
@@ -678,6 +718,7 @@ fn resolve_exports(
         .iter()
         .filter(|binding| {
             binding.enabled
+                && included.is_none_or(|ids| ids.contains(binding.id.as_str()))
                 && binding.project_id == project_id
                 && match &binding.scope {
                     BindingScope::Common => true,
@@ -751,20 +792,11 @@ fn resolve_exports(
 }
 
 fn validate_snapshot_conflicts(snapshot: &CatalogSnapshot) -> CatalogResult<()> {
-    validate_surface_resource_links(snapshot)?;
     validate_binding_selections(snapshot)?;
-    for project in &snapshot.projects {
-        let environments: Vec<&Environment> = snapshot
-            .environments
-            .iter()
-            .filter(|environment| environment.project_id == project.id)
-            .collect();
-        if environments.is_empty() {
-            resolve_exports(snapshot, &project.id, None)?;
-        } else {
-            for environment in environments {
-                resolve_catalog_snapshot(snapshot, &project.id, &environment.id)?;
-            }
+    validate_surface_inputs(snapshot)?;
+    for surface in &snapshot.surfaces {
+        if surface.kind == SurfaceKind::DotenvFile {
+            resolve_catalog_surface(snapshot, &surface.id)?;
         }
     }
     Ok(())
@@ -802,34 +834,68 @@ fn validate_binding_selections(snapshot: &CatalogSnapshot) -> CatalogResult<()> 
     Ok(())
 }
 
-fn validate_surface_resource_links(snapshot: &CatalogSnapshot) -> CatalogResult<()> {
+fn validate_surface_inputs(snapshot: &CatalogSnapshot) -> CatalogResult<()> {
     let resources: HashMap<&str, &Resource> = snapshot
         .resources
         .iter()
         .map(|resource| (resource.id.as_str(), resource))
         .collect();
+    let bindings: HashMap<&str, &Binding> = snapshot
+        .bindings
+        .iter()
+        .map(|binding| (binding.id.as_str(), binding))
+        .collect();
+    let environments: HashMap<&str, &Environment> = snapshot
+        .environments
+        .iter()
+        .map(|environment| (environment.id.as_str(), environment))
+        .collect();
     for surface in &snapshot.surfaces {
-        match surface.kind {
-            SurfaceKind::DotenvFile | SurfaceKind::LinesFile
-                if surface.resource_id.is_some() =>
-            {
-                return Err(CatalogError::Validation(format!(
-                    "{} surface {:?} cannot reference one resource",
-                    surface.kind.as_str(), surface.id
-                )));
+        let environment = environments.get(surface.environment_id.as_str()).ok_or_else(|| {
+            CatalogError::NotFound(format!("environment {}", surface.environment_id))
+        })?;
+        match (&surface.kind, &surface.input) {
+            (
+                SurfaceKind::DotenvFile | SurfaceKind::LinesFile,
+                SurfaceInput::Bindings { binding_ids },
+            ) => {
+                let mut unique = HashSet::new();
+                for binding_id in binding_ids {
+                    if !unique.insert(binding_id) {
+                        return Err(CatalogError::Validation(format!(
+                            "surface {:?} includes duplicate binding {:?}",
+                            surface.id, binding_id
+                        )));
+                    }
+                    let binding = bindings.get(binding_id.as_str()).ok_or_else(|| {
+                        CatalogError::NotFound(format!("binding {binding_id}"))
+                    })?;
+                    let applies = binding.project_id == environment.project_id
+                        && match &binding.scope {
+                            BindingScope::Common => true,
+                            BindingScope::Environment { environment_id } => {
+                                environment_id == &surface.environment_id
+                            }
+                        };
+                    if !applies {
+                        return Err(CatalogError::Validation(format!(
+                            "binding {binding_id:?} does not apply to surface {:?}",
+                            surface.id
+                        )));
+                    }
+                    let resource = resources.get(binding.resource_id.as_str()).ok_or_else(|| {
+                        CatalogError::NotFound(format!("resource {}", binding.resource_id))
+                    })?;
+                    validate_composed_surface_member(surface, binding, resource)?;
+                }
             }
-            SurfaceKind::EnvFileDirect => {
-                let resource_id = surface.resource_id.as_deref().ok_or_else(|| {
-                    CatalogError::Validation(format!(
-                        "env_file_direct surface {:?} requires resource_id",
-                        surface.id
-                    ))
-                })?;
-                let resource = resources.get(resource_id).ok_or_else(|| {
+            (SurfaceKind::EnvFileDirect, SurfaceInput::Resource { resource_id }) => {
+                let resource = resources.get(resource_id.as_str()).ok_or_else(|| {
                     CatalogError::NotFound(format!("resource {resource_id}"))
                 })?;
                 if resource.kind != ResourceKind::EnvFile
                     || resource.shape != ValueShape::KeyValueSet
+                    || resource.codec != ResourceCodec::Dotenv
                     || !matches!(resource.source, ResourceSource::SecretRef { .. })
                 {
                     return Err(CatalogError::Validation(format!(
@@ -838,14 +904,8 @@ fn validate_surface_resource_links(snapshot: &CatalogSnapshot) -> CatalogResult<
                     )));
                 }
             }
-            SurfaceKind::UnixSocket => {
-                let resource_id = surface.resource_id.as_deref().ok_or_else(|| {
-                    CatalogError::Validation(format!(
-                        "unix_socket surface {:?} requires resource_id",
-                        surface.id
-                    ))
-                })?;
-                let resource = resources.get(resource_id).ok_or_else(|| {
+            (SurfaceKind::UnixSocket, SurfaceInput::Resource { resource_id }) => {
+                let resource = resources.get(resource_id.as_str()).ok_or_else(|| {
                     CatalogError::NotFound(format!("resource {resource_id}"))
                 })?;
                 if resource.shape != ValueShape::Socket {
@@ -855,8 +915,75 @@ fn validate_surface_resource_links(snapshot: &CatalogSnapshot) -> CatalogResult<
                     )));
                 }
             }
-            _ => {}
+            (SurfaceKind::RegularFile, SurfaceInput::Resource { resource_id }) => {
+                if !resources.contains_key(resource_id.as_str()) {
+                    return Err(CatalogError::NotFound(format!("resource {resource_id}")));
+                }
+            }
+            _ => {
+                return Err(CatalogError::Validation(format!(
+                    "surface kind {} is incompatible with its input",
+                    surface.kind.as_str()
+                )))
+            }
         }
+    }
+    Ok(())
+}
+
+fn validate_composed_surface_member(
+    surface: &Surface,
+    binding: &Binding,
+    resource: &Resource,
+) -> CatalogResult<()> {
+    let entries = resource.entries.iter().filter(|entry| match &binding.selection {
+        EntrySelection::All => true,
+        EntrySelection::Entries { addresses } => addresses.contains(&entry.address),
+    });
+    match surface.kind {
+        SurfaceKind::DotenvFile => {
+            let compatible_source = matches!(
+                (&resource.shape, &resource.codec, &resource.source),
+                (
+                    ValueShape::Scalar,
+                    ResourceCodec::Opaque,
+                    ResourceSource::SecretRef { .. } | ResourceSource::Literal { .. }
+                ) | (
+                    ValueShape::KeyValueSet,
+                    ResourceCodec::Dotenv,
+                    ResourceSource::SecretRef { .. }
+                )
+            );
+            if !compatible_source
+                || entries.into_iter().any(|entry| {
+                    resource.shape != ValueShape::Scalar && entry.key.is_none()
+                        || resource.shape == ValueShape::Scalar
+                            && binding.key_override.as_ref().or(entry.key.as_ref()).is_none()
+                })
+            {
+                return Err(CatalogError::Validation(format!(
+                    "binding {:?} cannot feed dotenv surface {:?}",
+                    binding.id, surface.id
+                )));
+            }
+        }
+        SurfaceKind::LinesFile => {
+            let compatible = resource.shape == ValueShape::Scalar
+                && resource.codec == ResourceCodec::Opaque
+                && binding.key_override.is_none()
+                && entries.into_iter().all(|entry| entry.key.is_none())
+                && matches!(
+                    resource.source,
+                    ResourceSource::SecretRef { .. } | ResourceSource::Literal { .. }
+                );
+            if !compatible {
+                return Err(CatalogError::Validation(format!(
+                    "binding {:?} cannot feed lines surface {:?}",
+                    binding.id, surface.id
+                )));
+            }
+        }
+        _ => unreachable!("only composed surfaces call member validation"),
     }
     Ok(())
 }
@@ -880,18 +1007,11 @@ fn validate_resource(resource: &Resource) -> CatalogResult<()> {
         require_env_key(key)?;
     }
     let mut addresses = HashSet::new();
-    let mut entry_keys = HashSet::new();
     for entry in &resource.entries {
         require_entry_address(&entry.address)?;
         require_name(&entry.label, "resource entry label")?;
         if let Some(key) = &entry.key {
             require_env_key(key)?;
-            if !entry_keys.insert(key) {
-                return Err(CatalogError::Validation(format!(
-                    "resource {:?} exposes duplicate entry key {:?}",
-                    resource.id, key
-                )));
-            }
         }
         if !addresses.insert(&entry.address) {
             return Err(CatalogError::Validation(format!(
@@ -928,6 +1048,35 @@ fn validate_resource(resource: &Resource) -> CatalogResult<()> {
             ))
         }
         _ => {}
+    }
+
+    match (resource.shape, resource.codec) {
+        (
+            ValueShape::Scalar | ValueShape::Bytes | ValueShape::Socket,
+            ResourceCodec::Opaque,
+        )
+        | (ValueShape::KeyValueSet, ResourceCodec::Dotenv) => {}
+        _ => {
+            return Err(CatalogError::Validation(format!(
+                "resource shape {:?} is incompatible with codec {:?}",
+                resource.shape, resource.codec
+            )))
+        }
+    }
+
+    if resource.codec == ResourceCodec::Dotenv {
+        let mut keys = HashSet::new();
+        if let Some(key) = resource
+            .entries
+            .iter()
+            .filter_map(|entry| entry.key.as_ref())
+            .find(|key| !keys.insert(key.as_str()))
+        {
+            return Err(CatalogError::Validation(format!(
+                "dotenv resource {:?} exposes duplicate key {:?}",
+                resource.id, key
+            )));
+        }
     }
 
     match (&resource.kind, &resource.shape, &resource.source) {
@@ -1031,7 +1180,18 @@ fn validate_surface(surface: &Surface) -> CatalogResult<()> {
     require_path_component(&surface.id, "surface id")?;
     require_id(&surface.environment_id, "surface environment id")?;
     require_name(&surface.name, "surface name")?;
-    require_normalized_absolute_path(&surface.path, "surface path")
+    require_normalized_absolute_path(&surface.path, "surface path")?;
+    match &surface.input {
+        SurfaceInput::Bindings { binding_ids } => {
+            for binding_id in binding_ids {
+                require_id(binding_id, "surface binding id")?;
+            }
+        }
+        SurfaceInput::Resource { resource_id } => {
+            require_id(resource_id, "surface resource id")?;
+        }
+    }
+    Ok(())
 }
 
 fn require_id(value: &str, label: &str) -> CatalogResult<()> {
@@ -1186,6 +1346,7 @@ mod tests {
             name: id.to_string(),
             kind: ResourceKind::SharedSecret,
             shape: ValueShape::Scalar,
+            codec: ResourceCodec::Opaque,
             default_env_key: Some(key.to_string()),
             entries: vec![EntrySpec {
                 address: "value".to_string(),
@@ -1204,6 +1365,7 @@ mod tests {
             name: id.to_string(),
             kind: ResourceKind::EnvFile,
             shape: ValueShape::KeyValueSet,
+            codec: ResourceCodec::Dotenv,
             default_env_key: None,
             entries: vec![
                 EntrySpec {
@@ -1254,7 +1416,7 @@ mod tests {
         let error = migrate(&mut conn).unwrap_err();
         assert!(matches!(
             error,
-            CatalogError::UnsupportedSchema { found: 1, expected: 3 }
+            CatalogError::UnsupportedSchema { found: 1, expected: 4 }
         ));
     }
 
@@ -1314,7 +1476,9 @@ mod tests {
                 name: ".env".to_string(),
                 kind: SurfaceKind::DotenvFile,
                 path: PathBuf::from("/workspace/floria/.env"),
-                resource_id: None,
+                input: SurfaceInput::Bindings {
+                    binding_ids: vec!["common-cloudflare".to_string()],
+                },
                 position: 0,
             })
             .unwrap();
@@ -1371,7 +1535,9 @@ mod tests {
                     name: ".env".to_string(),
                     kind: SurfaceKind::DotenvFile,
                     path: PathBuf::from(path),
-                    resource_id: None,
+                    input: SurfaceInput::Bindings {
+                        binding_ids: vec!["fixture-common".to_string()],
+                    },
                     position: 0,
                 })
                 .unwrap();
@@ -1402,7 +1568,7 @@ mod tests {
                 name: ".env".to_string(),
                 kind: SurfaceKind::DotenvFile,
                 path: PathBuf::from("/workspace/other/.env"),
-                resource_id: None,
+                input: SurfaceInput::Bindings { binding_ids: vec![] },
                 position: 0,
             })
             .unwrap_err();
@@ -1419,7 +1585,7 @@ mod tests {
                 name: ".env".to_string(),
                 kind: SurfaceKind::DotenvFile,
                 path: PathBuf::from("/workspace/floria/.env"),
-                resource_id: None,
+                input: SurfaceInput::Bindings { binding_ids: vec![] },
                 position: 0,
             })
             .unwrap_err();
@@ -1438,7 +1604,7 @@ mod tests {
                 name: ".env.local".to_string(),
                 kind: SurfaceKind::EnvFileDirect,
                 path: PathBuf::from("/workspace/floria/.env.local"),
-                resource_id: Some(resource.id.clone()),
+                input: SurfaceInput::Resource { resource_id: resource.id.clone() },
                 position: 1,
             })
             .unwrap();
@@ -1465,7 +1631,7 @@ mod tests {
             name: ".env.local".to_string(),
             kind: SurfaceKind::EnvFileDirect,
             path: PathBuf::from("/workspace/floria/.env.local"),
-            resource_id: None,
+            input: SurfaceInput::Bindings { binding_ids: vec![] },
             position: 1,
         };
         assert!(matches!(
@@ -1477,7 +1643,7 @@ mod tests {
         catalog.upsert_resource(&scalar).unwrap();
         assert!(matches!(
             catalog.upsert_surface(&Surface {
-                resource_id: Some(scalar.id),
+                input: SurfaceInput::Resource { resource_id: scalar.id },
                 ..missing
             }),
             Err(CatalogError::Validation(_))
@@ -1485,7 +1651,7 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_binding_is_rejected_and_transaction_rolls_back() {
+    fn conflicting_surface_membership_is_rejected_and_transaction_rolls_back() {
         let (_dir, catalog) = catalog();
         catalog
             .upsert_resource(&scalar_resource("first", "TOKEN"))
@@ -1496,19 +1662,38 @@ mod tests {
         catalog
             .upsert_binding(&binding("first-binding", "first", BindingScope::Common))
             .unwrap();
-
-        let error = catalog
+        catalog
             .upsert_binding(&binding("second-binding", "second", BindingScope::Common))
-            .unwrap_err();
+            .unwrap();
+        let mut surface = Surface {
+            id: "fixture-dotenv".to_string(),
+            environment_id: "development".to_string(),
+            name: ".env".to_string(),
+            kind: SurfaceKind::DotenvFile,
+            path: PathBuf::from("/workspace/floria/.env"),
+            input: SurfaceInput::Bindings {
+                binding_ids: vec!["first-binding".to_string()],
+            },
+            position: 0,
+        };
+        catalog.upsert_surface(&surface).unwrap();
+
+        surface.input = SurfaceInput::Bindings {
+            binding_ids: vec!["first-binding".to_string(), "second-binding".to_string()],
+        };
+        let error = catalog.upsert_surface(&surface).unwrap_err();
         assert!(matches!(error, CatalogError::Conflict { ref key, .. } if key == "TOKEN"));
-        assert_eq!(catalog.snapshot().unwrap().bindings.len(), 1);
+        assert_eq!(
+            catalog.snapshot().unwrap().surfaces[0].input,
+            SurfaceInput::Bindings {
+                binding_ids: vec!["first-binding".to_string()]
+            }
+        );
     }
 
     #[test]
-    fn common_conflict_is_rejected_before_project_has_an_environment() {
-        let dir = tempfile::tempdir().unwrap();
-        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
-        catalog.upsert_project(&project()).unwrap();
+    fn the_same_key_can_belong_to_separate_surfaces() {
+        let (_dir, catalog) = catalog();
         catalog
             .upsert_resource(&scalar_resource("first", "TOKEN"))
             .unwrap();
@@ -1518,10 +1703,66 @@ mod tests {
         catalog
             .upsert_binding(&binding("first-binding", "first", BindingScope::Common))
             .unwrap();
-        let error = catalog
+        catalog
             .upsert_binding(&binding("second-binding", "second", BindingScope::Common))
-            .unwrap_err();
-        assert!(matches!(error, CatalogError::Conflict { ref key, .. } if key == "TOKEN"));
+            .unwrap();
+
+        for (id, name, binding_id) in [
+            ("first-surface", ".env.first", "first-binding"),
+            ("second-surface", ".env.second", "second-binding"),
+        ] {
+            catalog
+                .upsert_surface(&Surface {
+                    id: id.to_string(),
+                    environment_id: "development".to_string(),
+                    name: name.to_string(),
+                    kind: SurfaceKind::DotenvFile,
+                    path: PathBuf::from("/workspace/floria").join(name),
+                    input: SurfaceInput::Bindings {
+                        binding_ids: vec![binding_id.to_string()],
+                    },
+                    position: 0,
+                })
+                .unwrap();
+        }
+
+        assert_eq!(catalog.snapshot().unwrap().surfaces.len(), 2);
+    }
+
+    #[test]
+    fn surface_rejects_unknown_members_and_binding_removal_detaches_membership() {
+        let (_dir, catalog) = catalog();
+        let resource = scalar_resource("fixture", "FIXTURE_TOKEN");
+        catalog.upsert_resource(&resource).unwrap();
+        catalog
+            .upsert_binding(&binding("fixture-binding", &resource.id, BindingScope::Common))
+            .unwrap();
+        let mut surface = Surface {
+            id: "fixture-dotenv".to_string(),
+            environment_id: "development".to_string(),
+            name: ".env".to_string(),
+            kind: SurfaceKind::DotenvFile,
+            path: PathBuf::from("/workspace/floria/.env"),
+            input: SurfaceInput::Bindings {
+                binding_ids: vec!["missing-binding".to_string()],
+            },
+            position: 0,
+        };
+        assert!(matches!(
+            catalog.upsert_surface(&surface),
+            Err(CatalogError::NotFound(message)) if message.contains("missing-binding")
+        ));
+
+        surface.input = SurfaceInput::Bindings {
+            binding_ids: vec!["fixture-binding".to_string()],
+        };
+        catalog.upsert_surface(&surface).unwrap();
+        catalog.remove_binding("fixture-binding").unwrap();
+
+        assert_eq!(
+            catalog.snapshot().unwrap().surfaces[0].input,
+            SurfaceInput::Bindings { binding_ids: Vec::new() }
+        );
     }
 
     #[test]
@@ -1562,6 +1803,7 @@ mod tests {
                 name: "Defaults".to_string(),
                 kind: ResourceKind::EnvFile,
                 shape: ValueShape::KeyValueSet,
+                codec: ResourceCodec::Dotenv,
                 default_env_key: None,
                 entries: vec![EntrySpec {
                     address: "keys/LOG_LEVEL".to_string(),

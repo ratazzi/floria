@@ -28,8 +28,8 @@ use accessfs_core::snapshot::{content_version_of, SnapshotTable};
 use accessfs_core::writebuf::{WriteBufTable, WriteErr};
 use accessfs_store::{SecretId, SecretStore};
 use accessfs_surface::{
-    RegisteredSurface, SurfaceBacking, SurfaceError, SurfaceRegistry, SurfaceResolver,
-    DOTENV_MAX_SIZE, LINES_MAX_SIZE,
+    validate_secret_bytes, RegisteredSurface, SurfaceBacking, SurfaceError, SurfaceRegistry,
+    SurfaceResolver, DOTENV_MAX_SIZE, LINES_MAX_SIZE,
 };
 use dashmap::DashMap;
 use fuser::{
@@ -51,6 +51,7 @@ const OPEN_POOL_THREADS: usize = 32;
 /// allocated lazily per secret id and stay stable for the mount's lifetime.
 struct SecretsNs {
     store: Arc<dyn SecretStore>,
+    catalog: Option<Catalog>,
     /// Inode of the `secrets/` directory whose children this namespace owns.
     dir_ino: u64,
     id_to_ino: DashMap<String, u64>,
@@ -59,9 +60,15 @@ struct SecretsNs {
 }
 
 impl SecretsNs {
-    fn new(store: Arc<dyn SecretStore>, dir_ino: u64, next_ino: Arc<AtomicU64>) -> Self {
+    fn new(
+        store: Arc<dyn SecretStore>,
+        catalog: Option<Catalog>,
+        dir_ino: u64,
+        next_ino: Arc<AtomicU64>,
+    ) -> Self {
         SecretsNs {
             store,
+            catalog,
             dir_ino,
             id_to_ino: DashMap::new(),
             ino_to_id: DashMap::new(),
@@ -195,6 +202,7 @@ impl AccessFs {
         // surface children allocate from one shared inode sequence, so their numbers never clash.
         let tree = Tree::build(&cfg.files);
         let next_ino = Arc::new(AtomicU64::new(tree.next_ino()));
+        let secret_catalog = catalog.clone();
         let surfaces = match (catalog, store.as_ref(), surface_registry) {
             (Some(catalog), Some(store), Some(registry)) => Some(SurfaceNs::new(
                 registry,
@@ -207,8 +215,14 @@ impl AccessFs {
             }
             _ => None,
         };
-        let secrets = store
-            .map(|store| SecretsNs::new(store, tree.secrets_dir_ino(), Arc::clone(&next_ino)));
+        let secrets = store.map(|store| {
+            SecretsNs::new(
+                store,
+                secret_catalog,
+                tree.secrets_dir_ino(),
+                Arc::clone(&next_ino),
+            )
+        });
 
         let inner = Arc::new(Shared {
             tree,
@@ -386,6 +400,13 @@ impl Shared {
                     let sid: SecretId = id
                         .parse()
                         .map_err(|_| CommitFailure::io(format!("invalid secret id {id}")))?;
+                    if let Some(catalog) = &ns.catalog {
+                        let snapshot = catalog
+                            .snapshot()
+                            .map_err(|error| CommitFailure::io(error.to_string()))?;
+                        validate_secret_bytes(&snapshot, sid.as_str(), &bytes)
+                            .map_err(CommitFailure::surface)?;
+                    }
                     let version = ns
                         .store
                         .append_version(&sid, &bytes)
@@ -707,7 +728,7 @@ impl CommitFailure {
             SurfaceError::TooLarge { .. } => libc::EFBIG,
             SurfaceError::InvalidUtf8 { .. }
             | SurfaceError::DotenvParse { .. }
-            | SurfaceError::EnvFileKeysChanged { .. } => libc::EINVAL,
+            | SurfaceError::ResourceEntriesChanged { .. } => libc::EINVAL,
             _ => libc::EIO,
         };
         CommitFailure { errno: errno(code), message: error.to_string() }
@@ -1293,7 +1314,7 @@ pub fn mount(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use accessfs_catalog::{CatalogSnapshot, Surface, SurfaceKind};
+    use accessfs_catalog::{CatalogSnapshot, Surface, SurfaceInput, SurfaceKind};
     use accessfs_core::authz::AllowAll;
     use accessfs_core::identity::ProcessIdentity;
     use accessfs_store::{NewSecret, SecretRecord, StoreResult, VersionRecord};
@@ -1352,6 +1373,7 @@ mod tests {
         });
         let secret_ns = SecretsNs::new(
             Arc::clone(&store) as Arc<dyn SecretStore>,
+            None,
             tree.secrets_dir_ino(),
             Arc::clone(&next_ino),
         );
@@ -1361,7 +1383,7 @@ mod tests {
             name: ".env".to_string(),
             kind: SurfaceKind::DotenvFile,
             path: tmp.path().join("project/.env"),
-            resource_id: None,
+            input: SurfaceInput::Bindings { binding_ids: Vec::new() },
             position: 0,
         };
         let registry = Arc::new(SurfaceRegistry::from_snapshot(&CatalogSnapshot {
@@ -1390,7 +1412,7 @@ mod tests {
             name: ".env.local".to_string(),
             kind: SurfaceKind::DotenvFile,
             path: tmp.path().join("project/.env.local"),
-            resource_id: None,
+            input: SurfaceInput::Bindings { binding_ids: Vec::new() },
             position: 0,
         };
         registry.replace(&CatalogSnapshot {
@@ -1456,7 +1478,7 @@ mod tests {
     fn shared_with_store(store: Arc<dyn SecretStore>, tmp: &Path) -> Arc<Shared> {
         let tree = Tree::build(&[]);
         let next_ino = Arc::new(AtomicU64::new(tree.next_ino()));
-        let secrets = SecretsNs::new(store, tree.secrets_dir_ino(), next_ino);
+        let secrets = SecretsNs::new(store, None, tree.secrets_dir_ino(), next_ino);
         Arc::new(Shared {
             tree,
             snapshots: SnapshotTable::new(),

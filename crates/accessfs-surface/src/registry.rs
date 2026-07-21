@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 
-use accessfs_catalog::{CatalogSnapshot, ResourceSource, Surface, SurfaceKind};
+use accessfs_catalog::{CatalogSnapshot, ResourceSource, Surface, SurfaceInput, SurfaceKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SurfaceBacking {
@@ -66,7 +66,9 @@ fn file_surfaces(snapshot: &CatalogSnapshot) -> BTreeMap<String, RegisteredSurfa
                 SurfaceKind::DotenvFile => SurfaceBacking::DotenvComposed,
                 SurfaceKind::LinesFile => SurfaceBacking::LinesComposed,
                 SurfaceKind::EnvFileDirect => {
-                    let resource_id = surface.resource_id.as_ref()?;
+                    let SurfaceInput::Resource { resource_id } = &surface.input else {
+                        return None;
+                    };
                     let resource = snapshot
                         .resources
                         .iter()
@@ -92,7 +94,9 @@ fn file_surfaces(snapshot: &CatalogSnapshot) -> BTreeMap<String, RegisteredSurfa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use accessfs_catalog::{EntrySpec, Resource, ResourceKind, ValueShape};
+    use accessfs_catalog::{
+        EntrySpec, Resource, ResourceCodec, ResourceKind, SurfaceInput, ValueShape,
+    };
     use std::path::PathBuf;
 
     fn surface(id: &str, kind: SurfaceKind) -> Surface {
@@ -102,7 +106,7 @@ mod tests {
             name: ".env".to_string(),
             kind,
             path: PathBuf::from(format!("/fixture/project/{id}")),
-            resource_id: None,
+            input: SurfaceInput::Bindings { binding_ids: Vec::new() },
             position: 0,
         }
     }
@@ -110,7 +114,9 @@ mod tests {
     #[test]
     fn replacement_is_sorted_and_only_keeps_file_surfaces() {
         let direct = Surface {
-            resource_id: Some("fixture-env-resource".to_string()),
+            input: SurfaceInput::Resource {
+                resource_id: "fixture-env-resource".to_string(),
+            },
             ..surface("fixture-direct", SurfaceKind::EnvFileDirect)
         };
         let env_resource = Resource {
@@ -118,6 +124,7 @@ mod tests {
             name: "Fixture Env File".to_string(),
             kind: ResourceKind::EnvFile,
             shape: ValueShape::KeyValueSet,
+            codec: ResourceCodec::Dotenv,
             default_env_key: None,
             entries: vec![EntrySpec {
                 address: "keys/FIXTURE".to_string(),

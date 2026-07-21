@@ -1,15 +1,15 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use accessfs_catalog::{
-    resolve_catalog_snapshot, BindingScope, Catalog, CatalogSnapshot, EntrySelection, Resource,
-    ResourceSource, SurfaceKind, ValueShape,
+    resolve_catalog_surface, BindingScope, Catalog, CatalogSnapshot, EntrySelection, Resource,
+    ResourceCodec, ResourceSource, SurfaceInput, SurfaceKind, ValueShape,
 };
 use accessfs_core::audit::AuditDependency;
 use accessfs_store::{SecretId, SecretStore};
-use zeroize::Zeroizing;
 
-use crate::dotenv::{parse_dotenv, render_dotenv_refs};
+use crate::codec::{codec_capabilities, decode_resource as decode_resource_bytes, DecodedEntry};
+use crate::dotenv::render_dotenv_refs;
 use crate::error::{SurfaceError, SurfaceResult};
 use crate::lines::render_lines_refs;
 
@@ -151,49 +151,41 @@ impl SurfaceResolver {
                 kind: format!("{:?}", surface.kind),
             });
         }
-        let environment = snapshot
-            .environments
-            .iter()
-            .find(|environment| environment.id == surface.environment_id)
-            .ok_or_else(|| SurfaceError::NotFound(format!("environment {}", surface.environment_id)))?;
-        let resolved = resolve_catalog_snapshot(
-            &snapshot,
-            &environment.project_id,
-            &environment.id,
-        )?;
+        let exports = resolve_catalog_surface(&snapshot, surface_id)?;
         let resources: HashMap<&str, &Resource> = snapshot
             .resources
             .iter()
             .map(|resource| (resource.id.as_str(), resource))
             .collect();
 
-        let (frozen, versions) = self.freeze_versions(&snapshot, &resolved.exports)?;
-        let mut resource_values: HashMap<String, BTreeMap<String, Zeroizing<String>>> =
-            HashMap::new();
-        for export in &resolved.exports {
+        let (frozen, versions) = self.freeze_versions(&snapshot, &exports)?;
+        let mut resource_values: HashMap<String, Vec<DecodedEntry>> = HashMap::new();
+        for export in &exports {
             if resource_values.contains_key(&export.resource_id) {
                 continue;
             }
             let resource = resources
                 .get(export.resource_id.as_str())
                 .ok_or_else(|| SurfaceError::NotFound(format!("resource {}", export.resource_id)))?;
-            let values = self.resolve_resource(resource, frozen.get(&resource.id))?;
+            let values = self.decode_resource(resource, frozen.get(&resource.id))?;
             resource_values.insert(resource.id.clone(), values);
         }
 
-        let mut ordered = Vec::with_capacity(resolved.exports.len());
-        for export in &resolved.exports {
+        let mut ordered = Vec::with_capacity(exports.len());
+        for export in &exports {
             let value = resource_values
                 .get(&export.resource_id)
-                .and_then(|values| values.get(&export.source_key))
+                .and_then(|values| {
+                    values.iter().find(|entry| entry.address == export.source_key)
+                })
                 .ok_or_else(|| SurfaceError::MissingKey {
                     resource_id: export.resource_id.clone(),
                     key: export.source_key.clone(),
                 })?;
-            ordered.push((export.key.as_str(), value.as_str()));
+            ordered.push((export.key.as_str(), value.value.as_str()));
         }
         let bytes = render_dotenv_refs(ordered)?;
-        Ok(DotenvSnapshot { bytes, versions, exports: resolved.exports })
+        Ok(DotenvSnapshot { bytes, versions, exports })
     }
 
     /// Compose selected keyless scalar values in binding order. The projection treats each
@@ -216,43 +208,70 @@ impl SurfaceResolver {
             .iter()
             .find(|environment| environment.id == surface.environment_id)
             .ok_or_else(|| SurfaceError::NotFound(format!("environment {}", surface.environment_id)))?;
+        let SurfaceInput::Bindings { binding_ids } = &surface.input else {
+            return Err(SurfaceError::IncompatibleResource {
+                resource_id: "<surface-input>".to_string(),
+                reason: "lines surface requires explicit binding input".to_string(),
+            });
+        };
         let resources: HashMap<&str, &Resource> = snapshot
             .resources
             .iter()
             .map(|resource| (resource.id.as_str(), resource))
             .collect();
-        let mut bindings = snapshot
-            .bindings
-            .iter()
-            .filter(|binding| {
-                binding.enabled
-                    && binding.project_id == environment.project_id
-                    && match &binding.scope {
-                        BindingScope::Common => true,
-                        BindingScope::Environment { environment_id } => {
-                            environment_id == &environment.id
-                        }
+        let mut bindings = Vec::new();
+        for binding_id in binding_ids {
+            let binding = snapshot
+                .bindings
+                .iter()
+                .find(|binding| binding.id == *binding_id)
+                .ok_or_else(|| SurfaceError::NotFound(format!("binding {binding_id}")))?;
+            let applies = binding.project_id == environment.project_id
+                && match &binding.scope {
+                    BindingScope::Common => true,
+                    BindingScope::Environment { environment_id } => {
+                        environment_id == &environment.id
                     }
-            })
-            .filter(|binding| {
-                let Some(resource) = resources.get(binding.resource_id.as_str()) else {
-                    return false;
                 };
-                if resource.shape != ValueShape::Scalar
-                    || resource.entries.len() != 1
-                    || resource.entries[0].key.is_some()
-                    || binding.key_override.is_some()
-                {
-                    return false;
+            if !applies {
+                return Err(SurfaceError::IncompatibleResource {
+                    resource_id: binding.resource_id.clone(),
+                    reason: format!("binding {binding_id:?} does not apply to this surface"),
+                });
+            }
+            if !binding.enabled {
+                continue;
+            }
+            let resource = resources.get(binding.resource_id.as_str()).ok_or_else(|| {
+                SurfaceError::NotFound(format!("resource {}", binding.resource_id))
+            })?;
+            if resource.shape != ValueShape::Scalar
+                || resource.codec != ResourceCodec::Opaque
+                || resource.entries.len() != 1
+                || resource.entries[0].key.is_some()
+                || binding.key_override.is_some()
+            {
+                return Err(SurfaceError::IncompatibleResource {
+                    resource_id: resource.id.clone(),
+                    reason: format!(
+                        "binding {binding_id:?} does not expose one keyless scalar"
+                    ),
+                });
+            }
+            let selected = match &binding.selection {
+                EntrySelection::All => true,
+                EntrySelection::Entries { addresses } => {
+                    addresses.contains(&resource.entries[0].address)
                 }
-                match &binding.selection {
-                    EntrySelection::All => true,
-                    EntrySelection::Entries { addresses } => {
-                        addresses.contains(&resource.entries[0].address)
-                    }
-                }
-            })
-            .collect::<Vec<_>>();
+            };
+            if !selected {
+                return Err(SurfaceError::IncompatibleResource {
+                    resource_id: resource.id.clone(),
+                    reason: format!("binding {binding_id:?} does not select its scalar entry"),
+                });
+            }
+            bindings.push(binding);
+        }
         bindings.sort_by_key(|binding| {
             let scope_order = match binding.scope {
                 BindingScope::Common => 0,
@@ -290,19 +309,12 @@ impl SurfaceResolver {
             let resource = resources.get(binding.resource_id.as_str()).ok_or_else(|| {
                 SurfaceError::NotFound(format!("resource {}", binding.resource_id))
             })?;
-            let value = match &resource.source {
-                ResourceSource::SecretRef { .. } => {
-                    self.read_frozen_text(resource, frozen.get(&resource.id))?
-                }
-                ResourceSource::Literal { value } => Zeroizing::new(value.clone()),
-                _ => {
-                    return Err(SurfaceError::IncompatibleResource {
-                        resource_id: resource.id.clone(),
-                        reason: "source cannot produce an opaque line value".to_string(),
-                    });
-                }
-            };
-            values.push((resource.id.clone(), value));
+            let mut decoded = self.decode_resource(resource, frozen.get(&resource.id))?;
+            let value = decoded.pop().ok_or_else(|| SurfaceError::MissingKey {
+                resource_id: resource.id.clone(),
+                key: resource.entries[0].address.clone(),
+            })?;
+            values.push((resource.id.clone(), value.value));
             entries.push(ResolvedLineEntry {
                 address: resource.entries[0].address.clone(),
                 binding_id: binding.id.clone(),
@@ -346,8 +358,8 @@ impl SurfaceResolver {
     ) -> SurfaceResult<DirectEnvFileCommit> {
         let snapshot = self.catalog.snapshot()?;
         let target = direct_env_file_target(&snapshot, surface_id)?;
-        validate_direct_env_file(&target.resource, bytes)?;
         let id: SecretId = target.secret_id.parse()?;
+        crate::codec::validate_secret_bytes(&snapshot, id.as_str(), bytes)?;
         let version = self.store.append_version(&id, bytes)?;
         Ok(DirectEnvFileCommit {
             resource_id: target.resource.id,
@@ -394,79 +406,28 @@ impl SurfaceResolver {
         Ok((frozen, versions))
     }
 
-    fn resolve_resource(
+    fn decode_resource(
         &self,
         resource: &Resource,
         frozen: Option<&(SecretId, u32)>,
-    ) -> SurfaceResult<BTreeMap<String, Zeroizing<String>>> {
-        let mut values = BTreeMap::new();
-        match (&resource.shape, &resource.source) {
-            (ValueShape::Scalar, ResourceSource::SecretRef { .. }) => {
-                let text = self.read_frozen_text(resource, frozen)?;
-                values.insert(resource.entries[0].address.clone(), text);
+    ) -> SurfaceResult<Vec<DecodedEntry>> {
+        match &resource.source {
+            ResourceSource::SecretRef { .. } => {
+                let (id, version) = frozen.ok_or_else(|| {
+                    SurfaceError::NotFound(format!(
+                        "frozen version for resource {}",
+                        resource.id
+                    ))
+                })?;
+                let plaintext = self.store.get_version(id, *version)?;
+                decode_resource_bytes(resource, &plaintext)
             }
-            (ValueShape::KeyValueSet, ResourceSource::SecretRef { .. }) => {
-                let text = self.read_frozen_text(resource, frozen)?;
-                let mut parsed = parse_dotenv(&text)?;
-                for entry in &resource.entries {
-                    let key = entry.key.as_ref().ok_or_else(|| SurfaceError::MissingKey {
-                        resource_id: resource.id.clone(),
-                        key: entry.address.clone(),
-                    })?;
-                    let value = parsed.remove(key).ok_or_else(|| SurfaceError::MissingKey {
-                        resource_id: resource.id.clone(),
-                        key: key.clone(),
-                    })?;
-                    values.insert(entry.address.clone(), Zeroizing::new(value));
-                }
-            }
-            (ValueShape::Scalar, ResourceSource::Literal { value }) => {
-                values.insert(
-                    resource.entries[0].address.clone(),
-                    Zeroizing::new(value.clone()),
-                );
-            }
-            (ValueShape::Socket, ResourceSource::Socket { endpoint }) => {
-                values.insert(
-                    resource.entries[0].address.clone(),
-                    Zeroizing::new(endpoint.to_string_lossy().into_owned()),
-                );
-            }
-            (ValueShape::Bytes, _) => {
-                return Err(SurfaceError::IncompatibleResource {
-                    resource_id: resource.id.clone(),
-                    reason: "bytes cannot be rendered into dotenv".to_string(),
-                })
-            }
-            (_, ResourceSource::Command { .. }) => {
-                return Err(SurfaceError::IncompatibleResource {
-                    resource_id: resource.id.clone(),
-                    reason: "command resources are not enabled for dotenv yet".to_string(),
-                })
-            }
-            _ => {
-                return Err(SurfaceError::IncompatibleResource {
-                    resource_id: resource.id.clone(),
-                    reason: "shape and source do not produce dotenv values".to_string(),
-                })
-            }
+            ResourceSource::Literal { value } => decode_resource_bytes(resource, value.as_bytes()),
+            _ => Err(SurfaceError::IncompatibleResource {
+                resource_id: resource.id.clone(),
+                reason: "source cannot be decoded by a file projection".to_string(),
+            }),
         }
-        Ok(values)
-    }
-
-    fn read_frozen_text(
-        &self,
-        resource: &Resource,
-        frozen: Option<&(SecretId, u32)>,
-    ) -> SurfaceResult<Zeroizing<String>> {
-        let (id, version) = frozen.ok_or_else(|| SurfaceError::NotFound(format!(
-            "frozen version for resource {}",
-            resource.id
-        )))?;
-        let plaintext = self.store.get_version(id, *version)?;
-        let text = String::from_utf8(plaintext.to_vec())
-            .map_err(|_| SurfaceError::InvalidUtf8 { resource_id: resource.id.clone() })?;
-        Ok(Zeroizing::new(text))
     }
 }
 
@@ -485,16 +446,16 @@ fn direct_env_file_target(
             kind: format!("{:?}", surface.kind),
         });
     }
-    let resource_id = surface.resource_id.as_deref().ok_or_else(|| {
-        SurfaceError::IncompatibleResource {
-            resource_id: "<missing>".to_string(),
-            reason: "env_file_direct surface requires resource_id".to_string(),
-        }
-    })?;
+    let SurfaceInput::Resource { resource_id } = &surface.input else {
+        return Err(SurfaceError::IncompatibleResource {
+            resource_id: "<surface-input>".to_string(),
+            reason: "env_file_direct surface requires one resource input".to_string(),
+        });
+    };
     let resource = snapshot
         .resources
         .iter()
-        .find(|resource| resource.id == resource_id)
+        .find(|resource| resource.id == *resource_id)
         .ok_or_else(|| SurfaceError::NotFound(format!("resource {resource_id}")))?
         .clone();
     let secret_id = match &resource.source {
@@ -510,28 +471,14 @@ fn direct_env_file_target(
 }
 
 fn validate_direct_env_file(resource: &Resource, bytes: &[u8]) -> SurfaceResult<Vec<String>> {
-    if bytes.len() > crate::dotenv::DOTENV_MAX_SIZE {
-        return Err(SurfaceError::TooLarge { limit: crate::dotenv::DOTENV_MAX_SIZE });
-    }
-    let text = std::str::from_utf8(bytes)
-        .map_err(|_| SurfaceError::InvalidUtf8 { resource_id: resource.id.clone() })?;
-    let values = parse_dotenv(text)?;
-    let actual = values.keys().cloned().collect::<Vec<_>>();
-    let expected = resource
-        .entries
-        .iter()
-        .filter_map(|entry| entry.key.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    if actual != expected {
-        return Err(SurfaceError::EnvFileKeysChanged {
+    if !codec_capabilities(resource.codec).raw_writeback {
+        return Err(SurfaceError::IncompatibleResource {
             resource_id: resource.id.clone(),
-            expected,
-            actual,
+            reason: format!("codec {:?} does not support raw writeback", resource.codec),
         });
     }
-    Ok(values.into_keys().collect())
+    let decoded = decode_resource_bytes(resource, bytes)?;
+    Ok(decoded.into_iter().filter_map(|entry| entry.key).collect())
 }
 
 #[cfg(test)]
@@ -544,6 +491,7 @@ mod tests {
     use accessfs_store::{NewSecret, SecretOrigin, SecretRecord, StoreResult, VersionRecord};
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
+    use zeroize::Zeroizing;
 
     const TOKEN_ID: &str = "00000000-0000-0000-0000-000000000001";
     const ENV_FILE_ID: &str = "00000000-0000-0000-0000-000000000002";
@@ -685,6 +633,7 @@ mod tests {
                 name: "Fixture Token".to_string(),
                 kind: ResourceKind::SharedSecret,
                 shape: ValueShape::Scalar,
+                codec: ResourceCodec::Opaque,
                 default_env_key: Some("SERVICE_TOKEN".to_string()),
                 entries: vec![EntrySpec {
                     address: "value".to_string(),
@@ -703,6 +652,7 @@ mod tests {
                 name: "Fixture Env File".to_string(),
                 kind: ResourceKind::EnvFile,
                 shape: ValueShape::KeyValueSet,
+                codec: ResourceCodec::Dotenv,
                 default_env_key: None,
                 entries: vec![
                     EntrySpec {
@@ -729,6 +679,7 @@ mod tests {
                 name: "Fixture Mode".to_string(),
                 kind: ResourceKind::Literal,
                 shape: ValueShape::Scalar,
+                codec: ResourceCodec::Opaque,
                 default_env_key: Some("APP_ENV".to_string()),
                 entries: vec![EntrySpec {
                     address: "value".to_string(),
@@ -750,7 +701,13 @@ mod tests {
                 name: ".env".to_string(),
                 kind: SurfaceKind::DotenvFile,
                 path: PathBuf::from("/fixture/project/.env"),
-                resource_id: None,
+                input: SurfaceInput::Bindings {
+                    binding_ids: vec![
+                        "fixture-token-binding".to_string(),
+                        "fixture-env-binding".to_string(),
+                        "fixture-mode-binding".to_string(),
+                    ],
+                },
                 position: 0,
             })
             .unwrap();
@@ -761,7 +718,9 @@ mod tests {
                 name: ".env.source".to_string(),
                 kind: SurfaceKind::EnvFileDirect,
                 path: PathBuf::from("/fixture/project/.env.source"),
-                resource_id: Some("fixture-env-file".to_string()),
+                input: SurfaceInput::Resource {
+                    resource_id: "fixture-env-file".to_string(),
+                },
                 position: 1,
             })
             .unwrap();
@@ -832,7 +791,7 @@ mod tests {
         let error = resolver
             .commit_direct_env_file("fixture-direct-env", b"API_HOST=http://127.0.0.1:9999\n")
             .unwrap_err();
-        assert!(matches!(error, SurfaceError::EnvFileKeysChanged { .. }));
+        assert!(matches!(error, SurfaceError::ResourceEntriesChanged { .. }));
         assert_eq!(resolver.read_direct_env_file("fixture-direct-env").unwrap().version, 2);
     }
 
@@ -851,6 +810,7 @@ mod tests {
                     name: name.to_string(),
                     kind: ResourceKind::SharedSecret,
                     shape: ValueShape::Scalar,
+                    codec: ResourceCodec::Opaque,
                     default_env_key: None,
                     entries: vec![EntrySpec {
                         address: "value".to_string(),
@@ -872,10 +832,35 @@ mod tests {
                 name: ".pgpass".to_string(),
                 kind: SurfaceKind::LinesFile,
                 path: PathBuf::from("/fixture/project/.pgpass"),
-                resource_id: None,
+                input: SurfaceInput::Bindings {
+                    binding_ids: vec![
+                        "fixture-line-one-binding".to_string(),
+                        "fixture-line-two-binding".to_string(),
+                    ],
+                },
                 position: 2,
             })
             .unwrap();
+        catalog
+            .upsert_surface(&Surface {
+                id: "fixture-other-lines".to_string(),
+                environment_id: "fixture-development".to_string(),
+                name: "credentials.lines".to_string(),
+                kind: SurfaceKind::LinesFile,
+                path: PathBuf::from("/fixture/project/credentials.lines"),
+                input: SurfaceInput::Bindings {
+                    binding_ids: vec!["fixture-line-two-binding".to_string()],
+                },
+                position: 3,
+            })
+            .unwrap();
+
+        let mut invalid = catalog.resource("fixture-line-one").unwrap();
+        invalid.default_env_key = Some("DATABASE_LINE".to_string());
+        invalid.entries[0].key = Some("DATABASE_LINE".to_string());
+        assert!(catalog.upsert_resource(&invalid).is_err());
+        assert!(catalog.resource("fixture-line-one").unwrap().entries[0].key.is_none());
+
         let store = Arc::new(FixtureStore::new());
         let resolver = SurfaceResolver::new(catalog, Arc::clone(&store) as Arc<dyn SecretStore>);
 
@@ -903,5 +888,10 @@ mod tests {
         let dependencies = snapshot.audit_dependencies();
         assert_eq!(dependencies[0].binding_id, "fixture-line-one-binding");
         assert_eq!(dependencies[0].version, Some(1));
+
+        assert_eq!(
+            resolver.render_lines_surface("fixture-other-lines").unwrap().bytes,
+            b"db-two.fixture.invalid|5432|app|fixture-user|fixture-pass-two\n"
+        );
     }
 }
