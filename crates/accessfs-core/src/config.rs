@@ -239,15 +239,15 @@ fn build_ruleset(rule_cfgs: Vec<RuleCfg>, files: &[FileEntry]) -> Result<RuleSet
         enabled: true,
     });
 
-    // Rendered surfaces may contain several secrets. They are read-only, but must still prompt
-    // by default rather than inheriting the monitor-mode read allow below.
+    // File surfaces may contain several secrets. Prompt for both operations here; the filesystem
+    // capability gate still rejects writes to composed surfaces before authorization.
     rules.push(Rule {
         id: "surfaces-default".to_string(),
         priority: i32::MIN + 1,
         subject: SubjectMatch::default(),
         path_glob: compile_glob(&format!("{SURFACES_DIR}/**"))
             .expect("`surfaces/**` is a valid glob"),
-        ops: RuleOps::READ,
+        ops: RuleOps::READ_WRITE,
         enforcement: Enforcement::Prompt,
         enabled: true,
     });
@@ -609,14 +609,14 @@ mod tests {
             (Enforcement::Prompt, Some("secrets-default".to_string()))
         );
 
-        // composed surfaces are also gated by default; they never accept writes
+        // surfaces are gated for both operations; the filesystem decides which kinds are writable
         assert_eq!(
             rules.decide(&id, "surfaces/fixture-dotenv", None, Operation::Read),
             (Enforcement::Prompt, Some("surfaces-default".to_string()))
         );
         assert_eq!(
             rules.decide(&id, "surfaces/fixture-dotenv", None, Operation::Write),
-            (Enforcement::Deny, Some("default-deny".to_string()))
+            (Enforcement::Prompt, Some("surfaces-default".to_string()))
         );
 
         // explicit deny rule wins for prod
