@@ -173,7 +173,7 @@ fn push_value(output: &mut String, value: &str) {
     output.push('"');
 }
 
-fn valid_env_key(key: &str) -> bool {
+pub(crate) fn valid_env_key(key: &str) -> bool {
     let mut chars = key.chars();
     let Some(first) = chars.next() else { return false };
     (first == '_' || first.is_ascii_alphabetic())

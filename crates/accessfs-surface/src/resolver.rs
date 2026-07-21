@@ -9,6 +9,7 @@ use accessfs_core::audit::AuditDependency;
 use accessfs_store::{SecretId, SecretStore};
 
 use crate::codec::{codec_capabilities, decode_resource as decode_resource_bytes, DecodedEntry};
+use crate::direnv::render_direnv_refs;
 use crate::dotenv::render_dotenv_refs;
 use crate::error::{SurfaceError, SurfaceResult};
 use crate::ini::render_ini_refs;
@@ -29,6 +30,8 @@ pub struct DotenvSnapshot {
     pub versions: Vec<FrozenResourceVersion>,
     pub exports: Vec<accessfs_catalog::ResolvedExport>,
 }
+
+pub type DirenvSnapshot = DotenvSnapshot;
 
 #[derive(Debug)]
 pub struct DirectEnvFileSnapshot {
@@ -226,6 +229,58 @@ impl SurfaceResolver {
         }
         let bytes = render_dotenv_refs(ordered)?;
         Ok(DotenvSnapshot { bytes, versions, exports })
+    }
+
+    /// Resolve a keyed environment projection as inert `export` statements. Values are always
+    /// shell-quoted by the renderer; resources cannot contribute executable shell fragments.
+    pub fn render_direnv_surface(&self, surface_id: &str) -> SurfaceResult<DirenvSnapshot> {
+        let snapshot = self.catalog.snapshot()?;
+        let surface = snapshot
+            .surfaces
+            .iter()
+            .find(|surface| surface.id == surface_id)
+            .ok_or_else(|| SurfaceError::NotFound(surface_id.to_string()))?;
+        if surface.kind != SurfaceKind::DirenvFile {
+            return Err(SurfaceError::UnsupportedSurface {
+                surface_id: surface_id.to_string(),
+                kind: format!("{:?}", surface.kind),
+            });
+        }
+        let exports = resolve_catalog_surface(&snapshot, surface_id)?;
+        let resources: HashMap<&str, &Resource> = snapshot
+            .resources
+            .iter()
+            .map(|resource| (resource.id.as_str(), resource))
+            .collect();
+
+        let (frozen, versions) = self.freeze_versions(&snapshot, &exports)?;
+        let mut resource_values: HashMap<String, Vec<DecodedEntry>> = HashMap::new();
+        for export in &exports {
+            if resource_values.contains_key(&export.resource_id) {
+                continue;
+            }
+            let resource = resources
+                .get(export.resource_id.as_str())
+                .ok_or_else(|| SurfaceError::NotFound(format!("resource {}", export.resource_id)))?;
+            let values = self.decode_resource(resource, frozen.get(&resource.id))?;
+            resource_values.insert(resource.id.clone(), values);
+        }
+
+        let mut ordered = Vec::with_capacity(exports.len());
+        for export in &exports {
+            let value = resource_values
+                .get(&export.resource_id)
+                .and_then(|values| {
+                    values.iter().find(|entry| entry.address == export.source_key)
+                })
+                .ok_or_else(|| SurfaceError::MissingKey {
+                    resource_id: export.resource_id.clone(),
+                    key: export.source_key.clone(),
+                })?;
+            ordered.push((export.key.as_str(), value.value.as_str()));
+        }
+        let bytes = render_direnv_refs(ordered)?;
+        Ok(DirenvSnapshot { bytes, versions, exports })
     }
 
     /// Compose selected entries from ordered INI resources. Root entries are canonicalized
@@ -927,6 +982,23 @@ mod tests {
     fn renders_multiple_resources_in_binding_order_and_freezes_versions() {
         let dir = tempfile::tempdir().unwrap();
         let catalog = fixture_catalog(&dir.path().join("catalog.sqlite"));
+        catalog
+            .upsert_surface(&Surface {
+                id: "fixture-direnv".to_string(),
+                environment_id: "fixture-development".to_string(),
+                name: ".envrc".to_string(),
+                kind: SurfaceKind::DirenvFile,
+                path: PathBuf::from("/fixture/project/.envrc"),
+                input: SurfaceInput::Bindings {
+                    binding_ids: vec![
+                        "fixture-token-binding".to_string(),
+                        "fixture-env-binding".to_string(),
+                        "fixture-mode-binding".to_string(),
+                    ],
+                },
+                position: 2,
+            })
+            .unwrap();
         let store = Arc::new(FixtureStore::new());
         let resolver = SurfaceResolver::new(catalog, Arc::clone(&store) as Arc<dyn SecretStore>);
 
@@ -959,6 +1031,13 @@ mod tests {
         assert_eq!(dependencies[0].version, Some(2));
         assert_eq!(dependencies.last().unwrap().resource_id, "fixture-mode");
         assert_eq!(dependencies.last().unwrap().version, None);
+
+        let direnv = resolver.render_direnv_surface("fixture-direnv").unwrap();
+        assert_eq!(
+            std::str::from_utf8(&direnv.bytes).unwrap(),
+            "export SERVICE_TOKEN='fixture-token-value'\nexport API_HOST='http://127.0.0.1:8787'\nexport LOG_LEVEL='debug'\nexport APP_ENV='development'\n"
+        );
+        assert_eq!(direnv.audit_dependencies().len(), 4);
     }
 
     #[test]

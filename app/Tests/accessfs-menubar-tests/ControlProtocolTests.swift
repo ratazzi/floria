@@ -176,4 +176,13 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(snapshot.surfaces.first?.kind, "ini_file")
         XCTAssertEqual(snapshot.surfaces.first?.input.bindingIDs, ["fixture-binding"])
     }
+
+    func testDecodesDirenvSurfaceFromRustSnapshot() throws {
+        let data = Data(
+            #"{"projects":[],"environments":[],"resources":[],"bindings":[],"surfaces":[{"id":"fixture-direnv","environment_id":"fixture-development","name":".envrc","kind":"direnv_file","path":"/tmp/fixture/.envrc","input":{"type":"bindings","binding_ids":["fixture-binding"]},"position":1}]}"#.utf8)
+        let snapshot = try JSONDecoder().decode(CatalogSnapshot.self, from: data)
+
+        XCTAssertEqual(snapshot.surfaces.first?.kind, "direnv_file")
+        XCTAssertEqual(snapshot.surfaces.first?.name, ".envrc")
+    }
 }

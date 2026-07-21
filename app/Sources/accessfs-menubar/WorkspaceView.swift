@@ -303,6 +303,7 @@ private struct ProjectWorkspaceView: View {
     @State private var showingAddBinding = false
     @State private var showingNewEnvironment = false
     @State private var showingAddDotenvFile = false
+    @State private var showingAddDirenvFile = false
     @State private var showingAddIniFile = false
     @State private var showingAddDirectEnvFile = false
     @State private var showingAddLinesFile = false
@@ -330,6 +331,7 @@ private struct ProjectWorkspaceView: View {
             SurfaceInspector(
                 store: store,
                 addDotenvFile: { showingAddDotenvFile = true },
+                addDirenvFile: { showingAddDirenvFile = true },
                 addIniFile: { showingAddIniFile = true },
                 addDirectEnvFile: { showingAddDirectEnvFile = true },
                 addLinesFile: { showingAddLinesFile = true })
@@ -343,6 +345,9 @@ private struct ProjectWorkspaceView: View {
         }
         .sheet(isPresented: $showingAddDotenvFile) {
             AddDotenvSurfaceSheet(store: store)
+        }
+        .sheet(isPresented: $showingAddDirenvFile) {
+            AddDirenvSurfaceSheet(store: store)
         }
         .sheet(isPresented: $showingAddIniFile) {
             AddIniSurfaceSheet(store: store)
@@ -704,6 +709,7 @@ private struct ProjectAccessPane: View {
 private struct SurfaceInspector: View {
     @Bindable var store: WorkspaceStore
     let addDotenvFile: () -> Void
+    let addDirenvFile: () -> Void
     let addIniFile: () -> Void
     let addDirectEnvFile: () -> Void
     let addLinesFile: () -> Void
@@ -733,6 +739,9 @@ private struct SurfaceInspector: View {
                             Menu {
                                 Button("Composed Env Output", systemImage: "doc.text") {
                                     addDotenvFile()
+                                }
+                                Button("direnv Output", systemImage: "terminal") {
+                                    addDirenvFile()
                                 }
                                 Button("INI Output", systemImage: "list.bullet.rectangle") {
                                     addIniFile()
@@ -765,6 +774,10 @@ private struct SurfaceInspector: View {
                         DotenvSurfacePreview(
                             store: store, openInFinder: { revealSurface(surface) },
                             manageLink: { showingManageSurface = true })
+                    case .direnvFile:
+                        DirenvSurfacePreview(
+                            store: store, openInFinder: { revealSurface(surface) },
+                            manageLink: { showingManageSurface = true })
                     case .iniFile:
                         IniSurfacePreview(
                             store: store, openInFinder: { revealSurface(surface) },
@@ -792,6 +805,7 @@ private struct SurfaceInspector: View {
                     ContentUnavailableView("No output surface", systemImage: "doc.badge.plus")
                     Menu("Add Output", systemImage: "plus") {
                         Button("Composed Env Output", action: addDotenvFile)
+                        Button("direnv Output", action: addDirenvFile)
                         Button("INI Output", action: addIniFile)
                         Button("Direct EnvFile Output", action: addDirectEnvFile)
                         Button("Lines Output", action: addLinesFile)
@@ -921,6 +935,46 @@ private struct DotenvSurfacePreview: View {
             SurfaceFooter(
                 primaryTitle: "Manage Link", secondaryTitle: "Open in Finder",
                 note: "Generated on open · Read only",
+                primaryAction: manageLink, secondaryAction: openInFinder)
+        }
+    }
+}
+
+private struct DirenvSurfacePreview: View {
+    @Bindable var store: WorkspaceStore
+    let openInFinder: () -> Void
+    let manageLink: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(store.resolvedExports) { export in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("export \(export.key)='\(export.sensitive ? "••••••••••••" : export.previewValue)'")
+                                .font(.callout.monospaced())
+                                .lineLimit(2)
+                                .truncationMode(.middle)
+                            ResourceKindBadge(kind: export.resourceKind, label: export.resourceName)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 12)
+                        Divider().padding(.leading, 20)
+                    }
+                }
+            }
+            HStack(alignment: .top, spacing: 7) {
+                Image(systemName: "exclamationmark.triangle")
+                Text("Authorization identifies the shell or direnv session that reads this file, not each child process that inherits the environment.")
+            }
+            .font(.caption)
+            .foregroundStyle(.orange)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 10)
+            SurfaceFooter(
+                primaryTitle: "Manage Link", secondaryTitle: "Open in Finder",
+                note: "Strictly quoted exports · Read only · Session-level authorization",
                 primaryAction: manageLink, secondaryAction: openInFinder)
         }
     }
@@ -1068,12 +1122,14 @@ private struct ManageSurfaceSheet: View {
     @State private var selectedBindingIDs: Set<WorkspaceBinding.ID> = []
 
     private var isFileSurface: Bool {
-        surface.kind == .dotenvFile || surface.kind == .iniFile || surface.kind == .envFileDirect
+        surface.kind == .dotenvFile || surface.kind == .direnvFile || surface.kind == .iniFile
+            || surface.kind == .envFileDirect
             || surface.kind == .linesFile
     }
 
     private var isComposedSurface: Bool {
-        surface.kind == .dotenvFile || surface.kind == .iniFile || surface.kind == .linesFile
+        surface.kind == .dotenvFile || surface.kind == .direnvFile || surface.kind == .iniFile
+            || surface.kind == .linesFile
     }
 
     private var bindingCandidates: [WorkspaceBinding] {
@@ -1420,7 +1476,8 @@ private struct AddBindingSheet: View {
 
     private var outputs: [WorkspaceSurface] {
         (store.selectedEnvironment?.surfaces ?? []).filter {
-            $0.kind == .dotenvFile || $0.kind == .iniFile || $0.kind == .linesFile
+            $0.kind == .dotenvFile || $0.kind == .direnvFile || $0.kind == .iniFile
+                || $0.kind == .linesFile
         }
     }
 
@@ -1611,7 +1668,7 @@ private struct AddBindingSheet: View {
         guard let kind = outputs.first(where: { $0.id == outputSurfaceID })?.kind else { return [] }
         let selected = selectedAddressSet(for: resource)
         switch kind {
-        case .dotenvFile:
+        case .dotenvFile, .direnvFile:
             let current = Set(store.resolvedExports(for: outputSurfaceID).map(\.key))
             return resource.entries
                 .filter { selected.contains($0.address) }
@@ -2202,6 +2259,126 @@ private struct AddDotenvSurfaceSheet: View {
             defer { isSaving = false }
             do {
                 try await store.createDotenvSurface(
+                    fileName: fileName,
+                    bindingIDs: candidates.map(\.id).filter(selectedBindingIDs.contains))
+                dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func bindingSelection(_ id: WorkspaceBinding.ID) -> Binding<Bool> {
+        Binding(
+            get: { selectedBindingIDs.contains(id) },
+            set: { selected in
+                if selected { selectedBindingIDs.insert(id) }
+                else { selectedBindingIDs.remove(id) }
+            })
+    }
+}
+
+private struct AddDirenvSurfaceSheet: View {
+    @Bindable var store: WorkspaceStore
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var fileName = ".envrc"
+    @State private var selectedBindingIDs: Set<WorkspaceBinding.ID> = []
+    @State private var isSaving = false
+    @State private var errorMessage: String?
+
+    private var candidates: [WorkspaceBinding] {
+        store.compatibleBindings(for: .direnvFile)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Add direnv Output").font(.title2.bold())
+                Text("Generate a read-only .envrc containing strictly quoted export statements.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Project file name").font(.callout.weight(.medium))
+                TextField(".envrc", text: $fileName)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.body.monospaced())
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Included bindings").font(.callout.weight(.medium))
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(candidates) { binding in
+                            Toggle(
+                                store.resource(binding.resourceID)?.name ?? binding.resourceID,
+                                isOn: bindingSelection(binding.id)
+                            )
+                            .toggleStyle(.checkbox)
+                        }
+                        if candidates.isEmpty {
+                            Text("No compatible keyed bindings yet. You can add them later.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 170)
+            }
+
+            HStack(alignment: .top) {
+                Image(systemName: "exclamationmark.triangle")
+                Text("direnv reads .envrc from the shell session. Floria can authorize that read, but cannot separately identify child processes that inherit the exported values.")
+            }
+            .font(.caption)
+            .foregroundStyle(.orange)
+
+            HStack(alignment: .top) {
+                Image(systemName: "lock.fill")
+                Text("Resources contribute values only. Shell commands, substitutions, and unquoted fragments cannot be injected into this output.")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            Divider()
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Create Output", action: createSurface)
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isSaving || fileName.isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(width: 560)
+        .onAppear {
+            if selectedBindingIDs.isEmpty {
+                selectedBindingIDs = Set(candidates.map(\.id))
+            }
+        }
+        .alert(
+            "Could not create direnv output",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } })
+        ) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
+    }
+
+    private func createSurface() {
+        Task {
+            isSaving = true
+            defer { isSaving = false }
+            do {
+                try await store.createDirenvSurface(
                     fileName: fileName,
                     bindingIDs: candidates.map(\.id).filter(selectedBindingIDs.contains))
                 dismiss()

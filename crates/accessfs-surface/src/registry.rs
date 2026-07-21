@@ -6,6 +6,7 @@ use accessfs_catalog::{CatalogSnapshot, ResourceSource, Surface, SurfaceInput, S
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SurfaceBacking {
     DotenvComposed,
+    DirenvComposed,
     IniComposed,
     LinesComposed,
     EnvFileDirect { resource_id: String, secret_id: String },
@@ -65,6 +66,7 @@ fn file_surfaces(snapshot: &CatalogSnapshot) -> BTreeMap<String, RegisteredSurfa
         .filter_map(|surface| {
             let backing = match surface.kind {
                 SurfaceKind::DotenvFile => SurfaceBacking::DotenvComposed,
+                SurfaceKind::DirenvFile => SurfaceBacking::DirenvComposed,
                 SurfaceKind::IniFile => SurfaceBacking::IniComposed,
                 SurfaceKind::LinesFile => SurfaceBacking::LinesComposed,
                 SurfaceKind::EnvFileDirect => {
@@ -142,6 +144,7 @@ mod tests {
                 surface("fixture-b", SurfaceKind::DotenvFile),
                 surface("fixture-socket", SurfaceKind::UnixSocket),
                 surface("fixture-a", SurfaceKind::DotenvFile),
+                surface("fixture-direnv", SurfaceKind::DirenvFile),
                 surface("fixture-ini", SurfaceKind::IniFile),
                 surface("fixture-lines", SurfaceKind::LinesFile),
                 direct,
@@ -159,11 +162,16 @@ mod tests {
                 "fixture-a",
                 "fixture-b",
                 "fixture-direct",
+                "fixture-direnv",
                 "fixture-ini",
                 "fixture-lines",
             ]
         );
         assert_eq!(registry.get("fixture-ini").unwrap().backing, SurfaceBacking::IniComposed);
+        assert_eq!(
+            registry.get("fixture-direnv").unwrap().backing,
+            SurfaceBacking::DirenvComposed
+        );
         assert!(matches!(
             registry.get("fixture-direct").unwrap().backing,
             SurfaceBacking::EnvFileDirect { .. }

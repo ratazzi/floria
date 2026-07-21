@@ -678,9 +678,9 @@ pub fn resolve_catalog_surface(
         .iter()
         .find(|surface| surface.id == surface_id)
         .ok_or_else(|| CatalogError::NotFound(format!("surface {surface_id}")))?;
-    if surface.kind != SurfaceKind::DotenvFile {
+    if !matches!(surface.kind, SurfaceKind::DotenvFile | SurfaceKind::DirenvFile) {
         return Err(CatalogError::Validation(format!(
-            "surface {surface_id:?} is not a dotenv projection"
+            "surface {surface_id:?} is not a keyed environment projection"
         )));
     }
     let environment = snapshot
@@ -796,7 +796,7 @@ fn validate_snapshot_conflicts(snapshot: &CatalogSnapshot) -> CatalogResult<()> 
     validate_surface_inputs(snapshot)?;
     for surface in &snapshot.surfaces {
         match surface.kind {
-            SurfaceKind::DotenvFile => {
+            SurfaceKind::DotenvFile | SurfaceKind::DirenvFile => {
                 resolve_catalog_surface(snapshot, &surface.id)?;
             }
             SurfaceKind::IniFile => validate_ini_surface_conflicts(snapshot, surface)?,
@@ -860,7 +860,10 @@ fn validate_surface_inputs(snapshot: &CatalogSnapshot) -> CatalogResult<()> {
         })?;
         match (&surface.kind, &surface.input) {
             (
-                SurfaceKind::DotenvFile | SurfaceKind::IniFile | SurfaceKind::LinesFile,
+                SurfaceKind::DotenvFile
+                    | SurfaceKind::DirenvFile
+                    | SurfaceKind::IniFile
+                    | SurfaceKind::LinesFile,
                 SurfaceInput::Bindings { binding_ids },
             ) => {
                 let mut unique = HashSet::new();
@@ -945,7 +948,7 @@ fn validate_composed_surface_member(
         EntrySelection::Entries { addresses } => addresses.contains(&entry.address),
     });
     match surface.kind {
-        SurfaceKind::DotenvFile => {
+        SurfaceKind::DotenvFile | SurfaceKind::DirenvFile => {
             let compatible_source = matches!(
                 (&resource.shape, &resource.codec, &resource.source),
                 (
@@ -971,8 +974,14 @@ fn validate_composed_surface_member(
                 })
             {
                 return Err(CatalogError::Validation(format!(
-                    "binding {:?} cannot feed dotenv surface {:?}",
-                    binding.id, surface.id
+                    "binding {:?} cannot feed {} surface {:?}",
+                    binding.id,
+                    if surface.kind == SurfaceKind::DotenvFile {
+                        "dotenv"
+                    } else {
+                        "direnv"
+                    },
+                    surface.id
                 )));
             }
         }
@@ -1866,16 +1875,26 @@ mod tests {
             .upsert_binding(&binding("second-binding", "second", BindingScope::Common))
             .unwrap();
 
-        for (id, name, binding_id) in [
-            ("first-surface", ".env.first", "first-binding"),
-            ("second-surface", ".env.second", "second-binding"),
+        for (id, name, binding_id, kind) in [
+            (
+                "first-surface",
+                ".env.first",
+                "first-binding",
+                SurfaceKind::DotenvFile,
+            ),
+            (
+                "second-surface",
+                ".envrc",
+                "second-binding",
+                SurfaceKind::DirenvFile,
+            ),
         ] {
             catalog
                 .upsert_surface(&Surface {
                     id: id.to_string(),
                     environment_id: "development".to_string(),
                     name: name.to_string(),
-                    kind: SurfaceKind::DotenvFile,
+                    kind,
                     path: PathBuf::from("/workspace/floria").join(name),
                     input: SurfaceInput::Bindings {
                         binding_ids: vec![binding_id.to_string()],

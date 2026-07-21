@@ -29,6 +29,7 @@ pub fn ensure_file_surface_link(
     if !matches!(
         surface.kind,
         SurfaceKind::DotenvFile
+            | SurfaceKind::DirenvFile
             | SurfaceKind::IniFile
             | SurfaceKind::EnvFileDirect
             | SurfaceKind::LinesFile
@@ -63,6 +64,7 @@ pub fn remove_file_surface_link(
     if !matches!(
         surface.kind,
         SurfaceKind::DotenvFile
+            | SurfaceKind::DirenvFile
             | SurfaceKind::IniFile
             | SurfaceKind::EnvFileDirect
             | SurfaceKind::LinesFile

@@ -143,6 +143,8 @@ final class WorkspaceModelTests: XCTestCase {
 
         XCTAssertTrue(store.bindingIsCompatible(selected, with: .dotenvFile))
         XCTAssertFalse(store.bindingIsCompatible(all, with: .dotenvFile))
+        XCTAssertTrue(store.bindingIsCompatible(selected, with: .direnvFile))
+        XCTAssertFalse(store.bindingIsCompatible(all, with: .direnvFile))
         XCTAssertTrue(store.bindingIsCompatible(selected, with: .iniFile))
         XCTAssertTrue(store.bindingIsCompatible(all, with: .iniFile))
 
