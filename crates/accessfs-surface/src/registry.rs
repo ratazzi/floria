@@ -6,6 +6,7 @@ use accessfs_catalog::{CatalogSnapshot, ResourceSource, Surface, SurfaceKind};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SurfaceBacking {
     DotenvComposed,
+    LinesComposed,
     EnvFileDirect { resource_id: String, secret_id: String },
 }
 
@@ -63,6 +64,7 @@ fn file_surfaces(snapshot: &CatalogSnapshot) -> BTreeMap<String, RegisteredSurfa
         .filter_map(|surface| {
             let backing = match surface.kind {
                 SurfaceKind::DotenvFile => SurfaceBacking::DotenvComposed,
+                SurfaceKind::LinesFile => SurfaceBacking::LinesComposed,
                 SurfaceKind::EnvFileDirect => {
                     let resource_id = surface.resource_id.as_ref()?;
                     let resource = snapshot
@@ -90,7 +92,7 @@ fn file_surfaces(snapshot: &CatalogSnapshot) -> BTreeMap<String, RegisteredSurfa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use accessfs_catalog::{ExportSpec, Resource, ResourceKind, ValueShape};
+    use accessfs_catalog::{EntrySpec, Resource, ResourceKind, ValueShape};
     use std::path::PathBuf;
 
     fn surface(id: &str, kind: SurfaceKind) -> Surface {
@@ -117,7 +119,12 @@ mod tests {
             kind: ResourceKind::EnvFile,
             shape: ValueShape::KeyValueSet,
             default_env_key: None,
-            exports: vec![ExportSpec { key: "FIXTURE".to_string(), sensitive: true }],
+            entries: vec![EntrySpec {
+                address: "keys/FIXTURE".to_string(),
+                label: "FIXTURE".to_string(),
+                key: Some("FIXTURE".to_string()),
+                sensitive: true,
+            }],
             source: ResourceSource::SecretRef { secret_id: "fixture-secret".to_string() },
             detail: None,
         };
@@ -126,6 +133,7 @@ mod tests {
                 surface("fixture-b", SurfaceKind::DotenvFile),
                 surface("fixture-socket", SurfaceKind::UnixSocket),
                 surface("fixture-a", SurfaceKind::DotenvFile),
+                surface("fixture-lines", SurfaceKind::LinesFile),
                 direct,
             ],
             resources: vec![env_resource],
@@ -137,7 +145,7 @@ mod tests {
                 .into_iter()
                 .map(|registered| registered.surface.id)
                 .collect::<Vec<_>>(),
-            vec!["fixture-a", "fixture-b", "fixture-direct"]
+            vec!["fixture-a", "fixture-b", "fixture-direct", "fixture-lines"]
         );
         assert!(matches!(
             registry.get("fixture-direct").unwrap().backing,

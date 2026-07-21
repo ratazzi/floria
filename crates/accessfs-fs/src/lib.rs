@@ -29,7 +29,7 @@ use accessfs_core::writebuf::{WriteBufTable, WriteErr};
 use accessfs_store::{SecretId, SecretStore};
 use accessfs_surface::{
     RegisteredSurface, SurfaceBacking, SurfaceError, SurfaceRegistry, SurfaceResolver,
-    DOTENV_MAX_SIZE,
+    DOTENV_MAX_SIZE, LINES_MAX_SIZE,
 };
 use dashmap::DashMap;
 use fuser::{
@@ -261,6 +261,7 @@ impl Shared {
     fn surface_attr(&self, ino: u64, registered: &RegisteredSurface) -> Option<fuser::FileAttr> {
         let (size, mode) = match &registered.backing {
             SurfaceBacking::DotenvComposed => (DOTENV_MAX_SIZE as u64, 0o400),
+            SurfaceBacking::LinesComposed => (LINES_MAX_SIZE as u64, 0o400),
             SurfaceBacking::EnvFileDirect { secret_id, .. } => {
                 let ns = self.secrets.as_ref()?;
                 let id: SecretId = secret_id.parse().ok()?;
@@ -285,6 +286,7 @@ impl Shared {
                 let surface = registered.surface;
                 let kind = match registered.backing {
                     SurfaceBacking::DotenvComposed => OpenKind::DotenvSurface(surface.id.clone()),
+                    SurfaceBacking::LinesComposed => OpenKind::LinesSurface(surface.id.clone()),
                     SurfaceBacking::EnvFileDirect { .. } => {
                         OpenKind::DirectEnvFileSurface(surface.id.clone())
                     }
@@ -588,6 +590,30 @@ impl Shared {
                     }
                 }
             }
+            OpenKind::LinesSurface(surface_id) => {
+                let Some(surfaces) = &self.surfaces else {
+                    tracing::warn!(path = %target.virtual_path, "surface resolver is unavailable");
+                    reply.error(errno(libc::EIO));
+                    return;
+                };
+                match surfaces.resolver.render_lines_surface(surface_id) {
+                    Ok(snapshot) => {
+                        tracing::debug!(
+                            path = %target.virtual_path,
+                            resources = snapshot.versions.len(),
+                            entries = snapshot.entries.len(),
+                            "lines surface resolved"
+                        );
+                        let dependencies = snapshot.audit_dependencies();
+                        (snapshot.bytes, Some(dependencies))
+                    }
+                    Err(error) => {
+                        tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), %error, "lines surface failed");
+                        reply.error(errno(libc::EIO));
+                        return;
+                    }
+                }
+            }
             OpenKind::DirectEnvFileSurface(surface_id) => {
                 let Some(surfaces) = &self.surfaces else {
                     tracing::warn!(path = %target.virtual_path, "surface resolver is unavailable");
@@ -656,6 +682,7 @@ enum OpenKind {
     Handler(ContentHandler),
     Secret(String),
     DotenvSurface(String),
+    LinesSurface(String),
     DirectEnvFileSurface(String),
 }
 

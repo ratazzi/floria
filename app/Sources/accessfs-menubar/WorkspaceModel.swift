@@ -46,24 +46,90 @@ struct WorkspaceExport: Identifiable, Hashable, Sendable {
     let sensitive: Bool
 }
 
+struct WorkspaceEntry: Identifiable, Hashable, Sendable {
+    var id: String { address }
+    let address: String
+    let label: String
+    let key: String?
+    let previewValue: String
+    let sensitive: Bool
+
+    init(
+        address: String, label: String, key: String?, previewValue: String = "••••••••••••",
+        sensitive: Bool
+    ) {
+        self.address = address
+        self.label = label
+        self.key = key
+        self.previewValue = previewValue
+        self.sensitive = sensitive
+    }
+}
+
 struct WorkspaceResource: Identifiable, Hashable, Sendable {
     let id: String
     let name: String
     let kind: WorkspaceResourceKind
     let shape: WorkspaceValueShape
-    let exports: [WorkspaceExport]
+    let entries: [WorkspaceEntry]
     let detail: String
     let usageCount: Int
 
+    init(
+        id: String, name: String, kind: WorkspaceResourceKind, shape: WorkspaceValueShape,
+        exports: [WorkspaceExport], entries: [WorkspaceEntry] = [], detail: String,
+        usageCount: Int
+    ) {
+        self.id = id
+        self.name = name
+        self.kind = kind
+        self.shape = shape
+        self.entries = entries.isEmpty
+            ? exports.map {
+                WorkspaceEntry(
+                    address: "keys/\($0.key)", label: $0.key, key: $0.key,
+                    previewValue: $0.previewValue,
+                    sensitive: $0.sensitive)
+            }
+            : entries
+        self.detail = detail
+        self.usageCount = usageCount
+    }
+
+    var exports: [WorkspaceExport] {
+        entries.compactMap { entry in
+            entry.key.map {
+                WorkspaceExport(
+                    key: $0, previewValue: entry.previewValue, sensitive: entry.sensitive)
+            }
+        }
+    }
+
     var exportSummary: String {
+        if exports.isEmpty, entries.count == 1 { return "Keyless value" }
         if exports.count == 1, let key = exports.first?.key { return key }
-        return "\(exports.count) variables"
+        return "\(entries.count) entries"
+    }
+}
+
+enum WorkspaceEntrySelection: Hashable, Sendable {
+    case all
+    case entries([String])
+
+    func addresses(in resource: WorkspaceResource) -> [String] {
+        switch self {
+        case .all: return resource.entries.map(\.address)
+        case .entries(let addresses):
+            let selected = Set(addresses)
+            return resource.entries.map(\.address).filter(selected.contains)
+        }
     }
 }
 
 struct WorkspaceBinding: Identifiable, Hashable, Sendable {
     let id: String
     let resourceID: WorkspaceResource.ID
+    let selection: WorkspaceEntrySelection
     var keyOverride: String?
     var isEnabled: Bool
     let scope: WorkspaceBindingScope
@@ -71,12 +137,14 @@ struct WorkspaceBinding: Identifiable, Hashable, Sendable {
     let position: Int64
 
     init(
-        id: String, resourceID: WorkspaceResource.ID, keyOverride: String?, isEnabled: Bool,
+        id: String, resourceID: WorkspaceResource.ID,
+        selection: WorkspaceEntrySelection = .all, keyOverride: String?, isEnabled: Bool,
         scope: WorkspaceBindingScope = .environment(""), allowOverride: Bool = false,
         position: Int64 = 0
     ) {
         self.id = id
         self.resourceID = resourceID
+        self.selection = selection
         self.keyOverride = keyOverride
         self.isEnabled = isEnabled
         self.scope = scope
@@ -105,6 +173,7 @@ enum WorkspaceBindingTarget: String, CaseIterable, Sendable {
 enum WorkspaceSurfaceKind: String, Sendable {
     case dotenvFile
     case envFileDirect
+    case linesFile
     case regularFile
     case unixSocket
 
@@ -112,6 +181,7 @@ enum WorkspaceSurfaceKind: String, Sendable {
         switch self {
         case .dotenvFile: "Dotenv File"
         case .envFileDirect: "Direct Env File"
+        case .linesFile: "Lines File"
         case .regularFile: "File"
         case .unixSocket: "Unix Socket"
         }
@@ -121,6 +191,7 @@ enum WorkspaceSurfaceKind: String, Sendable {
         switch self {
         case .dotenvFile: "doc.text"
         case .envFileDirect: "doc.text.fill"
+        case .linesFile: "text.line.first.and.arrowtriangle.forward"
         case .regularFile: "doc"
         case .unixSocket: "point.3.connected.trianglepath.dotted"
         }
@@ -168,6 +239,14 @@ struct ResolvedWorkspaceExport: Identifiable, Hashable, Sendable {
     let sensitive: Bool
     let resourceName: String
     let resourceKind: WorkspaceResourceKind
+}
+
+struct ResolvedWorkspaceEntry: Identifiable, Hashable, Sendable {
+    var id: String { "\(bindingID):\(address)" }
+    let bindingID: WorkspaceBinding.ID
+    let address: String
+    let label: String
+    let resourceName: String
 }
 
 @Observable @MainActor
@@ -221,14 +300,34 @@ final class WorkspaceStore {
     var resolvedExports: [ResolvedWorkspaceExport] {
         activeBindings.flatMap { binding -> [ResolvedWorkspaceExport] in
             guard let resource = resource(binding.resourceID) else { return [] }
-            return resource.exports.map { export in
-                ResolvedWorkspaceExport(
+            let selected = Set(binding.selection.addresses(in: resource))
+            return resource.entries.compactMap { entry in
+                guard selected.contains(entry.address) else { return nil }
+                let key = resource.shape == .scalar ? (binding.keyOverride ?? entry.key) : entry.key
+                guard let key else { return nil }
+                return ResolvedWorkspaceExport(
                     bindingID: binding.id,
-                    key: resource.exports.count == 1 ? (binding.keyOverride ?? export.key) : export.key,
-                    previewValue: export.previewValue,
-                    sensitive: export.sensitive,
+                    key: key,
+                    previewValue: entry.previewValue,
+                    sensitive: entry.sensitive,
                     resourceName: resource.name,
                     resourceKind: resource.kind)
+            }
+        }
+    }
+
+    var resolvedLineEntries: [ResolvedWorkspaceEntry] {
+        activeBindings.flatMap { binding -> [ResolvedWorkspaceEntry] in
+            guard let resource = resource(binding.resourceID),
+                resource.shape == .scalar, binding.keyOverride == nil
+            else { return [] }
+            let selected = Set(binding.selection.addresses(in: resource))
+            return resource.entries.filter {
+                selected.contains($0.address) && $0.key == nil
+            }.map { entry in
+                ResolvedWorkspaceEntry(
+                    bindingID: binding.id, address: entry.address, label: entry.label,
+                    resourceName: resource.name)
             }
         }
     }
@@ -331,9 +430,10 @@ final class WorkspaceStore {
             throw WorkspaceStoreError.controlUnavailable
         }
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let key = defaultEnvKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let enteredKey = defaultEnvKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = enteredKey.isEmpty ? nil : enteredKey
         guard !name.isEmpty else { throw WorkspaceStoreError.invalid("Secret name is required") }
-        guard Self.isValidEnvKey(key) else {
+        if let key, !Self.isValidEnvKey(key) {
             throw WorkspaceStoreError.invalid(
                 "The default key must start with A-Z or _, followed by A-Z, 0-9, or _")
         }
@@ -428,6 +528,27 @@ final class WorkspaceStore {
     }
 
     @discardableResult
+    func createLinesSurface(fileName: String) async throws -> WorkspaceSurface.ID {
+        guard let controlClient else {
+            throw WorkspaceStoreError.controlUnavailable
+        }
+        guard let project = selectedProject, let environment = selectedEnvironment else {
+            throw WorkspaceStoreError.invalid("Select a project environment first")
+        }
+        let output = try newSurfaceOutput(fileName: fileName, in: project)
+        let surfaceID = Self.newID("lines")
+        try await controlClient.upsertSurface(
+            CatalogSurface(
+                id: surfaceID, environmentID: environment.id, name: output.name,
+                kind: "lines_file", path: output.path, resourceID: nil,
+                position: Int64(environment.surfaces.count)))
+        apply(try await controlClient.snapshot())
+        selectedSurfaceID = surfaceID
+        lastError = nil
+        return surfaceID
+    }
+
+    @discardableResult
     func createDirectEnvFileSurface(
         resourceID: WorkspaceResource.ID, fileName: String
     ) async throws -> WorkspaceSurface.ID {
@@ -467,7 +588,8 @@ final class WorkspaceStore {
                 CatalogBinding(
                     id: binding.id, projectID: project.id,
                     scope: binding.scope.catalogScope,
-                    resourceID: binding.resourceID, keyOverride: binding.keyOverride,
+                    resourceID: binding.resourceID, selection: binding.selection.catalogSelection,
+                    keyOverride: binding.keyOverride,
                     enabled: !binding.isEnabled, allowOverride: binding.allowOverride,
                     position: binding.position))
             apply(try await controlClient.snapshot())
@@ -478,9 +600,12 @@ final class WorkspaceStore {
     }
 
     func addResource(
-        _ resourceID: WorkspaceResource.ID, target: WorkspaceBindingTarget = .environment
+        _ resourceID: WorkspaceResource.ID, target: WorkspaceBindingTarget = .environment,
+        selectedEntries: Set<String>? = nil
     ) async throws {
-        guard availableResources.contains(where: { $0.id == resourceID }) else { return }
+        guard let resource = availableResources.first(where: { $0.id == resourceID }) else {
+            return
+        }
         guard let controlClient else {
             addResourceLocally(resourceID)
             return
@@ -493,10 +618,22 @@ final class WorkspaceStore {
             target == .common ? .common : .environment(environment.id)
         let position = Int64(
             target == .common ? project.commonBindings.count : environment.bindings.count)
+        let selection: CatalogEntrySelection
+        if resource.entries.isEmpty || selectedEntries == nil
+            || selectedEntries?.count == resource.entries.count
+        {
+            selection = .all
+        } else {
+            let addresses = resource.entries.map(\.address).filter { selectedEntries?.contains($0) == true }
+            guard !addresses.isEmpty else {
+                throw WorkspaceStoreError.invalid("Select at least one entry")
+            }
+            selection = .entries(addresses)
+        }
         try await controlClient.upsertBinding(
             CatalogBinding(
                 id: Self.newID("binding"), projectID: project.id, scope: scope.catalogScope,
-                resourceID: resourceID, keyOverride: nil, enabled: true,
+                resourceID: resourceID, selection: selection, keyOverride: nil, enabled: true,
                 allowOverride: false, position: position))
         apply(try await controlClient.snapshot())
         lastError = nil
@@ -642,11 +779,16 @@ final class WorkspaceStore {
             case "socket": preview = resource.source.endpoint ?? ""
             default: preview = "••••••••••••"
             }
+            let entries = resource.entries.map {
+                WorkspaceEntry(
+                    address: $0.address, label: $0.label, key: $0.key,
+                    previewValue: preview,
+                    sensitive: $0.sensitive)
+            }
             return WorkspaceResource(
                 id: resource.id, name: resource.name, kind: kind, shape: shape,
-                exports: resource.exports.map {
-                    WorkspaceExport(key: $0.key, previewValue: preview, sensitive: $0.sensitive)
-                },
+                exports: [],
+                entries: entries,
                 detail: resource.detail ?? resource.defaultEnvKey ?? kind.title,
                 usageCount: projectUsage[resource.id] ?? 0)
         }
@@ -705,9 +847,24 @@ private extension WorkspaceBinding {
         let scope: WorkspaceBindingScope = binding.scope.type == "common"
             ? .common : .environment(binding.scope.environmentID ?? "")
         self.init(
-            id: binding.id, resourceID: binding.resourceID, keyOverride: binding.keyOverride,
+            id: binding.id, resourceID: binding.resourceID,
+            selection: WorkspaceEntrySelection(binding.selection), keyOverride: binding.keyOverride,
             isEnabled: binding.enabled, scope: scope, allowOverride: binding.allowOverride,
             position: binding.position)
+    }
+}
+
+private extension WorkspaceEntrySelection {
+    init(_ selection: CatalogEntrySelection) {
+        self = selection.type == "entries"
+            ? .entries(selection.addresses ?? []) : .all
+    }
+
+    var catalogSelection: CatalogEntrySelection {
+        switch self {
+        case .all: .all
+        case .entries(let addresses): .entries(addresses)
+        }
     }
 }
 
@@ -766,6 +923,7 @@ private extension WorkspaceSurfaceKind {
         switch self {
         case .dotenvFile: "dotenv_file"
         case .envFileDirect: "env_file_direct"
+        case .linesFile: "lines_file"
         case .regularFile: "regular_file"
         case .unixSocket: "unix_socket"
         }
@@ -775,6 +933,7 @@ private extension WorkspaceSurfaceKind {
         switch catalogValue {
         case "dotenv_file": self = .dotenvFile
         case "env_file_direct": self = .envFileDirect
+        case "lines_file": self = .linesFile
         case "regular_file": self = .regularFile
         case "unix_socket": self = .unixSocket
         default: return nil

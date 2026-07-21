@@ -18,8 +18,10 @@ struct CatalogEnvironment: Codable, Sendable {
     }
 }
 
-struct CatalogExport: Codable, Sendable {
-    let key: String
+struct CatalogEntry: Codable, Sendable {
+    let address: String
+    let label: String
+    let key: String?
     let sensitive: Bool
 }
 
@@ -42,13 +44,24 @@ struct CatalogResource: Codable, Sendable {
     let kind: String
     let shape: String
     let defaultEnvKey: String?
-    let exports: [CatalogExport]
+    let entries: [CatalogEntry]
     let source: CatalogResourceSource
     let detail: String?
 
     enum CodingKeys: String, CodingKey {
-        case id, name, kind, shape, exports, source, detail
+        case id, name, kind, shape, entries, source, detail
         case defaultEnvKey = "default_env_key"
+    }
+}
+
+struct CatalogEntrySelection: Codable, Sendable {
+    let type: String
+    let addresses: [String]?
+
+    static let all = CatalogEntrySelection(type: "all", addresses: nil)
+
+    static func entries(_ addresses: [String]) -> CatalogEntrySelection {
+        CatalogEntrySelection(type: "entries", addresses: addresses)
     }
 }
 
@@ -73,13 +86,14 @@ struct CatalogBinding: Codable, Sendable {
     let projectID: String
     let scope: CatalogBindingScope
     let resourceID: String
+    let selection: CatalogEntrySelection
     let keyOverride: String?
     let enabled: Bool
     let allowOverride: Bool
     let position: Int64
 
     enum CodingKeys: String, CodingKey {
-        case id, scope, enabled, position
+        case id, scope, selection, enabled, position
         case projectID = "project_id"
         case resourceID = "resource_id"
         case keyOverride = "key_override"
@@ -113,7 +127,7 @@ struct CatalogSnapshot: Codable, Sendable {
 
 enum ControlCommand: Sendable {
     case snapshot
-    case sharedSecretCreate(resourceID: String, name: String, defaultEnvKey: String, value: String)
+    case sharedSecretCreate(resourceID: String, name: String, defaultEnvKey: String?, value: String)
     case envFileCreate(resourceID: String, name: String, value: String)
     case projectCreate(CatalogProject, CatalogEnvironment, CatalogSurface)
     case projectUpsert(CatalogProject)
@@ -208,7 +222,7 @@ private struct ControlRequest<Params: Encodable>: Encodable {
 private struct SharedSecretCreateParams: Encodable {
     let resourceID: String
     let name: String
-    let defaultEnvKey: String
+    let defaultEnvKey: String?
     let value: String
 }
 

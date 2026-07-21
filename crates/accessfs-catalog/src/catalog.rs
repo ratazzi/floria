@@ -6,13 +6,13 @@ use std::time::Duration;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::domain::{
-    Binding, BindingScope, CatalogSnapshot, Environment, Project, ResolvedEnvironment,
-    ResolvedExport, Resource, ResourceBindingUsage, ResourceKind, ResourceSource, ResourceUsage,
-    Surface, SurfaceKind, ValueShape,
+    Binding, BindingScope, CatalogSnapshot, EntrySelection, Environment, Project,
+    ResolvedEnvironment, ResolvedExport, Resource, ResourceBindingUsage, ResourceKind,
+    ResourceSource, ResourceUsage, Surface, SurfaceKind, ValueShape,
 };
 use crate::error::{CatalogError, CatalogResult};
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Clone)]
 pub struct Catalog {
@@ -138,19 +138,20 @@ impl Catalog {
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO resources
-                (id, name, kind, shape, default_env_key, exports_json, source_json, detail)
+                (id, name, kind, shape, default_env_key, entries_json, source_json, detail)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(id) DO UPDATE SET name = excluded.name, kind = excluded.kind,
                  shape = excluded.shape, default_env_key = excluded.default_env_key,
-                 exports_json = excluded.exports_json, source_json = excluded.source_json,
-                 detail = excluded.detail, updated_at = CURRENT_TIMESTAMP",
+                 entries_json = excluded.entries_json,
+                 source_json = excluded.source_json, detail = excluded.detail,
+                 updated_at = CURRENT_TIMESTAMP",
             params![
                 resource.id,
                 resource.name,
                 resource.kind.as_str(),
                 resource.shape.as_str(),
                 resource.default_env_key,
-                serde_json::to_string(&resource.exports)?,
+                serde_json::to_string(&resource.entries)?,
                 serde_json::to_string(&resource.source)?,
                 resource.detail,
             ],
@@ -180,7 +181,7 @@ impl Catalog {
         }
         tx.execute(
             "INSERT INTO resources
-                (id, name, kind, shape, default_env_key, exports_json, source_json, detail)
+                (id, name, kind, shape, default_env_key, entries_json, source_json, detail)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 resource.id,
@@ -188,7 +189,7 @@ impl Catalog {
                 resource.kind.as_str(),
                 resource.shape.as_str(),
                 resource.default_env_key,
-                serde_json::to_string(&resource.exports)?,
+                serde_json::to_string(&resource.entries)?,
                 serde_json::to_string(&resource.source)?,
                 resource.detail,
             ],
@@ -318,12 +319,13 @@ impl Catalog {
         tx.execute(
             "INSERT INTO bindings
                 (id, project_id, environment_id, resource_id, key_override, enabled,
-                 allow_override, position)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 allow_override, position, selection_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(id) DO UPDATE SET project_id = excluded.project_id,
                  environment_id = excluded.environment_id, resource_id = excluded.resource_id,
                  key_override = excluded.key_override, enabled = excluded.enabled,
                  allow_override = excluded.allow_override, position = excluded.position,
+                 selection_json = excluded.selection_json,
                  updated_at = CURRENT_TIMESTAMP",
             params![
                 binding.id,
@@ -334,6 +336,7 @@ impl Catalog {
                 binding.enabled,
                 binding.allow_override,
                 binding.position,
+                serde_json::to_string(&binding.selection)?,
             ],
         )?;
         validate_snapshot_conflicts(&snapshot_from(&tx)?)?;
@@ -487,7 +490,7 @@ fn migrate(conn: &mut Connection) -> CatalogResult<()> {
             kind TEXT NOT NULL,
             shape TEXT NOT NULL,
             default_env_key TEXT,
-            exports_json TEXT NOT NULL,
+            entries_json TEXT NOT NULL,
             source_json TEXT NOT NULL,
             detail TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -503,6 +506,7 @@ fn migrate(conn: &mut Connection) -> CatalogResult<()> {
             enabled INTEGER NOT NULL DEFAULT 1,
             allow_override INTEGER NOT NULL DEFAULT 0,
             position INTEGER NOT NULL DEFAULT 0,
+            selection_json TEXT NOT NULL DEFAULT '{\"type\":\"all\"}',
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
@@ -521,7 +525,7 @@ fn migrate(conn: &mut Connection) -> CatalogResult<()> {
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         CREATE INDEX surfaces_environment_idx ON surfaces(environment_id, position);
-        PRAGMA user_version = 1;",
+        PRAGMA user_version = 3;",
     )?;
     tx.commit()?;
     Ok(())
@@ -560,7 +564,7 @@ fn snapshot_from(conn: &Connection) -> CatalogResult<CatalogSnapshot> {
 
     let resources = {
         let mut stmt = conn.prepare(
-            "SELECT id, name, kind, shape, default_env_key, exports_json, source_json, detail
+            "SELECT id, name, kind, shape, default_env_key, entries_json, source_json, detail
              FROM resources ORDER BY name, id",
         )?;
         let values = stmt.query_map([], |row| {
@@ -572,7 +576,7 @@ fn snapshot_from(conn: &Connection) -> CatalogResult<CatalogSnapshot> {
                 kind: ResourceKind::parse(&kind).ok_or_else(|| invalid_value(2, kind))?,
                 shape: ValueShape::parse(&shape).ok_or_else(|| invalid_value(3, shape))?,
                 default_env_key: row.get(4)?,
-                exports: decode_json(5, &row.get::<_, String>(5)?)?,
+                entries: decode_json(5, &row.get::<_, String>(5)?)?,
                 source: decode_json(6, &row.get::<_, String>(6)?)?,
                 detail: row.get(7)?,
             })
@@ -584,7 +588,7 @@ fn snapshot_from(conn: &Connection) -> CatalogResult<CatalogSnapshot> {
     let bindings = {
         let mut stmt = conn.prepare(
             "SELECT id, project_id, environment_id, resource_id, key_override,
-                    enabled, allow_override, position
+                    enabled, allow_override, position, selection_json
              FROM bindings
              ORDER BY project_id, environment_id IS NOT NULL, environment_id, position, id",
         )?;
@@ -602,6 +606,7 @@ fn snapshot_from(conn: &Connection) -> CatalogResult<CatalogSnapshot> {
                 enabled: row.get(5)?,
                 allow_override: row.get(6)?,
                 position: row.get(7)?,
+                selection: decode_json(8, &row.get::<_, String>(8)?)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -696,20 +701,26 @@ fn resolve_exports(
         let resource = resources.get(binding.resource_id.as_str()).ok_or_else(|| {
             CatalogError::NotFound(format!("resource {}", binding.resource_id))
         })?;
-        for (index, export) in resource.exports.iter().enumerate() {
-            let key = if resource.shape == ValueShape::Scalar && index == 0 {
-                binding.key_override.as_ref().unwrap_or(&export.key).clone()
+        for entry in resource.entries.iter().filter(|entry| {
+            match &binding.selection {
+                EntrySelection::All => true,
+                EntrySelection::Entries { addresses } => addresses.contains(&entry.address),
+            }
+        }) {
+            let key = if resource.shape == ValueShape::Scalar {
+                binding.key_override.as_ref().or(entry.key.as_ref())
             } else {
-                export.key.clone()
+                entry.key.as_ref()
             };
+            let Some(key) = key.cloned() else { continue };
             let current_is_environment = matches!(binding.scope, BindingScope::Environment { .. });
             let resolved = ResolvedExport {
                 key: key.clone(),
-                source_key: export.key.clone(),
+                source_key: entry.address.clone(),
                 binding_id: binding.id.clone(),
                 resource_id: resource.id.clone(),
                 resource_name: resource.name.clone(),
-                sensitive: export.sensitive,
+                sensitive: entry.sensitive,
                 overrides_binding_id: None,
             };
 
@@ -741,6 +752,7 @@ fn resolve_exports(
 
 fn validate_snapshot_conflicts(snapshot: &CatalogSnapshot) -> CatalogResult<()> {
     validate_surface_resource_links(snapshot)?;
+    validate_binding_selections(snapshot)?;
     for project in &snapshot.projects {
         let environments: Vec<&Environment> = snapshot
             .environments
@@ -758,6 +770,38 @@ fn validate_snapshot_conflicts(snapshot: &CatalogSnapshot) -> CatalogResult<()> 
     Ok(())
 }
 
+fn validate_binding_selections(snapshot: &CatalogSnapshot) -> CatalogResult<()> {
+    let resources: HashMap<&str, &Resource> = snapshot
+        .resources
+        .iter()
+        .map(|resource| (resource.id.as_str(), resource))
+        .collect();
+    for binding in &snapshot.bindings {
+        let resource = resources.get(binding.resource_id.as_str()).ok_or_else(|| {
+            CatalogError::NotFound(format!("resource {}", binding.resource_id))
+        })?;
+        let selected = match &binding.selection {
+            EntrySelection::All => continue,
+            EntrySelection::Entries { addresses } => addresses
+                .iter()
+                .all(|address| resource.entries.iter().any(|entry| entry.address == *address)),
+        };
+        if !selected {
+            return Err(CatalogError::Validation(format!(
+                "binding {:?} selects entries not exposed by resource {:?}",
+                binding.id, resource.id
+            )));
+        }
+        if resource.entries.is_empty() {
+            return Err(CatalogError::Validation(format!(
+                "binding {:?} cannot select entries from flat resource {:?}",
+                binding.id, resource.id
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_surface_resource_links(snapshot: &CatalogSnapshot) -> CatalogResult<()> {
     let resources: HashMap<&str, &Resource> = snapshot
         .resources
@@ -766,10 +810,12 @@ fn validate_surface_resource_links(snapshot: &CatalogSnapshot) -> CatalogResult<
         .collect();
     for surface in &snapshot.surfaces {
         match surface.kind {
-            SurfaceKind::DotenvFile if surface.resource_id.is_some() => {
+            SurfaceKind::DotenvFile | SurfaceKind::LinesFile
+                if surface.resource_id.is_some() =>
+            {
                 return Err(CatalogError::Validation(format!(
-                    "dotenv_file surface {:?} cannot reference one resource",
-                    surface.id
+                    "{} surface {:?} cannot reference one resource",
+                    surface.kind.as_str(), surface.id
                 )));
             }
             SurfaceKind::EnvFileDirect => {
@@ -833,49 +879,59 @@ fn validate_resource(resource: &Resource) -> CatalogResult<()> {
     if let Some(key) = &resource.default_env_key {
         require_env_key(key)?;
     }
-    let mut keys = HashSet::new();
-    for export in &resource.exports {
-        require_env_key(&export.key)?;
-        if !keys.insert(&export.key) {
+    let mut addresses = HashSet::new();
+    let mut entry_keys = HashSet::new();
+    for entry in &resource.entries {
+        require_entry_address(&entry.address)?;
+        require_name(&entry.label, "resource entry label")?;
+        if let Some(key) = &entry.key {
+            require_env_key(key)?;
+            if !entry_keys.insert(key) {
+                return Err(CatalogError::Validation(format!(
+                    "resource {:?} exposes duplicate entry key {:?}",
+                    resource.id, key
+                )));
+            }
+        }
+        if !addresses.insert(&entry.address) {
             return Err(CatalogError::Validation(format!(
-                "resource {:?} exports duplicate key {:?}",
-                resource.id, export.key
+                "resource {:?} exposes duplicate entry address {:?}",
+                resource.id, entry.address
             )));
         }
     }
 
     match resource.shape {
-        ValueShape::Scalar if resource.exports.len() != 1 => {
+        ValueShape::Scalar if resource.entries.len() != 1 => {
             return Err(CatalogError::Validation(
-                "scalar resources must declare exactly one export".to_string(),
+                "scalar resources require exactly one entry".to_string(),
             ))
         }
-        ValueShape::KeyValueSet if resource.exports.is_empty() => {
+        ValueShape::KeyValueSet
+            if resource.entries.is_empty()
+                || resource.entries.iter().any(|entry| entry.key.is_none()) =>
+        {
             return Err(CatalogError::Validation(
-                "key_value_set resources must declare at least one export".to_string(),
+                "key_value_set resources require at least one keyed entry".to_string(),
             ))
         }
-        ValueShape::Bytes if !resource.exports.is_empty() => {
+        ValueShape::Bytes if !resource.entries.is_empty() => {
             return Err(CatalogError::Validation(
-                "bytes resources cannot declare environment exports".to_string(),
+                "bytes resources cannot declare entries".to_string(),
             ))
         }
-        ValueShape::Socket if resource.exports.len() != 1 => {
+        ValueShape::Socket
+            if resource.entries.len() != 1 || resource.entries[0].key.is_none() =>
+        {
             return Err(CatalogError::Validation(
-                "socket resources must declare exactly one endpoint export".to_string(),
+                "socket resources must declare exactly one keyed endpoint entry".to_string(),
             ))
         }
         _ => {}
     }
 
     match (&resource.kind, &resource.shape, &resource.source) {
-        (ResourceKind::SharedSecret, ValueShape::Scalar, ResourceSource::SecretRef { .. }) => {
-            if resource.default_env_key.is_none() {
-                return Err(CatalogError::Validation(
-                    "shared_secret requires default_env_key".to_string(),
-                ));
-            }
-        }
+        (ResourceKind::SharedSecret, ValueShape::Scalar, ResourceSource::SecretRef { .. }) => {}
         (ResourceKind::Secret, ValueShape::Scalar | ValueShape::Bytes, ResourceSource::SecretRef { .. }) => {}
         (ResourceKind::EnvFile, ValueShape::KeyValueSet, ResourceSource::SecretRef { .. }) => {}
         (ResourceKind::Literal, ValueShape::Scalar, ResourceSource::Literal { .. }) => {}
@@ -905,10 +961,10 @@ fn validate_resource(resource: &Resource) -> CatalogResult<()> {
         _ => {}
     }
     if matches!(resource.shape, ValueShape::Scalar)
-        && resource.default_env_key.as_ref().is_some_and(|key| key != &resource.exports[0].key)
+        && resource.default_env_key != resource.entries[0].key
     {
         return Err(CatalogError::Validation(
-            "default_env_key must match the scalar export key".to_string(),
+            "default_env_key must match the scalar entry key".to_string(),
         ));
     }
     Ok(())
@@ -921,6 +977,25 @@ fn validate_binding(binding: &Binding) -> CatalogResult<()> {
     if let Some(key) = &binding.key_override {
         require_env_key(key)?;
     }
+    let selected_addresses = match &binding.selection {
+        EntrySelection::All => &[][..],
+        EntrySelection::Entries { addresses } => addresses,
+    };
+    let mut unique = HashSet::new();
+    for address in selected_addresses {
+        require_entry_address(address)?;
+        if !unique.insert(address) {
+            return Err(CatalogError::Validation(format!(
+                "binding {:?} selects duplicate entry address {:?}",
+                binding.id, address
+            )));
+        }
+    }
+    if !matches!(&binding.selection, EntrySelection::All) && selected_addresses.is_empty() {
+        return Err(CatalogError::Validation(
+            "entry selection cannot be empty".to_string(),
+        ));
+    }
     match &binding.scope {
         BindingScope::Common if binding.allow_override => Err(CatalogError::Validation(
             "allow_override is only valid for environment bindings".to_string(),
@@ -929,6 +1004,25 @@ fn validate_binding(binding: &Binding) -> CatalogResult<()> {
             require_id(environment_id, "binding environment id")
         }
         BindingScope::Common => Ok(()),
+    }
+}
+
+fn require_entry_address(value: &str) -> CatalogResult<()> {
+    if value.is_empty()
+        || value.starts_with('/')
+        || value.ends_with('/')
+        || value.split('/').any(|segment| {
+            segment.is_empty()
+                || !segment
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+        })
+    {
+        Err(CatalogError::Validation(format!(
+            "invalid entry address {value:?}"
+        )))
+    } else {
+        Ok(())
     }
 }
 
@@ -1067,7 +1161,7 @@ fn invalid_value(column: usize, value: String) -> rusqlite::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::ExportSpec;
+    use crate::domain::EntrySpec;
 
     fn project() -> Project {
         Project {
@@ -1093,7 +1187,12 @@ mod tests {
             kind: ResourceKind::SharedSecret,
             shape: ValueShape::Scalar,
             default_env_key: Some(key.to_string()),
-            exports: vec![ExportSpec { key: key.to_string(), sensitive: true }],
+            entries: vec![EntrySpec {
+                address: "value".to_string(),
+                label: key.to_string(),
+                key: Some(key.to_string()),
+                sensitive: true,
+            }],
             source: ResourceSource::SecretRef { secret_id: format!("secret-{id}") },
             detail: None,
         }
@@ -1106,9 +1205,19 @@ mod tests {
             kind: ResourceKind::EnvFile,
             shape: ValueShape::KeyValueSet,
             default_env_key: None,
-            exports: vec![
-                ExportSpec { key: "API_HOST".to_string(), sensitive: true },
-                ExportSpec { key: "LOG_LEVEL".to_string(), sensitive: true },
+            entries: vec![
+                EntrySpec {
+                    address: "keys/API_HOST".to_string(),
+                    label: "API_HOST".to_string(),
+                    key: Some("API_HOST".to_string()),
+                    sensitive: true,
+                },
+                EntrySpec {
+                    address: "keys/LOG_LEVEL".to_string(),
+                    label: "LOG_LEVEL".to_string(),
+                    key: Some("LOG_LEVEL".to_string()),
+                    sensitive: true,
+                },
             ],
             source: ResourceSource::SecretRef { secret_id: format!("secret-{id}") },
             detail: None,
@@ -1121,6 +1230,7 @@ mod tests {
             project_id: "floria".to_string(),
             scope,
             resource_id: resource_id.to_string(),
+            selection: EntrySelection::All,
             key_override: None,
             enabled: true,
             allow_override: false,
@@ -1134,6 +1244,59 @@ mod tests {
         catalog.upsert_project(&project()).unwrap();
         catalog.upsert_environment(&environment()).unwrap();
         (dir, catalog)
+    }
+
+    #[test]
+    fn rejects_old_schema_during_development() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA user_version = 1;").unwrap();
+
+        let error = migrate(&mut conn).unwrap_err();
+        assert!(matches!(
+            error,
+            CatalogError::UnsupportedSchema { found: 1, expected: 3 }
+        ));
+    }
+
+    #[test]
+    fn entry_selection_must_reference_exposed_entries() {
+        let (_dir, catalog) = catalog();
+        catalog.upsert_resource(&env_file_resource("fixture-env-file")).unwrap();
+        let mut selected = binding(
+            "env-file-binding",
+            "fixture-env-file",
+            BindingScope::Environment { environment_id: "development".to_string() },
+        );
+        selected.selection = EntrySelection::Entries {
+            addresses: vec!["keys/API_HOST".to_string()],
+        };
+        catalog.upsert_binding(&selected).unwrap();
+
+        selected.selection = EntrySelection::Entries {
+            addresses: vec!["keys/MISSING".to_string()],
+        };
+        let error = catalog.upsert_binding(&selected).unwrap_err();
+        assert!(matches!(error, CatalogError::Validation(message) if message.contains("not exposed")));
+    }
+
+    #[test]
+    fn entry_selection_projects_only_the_selected_named_values() {
+        let (_dir, catalog) = catalog();
+        catalog.upsert_resource(&env_file_resource("fixture-sections")).unwrap();
+        let mut selected = binding(
+            "section-binding",
+            "fixture-sections",
+            BindingScope::Environment { environment_id: "development".to_string() },
+        );
+        selected.selection = EntrySelection::Entries {
+            addresses: vec!["keys/LOG_LEVEL".to_string()],
+        };
+        catalog.upsert_binding(&selected).unwrap();
+
+        let resolved = catalog.resolve_environment("floria", "development").unwrap();
+        assert_eq!(resolved.exports.len(), 1);
+        assert_eq!(resolved.exports[0].key, "LOG_LEVEL");
+        assert_eq!(resolved.exports[0].source_key, "keys/LOG_LEVEL");
     }
 
     #[test]
@@ -1400,7 +1563,12 @@ mod tests {
                 kind: ResourceKind::EnvFile,
                 shape: ValueShape::KeyValueSet,
                 default_env_key: None,
-                exports: vec![ExportSpec { key: "LOG_LEVEL".to_string(), sensitive: false }],
+                entries: vec![EntrySpec {
+                    address: "keys/LOG_LEVEL".to_string(),
+                    label: "LOG_LEVEL".to_string(),
+                    key: Some("LOG_LEVEL".to_string()),
+                    sensitive: false,
+                }],
                 source: ResourceSource::SecretRef { secret_id: "secret-defaults".to_string() },
                 detail: None,
             })

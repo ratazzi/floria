@@ -30,6 +30,10 @@ impl SecretValue {
     pub fn as_bytes(&self) -> &[u8] {
         self.0.as_bytes()
     }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 impl std::fmt::Debug for SecretValue {
@@ -54,7 +58,7 @@ pub enum ControlCommand {
     SharedSecretCreate {
         resource_id: String,
         name: String,
-        default_env_key: String,
+        default_env_key: Option<String>,
         value: SecretValue,
     },
     SharedSecretRotate { resource_id: String, value: SecretValue },
@@ -200,4 +204,5 @@ mod tests {
         assert_eq!(wire, "\"fixture-secret-value\"");
         assert_eq!(serde_json::from_str::<SecretValue>(&wire).unwrap(), value);
     }
+
 }

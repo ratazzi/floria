@@ -85,10 +85,21 @@ impl ValueShape {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ExportSpec {
-    pub key: String,
+pub struct EntrySpec {
+    pub address: String,
+    pub label: String,
+    #[serde(default)]
+    pub key: Option<String>,
     #[serde(default)]
     pub sensitive: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EntrySelection {
+    #[default]
+    All,
+    Entries { addresses: Vec<String> },
 }
 
 /// How a resource obtains its value. Secret values are referenced by id and never stored here.
@@ -110,7 +121,7 @@ pub struct Resource {
     #[serde(default)]
     pub default_env_key: Option<String>,
     #[serde(default)]
-    pub exports: Vec<ExportSpec>,
+    pub entries: Vec<EntrySpec>,
     pub source: ResourceSource,
     #[serde(default)]
     pub detail: Option<String>,
@@ -129,6 +140,8 @@ pub struct Binding {
     pub project_id: String,
     pub scope: BindingScope,
     pub resource_id: String,
+    #[serde(default)]
+    pub selection: EntrySelection,
     #[serde(default)]
     pub key_override: Option<String>,
     #[serde(default = "enabled_by_default")]
@@ -149,6 +162,7 @@ fn enabled_by_default() -> bool {
 pub enum SurfaceKind {
     DotenvFile,
     EnvFileDirect,
+    LinesFile,
     RegularFile,
     UnixSocket,
 }
@@ -158,6 +172,7 @@ impl SurfaceKind {
         match self {
             SurfaceKind::DotenvFile => "dotenv_file",
             SurfaceKind::EnvFileDirect => "env_file_direct",
+            SurfaceKind::LinesFile => "lines_file",
             SurfaceKind::RegularFile => "regular_file",
             SurfaceKind::UnixSocket => "unix_socket",
         }
@@ -167,6 +182,7 @@ impl SurfaceKind {
         match value {
             "dotenv_file" => Some(SurfaceKind::DotenvFile),
             "env_file_direct" => Some(SurfaceKind::EnvFileDirect),
+            "lines_file" => Some(SurfaceKind::LinesFile),
             "regular_file" => Some(SurfaceKind::RegularFile),
             "unix_socket" => Some(SurfaceKind::UnixSocket),
             _ => None,

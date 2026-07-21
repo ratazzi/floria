@@ -304,6 +304,7 @@ private struct ProjectWorkspaceView: View {
     @State private var showingNewEnvironment = false
     @State private var showingAddDotenvFile = false
     @State private var showingAddDirectEnvFile = false
+    @State private var showingAddLinesFile = false
     @State private var confirmingRemoveProject = false
     @State private var confirmingRemoveEnvironment = false
 
@@ -328,7 +329,8 @@ private struct ProjectWorkspaceView: View {
             SurfaceInspector(
                 store: store,
                 addDotenvFile: { showingAddDotenvFile = true },
-                addDirectEnvFile: { showingAddDirectEnvFile = true })
+                addDirectEnvFile: { showingAddDirectEnvFile = true },
+                addLinesFile: { showingAddLinesFile = true })
                 .frame(width: 390)
         }
         .sheet(isPresented: $showingAddBinding) {
@@ -339,6 +341,9 @@ private struct ProjectWorkspaceView: View {
         }
         .sheet(isPresented: $showingAddDotenvFile) {
             AddDotenvSurfaceSheet(store: store)
+        }
+        .sheet(isPresented: $showingAddLinesFile) {
+            AddLinesSurfaceSheet(store: store)
         }
         .sheet(isPresented: $showingNewEnvironment) {
             NewEnvironmentSheet(store: store)
@@ -569,6 +574,12 @@ private struct BindingRow: View {
     let resource: WorkspaceResource
     @Bindable var store: WorkspaceStore
 
+    private var summary: String {
+        guard resource.entries.count > 1 else { return resource.exportSummary }
+        let selected = binding.selection.addresses(in: resource).count
+        return "\(selected) of \(resource.entries.count) entries"
+    }
+
     var body: some View {
         HStack(spacing: 12) {
             ResourceIcon(kind: resource.kind)
@@ -577,7 +588,7 @@ private struct BindingRow: View {
                     .font(.body.weight(.medium))
                 HStack(spacing: 7) {
                     ResourceKindBadge(kind: resource.kind)
-                    Text(resource.exportSummary)
+                    Text(summary)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -595,8 +606,14 @@ private struct BindingRow: View {
             .labelsHidden()
             .controlSize(.small)
             Menu {
-                Button("Copy Export Names", systemImage: "doc.on.doc") {
-                    copyToPasteboard(resource.exports.map(\.key).joined(separator: "\n"))
+                Button(
+                    resource.entries.isEmpty ? "Copy Export Names" : "Copy Entry Addresses",
+                    systemImage: "doc.on.doc"
+                ) {
+                    let values = resource.entries.isEmpty
+                        ? resource.exports.map(\.key)
+                        : binding.selection.addresses(in: resource)
+                    copyToPasteboard(values.joined(separator: "\n"))
                 }
                 Divider()
                 Button("Remove Binding", systemImage: "trash", role: .destructive) {
@@ -683,6 +700,7 @@ private struct SurfaceInspector: View {
     @Bindable var store: WorkspaceStore
     let addDotenvFile: () -> Void
     let addDirectEnvFile: () -> Void
+    let addLinesFile: () -> Void
     @State private var showingManageSurface = false
 
     var body: some View {
@@ -713,6 +731,9 @@ private struct SurfaceInspector: View {
                                 Button("Direct EnvFile Output", systemImage: "doc.text.fill") {
                                     addDirectEnvFile()
                                 }
+                                Button("Lines Output", systemImage: "text.line.first.and.arrowtriangle.forward") {
+                                    addLinesFile()
+                                }
                             } label: {
                                 Image(systemName: "plus")
                             }
@@ -739,6 +760,10 @@ private struct SurfaceInspector: View {
                         DirectEnvFileSurfacePreview(
                             store: store, openInFinder: { revealSurface(surface) },
                             manageLink: { showingManageSurface = true })
+                    case .linesFile:
+                        LinesSurfacePreview(
+                            store: store, openInFinder: { revealSurface(surface) },
+                            manageLink: { showingManageSurface = true })
                     case .unixSocket:
                         SocketSurfacePreview(
                             store: store, copyPath: { copyToPasteboard(surface.path) },
@@ -755,6 +780,7 @@ private struct SurfaceInspector: View {
                     Menu("Add Output", systemImage: "plus") {
                         Button("Composed Env Output", action: addDotenvFile)
                         Button("Direct EnvFile Output", action: addDirectEnvFile)
+                        Button("Lines Output", action: addLinesFile)
                     }
                     .buttonStyle(.borderedProminent)
                 }
@@ -771,6 +797,46 @@ private struct SurfaceInspector: View {
 
     private func revealSurface(_ surface: WorkspaceSurface) {
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: surface.path)])
+    }
+}
+
+private struct LinesSurfacePreview: View {
+    @Bindable var store: WorkspaceStore
+    let openInFinder: () -> Void
+    let manageLink: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(store.resolvedLineEntries) { entry in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("••••••••••••")
+                                .font(.callout.monospaced())
+                            Text("\(entry.label) · \(entry.resourceName)")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 12)
+                        Divider().padding(.leading, 20)
+                    }
+                    if store.resolvedLineEntries.isEmpty {
+                        ContentUnavailableView(
+                            "No keyless values",
+                            systemImage: "text.line.first.and.arrowtriangle.forward",
+                            description: Text(
+                                "Bind a Shared Secret without a default environment key first."))
+                            .padding(24)
+                    }
+                }
+            }
+            SurfaceFooter(
+                primaryTitle: "Manage Link", secondaryTitle: "Open in Finder",
+                note: "One value per line · Read only · Binding order preserved",
+                primaryAction: manageLink, secondaryAction: openInFinder)
+        }
     }
 }
 
@@ -948,6 +1014,7 @@ private struct ManageSurfaceSheet: View {
 
     private var isFileSurface: Bool {
         surface.kind == .dotenvFile || surface.kind == .envFileDirect
+            || surface.kind == .linesFile
     }
 
     private var expectedTarget: String {
@@ -1234,6 +1301,7 @@ private struct AddBindingSheet: View {
     @State private var target = WorkspaceBindingTarget.environment
     @State private var isSaving = false
     @State private var errorMessage: String?
+    @State private var selectedEntries: [WorkspaceResource.ID: Set<String>] = [:]
 
     private var filtered: [WorkspaceResource] {
         guard !search.isEmpty else { return store.availableResources }
@@ -1241,6 +1309,7 @@ private struct AddBindingSheet: View {
             $0.name.localizedCaseInsensitiveContains(search)
                 || $0.kind.title.localizedCaseInsensitiveContains(search)
                 || $0.exportSummary.localizedCaseInsensitiveContains(search)
+                || $0.entries.contains { $0.label.localizedCaseInsensitiveContains(search) }
         }
     }
 
@@ -1274,36 +1343,62 @@ private struct AddBindingSheet: View {
             Divider()
             List(filtered) { resource in
                 let conflicts = prospectiveConflicts(resource)
-                HStack(spacing: 12) {
-                    ResourceIcon(kind: resource.kind)
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack(spacing: 7) {
-                            Text(resource.name).font(.body.weight(.medium))
-                            ResourceKindBadge(kind: resource.kind)
-                        }
-                        Text(resource.exportSummary)
-                            .font(.caption.monospaced())
-                            .foregroundStyle(conflicts.isEmpty ? Color.secondary : Color.orange)
-                        if !conflicts.isEmpty {
-                            Text("Conflicts with \(conflicts.joined(separator: ", "))")
-                                .font(.caption)
-                                .foregroundStyle(.orange)
-                        }
-                    }
-                    Spacer()
-                    Button("Add") {
-                        Task {
-                            isSaving = true
-                            defer { isSaving = false }
-                            do {
-                                try await store.addResource(resource.id, target: target)
-                            } catch {
-                                errorMessage = error.localizedDescription
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 12) {
+                        ResourceIcon(kind: resource.kind)
+                        VStack(alignment: .leading, spacing: 4) {
+                            HStack(spacing: 7) {
+                                Text(resource.name).font(.body.weight(.medium))
+                                ResourceKindBadge(kind: resource.kind)
+                            }
+                            Text(resource.exportSummary)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(conflicts.isEmpty ? Color.secondary : Color.orange)
+                            if !conflicts.isEmpty {
+                                Text("Conflicts with \(conflicts.joined(separator: ", "))")
+                                    .font(.caption)
+                                    .foregroundStyle(.orange)
                             }
                         }
+                        Spacer()
+                        Button("Add") {
+                            Task {
+                                isSaving = true
+                                defer { isSaving = false }
+                                do {
+                                    try await store.addResource(
+                                        resource.id, target: target,
+                                        selectedEntries: selectedAddressSet(for: resource))
+                                } catch {
+                                    errorMessage = error.localizedDescription
+                                }
+                            }
+                        }
+                            .buttonStyle(.bordered)
+                            .disabled(
+                                !conflicts.isEmpty || isSaving
+                                    || (resource.entries.count > 1
+                                        && selectedAddressSet(for: resource).isEmpty))
                     }
-                        .buttonStyle(.bordered)
-                        .disabled(!conflicts.isEmpty || isSaving)
+
+                    if resource.entries.count > 1 {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Include entries in source order")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                            ForEach(resource.entries) { entry in
+                                Toggle(
+                                    entry.label,
+                                    isOn: Binding(
+                                        get: { selectedAddressSet(for: resource).contains(entry.address) },
+                                        set: { setEntry(entry.address, selected: $0, in: resource) })
+                                )
+                                .toggleStyle(.checkbox)
+                                .font(.callout)
+                            }
+                        }
+                        .padding(.leading, 46)
+                    }
                 }
                 .padding(.vertical, 5)
             }
@@ -1313,7 +1408,7 @@ private struct AddBindingSheet: View {
                 }
             }
         }
-        .searchable(text: $search, prompt: "Search secrets and env files")
+        .searchable(text: $search, prompt: "Search resources and entries")
         .frame(minWidth: 580, minHeight: 460)
         .alert(
             "Could not add binding",
@@ -1329,7 +1424,22 @@ private struct AddBindingSheet: View {
 
     private func prospectiveConflicts(_ resource: WorkspaceResource) -> [String] {
         let current = Set(store.resolvedExports.map(\.key))
-        return resource.exports.map(\.key).filter(current.contains).sorted()
+        let selected = selectedAddressSet(for: resource)
+        return resource.entries
+            .filter { selected.contains($0.address) }
+            .compactMap(\.key)
+            .filter(current.contains)
+            .sorted()
+    }
+
+    private func selectedAddressSet(for resource: WorkspaceResource) -> Set<String> {
+        selectedEntries[resource.id] ?? Set(resource.entries.map(\.address))
+    }
+
+    private func setEntry(_ address: String, selected: Bool, in resource: WorkspaceResource) {
+        var addresses = selectedAddressSet(for: resource)
+        if selected { addresses.insert(address) } else { addresses.remove(address) }
+        selectedEntries[resource.id] = addresses
     }
 }
 
@@ -1449,10 +1559,13 @@ private struct NewSharedSecretSheet: View {
                 TextField("Cloudflare API Token", text: $name)
                     .textFieldStyle(.roundedBorder)
             }
-            field("Default environment key") {
+            field("Default environment key (optional)") {
                 TextField("CLOUDFLARE_API_TOKEN", text: $defaultKey)
                     .textFieldStyle(.roundedBorder)
                     .font(.body.monospaced())
+                Text("Leave empty for an opaque, keyless value that can be used by Lines outputs.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             field("Secret value") {
                 SecureField("Value", text: $value)
@@ -1474,7 +1587,7 @@ private struct NewSharedSecretSheet: View {
                 Button("Create Secret") { createSecret() }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(isSaving || name.isEmpty || defaultKey.isEmpty || value.isEmpty)
+                    .disabled(isSaving || name.isEmpty || value.isEmpty)
             }
         }
         .padding(24)
@@ -1784,6 +1897,76 @@ private struct AddDotenvSurfaceSheet: View {
             defer { isSaving = false }
             do {
                 try await store.createDotenvSurface(fileName: fileName)
+                dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+}
+
+private struct AddLinesSurfaceSheet: View {
+    @Bindable var store: WorkspaceStore
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var fileName = ".pgpass"
+    @State private var isSaving = false
+    @State private var errorMessage: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Add Lines Output").font(.title2.bold())
+                Text("Compose bound keyless values as a read-only file, one opaque value per line.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Project file name").font(.callout.weight(.medium))
+                TextField(".pgpass", text: $fileName)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.body.monospaced())
+            }
+
+            HStack(alignment: .top) {
+                Image(systemName: "lock.fill")
+                Text("The file name and value syntax are not interpreted. Binding order determines line order; .pgpass is one possible use.")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            Divider()
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Create Output", action: createSurface)
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isSaving || fileName.isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(width: 560)
+        .alert(
+            "Could not create Lines output",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } })
+        ) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
+    }
+
+    private func createSurface() {
+        Task {
+            isSaving = true
+            defer { isSaving = false }
+            do {
+                try await store.createLinesSurface(fileName: fileName)
                 dismiss()
             } catch {
                 errorMessage = error.localizedDescription

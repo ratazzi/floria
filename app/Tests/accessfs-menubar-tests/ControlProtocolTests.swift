@@ -20,7 +20,8 @@ final class ControlProtocolTests: XCTestCase {
             CatalogBinding(
                 id: "fixture-binding", projectID: "fixture-project",
                 scope: .environment("fixture-development"), resourceID: "fixture-resource",
-                keyOverride: nil, enabled: true, allowOverride: false, position: 0))
+                selection: .entries(["records/fixture-primary"]), keyOverride: nil,
+                enabled: true, allowOverride: false, position: 0))
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
         let data = try command.requestData(requestID: 8, encoder: encoder)
@@ -29,10 +30,31 @@ final class ControlProtocolTests: XCTestCase {
         let params = try XCTUnwrap(value["params"] as? [String: Any])
         let binding = try XCTUnwrap(params["binding"] as? [String: Any])
         let scope = try XCTUnwrap(binding["scope"] as? [String: Any])
+        let selection = try XCTUnwrap(binding["selection"] as? [String: Any])
 
         XCTAssertEqual(value["method"] as? String, "binding_upsert")
         XCTAssertEqual(scope["type"] as? String, "environment")
         XCTAssertEqual(scope["environment_id"] as? String, "fixture-development")
+        XCTAssertEqual(selection["type"] as? String, "entries")
+        XCTAssertEqual(selection["addresses"] as? [String], ["records/fixture-primary"])
+    }
+
+    func testSharedSecretCreateAllowsAKeylessValue() throws {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let data = try ControlCommand.sharedSecretCreate(
+            resourceID: "fixture-line", name: "Fixture Line", defaultEnvKey: nil,
+            value: "fixture-host|5432|fixture-db|fixture-user|fixture-value"
+        ).requestData(requestID: 9, encoder: encoder)
+        let value = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let params = try XCTUnwrap(value["params"] as? [String: Any])
+
+        XCTAssertEqual(value["method"] as? String, "shared_secret_create")
+        XCTAssertNil(params["default_env_key"])
+        XCTAssertEqual(
+            params["value"] as? String,
+            "fixture-host|5432|fixture-db|fixture-user|fixture-value")
     }
 
     func testEnvFileCreateRequestCarriesPlaintextOnlyInTheControlBody() throws {
@@ -52,6 +74,16 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(
             params["value"] as? String,
             "API_HOST=http://127.0.0.1:8787\nLOG_LEVEL=debug\n")
+    }
+
+    func testDecodesResourceEntriesWithoutLegacyExportMetadata() throws {
+        let data = Data(
+            #"{"projects":[],"environments":[],"resources":[{"id":"fixture-line","name":"Fixture Line","kind":"shared_secret","shape":"scalar","default_env_key":null,"entries":[{"address":"value","label":"Fixture Line","key":null,"sensitive":true}],"source":{"type":"secret_ref","secret_id":"fixture-secret"},"detail":null}],"bindings":[],"surfaces":[]}"#.utf8)
+
+        let snapshot = try JSONDecoder().decode(CatalogSnapshot.self, from: data)
+
+        XCTAssertEqual(snapshot.resources.first?.entries.first?.address, "value")
+        XCTAssertNil(snapshot.resources.first?.entries.first?.key)
     }
 
     func testProjectCreateRequestCarriesCompleteWorkspace() throws {

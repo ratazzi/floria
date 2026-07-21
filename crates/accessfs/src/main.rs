@@ -383,7 +383,12 @@ fn cleanup_removed_file_links(
         let still_present = snapshot.surfaces.iter().any(|current| {
             current.id == surface.id
                 && current.path == surface.path
-                && matches!(current.kind, SurfaceKind::DotenvFile | SurfaceKind::EnvFileDirect)
+                && matches!(
+                    current.kind,
+                    SurfaceKind::DotenvFile
+                        | SurfaceKind::EnvFileDirect
+                        | SurfaceKind::LinesFile
+                )
         });
         if still_present {
             continue;
@@ -410,7 +415,12 @@ fn reconcile_file_links(snapshot: &CatalogSnapshot, mount_path: &Path) {
         .surfaces
         .iter()
         .filter(|surface| {
-            matches!(surface.kind, SurfaceKind::DotenvFile | SurfaceKind::EnvFileDirect)
+            matches!(
+                surface.kind,
+                SurfaceKind::DotenvFile
+                    | SurfaceKind::EnvFileDirect
+                    | SurfaceKind::LinesFile
+            )
         })
     {
         match ensure_file_surface_link(surface, mount_path) {

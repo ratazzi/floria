@@ -26,7 +26,10 @@ pub fn ensure_file_surface_link(
     surface: &Surface,
     mount_path: &Path,
 ) -> SurfaceResult<SurfaceLinkState> {
-    if !matches!(surface.kind, SurfaceKind::DotenvFile | SurfaceKind::EnvFileDirect) {
+    if !matches!(
+        surface.kind,
+        SurfaceKind::DotenvFile | SurfaceKind::EnvFileDirect | SurfaceKind::LinesFile
+    ) {
         return Err(SurfaceError::UnsupportedSurface {
             surface_id: surface.id.clone(),
             kind: format!("{:?}", surface.kind),
@@ -54,7 +57,10 @@ pub fn remove_file_surface_link(
     surface: &Surface,
     mount_path: &Path,
 ) -> SurfaceResult<SurfaceLinkRemoval> {
-    if !matches!(surface.kind, SurfaceKind::DotenvFile | SurfaceKind::EnvFileDirect) {
+    if !matches!(
+        surface.kind,
+        SurfaceKind::DotenvFile | SurfaceKind::EnvFileDirect | SurfaceKind::LinesFile
+    ) {
         return Ok(SurfaceLinkRemoval::Preserved);
     }
     validate_surface_id(&surface.id)?;

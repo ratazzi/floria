@@ -20,7 +20,7 @@ final class ControlClient: @unchecked Sendable {
     }
 
     func createSharedSecret(
-        resourceID: String, name: String, defaultEnvKey: String, value: String
+        resourceID: String, name: String, defaultEnvKey: String?, value: String
     ) async throws {
         let _: SharedSecretCreated? = try await request(
             .sharedSecretCreate(
@@ -200,6 +200,7 @@ final class ControlClient: @unchecked Sendable {
     private struct EnvFileCreated: Decodable {
         let version: UInt32
     }
+
 }
 
 enum ControlClientError: LocalizedError {

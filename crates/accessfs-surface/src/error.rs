@@ -39,8 +39,11 @@ pub enum SurfaceError {
         actual: Vec<String>,
     },
 
-    #[error("rendered dotenv exceeds {limit} bytes")]
+    #[error("rendered surface exceeds {limit} bytes")]
     TooLarge { limit: usize },
+
+    #[error("resource {resource_id:?} cannot be rendered as one line: {reason}")]
+    InvalidLineValue { resource_id: String, reason: String },
 
     #[error("invalid surface id for a filesystem entry: {0:?}")]
     InvalidSurfaceId(String),

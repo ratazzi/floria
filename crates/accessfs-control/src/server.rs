@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use accessfs_catalog::{
-    Catalog, CatalogError, CatalogSnapshot, ExportSpec, Resource, ResourceKind, ResourceSource,
-    ValueShape,
+    Catalog, CatalogError, CatalogSnapshot, EntrySpec, Resource, ResourceKind,
+    ResourceSource, ValueShape,
 };
 use accessfs_store::{NewSecret, SecretId, SecretStore, StoreError};
 use accessfs_surface::{parse_dotenv, DOTENV_MAX_SIZE};
@@ -354,7 +354,7 @@ fn create_shared_secret(
     store: &dyn SecretStore,
     resource_id: String,
     name: String,
-    default_env_key: String,
+    default_env_key: Option<String>,
     value: crate::protocol::SecretValue,
 ) -> Result<ControlResult, DispatchError> {
     if value.as_bytes().is_empty() {
@@ -362,13 +362,19 @@ fn create_shared_secret(
             "shared secret value cannot be empty".to_string(),
         ));
     }
+    let entry_label = name.clone();
     let mut resource = Resource {
         id: resource_id,
         name,
         kind: ResourceKind::SharedSecret,
         shape: ValueShape::Scalar,
-        default_env_key: Some(default_env_key.clone()),
-        exports: vec![ExportSpec { key: default_env_key, sensitive: true }],
+        default_env_key: default_env_key.clone(),
+        entries: vec![EntrySpec {
+            address: "value".to_string(),
+            label: entry_label,
+            key: default_env_key,
+            sensitive: true,
+        }],
         source: ResourceSource::SecretRef { secret_id: "pending-secret-id".to_string() },
         detail: None,
     };
@@ -443,15 +449,21 @@ fn create_env_file(
             "env file must contain at least one KEY=VALUE entry".to_string(),
         ));
     }
+    let keys = values.into_keys().collect::<Vec<_>>();
     let mut resource = Resource {
         id: resource_id,
         name,
         kind: ResourceKind::EnvFile,
         shape: ValueShape::KeyValueSet,
         default_env_key: None,
-        exports: values
-            .into_keys()
-            .map(|key| ExportSpec { key, sensitive: true })
+        entries: keys
+            .into_iter()
+            .map(|key| EntrySpec {
+                address: format!("keys/{key}"),
+                label: key.clone(),
+                key: Some(key),
+                sensitive: true,
+            })
             .collect(),
         source: ResourceSource::SecretRef { secret_id: "pending-secret-id".to_string() },
         detail: None,
@@ -520,7 +532,11 @@ mod tests {
             assert!(matches!(
                 meta.origin,
                 SecretOrigin::Managed { ref label }
-                    if matches!(label.as_str(), "Fixture Shared Secret" | "Fixture Env File")
+                    if matches!(
+                        label.as_str(),
+                        "Fixture Shared Secret"
+                            | "Fixture Env File"
+                    )
             ));
             let id: SecretId = FIXTURE_SECRET_ID.parse().unwrap();
             self.entries
@@ -607,7 +623,7 @@ mod tests {
         let mut client = ControlClient::connect(&socket).unwrap();
         assert_eq!(
             client.request(ControlCommand::Ping).unwrap(),
-            ControlResult::Pong { schema_version: 1 }
+            ControlResult::Pong { schema_version: 3 }
         );
         client
             .request(ControlCommand::ProjectUpsert {
@@ -814,7 +830,7 @@ mod tests {
             .request(ControlCommand::SharedSecretCreate {
                 resource_id: "fixture-shared-secret".to_string(),
                 name: "Fixture Shared Secret".to_string(),
-                default_env_key: "FIXTURE_TOKEN".to_string(),
+                default_env_key: Some("FIXTURE_TOKEN".to_string()),
                 value: crate::protocol::SecretValue::new("fixture-value-one"),
             })
             .unwrap();
@@ -883,7 +899,7 @@ mod tests {
         assert_eq!(version, 1);
         assert_eq!(resource.kind, ResourceKind::EnvFile);
         assert_eq!(
-            resource.exports.iter().map(|export| export.key.as_str()).collect::<Vec<_>>(),
+            resource.entries.iter().filter_map(|entry| entry.key.as_deref()).collect::<Vec<_>>(),
             vec!["API_HOST", "LOG_LEVEL"]
         );
         let ResourceSource::SecretRef { secret_id } = resource.source else {
@@ -898,4 +914,5 @@ mod tests {
         assert!(!encoded.contains("127.0.0.1"));
         assert!(!encoded.contains("LOG_LEVEL=debug"));
     }
+
 }

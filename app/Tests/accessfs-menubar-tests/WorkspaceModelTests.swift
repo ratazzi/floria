@@ -56,4 +56,58 @@ final class WorkspaceModelTests: XCTestCase {
         XCTAssertNil(store.selectedSurface)
         XCTAssertTrue(store.resolvedExports.isEmpty)
     }
+
+    func testEntrySelectionUsesResourceOrderInsteadOfCheckboxOrder() {
+        let resource = WorkspaceResource(
+            id: "fixture-env", name: "Fixture Env File",
+            kind: .envFile, shape: .keyValueSet,
+            exports: [
+                WorkspaceExport(key: "PRIMARY_URL", previewValue: "fixture-primary", sensitive: true),
+                WorkspaceExport(key: "FALLBACK_URL", previewValue: "fixture-fallback", sensitive: true),
+            ],
+            entries: [
+                WorkspaceEntry(
+                    address: "keys/PRIMARY_URL", label: "PRIMARY_URL", key: "PRIMARY_URL",
+                    sensitive: true),
+                WorkspaceEntry(
+                    address: "keys/FALLBACK_URL", label: "FALLBACK_URL", key: "FALLBACK_URL",
+                    sensitive: true),
+            ],
+            detail: "2 entries", usageCount: 0)
+        let selection = WorkspaceEntrySelection.entries([
+            "keys/FALLBACK_URL", "keys/PRIMARY_URL",
+        ])
+
+        XCTAssertEqual(
+            selection.addresses(in: resource),
+            ["keys/PRIMARY_URL", "keys/FALLBACK_URL"])
+    }
+
+    func testBindingSelectionIncludesOnlyChosenEnvFileEntries() {
+        let resource = WorkspaceResource(
+            id: "fixture-env", name: "Fixture Env File", kind: .envFile,
+            shape: .keyValueSet, exports: [],
+            entries: [
+                WorkspaceEntry(
+                    address: "keys/API_HOST", label: "API_HOST", key: "API_HOST",
+                    previewValue: "fixture-host", sensitive: false),
+                WorkspaceEntry(
+                    address: "keys/LOG_LEVEL", label: "LOG_LEVEL", key: "LOG_LEVEL",
+                    previewValue: "debug", sensitive: false),
+            ], detail: "2 entries", usageCount: 0)
+        let environment = WorkspaceEnvironment(
+            id: "development", name: "Development",
+            bindings: [
+                WorkspaceBinding(
+                    id: "fixture-binding", resourceID: resource.id,
+                    selection: .entries(["keys/LOG_LEVEL"]), keyOverride: nil,
+                    isEnabled: true)
+            ], surfaces: [])
+        let project = WorkspaceProject(
+            id: "fixture-project", name: "Fixture", path: "/tmp/fixture",
+            commonBindings: [], environments: [environment])
+        let store = WorkspaceStore(projects: [project], resources: [resource])
+
+        XCTAssertEqual(store.resolvedExports.map(\.key), ["LOG_LEVEL"])
+    }
 }
