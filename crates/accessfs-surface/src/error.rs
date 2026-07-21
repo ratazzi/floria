@@ -30,6 +30,9 @@ pub enum SurfaceError {
     #[error("INI parse error on line {line}: {reason}")]
     IniParse { line: usize, reason: String },
 
+    #[error("INI projection error: {reason}")]
+    IniProjection { reason: String },
+
     #[error("resolved resource {resource_id:?} is missing key {key:?}")]
     MissingKey { resource_id: String, key: String },
 

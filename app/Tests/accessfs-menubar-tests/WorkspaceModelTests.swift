@@ -116,7 +116,7 @@ final class WorkspaceModelTests: XCTestCase {
         XCTAssertEqual(store.resolvedExports.map(\.key), ["LOG_LEVEL"])
     }
 
-    func testIniBindingCanSelectOneSectionForDotenvProjection() {
+    func testIniBindingSupportsNativeAndSelectedDotenvProjections() {
         let resource = WorkspaceResource(
             id: "fixture-ini", name: "Fixture INI", kind: .envFile,
             shape: .keyValueSet, codec: .ini, exports: [],
@@ -143,6 +143,25 @@ final class WorkspaceModelTests: XCTestCase {
 
         XCTAssertTrue(store.bindingIsCompatible(selected, with: .dotenvFile))
         XCTAssertFalse(store.bindingIsCompatible(all, with: .dotenvFile))
+        XCTAssertTrue(store.bindingIsCompatible(selected, with: .iniFile))
+        XCTAssertTrue(store.bindingIsCompatible(all, with: .iniFile))
+
+        let environment = WorkspaceEnvironment(
+            id: "development", name: "Development", bindings: [selected],
+            surfaces: [
+                WorkspaceSurface(
+                    id: "fixture-ini-output", name: "credentials.ini", kind: .iniFile,
+                    path: "/tmp/fixture/credentials.ini", status: .linked,
+                    input: .bindings([selected.id]))
+            ])
+        let projected = WorkspaceStore(
+            projects: [
+                WorkspaceProject(
+                    id: "fixture-project", name: "Fixture", path: "/tmp/fixture",
+                    commonBindings: [], environments: [environment])
+            ], resources: [resource])
+
+        XCTAssertEqual(projected.resolvedIniEntries.map(\.label), ["[staging] REGION"])
     }
 
     func testEachSurfaceResolvesOnlyItsExplicitMembers() {

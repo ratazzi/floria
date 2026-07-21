@@ -181,6 +181,7 @@ enum WorkspaceBindingTarget: String, CaseIterable, Sendable {
 
 enum WorkspaceSurfaceKind: String, Sendable {
     case dotenvFile
+    case iniFile
     case envFileDirect
     case linesFile
     case regularFile
@@ -189,6 +190,7 @@ enum WorkspaceSurfaceKind: String, Sendable {
     var title: String {
         switch self {
         case .dotenvFile: "Dotenv File"
+        case .iniFile: "INI File"
         case .envFileDirect: "Direct Env File"
         case .linesFile: "Lines File"
         case .regularFile: "File"
@@ -199,6 +201,7 @@ enum WorkspaceSurfaceKind: String, Sendable {
     var systemImage: String {
         switch self {
         case .dotenvFile: "doc.text"
+        case .iniFile: "list.bullet.rectangle"
         case .envFileDirect: "doc.text.fill"
         case .linesFile: "text.line.first.and.arrowtriangle.forward"
         case .regularFile: "doc"
@@ -371,6 +374,20 @@ final class WorkspaceStore {
         }
     }
 
+    var resolvedIniEntries: [ResolvedWorkspaceEntry] {
+        selectedSurfaceBindings.flatMap { binding -> [ResolvedWorkspaceEntry] in
+            guard let resource = resource(binding.resourceID), resource.codec == .ini else {
+                return []
+            }
+            let selected = Set(binding.selection.addresses(in: resource))
+            return resource.entries.filter { selected.contains($0.address) }.map { entry in
+                ResolvedWorkspaceEntry(
+                    bindingID: binding.id, address: entry.address, label: entry.label,
+                    resourceName: resource.name)
+            }
+        }
+    }
+
     var conflictingKeys: Set<String> {
         let counts = Dictionary(grouping: resolvedExports, by: \.key).mapValues(\.count)
         return Set(counts.filter { $0.value > 1 }.keys)
@@ -413,6 +430,10 @@ final class WorkspaceStore {
                     guard let key = entry.key else { return false }
                     return Self.isValidEnvKey(key)
                 }
+        case .iniFile:
+            return resource.kind == .envFile && resource.shape == .keyValueSet
+                && resource.codec == .ini && binding.keyOverride == nil
+                && entries.allSatisfy { $0.key != nil }
         case .linesFile:
             return resource.shape == .scalar && resource.codec == .opaque
                 && (resource.kind == .sharedSecret || resource.kind == .secret
@@ -617,6 +638,29 @@ final class WorkspaceStore {
     }
 
     @discardableResult
+    func createIniSurface(
+        fileName: String, bindingIDs: [WorkspaceBinding.ID]
+    ) async throws -> WorkspaceSurface.ID {
+        guard let controlClient else {
+            throw WorkspaceStoreError.controlUnavailable
+        }
+        guard let project = selectedProject, let environment = selectedEnvironment else {
+            throw WorkspaceStoreError.invalid("Select a project environment first")
+        }
+        let output = try newSurfaceOutput(fileName: fileName, in: project)
+        let surfaceID = Self.newID("ini")
+        try await controlClient.upsertSurface(
+            CatalogSurface(
+                id: surfaceID, environmentID: environment.id, name: output.name,
+                kind: "ini_file", path: output.path, input: .bindings(bindingIDs),
+                position: Int64(environment.surfaces.count)))
+        apply(try await controlClient.snapshot())
+        selectedSurfaceID = surfaceID
+        lastError = nil
+        return surfaceID
+    }
+
+    @discardableResult
     func createLinesSurface(
         fileName: String, bindingIDs: [WorkspaceBinding.ID]
     ) async throws -> WorkspaceSurface.ID {
@@ -702,7 +746,8 @@ final class WorkspaceStore {
         }
         let surfaceID = requestedSurfaceID ?? selectedSurfaceID
         guard let surface = environment.surfaces.first(where: { $0.id == surfaceID }),
-            surface.kind == .dotenvFile || surface.kind == .linesFile
+            surface.kind == .dotenvFile || surface.kind == .iniFile
+                || surface.kind == .linesFile
         else {
             throw WorkspaceStoreError.invalid("Choose a composed output for this binding")
         }
@@ -796,7 +841,8 @@ final class WorkspaceStore {
         guard let environment = selectedEnvironment,
             let position = environment.surfaces.firstIndex(where: { $0.id == id }),
             let surface = environment.surfaces.first(where: { $0.id == id }),
-            surface.kind == .dotenvFile || surface.kind == .linesFile
+            surface.kind == .dotenvFile || surface.kind == .iniFile
+                || surface.kind == .linesFile
         else {
             throw WorkspaceStoreError.invalid("Choose a composed output first")
         }
@@ -1094,6 +1140,7 @@ private extension WorkspaceSurfaceKind {
     var catalogValue: String {
         switch self {
         case .dotenvFile: "dotenv_file"
+        case .iniFile: "ini_file"
         case .envFileDirect: "env_file_direct"
         case .linesFile: "lines_file"
         case .regularFile: "regular_file"
@@ -1104,6 +1151,7 @@ private extension WorkspaceSurfaceKind {
     init?(catalogValue: String) {
         switch catalogValue {
         case "dotenv_file": self = .dotenvFile
+        case "ini_file": self = .iniFile
         case "env_file_direct": self = .envFileDirect
         case "lines_file": self = .linesFile
         case "regular_file": self = .regularFile

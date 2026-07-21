@@ -167,4 +167,13 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(snapshot.surfaces.first?.kind, "env_file_direct")
         XCTAssertEqual(snapshot.surfaces.first?.input.resourceID, "fixture-env-file")
     }
+
+    func testDecodesIniSurfaceFromRustSnapshot() throws {
+        let data = Data(
+            #"{"projects":[],"environments":[],"resources":[],"bindings":[],"surfaces":[{"id":"fixture-ini","environment_id":"fixture-development","name":"credentials.ini","kind":"ini_file","path":"/tmp/fixture/credentials.ini","input":{"type":"bindings","binding_ids":["fixture-binding"]},"position":1}]}"#.utf8)
+        let snapshot = try JSONDecoder().decode(CatalogSnapshot.self, from: data)
+
+        XCTAssertEqual(snapshot.surfaces.first?.kind, "ini_file")
+        XCTAssertEqual(snapshot.surfaces.first?.input.bindingIDs, ["fixture-binding"])
+    }
 }

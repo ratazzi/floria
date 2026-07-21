@@ -405,6 +405,7 @@ fn cleanup_removed_file_links(
                 && matches!(
                     current.kind,
                     SurfaceKind::DotenvFile
+                        | SurfaceKind::IniFile
                         | SurfaceKind::EnvFileDirect
                         | SurfaceKind::LinesFile
                 )
@@ -437,6 +438,7 @@ fn reconcile_file_links(snapshot: &CatalogSnapshot, mount_path: &Path) {
             matches!(
                 surface.kind,
                 SurfaceKind::DotenvFile
+                    | SurfaceKind::IniFile
                     | SurfaceKind::EnvFileDirect
                     | SurfaceKind::LinesFile
             )

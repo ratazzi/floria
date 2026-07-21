@@ -795,8 +795,12 @@ fn validate_snapshot_conflicts(snapshot: &CatalogSnapshot) -> CatalogResult<()> 
     validate_binding_selections(snapshot)?;
     validate_surface_inputs(snapshot)?;
     for surface in &snapshot.surfaces {
-        if surface.kind == SurfaceKind::DotenvFile {
-            resolve_catalog_surface(snapshot, &surface.id)?;
+        match surface.kind {
+            SurfaceKind::DotenvFile => {
+                resolve_catalog_surface(snapshot, &surface.id)?;
+            }
+            SurfaceKind::IniFile => validate_ini_surface_conflicts(snapshot, surface)?,
+            _ => {}
         }
     }
     Ok(())
@@ -856,7 +860,7 @@ fn validate_surface_inputs(snapshot: &CatalogSnapshot) -> CatalogResult<()> {
         })?;
         match (&surface.kind, &surface.input) {
             (
-                SurfaceKind::DotenvFile | SurfaceKind::LinesFile,
+                SurfaceKind::DotenvFile | SurfaceKind::IniFile | SurfaceKind::LinesFile,
                 SurfaceInput::Bindings { binding_ids },
             ) => {
                 let mut unique = HashSet::new();
@@ -972,6 +976,20 @@ fn validate_composed_surface_member(
                 )));
             }
         }
+        SurfaceKind::IniFile => {
+            let compatible = resource.kind == ResourceKind::EnvFile
+                && resource.shape == ValueShape::KeyValueSet
+                && resource.codec == ResourceCodec::Ini
+                && binding.key_override.is_none()
+                && entries.into_iter().all(|entry| entry.key.is_some())
+                && matches!(resource.source, ResourceSource::SecretRef { .. });
+            if !compatible {
+                return Err(CatalogError::Validation(format!(
+                    "binding {:?} cannot feed INI surface {:?}",
+                    binding.id, surface.id
+                )));
+            }
+        }
         SurfaceKind::LinesFile => {
             let compatible = resource.shape == ValueShape::Scalar
                 && resource.codec == ResourceCodec::Opaque
@@ -989,6 +1007,52 @@ fn validate_composed_surface_member(
             }
         }
         _ => unreachable!("only composed surfaces call member validation"),
+    }
+    Ok(())
+}
+
+fn validate_ini_surface_conflicts(
+    snapshot: &CatalogSnapshot,
+    surface: &Surface,
+) -> CatalogResult<()> {
+    let SurfaceInput::Bindings { binding_ids } = &surface.input else {
+        return Err(CatalogError::Validation(format!(
+            "INI surface {:?} requires binding input",
+            surface.id
+        )));
+    };
+    let resources = snapshot
+        .resources
+        .iter()
+        .map(|resource| (resource.id.as_str(), resource))
+        .collect::<HashMap<_, _>>();
+    let bindings = snapshot
+        .bindings
+        .iter()
+        .map(|binding| (binding.id.as_str(), binding))
+        .collect::<HashMap<_, _>>();
+    let mut addresses: HashMap<&str, &str> = HashMap::new();
+    for binding_id in binding_ids {
+        let binding = bindings
+            .get(binding_id.as_str())
+            .ok_or_else(|| CatalogError::NotFound(format!("binding {binding_id}")))?;
+        if !binding.enabled {
+            continue;
+        }
+        let resource = resources.get(binding.resource_id.as_str()).ok_or_else(|| {
+            CatalogError::NotFound(format!("resource {}", binding.resource_id))
+        })?;
+        for entry in resource.entries.iter().filter(|entry| match &binding.selection {
+            EntrySelection::All => true,
+            EntrySelection::Entries { addresses } => addresses.contains(&entry.address),
+        }) {
+            if let Some(existing_binding) = addresses.insert(&entry.address, &binding.id) {
+                return Err(CatalogError::Conflict {
+                    key: entry.address.clone(),
+                    binding_ids: vec![existing_binding.to_string(), binding.id.clone()],
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -1516,6 +1580,44 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(error, CatalogError::Validation(message) if message.contains("cannot feed dotenv")));
+
+        let mut ini_surface = Surface {
+            id: "fixture-ini-output".to_string(),
+            environment_id: "development".to_string(),
+            name: "credentials.ini".to_string(),
+            kind: SurfaceKind::IniFile,
+            path: PathBuf::from("/workspace/floria/credentials.ini"),
+            input: SurfaceInput::Bindings {
+                binding_ids: vec!["fixture-ini-binding".to_string()],
+            },
+            position: 0,
+        };
+        catalog.upsert_surface(&ini_surface).unwrap();
+
+        let mut duplicate = resource.clone();
+        duplicate.id = "fixture-ini-duplicate".to_string();
+        duplicate.source = ResourceSource::SecretRef {
+            secret_id: "fixture-ini-secret-two".to_string(),
+        };
+        catalog.upsert_resource(&duplicate).unwrap();
+        catalog
+            .upsert_binding(&binding(
+                "fixture-ini-binding-two",
+                &duplicate.id,
+                BindingScope::Environment { environment_id: "development".to_string() },
+            ))
+            .unwrap();
+        ini_surface.input = SurfaceInput::Bindings {
+            binding_ids: vec![
+                "fixture-ini-binding".to_string(),
+                "fixture-ini-binding-two".to_string(),
+            ],
+        };
+        assert!(matches!(
+            catalog.upsert_surface(&ini_surface),
+            Err(CatalogError::Conflict { key, .. })
+                if key == "sections/fixture/keys/credential-process"
+        ));
     }
 
     #[test]

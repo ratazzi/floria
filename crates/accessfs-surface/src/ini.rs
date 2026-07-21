@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use zeroize::Zeroizing;
 
@@ -76,6 +76,87 @@ pub fn parse_ini(input: &str) -> SurfaceResult<Vec<ParsedIniEntry>> {
     Ok(entries)
 }
 
+/// Render addressed values as deterministic INI. Root entries are emitted before sectioned
+/// entries so composing multiple resources cannot accidentally place a root key in a section.
+pub(crate) fn render_ini_refs<'a>(
+    entries: impl IntoIterator<Item = (Option<&'a str>, &'a str, &'a str)>,
+) -> SurfaceResult<Vec<u8>> {
+    let entries = entries.into_iter().collect::<Vec<_>>();
+    let mut identities = HashSet::new();
+    for (section, key, value) in &entries {
+        validate_render_entry(*section, key, value)?;
+        if !identities.insert((*section, *key)) {
+            return Err(SurfaceError::IniProjection {
+                reason: format!(
+                    "duplicate key {key:?} in {}",
+                    section
+                        .map(|name| format!("section {name:?}"))
+                        .unwrap_or_else(|| "the root section".to_string())
+                ),
+            });
+        }
+    }
+
+    let ordered = entries
+        .iter()
+        .copied()
+        .filter(|(section, _, _)| section.is_none())
+        .chain(entries.iter().copied().filter(|(section, _, _)| section.is_some()));
+    let mut output = String::new();
+    let mut active_section: Option<&str> = None;
+    let mut emitted_section = false;
+    for (section, key, value) in ordered {
+        if let Some(section) = section {
+            if active_section != Some(section) {
+                if !output.is_empty() {
+                    output.push('\n');
+                }
+                output.push('[');
+                output.push_str(section);
+                output.push_str("]\n");
+                active_section = Some(section);
+                emitted_section = true;
+            }
+        } else if emitted_section {
+            unreachable!("root entries are canonicalized before sections");
+        }
+        output.push_str(key);
+        output.push_str(" = ");
+        output.push_str(value);
+        output.push('\n');
+        if output.len() > INI_MAX_SIZE {
+            return Err(SurfaceError::TooLarge { limit: INI_MAX_SIZE });
+        }
+    }
+    Ok(output.into_bytes())
+}
+
+fn validate_render_entry(section: Option<&str>, key: &str, value: &str) -> SurfaceResult<()> {
+    if section.is_some_and(|name| {
+        name.is_empty()
+            || name.trim() != name
+            || name.contains([']', '\n', '\r', '\0'])
+    }) {
+        return Err(SurfaceError::IniProjection {
+            reason: format!("invalid section name {section:?}"),
+        });
+    }
+    if key.is_empty()
+        || key.trim() != key
+        || key.contains(['=', ':', '\n', '\r', '\0'])
+    {
+        return Err(SurfaceError::IniProjection {
+            reason: format!("invalid key {key:?}"),
+        });
+    }
+    if value.contains(['\n', '\r', '\0']) {
+        return Err(SurfaceError::IniProjection {
+            reason: format!("key {key:?} has a multiline or NUL value"),
+        });
+    }
+    Ok(())
+}
+
 fn entry_address(section: Option<&str>, key: &str) -> String {
     match section {
         Some(section) => format!(
@@ -134,5 +215,32 @@ mod tests {
 
         assert_eq!(entries[0].address, "sections/fixture~0team/keys/key~1name");
         assert_eq!(entries[0].key, "key/name");
+    }
+
+    #[test]
+    fn renderer_canonicalizes_roots_then_preserves_section_order() {
+        let rendered = render_ini_refs([
+            (Some("fixture-one"), "mode", "one"),
+            (None, "root", "fixture-root"),
+            (Some("fixture-two"), "mode", "two"),
+        ])
+        .unwrap();
+
+        assert_eq!(
+            rendered,
+            b"root = fixture-root\n\n[fixture-one]\nmode = one\n\n[fixture-two]\nmode = two\n"
+        );
+    }
+
+    #[test]
+    fn renderer_rejects_duplicate_section_keys() {
+        let error = render_ini_refs([
+            (Some("fixture"), "mode", "one"),
+            (Some("fixture"), "mode", "two"),
+        ])
+        .unwrap_err();
+
+        assert!(matches!(error, SurfaceError::IniProjection { .. }));
+        assert!(error.to_string().contains("duplicate key"));
     }
 }

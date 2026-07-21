@@ -303,6 +303,7 @@ private struct ProjectWorkspaceView: View {
     @State private var showingAddBinding = false
     @State private var showingNewEnvironment = false
     @State private var showingAddDotenvFile = false
+    @State private var showingAddIniFile = false
     @State private var showingAddDirectEnvFile = false
     @State private var showingAddLinesFile = false
     @State private var confirmingRemoveProject = false
@@ -329,6 +330,7 @@ private struct ProjectWorkspaceView: View {
             SurfaceInspector(
                 store: store,
                 addDotenvFile: { showingAddDotenvFile = true },
+                addIniFile: { showingAddIniFile = true },
                 addDirectEnvFile: { showingAddDirectEnvFile = true },
                 addLinesFile: { showingAddLinesFile = true })
                 .frame(width: 390)
@@ -341,6 +343,9 @@ private struct ProjectWorkspaceView: View {
         }
         .sheet(isPresented: $showingAddDotenvFile) {
             AddDotenvSurfaceSheet(store: store)
+        }
+        .sheet(isPresented: $showingAddIniFile) {
+            AddIniSurfaceSheet(store: store)
         }
         .sheet(isPresented: $showingAddLinesFile) {
             AddLinesSurfaceSheet(store: store)
@@ -699,6 +704,7 @@ private struct ProjectAccessPane: View {
 private struct SurfaceInspector: View {
     @Bindable var store: WorkspaceStore
     let addDotenvFile: () -> Void
+    let addIniFile: () -> Void
     let addDirectEnvFile: () -> Void
     let addLinesFile: () -> Void
     @State private var showingManageSurface = false
@@ -728,6 +734,9 @@ private struct SurfaceInspector: View {
                                 Button("Composed Env Output", systemImage: "doc.text") {
                                     addDotenvFile()
                                 }
+                                Button("INI Output", systemImage: "list.bullet.rectangle") {
+                                    addIniFile()
+                                }
                                 Button("Direct EnvFile Output", systemImage: "doc.text.fill") {
                                     addDirectEnvFile()
                                 }
@@ -756,6 +765,10 @@ private struct SurfaceInspector: View {
                         DotenvSurfacePreview(
                             store: store, openInFinder: { revealSurface(surface) },
                             manageLink: { showingManageSurface = true })
+                    case .iniFile:
+                        IniSurfacePreview(
+                            store: store, openInFinder: { revealSurface(surface) },
+                            manageLink: { showingManageSurface = true })
                     case .envFileDirect:
                         DirectEnvFileSurfacePreview(
                             store: store, openInFinder: { revealSurface(surface) },
@@ -779,6 +792,7 @@ private struct SurfaceInspector: View {
                     ContentUnavailableView("No output surface", systemImage: "doc.badge.plus")
                     Menu("Add Output", systemImage: "plus") {
                         Button("Composed Env Output", action: addDotenvFile)
+                        Button("INI Output", action: addIniFile)
                         Button("Direct EnvFile Output", action: addDirectEnvFile)
                         Button("Lines Output", action: addLinesFile)
                     }
@@ -797,6 +811,46 @@ private struct SurfaceInspector: View {
 
     private func revealSurface(_ surface: WorkspaceSurface) {
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: surface.path)])
+    }
+}
+
+private struct IniSurfacePreview: View {
+    @Bindable var store: WorkspaceStore
+    let openInFinder: () -> Void
+    let manageLink: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(store.resolvedIniEntries) { entry in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("\(entry.label) = ••••••••••••")
+                                .font(.callout.monospaced())
+                                .lineLimit(2)
+                                .truncationMode(.middle)
+                            Text(entry.resourceName)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 12)
+                        Divider().padding(.leading, 20)
+                    }
+                    if store.resolvedIniEntries.isEmpty {
+                        ContentUnavailableView(
+                            "No INI entries", systemImage: "list.bullet.rectangle",
+                            description: Text("Bind an INI Env File and select its sections first."))
+                            .padding(24)
+                    }
+                }
+            }
+            SurfaceFooter(
+                primaryTitle: "Manage Link", secondaryTitle: "Open in Finder",
+                note: "Generated on open · Read only · Section order preserved",
+                primaryAction: manageLink, secondaryAction: openInFinder)
+        }
     }
 }
 
@@ -1014,12 +1068,12 @@ private struct ManageSurfaceSheet: View {
     @State private var selectedBindingIDs: Set<WorkspaceBinding.ID> = []
 
     private var isFileSurface: Bool {
-        surface.kind == .dotenvFile || surface.kind == .envFileDirect
+        surface.kind == .dotenvFile || surface.kind == .iniFile || surface.kind == .envFileDirect
             || surface.kind == .linesFile
     }
 
     private var isComposedSurface: Bool {
-        surface.kind == .dotenvFile || surface.kind == .linesFile
+        surface.kind == .dotenvFile || surface.kind == .iniFile || surface.kind == .linesFile
     }
 
     private var bindingCandidates: [WorkspaceBinding] {
@@ -1366,7 +1420,7 @@ private struct AddBindingSheet: View {
 
     private var outputs: [WorkspaceSurface] {
         (store.selectedEnvironment?.surfaces ?? []).filter {
-            $0.kind == .dotenvFile || $0.kind == .linesFile
+            $0.kind == .dotenvFile || $0.kind == .iniFile || $0.kind == .linesFile
         }
     }
 
@@ -1554,16 +1608,28 @@ private struct AddBindingSheet: View {
     }
 
     private func prospectiveConflicts(_ resource: WorkspaceResource) -> [String] {
-        guard outputs.first(where: { $0.id == outputSurfaceID })?.kind == .dotenvFile else {
+        guard let kind = outputs.first(where: { $0.id == outputSurfaceID })?.kind else { return [] }
+        let selected = selectedAddressSet(for: resource)
+        switch kind {
+        case .dotenvFile:
+            let current = Set(store.resolvedExports(for: outputSurfaceID).map(\.key))
+            return resource.entries
+                .filter { selected.contains($0.address) }
+                .compactMap(\.key)
+                .filter(current.contains)
+                .sorted()
+        case .iniFile:
+            let current = Set(store.bindings(for: outputSurfaceID).flatMap { binding in
+                guard let existing = store.resource(binding.resourceID) else { return [String]() }
+                let included = Set(binding.selection.addresses(in: existing))
+                return existing.entries.filter { included.contains($0.address) }.map(\.address)
+            })
+            return resource.entries
+                .filter { selected.contains($0.address) && current.contains($0.address) }
+                .map(\.label)
+        case .linesFile, .envFileDirect, .regularFile, .unixSocket:
             return []
         }
-        let current = Set(store.resolvedExports(for: outputSurfaceID).map(\.key))
-        let selected = selectedAddressSet(for: resource)
-        return resource.entries
-            .filter { selected.contains($0.address) }
-            .compactMap(\.key)
-            .filter(current.contains)
-            .sorted()
     }
 
     private func isCompatible(_ resource: WorkspaceResource) -> Bool {
@@ -2136,6 +2202,119 @@ private struct AddDotenvSurfaceSheet: View {
             defer { isSaving = false }
             do {
                 try await store.createDotenvSurface(
+                    fileName: fileName,
+                    bindingIDs: candidates.map(\.id).filter(selectedBindingIDs.contains))
+                dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func bindingSelection(_ id: WorkspaceBinding.ID) -> Binding<Bool> {
+        Binding(
+            get: { selectedBindingIDs.contains(id) },
+            set: { selected in
+                if selected { selectedBindingIDs.insert(id) }
+                else { selectedBindingIDs.remove(id) }
+            })
+    }
+}
+
+private struct AddIniSurfaceSheet: View {
+    @Bindable var store: WorkspaceStore
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var fileName = "credentials.ini"
+    @State private var selectedBindingIDs: Set<WorkspaceBinding.ID> = []
+    @State private var isSaving = false
+    @State private var errorMessage: String?
+
+    private var candidates: [WorkspaceBinding] {
+        store.compatibleBindings(for: .iniFile)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Add INI Output").font(.title2.bold())
+                Text("Render selected entries from INI resources as a read-only structured file.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Project file name").font(.callout.weight(.medium))
+                TextField("credentials.ini", text: $fileName)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.body.monospaced())
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Included bindings").font(.callout.weight(.medium))
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(candidates) { binding in
+                            Toggle(
+                                store.resource(binding.resourceID)?.name ?? binding.resourceID,
+                                isOn: bindingSelection(binding.id)
+                            )
+                            .toggleStyle(.checkbox)
+                        }
+                        if candidates.isEmpty {
+                            Text("Bind an INI Env File first, or create an empty output.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 170)
+            }
+
+            HStack(alignment: .top) {
+                Image(systemName: "lock.fill")
+                Text("Only selected entries are rendered. Root entries are placed before sections; duplicate section keys are rejected.")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            Divider()
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Create Output", action: createSurface)
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isSaving || fileName.isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(width: 560)
+        .onAppear {
+            if selectedBindingIDs.isEmpty {
+                selectedBindingIDs = Set(candidates.map(\.id))
+            }
+        }
+        .alert(
+            "Could not create INI output",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } })
+        ) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
+    }
+
+    private func createSurface() {
+        Task {
+            isSaving = true
+            defer { isSaving = false }
+            do {
+                try await store.createIniSurface(
                     fileName: fileName,
                     bindingIDs: candidates.map(\.id).filter(selectedBindingIDs.contains))
                 dismiss()

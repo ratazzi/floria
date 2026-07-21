@@ -23,5 +23,5 @@ pub use lines::LINES_MAX_SIZE;
 pub use registry::{RegisteredSurface, SurfaceBacking, SurfaceRegistry};
 pub use resolver::{
     DirectEnvFileCommit, DirectEnvFileSnapshot, DotenvSnapshot, FrozenResourceVersion,
-    LinesSnapshot, SurfaceResolver,
+    IniSnapshot, LinesSnapshot, ResolvedIniEntry, SurfaceResolver,
 };

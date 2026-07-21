@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use accessfs_catalog::{
     resolve_catalog_surface, BindingScope, Catalog, CatalogSnapshot, EntrySelection, Resource,
-    ResourceCodec, ResourceSource, SurfaceInput, SurfaceKind, ValueShape,
+    ResourceCodec, ResourceKind, ResourceSource, SurfaceInput, SurfaceKind, ValueShape,
 };
 use accessfs_core::audit::AuditDependency;
 use accessfs_store::{SecretId, SecretStore};
@@ -11,6 +11,7 @@ use accessfs_store::{SecretId, SecretStore};
 use crate::codec::{codec_capabilities, decode_resource as decode_resource_bytes, DecodedEntry};
 use crate::dotenv::render_dotenv_refs;
 use crate::error::{SurfaceError, SurfaceResult};
+use crate::ini::render_ini_refs;
 use crate::lines::render_lines_refs;
 
 type FrozenSecretVersions = HashMap<String, (SecretId, u32)>;
@@ -50,6 +51,45 @@ pub struct LinesSnapshot {
     pub bytes: Vec<u8>,
     pub versions: Vec<FrozenResourceVersion>,
     pub entries: Vec<ResolvedLineEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedIniEntry {
+    pub address: String,
+    pub section: Option<String>,
+    pub key: String,
+    pub binding_id: String,
+    pub resource_id: String,
+}
+
+#[derive(Debug)]
+pub struct IniSnapshot {
+    pub bytes: Vec<u8>,
+    pub versions: Vec<FrozenResourceVersion>,
+    pub entries: Vec<ResolvedIniEntry>,
+}
+
+impl IniSnapshot {
+    pub fn audit_dependencies(&self) -> Vec<AuditDependency> {
+        let versions: HashMap<&str, &FrozenResourceVersion> = self
+            .versions
+            .iter()
+            .map(|version| (version.resource_id.as_str(), version))
+            .collect();
+        self.entries
+            .iter()
+            .map(|entry| {
+                let version = versions.get(entry.resource_id.as_str()).copied();
+                AuditDependency {
+                    key: entry.address.clone(),
+                    binding_id: entry.binding_id.clone(),
+                    resource_id: entry.resource_id.clone(),
+                    secret_id: version.map(|version| version.secret_id.clone()),
+                    version: version.map(|version| version.version),
+                }
+            })
+            .collect()
+    }
 }
 
 impl LinesSnapshot {
@@ -186,6 +226,154 @@ impl SurfaceResolver {
         }
         let bytes = render_dotenv_refs(ordered)?;
         Ok(DotenvSnapshot { bytes, versions, exports })
+    }
+
+    /// Compose selected entries from ordered INI resources. Root entries are canonicalized
+    /// before sectioned entries so multiple bindings cannot alter their INI scope.
+    pub fn render_ini_surface(&self, surface_id: &str) -> SurfaceResult<IniSnapshot> {
+        let snapshot = self.catalog.snapshot()?;
+        let surface = snapshot
+            .surfaces
+            .iter()
+            .find(|surface| surface.id == surface_id)
+            .ok_or_else(|| SurfaceError::NotFound(surface_id.to_string()))?;
+        if surface.kind != SurfaceKind::IniFile {
+            return Err(SurfaceError::UnsupportedSurface {
+                surface_id: surface_id.to_string(),
+                kind: format!("{:?}", surface.kind),
+            });
+        }
+        let environment = snapshot
+            .environments
+            .iter()
+            .find(|environment| environment.id == surface.environment_id)
+            .ok_or_else(|| SurfaceError::NotFound(format!("environment {}", surface.environment_id)))?;
+        let SurfaceInput::Bindings { binding_ids } = &surface.input else {
+            return Err(SurfaceError::IncompatibleResource {
+                resource_id: "<surface-input>".to_string(),
+                reason: "INI surface requires explicit binding input".to_string(),
+            });
+        };
+        let resources = snapshot
+            .resources
+            .iter()
+            .map(|resource| (resource.id.as_str(), resource))
+            .collect::<HashMap<_, _>>();
+        let mut bindings = Vec::new();
+        for binding_id in binding_ids {
+            let binding = snapshot
+                .bindings
+                .iter()
+                .find(|binding| binding.id == *binding_id)
+                .ok_or_else(|| SurfaceError::NotFound(format!("binding {binding_id}")))?;
+            let applies = binding.project_id == environment.project_id
+                && match &binding.scope {
+                    BindingScope::Common => true,
+                    BindingScope::Environment { environment_id } => {
+                        environment_id == &environment.id
+                    }
+                };
+            if !applies {
+                return Err(SurfaceError::IncompatibleResource {
+                    resource_id: binding.resource_id.clone(),
+                    reason: format!("binding {binding_id:?} does not apply to this surface"),
+                });
+            }
+            if !binding.enabled {
+                continue;
+            }
+            let resource = resources.get(binding.resource_id.as_str()).ok_or_else(|| {
+                SurfaceError::NotFound(format!("resource {}", binding.resource_id))
+            })?;
+            if resource.kind != ResourceKind::EnvFile
+                || resource.shape != ValueShape::KeyValueSet
+                || resource.codec != ResourceCodec::Ini
+                || !matches!(resource.source, ResourceSource::SecretRef { .. })
+                || binding.key_override.is_some()
+            {
+                return Err(SurfaceError::IncompatibleResource {
+                    resource_id: resource.id.clone(),
+                    reason: format!("binding {binding_id:?} does not expose an INI resource"),
+                });
+            }
+            bindings.push(binding);
+        }
+        bindings.sort_by_key(|binding| {
+            let scope_order = match binding.scope {
+                BindingScope::Common => 0,
+                BindingScope::Environment { .. } => 1,
+            };
+            (scope_order, binding.position, binding.id.as_str())
+        });
+
+        let mut frozen = HashMap::new();
+        let mut versions = Vec::new();
+        for binding in &bindings {
+            if frozen.contains_key(&binding.resource_id) {
+                continue;
+            }
+            let resource = resources.get(binding.resource_id.as_str()).ok_or_else(|| {
+                SurfaceError::NotFound(format!("resource {}", binding.resource_id))
+            })?;
+            let ResourceSource::SecretRef { secret_id } = &resource.source else {
+                unreachable!("INI compatibility requires a stored secret");
+            };
+            let id: SecretId = secret_id.parse()?;
+            let record = self
+                .store
+                .record(&id)?
+                .ok_or_else(|| SurfaceError::NotFound(format!("secret {secret_id}")))?;
+            frozen.insert(resource.id.clone(), (id, record.current_version));
+            versions.push(FrozenResourceVersion {
+                resource_id: resource.id.clone(),
+                secret_id: secret_id.clone(),
+                version: record.current_version,
+            });
+        }
+
+        let mut decoded_resources = HashMap::new();
+        let mut values = Vec::new();
+        for binding in bindings {
+            let resource = resources.get(binding.resource_id.as_str()).ok_or_else(|| {
+                SurfaceError::NotFound(format!("resource {}", binding.resource_id))
+            })?;
+            if !decoded_resources.contains_key(&resource.id) {
+                let decoded = self.decode_resource(resource, frozen.get(&resource.id))?;
+                decoded_resources.insert(resource.id.clone(), decoded);
+            }
+            let decoded = decoded_resources.get(&resource.id).ok_or_else(|| {
+                SurfaceError::NotFound(format!("decoded resource {}", resource.id))
+            })?;
+            let selected = |address: &str| match &binding.selection {
+                EntrySelection::All => true,
+                EntrySelection::Entries { addresses } => addresses.iter().any(|item| item == address),
+            };
+            for entry in decoded.iter().filter(|entry| selected(&entry.address)) {
+                let key = entry.key.clone().ok_or_else(|| SurfaceError::MissingKey {
+                    resource_id: resource.id.clone(),
+                    key: entry.address.clone(),
+                })?;
+                values.push((
+                    ResolvedIniEntry {
+                        address: entry.address.clone(),
+                        section: entry.section.clone(),
+                        key,
+                        binding_id: binding.id.clone(),
+                        resource_id: resource.id.clone(),
+                    },
+                    entry.value.clone(),
+                ));
+            }
+        }
+        let (roots, sectioned): (Vec<_>, Vec<_>) = values
+            .into_iter()
+            .partition(|(entry, _)| entry.section.is_none());
+        let values = roots.into_iter().chain(sectioned).collect::<Vec<_>>();
+        let bytes = render_ini_refs(values.iter().map(|(entry, value)| {
+            (entry.section.as_deref(), entry.key.as_str(), value.as_str())
+        }))?;
+        let entries = values.into_iter().map(|(entry, _)| entry).collect();
+        Ok(IniSnapshot { bytes, versions, entries })
     }
 
     /// Compose selected keyless scalar values in binding order. The projection treats each
@@ -804,7 +992,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_ini_section_entries_feed_dotenv_without_exposing_other_sections() {
+    fn selected_ini_section_entries_feed_dotenv_and_ini_without_exposing_other_sections() {
         let dir = tempfile::tempdir().unwrap();
         let catalog = fixture_catalog(&dir.path().join("catalog.sqlite"));
         add_resource(
@@ -879,6 +1067,19 @@ mod tests {
                 position: 2,
             })
             .unwrap();
+        catalog
+            .upsert_surface(&Surface {
+                id: "fixture-ini-output".to_string(),
+                environment_id: "fixture-development".to_string(),
+                name: "fixture-credentials.ini".to_string(),
+                kind: SurfaceKind::IniFile,
+                path: PathBuf::from("/fixture/project/fixture-credentials.ini"),
+                input: SurfaceInput::Bindings {
+                    binding_ids: vec!["fixture-ini-binding".to_string()],
+                },
+                position: 3,
+            })
+            .unwrap();
 
         let store = Arc::new(FixtureStore::new());
         let resolver = SurfaceResolver::new(catalog, Arc::clone(&store) as Arc<dyn SecretStore>);
@@ -886,6 +1087,18 @@ mod tests {
 
         assert_eq!(snapshot.bytes, b"REGION=fixture-region-two\nOUTPUT=fixture-text\n");
         assert!(!std::str::from_utf8(&snapshot.bytes).unwrap().contains("fixture-region-one"));
+
+        let snapshot = resolver.render_ini_surface("fixture-ini-output").unwrap();
+        assert_eq!(
+            snapshot.bytes,
+            b"[fixture-staging]\nREGION = fixture-region-two\nOUTPUT = fixture-text\n"
+        );
+        assert_eq!(snapshot.entries.len(), 2);
+        assert_eq!(snapshot.entries[0].section.as_deref(), Some("fixture-staging"));
+        let dependencies = snapshot.audit_dependencies();
+        assert_eq!(dependencies[0].key, "sections/fixture-staging/keys/REGION");
+        assert_eq!(dependencies[0].secret_id.as_deref(), Some(INI_FILE_ID));
+        assert_eq!(dependencies[0].version, Some(1));
     }
 
     #[test]
