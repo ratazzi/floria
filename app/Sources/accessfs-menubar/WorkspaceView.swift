@@ -17,6 +17,7 @@ struct DashboardView: View {
     @State private var search = ""
     @State private var showingNewProject = false
     @State private var showingNewSharedSecret = false
+    @State private var showingNewEnvFile = false
 
     var body: some View {
         HStack(spacing: 0) {
@@ -42,6 +43,9 @@ struct DashboardView: View {
         }
         .sheet(isPresented: $showingNewSharedSecret) {
             NewSharedSecretSheet(store: state.workspace)
+        }
+        .sheet(isPresented: $showingNewEnvFile) {
+            NewEnvFileSheet(store: state.workspace)
         }
         .alert(
             "Floria could not update the workspace",
@@ -78,6 +82,9 @@ struct DashboardView: View {
                 }
                 Button("New Shared Secret", systemImage: "key.fill") {
                     showingNewSharedSecret = true
+                }
+                Button("New Env File", systemImage: "doc.badge.plus") {
+                    showingNewEnvFile = true
                 }
             } label: {
                 Image(systemName: "plus")
@@ -223,12 +230,13 @@ struct DashboardView: View {
                 store: state.workspace, title: "Shared Secrets",
                 subtitle: "Reusable scalar values with a default environment key",
                 kinds: [.sharedSecret, .secret], search: search,
-                addResource: { showingNewSharedSecret = true })
+                addResourceTitle: "Add Secret", addResource: { showingNewSharedSecret = true })
         case .envFiles:
             ResourceCatalogView(
                 store: state.workspace, title: "Env Files",
                 subtitle: "Reusable groups of environment variables",
-                kinds: [.envFile], search: search, addResource: nil)
+                kinds: [.envFile], search: search,
+                addResourceTitle: "Add Env File", addResource: { showingNewEnvFile = true })
         case .accessLog:
             AccessLogView(state: state)
         case nil:
@@ -256,6 +264,7 @@ private struct ProjectWorkspaceView: View {
     @Bindable var state: AppState
     @State private var tab = ProjectWorkspaceTab.bindings
     @State private var showingAddBinding = false
+    @State private var showingAddDirectEnvFile = false
 
     var body: some View {
         HStack(spacing: 0) {
@@ -275,11 +284,14 @@ private struct ProjectWorkspaceView: View {
             .frame(minWidth: 500, idealWidth: 720)
 
             Divider()
-            SurfaceInspector(store: store)
+            SurfaceInspector(store: store, addDirectEnvFile: { showingAddDirectEnvFile = true })
                 .frame(width: 390)
         }
         .sheet(isPresented: $showingAddBinding) {
             AddBindingSheet(store: store)
+        }
+        .sheet(isPresented: $showingAddDirectEnvFile) {
+            AddDirectEnvFileSurfaceSheet(store: store)
         }
         .navigationTitle(store.selectedProject?.name ?? "Project")
     }
@@ -540,6 +552,7 @@ private struct ProjectAccessPane: View {
 
 private struct SurfaceInspector: View {
     @Bindable var store: WorkspaceStore
+    let addDirectEnvFile: () -> Void
 
     @ViewBuilder
     var body: some View {
@@ -561,6 +574,11 @@ private struct SurfaceInspector: View {
                     .labelsHidden()
                     .font(.headline)
                     Spacer()
+                    Button(action: addDirectEnvFile) {
+                        Image(systemName: "plus")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Add direct Env File output")
                     SurfaceStatusBadge(status: surface.status)
                 }
                 Text(surface.path)
@@ -576,6 +594,8 @@ private struct SurfaceInspector: View {
             switch surface.kind {
             case .dotenvFile:
                 DotenvSurfacePreview(store: store)
+            case .envFileDirect:
+                DirectEnvFileSurfacePreview(store: store)
             case .unixSocket:
                 SocketSurfacePreview(store: store)
             case .regularFile:
@@ -585,9 +605,13 @@ private struct SurfaceInspector: View {
         }
         .background(Color.primary.opacity(0.018))
         } else {
-            ContentUnavailableView("No output surface", systemImage: "doc.badge.plus")
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Color.primary.opacity(0.018))
+            VStack(spacing: 12) {
+                ContentUnavailableView("No output surface", systemImage: "doc.badge.plus")
+                Button("Add Direct Env File", action: addDirectEnvFile)
+                    .buttonStyle(.borderedProminent)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color.primary.opacity(0.018))
         }
     }
 }
@@ -617,6 +641,40 @@ private struct DotenvSurfacePreview: View {
             SurfaceFooter(
                 primaryTitle: "Manage Link", secondaryTitle: "Open in Finder",
                 note: "Generated on open · Read only")
+        }
+    }
+}
+
+private struct DirectEnvFileSurfacePreview: View {
+    @Bindable var store: WorkspaceStore
+
+    private var resource: WorkspaceResource? {
+        guard let resourceID = store.selectedSurface?.resourceID else { return nil }
+        return store.resource(resourceID)
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(resource?.exports ?? []) { export in
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("\(export.key)=••••••••••••")
+                                .font(.callout.monospaced())
+                            Text("Editable value · key schema is fixed")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 20)
+                        .padding(.vertical, 12)
+                        Divider().padding(.leading, 20)
+                    }
+                }
+            }
+            SurfaceFooter(
+                primaryTitle: "Manage Link", secondaryTitle: "Open in Finder",
+                note: "Stored EnvFile · Editable · Every save creates a version")
         }
     }
 }
@@ -806,6 +864,7 @@ private struct ResourceCatalogView: View {
     let subtitle: String
     let kinds: Set<WorkspaceResourceKind>
     let search: String
+    let addResourceTitle: String
     let addResource: (() -> Void)?
 
     private var filtered: [WorkspaceResource] {
@@ -826,7 +885,7 @@ private struct ResourceCatalogView: View {
                 }
                 Spacer()
                 if let addResource {
-                    Button("Add Secret", systemImage: "plus", action: addResource)
+                    Button(addResourceTitle, systemImage: "plus", action: addResource)
                         .buttonStyle(.borderedProminent)
                 }
             }
@@ -1147,6 +1206,233 @@ private struct NewSharedSecretSheet: View {
             do {
                 try await store.createSharedSecret(
                     name: name, defaultEnvKey: defaultKey.uppercased(), value: submittedValue)
+                dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+}
+
+private struct NewEnvFileSheet: View {
+    @Bindable var store: WorkspaceStore
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+    @State private var value = ""
+    @State private var isSaving = false
+    @State private var errorMessage: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .top) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("New Env File").font(.title2.bold())
+                    Text("Store one dotenv document, then bind it or expose it as an editable file.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Load File…", action: chooseFile)
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Name").font(.callout.weight(.medium))
+                TextField("Team defaults", text: $name)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Dotenv content").font(.callout.weight(.medium))
+                TextEditor(text: $value)
+                    .font(.body.monospaced())
+                    .scrollContentBackground(.hidden)
+                    .padding(8)
+                    .background(Color(nsColor: .textBackgroundColor))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 8)
+                            .stroke(Color.secondary.opacity(0.25), lineWidth: 1)
+                    }
+                    .overlay(alignment: .topLeading) {
+                        if value.isEmpty {
+                            Text("API_HOST=http://127.0.0.1:8787\nLOG_LEVEL=debug")
+                                .font(.body.monospaced())
+                                .foregroundStyle(.tertiary)
+                                .padding(13)
+                                .allowsHitTesting(false)
+                        }
+                    }
+                    .frame(minHeight: 230)
+            }
+
+            HStack {
+                Image(systemName: "lock.fill")
+                Text("Values are encrypted in the store; only KEY metadata appears in the catalog.")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            Divider()
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Create Env File", action: createEnvFile)
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isSaving || name.isEmpty || value.isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(width: 620, height: 520)
+        .alert(
+            "Could not create Env File",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } })
+        ) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
+    }
+
+    private func chooseFile() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url {
+            do {
+                value = try String(contentsOf: url, encoding: .utf8)
+                if name.isEmpty { name = url.lastPathComponent }
+            } catch {
+                errorMessage = "Could not read \(url.path): \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func createEnvFile() {
+        Task {
+            isSaving = true
+            defer { isSaving = false }
+            let submittedValue = value
+            value = ""
+            do {
+                try await store.createEnvFile(name: name, value: submittedValue)
+                dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+}
+
+private struct AddDirectEnvFileSurfaceSheet: View {
+    @Bindable var store: WorkspaceStore
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var resourceID = ""
+    @State private var fileName = ".env.local"
+    @State private var isSaving = false
+    @State private var errorMessage: String?
+
+    private var resource: WorkspaceResource? {
+        store.envFileResources.first { $0.id == resourceID }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Add Direct Env File").font(.title2.bold())
+                Text("Expose one stored EnvFile as an editable file in this project.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            if store.envFileResources.isEmpty {
+                ContentUnavailableView(
+                    "No Env Files", systemImage: "doc.badge.plus",
+                    description: Text("Create an Env File resource first."))
+                    .frame(maxWidth: .infinity, minHeight: 180)
+            } else {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("Env File").font(.callout.weight(.medium))
+                    Picker("Env File", selection: $resourceID) {
+                        ForEach(store.envFileResources) { resource in
+                            Text("\(resource.name) · \(resource.exportSummary)").tag(resource.id)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(maxWidth: .infinity)
+                }
+
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("Project file name").font(.callout.weight(.medium))
+                    TextField(".env.local", text: $fileName)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.body.monospaced())
+                }
+
+                if let resource {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Editable values").font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                        Text(resource.exports.map(\.key).joined(separator: " · "))
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                            .lineLimit(3)
+                    }
+                    .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.primary.opacity(0.035))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+
+                HStack(alignment: .top) {
+                    Image(systemName: "info.circle")
+                    Text("Values may be edited through the file. Adding or removing KEYs is rejected because bindings depend on the catalog schema. Existing paths are never replaced.")
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
+            Divider()
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Create Direct File", action: createSurface)
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isSaving || resourceID.isEmpty || fileName.isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(width: 560)
+        .onAppear {
+            if resourceID.isEmpty { resourceID = store.envFileResources.first?.id ?? "" }
+        }
+        .alert(
+            "Could not create direct Env File",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } })
+        ) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
+    }
+
+    private func createSurface() {
+        Task {
+            isSaving = true
+            defer { isSaving = false }
+            do {
+                try await store.createDirectEnvFileSurface(
+                    resourceID: resourceID, fileName: fileName)
                 dismiss()
             } catch {
                 errorMessage = error.localizedDescription

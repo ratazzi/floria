@@ -104,12 +104,14 @@ enum WorkspaceBindingTarget: String, CaseIterable, Sendable {
 
 enum WorkspaceSurfaceKind: String, Sendable {
     case dotenvFile
+    case envFileDirect
     case regularFile
     case unixSocket
 
     var title: String {
         switch self {
         case .dotenvFile: "Dotenv File"
+        case .envFileDirect: "Direct Env File"
         case .regularFile: "File"
         case .unixSocket: "Unix Socket"
         }
@@ -118,6 +120,7 @@ enum WorkspaceSurfaceKind: String, Sendable {
     var systemImage: String {
         switch self {
         case .dotenvFile: "doc.text"
+        case .envFileDirect: "doc.text.fill"
         case .regularFile: "doc"
         case .unixSocket: "point.3.connected.trianglepath.dotted"
         }
@@ -240,6 +243,10 @@ final class WorkspaceStore {
         return resources.filter { !bound.contains($0.id) }
     }
 
+    var envFileResources: [WorkspaceResource] {
+        resources.filter { $0.kind == .envFile }
+    }
+
     func resource(_ id: WorkspaceResource.ID) -> WorkspaceResource? {
         resources.first { $0.id == id }
     }
@@ -338,6 +345,67 @@ final class WorkspaceStore {
         apply(try await controlClient.snapshot())
         lastError = nil
         return resourceID
+    }
+
+    @discardableResult
+    func createEnvFile(name: String, value: String) async throws -> WorkspaceResource.ID {
+        guard let controlClient else {
+            throw WorkspaceStoreError.controlUnavailable
+        }
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { throw WorkspaceStoreError.invalid("Env file name is required") }
+        guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw WorkspaceStoreError.invalid("Enter at least one KEY=VALUE line")
+        }
+
+        let resourceID = Self.newID("env-file")
+        try await controlClient.createEnvFile(resourceID: resourceID, name: name, value: value)
+        apply(try await controlClient.snapshot())
+        lastError = nil
+        return resourceID
+    }
+
+    @discardableResult
+    func createDirectEnvFileSurface(
+        resourceID: WorkspaceResource.ID, fileName: String
+    ) async throws -> WorkspaceSurface.ID {
+        guard let controlClient else {
+            throw WorkspaceStoreError.controlUnavailable
+        }
+        guard let project = selectedProject, let environment = selectedEnvironment else {
+            throw WorkspaceStoreError.invalid("Select a project environment first")
+        }
+        guard envFileResources.contains(where: { $0.id == resourceID }) else {
+            throw WorkspaceStoreError.invalid("Choose an Env File resource")
+        }
+        let fileName = fileName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !fileName.isEmpty,
+            fileName != ".", fileName != "..",
+            (fileName as NSString).lastPathComponent == fileName
+        else {
+            throw WorkspaceStoreError.invalid("Output name must be one file name")
+        }
+        let path = (project.path as NSString).appendingPathComponent(fileName)
+        var fileInfo = stat()
+        let status = path.withCString { lstat($0, &fileInfo) }
+        guard status != 0 else {
+            throw WorkspaceStoreError.invalid(
+                "\(path) already exists. Floria will never replace it automatically.")
+        }
+        guard errno == ENOENT else {
+            throw WorkspaceStoreError.invalid("Floria could not inspect \(path)")
+        }
+
+        let surfaceID = Self.newID("direct-env-file")
+        try await controlClient.upsertSurface(
+            CatalogSurface(
+                id: surfaceID, environmentID: environment.id, name: fileName,
+                kind: "env_file_direct", path: path, resourceID: resourceID,
+                position: Int64(environment.surfaces.count)))
+        apply(try await controlClient.snapshot())
+        selectedSurfaceID = surfaceID
+        lastError = nil
+        return surfaceID
     }
 
     func toggleBinding(_ id: WorkspaceBinding.ID) async {
@@ -559,6 +627,7 @@ private extension WorkspaceSurfaceKind {
     init?(catalogValue: String) {
         switch catalogValue {
         case "dotenv_file": self = .dotenvFile
+        case "env_file_direct": self = .envFileDirect
         case "regular_file": self = .regularFile
         case "unix_socket": self = .unixSocket
         default: return nil

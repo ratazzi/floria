@@ -35,6 +35,25 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(scope["environment_id"] as? String, "fixture-development")
     }
 
+    func testEnvFileCreateRequestCarriesPlaintextOnlyInTheControlBody() throws {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let data = try ControlCommand.envFileCreate(
+            resourceID: "fixture-env-file", name: "Fixture Env File",
+            value: "API_HOST=http://127.0.0.1:8787\nLOG_LEVEL=debug\n"
+        ).requestData(requestID: 12, encoder: encoder)
+        let value = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let params = try XCTUnwrap(value["params"] as? [String: Any])
+
+        XCTAssertEqual(value["method"] as? String, "env_file_create")
+        XCTAssertEqual(params["resource_id"] as? String, "fixture-env-file")
+        XCTAssertEqual(params["name"] as? String, "Fixture Env File")
+        XCTAssertEqual(
+            params["value"] as? String,
+            "API_HOST=http://127.0.0.1:8787\nLOG_LEVEL=debug\n")
+    }
+
     func testProjectCreateRequestCarriesCompleteWorkspace() throws {
         let command = ControlCommand.projectCreate(
             CatalogProject(
@@ -82,5 +101,14 @@ final class ControlProtocolTests: XCTestCase {
 
         XCTAssertEqual(snapshot.environments.first?.projectID, "fixture-project")
         XCTAssertEqual(snapshot.surfaces.first?.environmentID, "fixture-development")
+    }
+
+    func testDecodesDirectEnvFileSurfaceFromRustSnapshot() throws {
+        let data = Data(
+            #"{"projects":[],"environments":[],"resources":[],"bindings":[],"surfaces":[{"id":"fixture-direct","environment_id":"fixture-development","name":".env.local","kind":"env_file_direct","path":"/tmp/fixture/.env.local","resource_id":"fixture-env-file","position":1}]}"#.utf8)
+        let snapshot = try JSONDecoder().decode(CatalogSnapshot.self, from: data)
+
+        XCTAssertEqual(snapshot.surfaces.first?.kind, "env_file_direct")
+        XCTAssertEqual(snapshot.surfaces.first?.resourceID, "fixture-env-file")
     }
 }
