@@ -45,6 +45,66 @@ enum WorkspaceResourceCodec: String, Sendable {
     case ini
 }
 
+enum WorkspaceIniPreset: String, CaseIterable, Sendable {
+    case generic
+    case awsCredentials
+    case awsConfig
+
+    var title: String {
+        switch self {
+        case .generic: "Generic INI"
+        case .awsCredentials: "AWS credentials"
+        case .awsConfig: "AWS config"
+        }
+    }
+
+    var suggestedResourceName: String {
+        switch self {
+        case .generic: "Team settings"
+        case .awsCredentials: "AWS credentials"
+        case .awsConfig: "AWS config"
+        }
+    }
+
+    var suggestedOutputName: String {
+        switch self {
+        case .generic: "credentials.ini"
+        case .awsCredentials: ".aws-credentials"
+        case .awsConfig: ".aws-config"
+        }
+    }
+
+    var contentPlaceholder: String {
+        switch self {
+        case .generic:
+            "[development]\nREGION=fixture-region\nOUTPUT=json"
+        case .awsCredentials:
+            "[default]\naws_access_key_id=...\naws_secret_access_key=...\naws_session_token=..."
+        case .awsConfig:
+            "[profile staging]\nregion=us-east-1\noutput=json"
+        }
+    }
+
+    var pathEnvironmentKey: String? {
+        switch self {
+        case .generic: nil
+        case .awsCredentials: "AWS_SHARED_CREDENTIALS_FILE"
+        case .awsConfig: "AWS_CONFIG_FILE"
+        }
+    }
+
+    var sectionGuidance: String {
+        switch self {
+        case .generic:
+            "Sections and entries remain generic and selectable."
+        case .awsCredentials:
+            "Named credential profiles use [name], without a profile prefix."
+        case .awsConfig:
+            "Named config profiles use [profile name]; [default] remains unprefixed."
+        }
+    }
+}
+
 struct WorkspaceExport: Identifiable, Hashable, Sendable {
     var id: String { key }
     let key: String

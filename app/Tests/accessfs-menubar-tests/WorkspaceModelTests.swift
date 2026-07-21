@@ -166,6 +166,25 @@ final class WorkspaceModelTests: XCTestCase {
         XCTAssertEqual(projected.resolvedIniEntries.map(\.label), ["[staging] REGION"])
     }
 
+    func testAwsIniPresetsStayProjectScopedAndDescribeTheirDialects() {
+        XCTAssertEqual(
+            WorkspaceIniPreset.awsCredentials.pathEnvironmentKey,
+            "AWS_SHARED_CREDENTIALS_FILE")
+        XCTAssertEqual(WorkspaceIniPreset.awsCredentials.suggestedOutputName, ".aws-credentials")
+        XCTAssertTrue(
+            WorkspaceIniPreset.awsCredentials.contentPlaceholder.hasPrefix("[default]\n"))
+        XCTAssertTrue(
+            WorkspaceIniPreset.awsCredentials.sectionGuidance.contains("without a profile prefix"))
+
+        XCTAssertEqual(WorkspaceIniPreset.awsConfig.pathEnvironmentKey, "AWS_CONFIG_FILE")
+        XCTAssertEqual(WorkspaceIniPreset.awsConfig.suggestedOutputName, ".aws-config")
+        XCTAssertTrue(
+            WorkspaceIniPreset.awsConfig.contentPlaceholder.hasPrefix("[profile staging]\n"))
+        XCTAssertTrue(WorkspaceIniPreset.awsConfig.sectionGuidance.contains("[profile name]"))
+
+        XCTAssertNil(WorkspaceIniPreset.generic.pathEnvironmentKey)
+    }
+
     func testEachSurfaceResolvesOnlyItsExplicitMembers() {
         let resources = [
             WorkspaceResource(

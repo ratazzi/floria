@@ -1951,6 +1951,7 @@ private struct NewEnvFileSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
     @State private var codec = WorkspaceResourceCodec.dotenv
+    @State private var iniPreset = WorkspaceIniPreset.generic
     @State private var value = ""
     @State private var isSaving = false
     @State private var errorMessage: String?
@@ -1980,6 +1981,29 @@ private struct NewEnvFileSheet: View {
             }
             .pickerStyle(.segmented)
 
+            if codec == .ini {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("INI use case").font(.callout.weight(.medium))
+                    Picker("INI use case", selection: $iniPreset) {
+                        ForEach(WorkspaceIniPreset.allCases, id: \.self) { preset in
+                            Text(preset.title).tag(preset)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.segmented)
+                    Text(iniPreset.sectionGuidance)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .onChange(of: iniPreset) {
+                    if name.isEmpty
+                        || WorkspaceIniPreset.allCases.map(\.suggestedResourceName).contains(name)
+                    {
+                        name = iniPreset.suggestedResourceName
+                    }
+                }
+            }
+
             VStack(alignment: .leading, spacing: 7) {
                 Text(codec == .ini ? "INI content" : "Dotenv content")
                     .font(.callout.weight(.medium))
@@ -1997,7 +2021,7 @@ private struct NewEnvFileSheet: View {
                         if value.isEmpty {
                             Text(
                                 codec == .ini
-                                    ? "[development]\nREGION=fixture-region\nOUTPUT=json"
+                                    ? iniPreset.contentPlaceholder
                                     : "API_HOST=http://127.0.0.1:8787\nLOG_LEVEL=debug"
                             )
                                 .font(.body.monospaced())
@@ -2028,7 +2052,7 @@ private struct NewEnvFileSheet: View {
             }
         }
         .padding(24)
-        .frame(width: 620, height: 520)
+        .frame(width: 620, height: 640)
         .alert(
             "Could not create Env File",
             isPresented: Binding(
@@ -2402,13 +2426,20 @@ private struct AddIniSurfaceSheet: View {
     @Bindable var store: WorkspaceStore
 
     @Environment(\.dismiss) private var dismiss
-    @State private var fileName = "credentials.ini"
+    @State private var preset = WorkspaceIniPreset.generic
+    @State private var fileName = WorkspaceIniPreset.generic.suggestedOutputName
+    @State private var customizedFileName = false
     @State private var selectedBindingIDs: Set<WorkspaceBinding.ID> = []
     @State private var isSaving = false
     @State private var errorMessage: String?
 
     private var candidates: [WorkspaceBinding] {
         store.compatibleBindings(for: .iniFile)
+    }
+
+    private var outputPath: String {
+        guard let project = store.selectedProject else { return fileName }
+        return (project.path as NSString).appendingPathComponent(fileName)
     }
 
     var body: some View {
@@ -2421,10 +2452,55 @@ private struct AddIniSurfaceSheet: View {
             }
 
             VStack(alignment: .leading, spacing: 7) {
+                Text("Use case").font(.callout.weight(.medium))
+                Picker("Use case", selection: $preset) {
+                    ForEach(WorkspaceIniPreset.allCases, id: \.self) { item in
+                        Text(item.title).tag(item)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                Text(preset.sectionGuidance)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .onChange(of: preset) {
+                if !customizedFileName { fileName = preset.suggestedOutputName }
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
                 Text("Project file name").font(.callout.weight(.medium))
-                TextField("credentials.ini", text: $fileName)
+                TextField(
+                    preset.suggestedOutputName,
+                    text: Binding(
+                        get: { fileName },
+                        set: {
+                            fileName = $0
+                            customizedFileName = true
+                        }))
                     .textFieldStyle(.roundedBorder)
                     .font(.body.monospaced())
+            }
+
+            if let environmentKey = preset.pathEnvironmentKey {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack {
+                        Text("Point AWS to this project-scoped output")
+                            .font(.caption.weight(.semibold))
+                        Spacer()
+                        Button("Copy path") { copyToPasteboard(outputPath) }
+                            .controlSize(.small)
+                    }
+                    Text("\(environmentKey)=\(outputPath)")
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                    Text("Floria leaves the global ~/.aws files untouched, so projects and environments do not replace one another.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(10)
+                .background(Color.blue.opacity(0.08))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
             }
 
             VStack(alignment: .leading, spacing: 8) {
@@ -2468,7 +2544,7 @@ private struct AddIniSurfaceSheet: View {
             }
         }
         .padding(24)
-        .frame(width: 560)
+        .frame(width: 620)
         .onAppear {
             if selectedBindingIDs.isEmpty {
                 selectedBindingIDs = Set(candidates.map(\.id))
