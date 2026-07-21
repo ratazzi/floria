@@ -79,6 +79,26 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(surface["environment_id"] as? String, "fixture-development")
     }
 
+    func testLifecycleRemoveCommandsMatchRustWireShape() throws {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let commands: [(ControlCommand, String)] = [
+            (.projectRemove("fixture-project"), "project_remove"),
+            (.environmentRemove("fixture-environment"), "environment_remove"),
+            (.bindingRemove("fixture-binding"), "binding_remove"),
+            (.surfaceRemove("fixture-surface"), "surface_remove"),
+        ]
+
+        for (offset, item) in commands.enumerated() {
+            let data = try item.0.requestData(requestID: UInt64(20 + offset), encoder: encoder)
+            let value = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: data) as? [String: Any])
+            let params = try XCTUnwrap(value["params"] as? [String: Any])
+            XCTAssertEqual(value["method"] as? String, item.1)
+            XCTAssertNotNil(params["id"] as? String)
+        }
+    }
+
     func testDecodesRustEmptyResponseWithSnakeCaseRequestID() throws {
         let data = Data(
             #"{"request_id":9,"status":"ok","result":{"type":"empty"}}"#.utf8)

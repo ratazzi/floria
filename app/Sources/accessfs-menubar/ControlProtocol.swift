@@ -117,9 +117,13 @@ enum ControlCommand: Sendable {
     case envFileCreate(resourceID: String, name: String, value: String)
     case projectCreate(CatalogProject, CatalogEnvironment, CatalogSurface)
     case projectUpsert(CatalogProject)
+    case projectRemove(String)
     case environmentUpsert(CatalogEnvironment)
+    case environmentRemove(String)
     case bindingUpsert(CatalogBinding)
+    case bindingRemove(String)
     case surfaceUpsert(CatalogSurface)
+    case surfaceRemove(String)
 
     var method: String {
         switch self {
@@ -128,9 +132,13 @@ enum ControlCommand: Sendable {
         case .envFileCreate: "env_file_create"
         case .projectCreate: "project_create"
         case .projectUpsert: "project_upsert"
+        case .projectRemove: "project_remove"
         case .environmentUpsert: "environment_upsert"
+        case .environmentRemove: "environment_remove"
         case .bindingUpsert: "binding_upsert"
+        case .bindingRemove: "binding_remove"
         case .surfaceUpsert: "surface_upsert"
+        case .surfaceRemove: "surface_remove"
         }
     }
 
@@ -162,6 +170,11 @@ enum ControlCommand: Sendable {
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: ProjectUpsertParams(project: project)))
+        case .projectRemove(let id), .environmentRemove(let id), .bindingRemove(let id),
+            .surfaceRemove(let id):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method, params: RemoveParams(id: id)))
         case .environmentUpsert(let environment):
             return try encoder.encode(
                 ControlRequest(
@@ -206,6 +219,7 @@ private struct EnvFileCreateParams: Encodable {
 }
 
 private struct ProjectUpsertParams: Encodable { let project: CatalogProject }
+private struct RemoveParams: Encodable { let id: String }
 private struct ProjectCreateParams: Encodable {
     let project: CatalogProject
     let environment: CatalogEnvironment

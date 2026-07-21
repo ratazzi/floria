@@ -38,6 +38,10 @@ final class ControlClient: @unchecked Sendable {
         try await requestEmpty(.projectUpsert(project))
     }
 
+    func removeProject(_ id: String) async throws {
+        try await requestEmpty(.projectRemove(id))
+    }
+
     func createProject(
         _ project: CatalogProject, environment: CatalogEnvironment, surface: CatalogSurface
     ) async throws {
@@ -48,12 +52,24 @@ final class ControlClient: @unchecked Sendable {
         try await requestEmpty(.environmentUpsert(environment))
     }
 
+    func removeEnvironment(_ id: String) async throws {
+        try await requestEmpty(.environmentRemove(id))
+    }
+
     func upsertBinding(_ binding: CatalogBinding) async throws {
         try await requestEmpty(.bindingUpsert(binding))
     }
 
+    func removeBinding(_ id: String) async throws {
+        try await requestEmpty(.bindingRemove(id))
+    }
+
     func upsertSurface(_ surface: CatalogSurface) async throws {
         try await requestEmpty(.surfaceUpsert(surface))
+    }
+
+    func removeSurface(_ id: String) async throws {
+        try await requestEmpty(.surfaceRemove(id))
     }
 
     private func requestEmpty(_ command: ControlCommand) async throws {

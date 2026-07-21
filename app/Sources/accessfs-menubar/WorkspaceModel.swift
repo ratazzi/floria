@@ -366,6 +366,68 @@ final class WorkspaceStore {
     }
 
     @discardableResult
+    func createEnvironment(name: String, fileName: String) async throws -> WorkspaceEnvironment.ID {
+        guard let controlClient else {
+            throw WorkspaceStoreError.controlUnavailable
+        }
+        guard let project = selectedProject else {
+            throw WorkspaceStoreError.invalid("Select a project first")
+        }
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else {
+            throw WorkspaceStoreError.invalid("Environment name is required")
+        }
+        guard !project.environments.contains(where: {
+            $0.name.compare(name, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
+        }) else {
+            throw WorkspaceStoreError.invalid("An environment named \(name) already exists")
+        }
+        let output = try newSurfaceOutput(fileName: fileName, in: project)
+        let environmentID = Self.newID("environment")
+        let surfaceID = Self.newID("dotenv")
+        try await controlClient.upsertEnvironment(
+            CatalogEnvironment(
+                id: environmentID, projectID: project.id, name: name,
+                position: Int64(project.environments.count)))
+        do {
+            try await controlClient.upsertSurface(
+                CatalogSurface(
+                    id: surfaceID, environmentID: environmentID, name: output.name,
+                    kind: "dotenv_file", path: output.path, resourceID: nil, position: 0))
+        } catch {
+            try? await controlClient.removeEnvironment(environmentID)
+            await reload()
+            throw error
+        }
+        apply(try await controlClient.snapshot())
+        selectedEnvironmentID = environmentID
+        selectedSurfaceID = surfaceID
+        lastError = nil
+        return environmentID
+    }
+
+    @discardableResult
+    func createDotenvSurface(fileName: String) async throws -> WorkspaceSurface.ID {
+        guard let controlClient else {
+            throw WorkspaceStoreError.controlUnavailable
+        }
+        guard let project = selectedProject, let environment = selectedEnvironment else {
+            throw WorkspaceStoreError.invalid("Select a project environment first")
+        }
+        let output = try newSurfaceOutput(fileName: fileName, in: project)
+        let surfaceID = Self.newID("dotenv")
+        try await controlClient.upsertSurface(
+            CatalogSurface(
+                id: surfaceID, environmentID: environment.id, name: output.name,
+                kind: "dotenv_file", path: output.path, resourceID: nil,
+                position: Int64(environment.surfaces.count)))
+        apply(try await controlClient.snapshot())
+        selectedSurfaceID = surfaceID
+        lastError = nil
+        return surfaceID
+    }
+
+    @discardableResult
     func createDirectEnvFileSurface(
         resourceID: WorkspaceResource.ID, fileName: String
     ) async throws -> WorkspaceSurface.ID {
@@ -378,29 +440,13 @@ final class WorkspaceStore {
         guard envFileResources.contains(where: { $0.id == resourceID }) else {
             throw WorkspaceStoreError.invalid("Choose an Env File resource")
         }
-        let fileName = fileName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !fileName.isEmpty,
-            fileName != ".", fileName != "..",
-            (fileName as NSString).lastPathComponent == fileName
-        else {
-            throw WorkspaceStoreError.invalid("Output name must be one file name")
-        }
-        let path = (project.path as NSString).appendingPathComponent(fileName)
-        var fileInfo = stat()
-        let status = path.withCString { lstat($0, &fileInfo) }
-        guard status != 0 else {
-            throw WorkspaceStoreError.invalid(
-                "\(path) already exists. Floria will never replace it automatically.")
-        }
-        guard errno == ENOENT else {
-            throw WorkspaceStoreError.invalid("Floria could not inspect \(path)")
-        }
+        let output = try newSurfaceOutput(fileName: fileName, in: project)
 
         let surfaceID = Self.newID("direct-env-file")
         try await controlClient.upsertSurface(
             CatalogSurface(
-                id: surfaceID, environmentID: environment.id, name: fileName,
-                kind: "env_file_direct", path: path, resourceID: resourceID,
+                id: surfaceID, environmentID: environment.id, name: output.name,
+                kind: "env_file_direct", path: output.path, resourceID: resourceID,
                 position: Int64(environment.surfaces.count)))
         apply(try await controlClient.snapshot())
         selectedSurfaceID = surfaceID
@@ -454,6 +500,93 @@ final class WorkspaceStore {
                 allowOverride: false, position: position))
         apply(try await controlClient.snapshot())
         lastError = nil
+    }
+
+    func removeProject(_ id: WorkspaceProject.ID) async throws {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        try await controlClient.removeProject(id)
+        apply(try await controlClient.snapshot())
+        lastError = nil
+    }
+
+    func removeEnvironment(_ id: WorkspaceEnvironment.ID) async throws {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        guard let project = selectedProject, project.environments.count > 1 else {
+            throw WorkspaceStoreError.invalid("A project must keep at least one environment")
+        }
+        try await controlClient.removeEnvironment(id)
+        apply(try await controlClient.snapshot())
+        lastError = nil
+    }
+
+    func removeBinding(_ id: WorkspaceBinding.ID) async throws {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        try await controlClient.removeBinding(id)
+        apply(try await controlClient.snapshot())
+        lastError = nil
+    }
+
+    func removeSurface(_ id: WorkspaceSurface.ID) async throws {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        try await controlClient.removeSurface(id)
+        apply(try await controlClient.snapshot())
+        lastError = nil
+    }
+
+    func repairSurfaceLink(_ id: WorkspaceSurface.ID) async throws {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        guard let environment = selectedEnvironment,
+            let position = environment.surfaces.firstIndex(where: { $0.id == id }),
+            let surface = environment.surfaces.first(where: { $0.id == id })
+        else {
+            throw WorkspaceStoreError.invalid("Select an output surface first")
+        }
+        try await controlClient.upsertSurface(
+            CatalogSurface(
+                id: surface.id, environmentID: environment.id, name: surface.name,
+                kind: surface.kind.catalogValue, path: surface.path,
+                resourceID: surface.resourceID, position: Int64(position)))
+        apply(try await controlClient.snapshot())
+        selectedSurfaceID = id
+        guard managedLinkTarget(for: surface) == expectedLinkTarget(for: surface) else {
+            throw WorkspaceStoreError.invalid(
+                "The path is occupied by another file or link. Floria did not replace it.")
+        }
+        lastError = nil
+    }
+
+    func expectedLinkTarget(for surface: WorkspaceSurface) -> String {
+        (NSHomeDirectory() as NSString).appendingPathComponent(
+            ".accessfs/surfaces/\(surface.id)")
+    }
+
+    func managedLinkTarget(for surface: WorkspaceSurface) -> String? {
+        try? FileManager.default.destinationOfSymbolicLink(atPath: surface.path)
+    }
+
+    private func newSurfaceOutput(
+        fileName: String, in project: WorkspaceProject
+    ) throws -> (name: String, path: String) {
+        let name = fileName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name != ".", name != "..",
+            (name as NSString).lastPathComponent == name
+        else {
+            throw WorkspaceStoreError.invalid("Output name must be one file name")
+        }
+        let path = (project.path as NSString).appendingPathComponent(name)
+        guard !project.environments.flatMap(\.surfaces).contains(where: { $0.path == path }) else {
+            throw WorkspaceStoreError.invalid("\(path) is already used by another output")
+        }
+        var fileInfo = stat()
+        let status = path.withCString { lstat($0, &fileInfo) }
+        guard status != 0 else {
+            throw WorkspaceStoreError.invalid(
+                "\(path) already exists. Floria will never replace it automatically.")
+        }
+        guard errno == ENOENT else {
+            throw WorkspaceStoreError.invalid("Floria could not inspect \(path)")
+        }
+        return (name, path)
     }
 
     private func toggleBindingLocally(_ id: WorkspaceBinding.ID) {
@@ -590,9 +723,14 @@ private extension WorkspaceBindingScope {
 private extension WorkspaceSurface {
     init?(_ surface: CatalogSurface) {
         guard let kind = WorkspaceSurfaceKind(catalogValue: surface.kind) else { return nil }
+        let expectedTarget = (NSHomeDirectory() as NSString).appendingPathComponent(
+            ".accessfs/surfaces/\(surface.id)")
+        let linkTarget = try? FileManager.default.destinationOfSymbolicLink(atPath: surface.path)
+        let status: WorkspaceSurfaceStatus = kind == .unixSocket
+            ? .listening : (linkTarget == expectedTarget ? .linked : .stopped)
         self.init(
             id: surface.id, name: surface.name, kind: kind, path: surface.path,
-            status: kind == .unixSocket ? .listening : .linked,
+            status: status,
             resourceID: surface.resourceID)
     }
 }
@@ -624,6 +762,15 @@ private extension WorkspaceValueShape {
 }
 
 private extension WorkspaceSurfaceKind {
+    var catalogValue: String {
+        switch self {
+        case .dotenvFile: "dotenv_file"
+        case .envFileDirect: "env_file_direct"
+        case .regularFile: "regular_file"
+        case .unixSocket: "unix_socket"
+        }
+    }
+
     init?(catalogValue: String) {
         switch catalogValue {
         case "dotenv_file": self = .dotenvFile

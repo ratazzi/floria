@@ -1,6 +1,30 @@
 import AppKit
 import SwiftUI
 
+private func copyToPasteboard(_ value: String) {
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(value, forType: .string)
+}
+
+private func defaultEnvironmentFileName(_ name: String) -> String {
+    let slug = name
+        .lowercased()
+        .replacingOccurrences(of: "[^a-z0-9]+", with: "-", options: .regularExpression)
+        .trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+    return ".env.\(slug.isEmpty ? "environment" : slug)"
+}
+
+private func availableEnvironmentFileName(
+    _ name: String, in project: WorkspaceProject?
+) -> String {
+    let base = defaultEnvironmentFileName(name)
+    let used = Set(project?.environments.flatMap(\.surfaces).map(\.name) ?? [])
+    guard used.contains(base) else { return base }
+    var suffix = 2
+    while used.contains("\(base).\(suffix)") { suffix += 1 }
+    return "\(base).\(suffix)"
+}
+
 private enum WorkspaceSidebarSelection: Hashable {
     case projects
     case project(WorkspaceProject.ID)
@@ -94,7 +118,17 @@ struct DashboardView: View {
 
             Spacer(minLength: 16)
 
-            Button { } label: {
+            Menu {
+                Button(state.connected ? "Daemon connected" : "Daemon disconnected") { }
+                    .disabled(true)
+                Button("Refresh Workspace", systemImage: "arrow.clockwise") {
+                    Task { await state.workspace.reload(reportErrors: true) }
+                }
+                Divider()
+                Button("Open Access Log", systemImage: "clock") {
+                    selection = .accessLog
+                }
+            } label: {
                 HStack(spacing: 8) {
                     Image(systemName: "checkmark.shield.fill")
                         .foregroundStyle(state.connected ? Color.green : Color.secondary)
@@ -221,7 +255,9 @@ struct DashboardView: View {
                 addProject: { showingNewProject = true })
         case .project:
             if state.workspace.selectedProject != nil {
-                ProjectWorkspaceView(store: state.workspace, state: state)
+                ProjectWorkspaceView(
+                    store: state.workspace, state: state,
+                    onProjectRemoved: { selection = .projects })
             } else {
                 ContentUnavailableView("Select a project", systemImage: "folder")
             }
@@ -262,9 +298,14 @@ private enum ProjectWorkspaceTab: String, CaseIterable {
 private struct ProjectWorkspaceView: View {
     @Bindable var store: WorkspaceStore
     @Bindable var state: AppState
+    let onProjectRemoved: () -> Void
     @State private var tab = ProjectWorkspaceTab.bindings
     @State private var showingAddBinding = false
+    @State private var showingNewEnvironment = false
+    @State private var showingAddDotenvFile = false
     @State private var showingAddDirectEnvFile = false
+    @State private var confirmingRemoveProject = false
+    @State private var confirmingRemoveEnvironment = false
 
     var body: some View {
         HStack(spacing: 0) {
@@ -284,7 +325,10 @@ private struct ProjectWorkspaceView: View {
             .frame(minWidth: 500, idealWidth: 720)
 
             Divider()
-            SurfaceInspector(store: store, addDirectEnvFile: { showingAddDirectEnvFile = true })
+            SurfaceInspector(
+                store: store,
+                addDotenvFile: { showingAddDotenvFile = true },
+                addDirectEnvFile: { showingAddDirectEnvFile = true })
                 .frame(width: 390)
         }
         .sheet(isPresented: $showingAddBinding) {
@@ -292,6 +336,43 @@ private struct ProjectWorkspaceView: View {
         }
         .sheet(isPresented: $showingAddDirectEnvFile) {
             AddDirectEnvFileSurfaceSheet(store: store)
+        }
+        .sheet(isPresented: $showingAddDotenvFile) {
+            AddDotenvSurfaceSheet(store: store)
+        }
+        .sheet(isPresented: $showingNewEnvironment) {
+            NewEnvironmentSheet(store: store)
+        }
+        .alert("Remove project from Floria?", isPresented: $confirmingRemoveProject) {
+            Button("Cancel", role: .cancel) { }
+            Button("Remove Project", role: .destructive) {
+                guard let id = store.selectedProject?.id else { return }
+                Task {
+                    do {
+                        try await store.removeProject(id)
+                        onProjectRemoved()
+                    } catch {
+                        store.lastError = error.localizedDescription
+                    }
+                }
+            }
+        } message: {
+            Text("Managed output links are removed safely. Project files and stored resources are kept.")
+        }
+        .alert("Remove environment?", isPresented: $confirmingRemoveEnvironment) {
+            Button("Cancel", role: .cancel) { }
+            Button("Remove Environment", role: .destructive) {
+                guard let id = store.selectedEnvironment?.id else { return }
+                Task {
+                    do {
+                        try await store.removeEnvironment(id)
+                    } catch {
+                        store.lastError = error.localizedDescription
+                    }
+                }
+            }
+        } message: {
+            Text("Its bindings and outputs are removed. Shared resources are kept.")
         }
         .navigationTitle(store.selectedProject?.name ?? "Project")
     }
@@ -307,25 +388,57 @@ private struct ProjectWorkspaceView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button { } label: {
+                Menu {
+                    Button("Add Environment", systemImage: "plus") {
+                        showingNewEnvironment = true
+                    }
+                    Button("Open Project in Finder", systemImage: "folder") {
+                        guard let path = store.selectedProject?.path else { return }
+                        NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                    }
+                    Button("Copy Project Path", systemImage: "doc.on.doc") {
+                        guard let path = store.selectedProject?.path else { return }
+                        copyToPasteboard(path)
+                    }
+                    Divider()
+                    Button("Remove Current Environment", systemImage: "minus.circle", role: .destructive) {
+                        confirmingRemoveEnvironment = true
+                    }
+                    .disabled((store.selectedProject?.environments.count ?? 0) <= 1)
+                    Button("Remove Project", systemImage: "trash", role: .destructive) {
+                        confirmingRemoveProject = true
+                    }
+                } label: {
                     Image(systemName: "ellipsis")
                 }
                 .buttonStyle(.bordered)
             }
 
-            Picker(
-                "Environment",
-                selection: Binding(
-                    get: { store.selectedEnvironmentID },
-                    set: { store.selectEnvironment($0) })
-            ) {
-                ForEach(store.selectedProject?.environments ?? []) { environment in
-                    Text(environment.name).tag(environment.id)
+            HStack(spacing: 10) {
+                Text("Environment")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Picker(
+                    "Environment",
+                    selection: Binding(
+                        get: { store.selectedEnvironmentID },
+                        set: { store.selectEnvironment($0) })
+                ) {
+                    ForEach(store.selectedProject?.environments ?? []) { environment in
+                        Text(environment.name).tag(environment.id)
+                    }
                 }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .frame(maxWidth: 260, alignment: .leading)
+                Button {
+                    showingNewEnvironment = true
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .buttonStyle(.borderless)
+                .help("Add environment")
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .frame(maxWidth: 520)
         }
         .padding(.horizontal, 24)
         .padding(.top, 20)
@@ -481,7 +594,23 @@ private struct BindingRow: View {
             .toggleStyle(.switch)
             .labelsHidden()
             .controlSize(.small)
-            Button { } label: { Image(systemName: "ellipsis") }
+            Menu {
+                Button("Copy Export Names", systemImage: "doc.on.doc") {
+                    copyToPasteboard(resource.exports.map(\.key).joined(separator: "\n"))
+                }
+                Divider()
+                Button("Remove Binding", systemImage: "trash", role: .destructive) {
+                    Task {
+                        do {
+                            try await store.removeBinding(binding.id)
+                        } catch {
+                            store.lastError = error.localizedDescription
+                        }
+                    }
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+            }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
         }
@@ -552,72 +681,103 @@ private struct ProjectAccessPane: View {
 
 private struct SurfaceInspector: View {
     @Bindable var store: WorkspaceStore
+    let addDotenvFile: () -> Void
     let addDirectEnvFile: () -> Void
+    @State private var showingManageSurface = false
 
-    @ViewBuilder
     var body: some View {
-        if let surface = store.selectedSurface, let environment = store.selectedEnvironment {
-            VStack(spacing: 0) {
-            VStack(alignment: .leading, spacing: 10) {
-                HStack {
-                    Picker(
-                        "Surface",
-                        selection: Binding(
-                            get: { store.selectedSurfaceID },
-                            set: { store.selectedSurfaceID = $0 })
-                    ) {
-                        ForEach(environment.surfaces) { surface in
-                            Label(surface.name, systemImage: surface.kind.systemImage).tag(surface.id)
+        Group {
+            if let surface = store.selectedSurface, let environment = store.selectedEnvironment {
+                VStack(spacing: 0) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Picker(
+                                "Surface",
+                                selection: Binding(
+                                    get: { store.selectedSurfaceID },
+                                    set: { store.selectedSurfaceID = $0 })
+                            ) {
+                                ForEach(environment.surfaces) { surface in
+                                    Label(surface.name, systemImage: surface.kind.systemImage)
+                                        .tag(surface.id)
+                                }
+                            }
+                            .pickerStyle(.menu)
+                            .labelsHidden()
+                            .font(.headline)
+                            Spacer()
+                            Menu {
+                                Button("Composed Env Output", systemImage: "doc.text") {
+                                    addDotenvFile()
+                                }
+                                Button("Direct EnvFile Output", systemImage: "doc.text.fill") {
+                                    addDirectEnvFile()
+                                }
+                            } label: {
+                                Image(systemName: "plus")
+                            }
+                            .buttonStyle(.borderless)
+                            .help("Add output surface")
+                            SurfaceStatusBadge(status: surface.status)
                         }
+                        Text(surface.path)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                            .truncationMode(.middle)
+                            .textSelection(.enabled)
                     }
-                    .pickerStyle(.menu)
-                    .labelsHidden()
-                    .font(.headline)
-                    Spacer()
-                    Button(action: addDirectEnvFile) {
-                        Image(systemName: "plus")
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Add direct Env File output")
-                    SurfaceStatusBadge(status: surface.status)
-                }
-                Text(surface.path)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                    .truncationMode(.middle)
-                    .textSelection(.enabled)
-            }
-            .padding(20)
+                    .padding(20)
 
-            Divider()
-            switch surface.kind {
-            case .dotenvFile:
-                DotenvSurfacePreview(store: store)
-            case .envFileDirect:
-                DirectEnvFileSurfacePreview(store: store)
-            case .unixSocket:
-                SocketSurfacePreview(store: store)
-            case .regularFile:
-                ContentUnavailableView("No preview", systemImage: "doc")
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-        }
-        .background(Color.primary.opacity(0.018))
-        } else {
-            VStack(spacing: 12) {
-                ContentUnavailableView("No output surface", systemImage: "doc.badge.plus")
-                Button("Add Direct Env File", action: addDirectEnvFile)
+                    Divider()
+                    switch surface.kind {
+                    case .dotenvFile:
+                        DotenvSurfacePreview(
+                            store: store, openInFinder: { revealSurface(surface) },
+                            manageLink: { showingManageSurface = true })
+                    case .envFileDirect:
+                        DirectEnvFileSurfacePreview(
+                            store: store, openInFinder: { revealSurface(surface) },
+                            manageLink: { showingManageSurface = true })
+                    case .unixSocket:
+                        SocketSurfacePreview(
+                            store: store, copyPath: { copyToPasteboard(surface.path) },
+                            manageSocket: { showingManageSurface = true })
+                    case .regularFile:
+                        ContentUnavailableView("No preview", systemImage: "doc")
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    }
+                }
+                .background(Color.primary.opacity(0.018))
+            } else {
+                VStack(spacing: 12) {
+                    ContentUnavailableView("No output surface", systemImage: "doc.badge.plus")
+                    Menu("Add Output", systemImage: "plus") {
+                        Button("Composed Env Output", action: addDotenvFile)
+                        Button("Direct EnvFile Output", action: addDirectEnvFile)
+                    }
                     .buttonStyle(.borderedProminent)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color.primary.opacity(0.018))
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color.primary.opacity(0.018))
         }
+        .sheet(isPresented: $showingManageSurface) {
+            if let surface = store.selectedSurface {
+                ManageSurfaceSheet(store: store, surface: surface)
+            }
+        }
+    }
+
+    private func revealSurface(_ surface: WorkspaceSurface) {
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: surface.path)])
     }
 }
 
 private struct DotenvSurfacePreview: View {
     @Bindable var store: WorkspaceStore
+    let openInFinder: () -> Void
+    let manageLink: () -> Void
 
     var body: some View {
         VStack(spacing: 0) {
@@ -640,13 +800,16 @@ private struct DotenvSurfacePreview: View {
             }
             SurfaceFooter(
                 primaryTitle: "Manage Link", secondaryTitle: "Open in Finder",
-                note: "Generated on open · Read only")
+                note: "Generated on open · Read only",
+                primaryAction: manageLink, secondaryAction: openInFinder)
         }
     }
 }
 
 private struct DirectEnvFileSurfacePreview: View {
     @Bindable var store: WorkspaceStore
+    let openInFinder: () -> Void
+    let manageLink: () -> Void
 
     private var resource: WorkspaceResource? {
         guard let resourceID = store.selectedSurface?.resourceID else { return nil }
@@ -674,13 +837,16 @@ private struct DirectEnvFileSurfacePreview: View {
             }
             SurfaceFooter(
                 primaryTitle: "Manage Link", secondaryTitle: "Open in Finder",
-                note: "Stored EnvFile · Editable · Every save creates a version")
+                note: "Stored EnvFile · Editable · Every save creates a version",
+                primaryAction: manageLink, secondaryAction: openInFinder)
         }
     }
 }
 
 private struct SocketSurfacePreview: View {
     @Bindable var store: WorkspaceStore
+    let copyPath: () -> Void
+    let manageSocket: () -> Void
 
     private var resource: WorkspaceResource? {
         guard let resourceID = store.selectedSurface?.resourceID else { return nil }
@@ -723,7 +889,8 @@ private struct SocketSurfacePreview: View {
             }
             SurfaceFooter(
                 primaryTitle: "Manage Socket", secondaryTitle: "Copy Path",
-                note: "Real Unix socket · Policy on connect and sign")
+                note: "Real Unix socket · Policy on connect and sign",
+                primaryAction: manageSocket, secondaryAction: copyPath)
         }
     }
 }
@@ -748,14 +915,16 @@ private struct SurfaceFooter: View {
     let primaryTitle: String
     let secondaryTitle: String
     let note: String
+    let primaryAction: () -> Void
+    let secondaryAction: () -> Void
 
     var body: some View {
         VStack(spacing: 10) {
             Divider()
             HStack {
-                Button(secondaryTitle) { }
+                Button(secondaryTitle, action: secondaryAction)
                 Spacer()
-                Button(primaryTitle) { }
+                Button(primaryTitle, action: primaryAction)
                     .buttonStyle(.borderedProminent)
             }
             Text(note)
@@ -765,6 +934,138 @@ private struct SurfaceFooter: View {
         }
         .padding(16)
         .background(.bar)
+    }
+}
+
+private struct ManageSurfaceSheet: View {
+    @Bindable var store: WorkspaceStore
+    let surface: WorkspaceSurface
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var isWorking = false
+    @State private var confirmingRemoval = false
+    @State private var errorMessage: String?
+
+    private var isFileSurface: Bool {
+        surface.kind == .dotenvFile || surface.kind == .envFileDirect
+    }
+
+    private var expectedTarget: String {
+        store.expectedLinkTarget(for: surface)
+    }
+
+    private var actualTarget: String? {
+        store.managedLinkTarget(for: surface)
+    }
+
+    private var linkSummary: String {
+        guard isFileSurface else { return "Socket lifecycle is not implemented yet" }
+        guard let actualTarget else { return "Missing — repair will recreate the link" }
+        return actualTarget == expectedTarget
+            ? "Managed link is healthy"
+            : "Conflict — Floria will not replace this link"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Manage \(surface.name)").font(.title2.bold())
+                Text(linkSummary)
+                    .font(.callout)
+                    .foregroundStyle(actualTarget == expectedTarget ? Color.green : Color.orange)
+            }
+
+            InspectorSection(title: "Project path") {
+                Text(surface.path)
+                    .font(.callout.monospaced())
+                    .textSelection(.enabled)
+            }
+
+            if isFileSurface {
+                InspectorSection(title: "Mounted target") {
+                    Text(expectedTarget)
+                        .font(.callout.monospaced())
+                        .textSelection(.enabled)
+                }
+                if let actualTarget, actualTarget != expectedTarget {
+                    InspectorSection(title: "Current target") {
+                        Text(actualTarget)
+                            .font(.callout.monospaced())
+                            .textSelection(.enabled)
+                    }
+                }
+            }
+
+            HStack {
+                Button("Copy Path", systemImage: "doc.on.doc") {
+                    copyToPasteboard(surface.path)
+                }
+                Button("Open in Finder", systemImage: "folder") {
+                    NSWorkspace.shared.activateFileViewerSelecting(
+                        [URL(fileURLWithPath: surface.path)])
+                }
+                Spacer()
+                if isFileSurface {
+                    Button("Repair Link", systemImage: "wrench.and.screwdriver", action: repairLink)
+                        .disabled(isWorking)
+                }
+            }
+
+            Divider()
+            HStack {
+                Text("Removing an output keeps its resources and bindings.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Remove Output", systemImage: "trash", role: .destructive) {
+                    confirmingRemoval = true
+                }
+                .disabled(isWorking)
+            }
+        }
+        .padding(24)
+        .frame(width: 620)
+        .alert("Remove output?", isPresented: $confirmingRemoval) {
+            Button("Cancel", role: .cancel) { }
+            Button("Remove", role: .destructive, action: removeSurface)
+        } message: {
+            Text("Floria removes only a link that still points to this exact managed surface.")
+        }
+        .alert(
+            "Could not manage output",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } })
+        ) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
+    }
+
+    private func repairLink() {
+        Task {
+            isWorking = true
+            defer { isWorking = false }
+            do {
+                try await store.repairSurfaceLink(surface.id)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func removeSurface() {
+        Task {
+            isWorking = true
+            defer { isWorking = false }
+            do {
+                try await store.removeSurface(surface.id)
+                dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
     }
 }
 
@@ -1321,6 +1622,168 @@ private struct NewEnvFileSheet: View {
             value = ""
             do {
                 try await store.createEnvFile(name: name, value: submittedValue)
+                dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+}
+
+private struct NewEnvironmentSheet: View {
+    @Bindable var store: WorkspaceStore
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+    @State private var fileName = ""
+    @State private var customizedFileName = false
+    @State private var isSaving = false
+    @State private var errorMessage: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("New Environment").font(.title2.bold())
+                Text("Each environment owns its bindings and can expose multiple output files.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Name").font(.callout.weight(.medium))
+                TextField("Staging", text: $name)
+                    .textFieldStyle(.roundedBorder)
+                    .onChange(of: name) {
+                        if !customizedFileName {
+                            fileName = availableEnvironmentFileName(name, in: store.selectedProject)
+                        }
+                    }
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Initial composed output").font(.callout.weight(.medium))
+                TextField(
+                    ".env.staging",
+                    text: Binding(
+                        get: { fileName },
+                        set: {
+                            fileName = $0
+                            customizedFileName = true
+                        }))
+                    .textFieldStyle(.roundedBorder)
+                    .font(.body.monospaced())
+                Text("The output is read-only and generated from this environment's bindings.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider()
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Create Environment", action: createEnvironment)
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isSaving || name.isEmpty || fileName.isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(width: 540)
+        .alert(
+            "Could not create environment",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } })
+        ) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
+    }
+
+    private func createEnvironment() {
+        Task {
+            isSaving = true
+            defer { isSaving = false }
+            do {
+                try await store.createEnvironment(name: name, fileName: fileName)
+                dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+}
+
+private struct AddDotenvSurfaceSheet: View {
+    @Bindable var store: WorkspaceStore
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var fileName = ""
+    @State private var isSaving = false
+    @State private var errorMessage: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Add Composed Env Output").font(.title2.bold())
+                Text("Expose the selected environment's bindings as another read-only dotenv file.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Project file name").font(.callout.weight(.medium))
+                TextField(".env.generated", text: $fileName)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.body.monospaced())
+            }
+
+            HStack(alignment: .top) {
+                Image(systemName: "info.circle")
+                Text("Different outputs may later use different projections such as dotenv or direnv. This output currently uses dotenv.")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            Divider()
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Create Output", action: createSurface)
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isSaving || fileName.isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(width: 560)
+        .onAppear {
+            if fileName.isEmpty {
+                fileName = availableEnvironmentFileName(
+                    store.selectedEnvironment?.name ?? "generated", in: store.selectedProject)
+            }
+        }
+        .alert(
+            "Could not create output",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } })
+        ) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
+    }
+
+    private func createSurface() {
+        Task {
+            isSaving = true
+            defer { isSaving = false }
+            do {
+                try await store.createDotenvSurface(fileName: fileName)
                 dismiss()
             } catch {
                 errorMessage = error.localizedDescription
