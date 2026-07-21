@@ -9,11 +9,11 @@ final class WorkspaceModelTests: XCTestCase {
 
         XCTAssertEqual(store.selectedProject?.name, "floria-web")
         XCTAssertEqual(store.selectedEnvironment?.name, "Development")
-        XCTAssertEqual(store.resolvedExports.count, 12)
+        XCTAssertEqual(store.resolvedExports.count, 11)
         XCTAssertTrue(store.conflictingKeys.isEmpty)
         XCTAssertEqual(store.selectedEnvironment?.surfaces.map(\.kind), [.dotenvFile, .unixSocket])
         XCTAssertTrue(store.resolvedExports.contains { $0.key == "CLOUDFLARE_API_TOKEN" })
-        XCTAssertTrue(store.resolvedExports.contains { $0.key == "SSH_AUTH_SOCK" })
+        XCTAssertFalse(store.resolvedExports.contains { $0.key == "SSH_AUTH_SOCK" })
     }
 
     func testDisablingBindingRemovesItsExports() async throws {
@@ -24,7 +24,7 @@ final class WorkspaceModelTests: XCTestCase {
         await store.toggleBinding(binding.id)
 
         XCTAssertFalse(store.resolvedExports.contains { $0.key == "DATABASE_URL" })
-        XCTAssertEqual(store.resolvedExports.count, 9)
+        XCTAssertEqual(store.resolvedExports.count, 8)
     }
 
     func testSelectingEnvironmentResetsSurfaceSelection() throws {
@@ -102,12 +102,59 @@ final class WorkspaceModelTests: XCTestCase {
                     id: "fixture-binding", resourceID: resource.id,
                     selection: .entries(["keys/LOG_LEVEL"]), keyOverride: nil,
                     isEnabled: true)
-            ], surfaces: [])
+            ], surfaces: [
+                WorkspaceSurface(
+                    id: "fixture-dotenv", name: ".env", kind: .dotenvFile,
+                    path: "/tmp/fixture/.env", status: .linked,
+                    input: .bindings(["fixture-binding"]))
+            ])
         let project = WorkspaceProject(
             id: "fixture-project", name: "Fixture", path: "/tmp/fixture",
             commonBindings: [], environments: [environment])
         let store = WorkspaceStore(projects: [project], resources: [resource])
 
         XCTAssertEqual(store.resolvedExports.map(\.key), ["LOG_LEVEL"])
+    }
+
+    func testEachSurfaceResolvesOnlyItsExplicitMembers() {
+        let resources = [
+            WorkspaceResource(
+                id: "first", name: "First", kind: .sharedSecret, shape: .scalar,
+                exports: [WorkspaceExport(key: "FIRST", previewValue: "one", sensitive: true)],
+                detail: "First", usageCount: 1),
+            WorkspaceResource(
+                id: "second", name: "Second", kind: .sharedSecret, shape: .scalar,
+                exports: [WorkspaceExport(key: "SECOND", previewValue: "two", sensitive: true)],
+                detail: "Second", usageCount: 1),
+        ]
+        let environment = WorkspaceEnvironment(
+            id: "development", name: "Development",
+            bindings: [
+                WorkspaceBinding(
+                    id: "first-binding", resourceID: "first", keyOverride: nil, isEnabled: true),
+                WorkspaceBinding(
+                    id: "second-binding", resourceID: "second", keyOverride: nil,
+                    isEnabled: true),
+            ],
+            surfaces: [
+                WorkspaceSurface(
+                    id: "first-surface", name: ".env.first", kind: .dotenvFile,
+                    path: "/tmp/fixture/.env.first", status: .linked,
+                    input: .bindings(["first-binding"])),
+                WorkspaceSurface(
+                    id: "second-surface", name: ".env.second", kind: .dotenvFile,
+                    path: "/tmp/fixture/.env.second", status: .linked,
+                    input: .bindings(["second-binding"])),
+            ])
+        let store = WorkspaceStore(
+            projects: [
+                WorkspaceProject(
+                    id: "fixture", name: "Fixture", path: "/tmp/fixture",
+                    commonBindings: [], environments: [environment])
+            ], resources: resources)
+
+        XCTAssertEqual(store.resolvedExports.map(\.key), ["FIRST"])
+        store.selectedSurfaceID = "second-surface"
+        XCTAssertEqual(store.resolvedExports.map(\.key), ["SECOND"])
     }
 }

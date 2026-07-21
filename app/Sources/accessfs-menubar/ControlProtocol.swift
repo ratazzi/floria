@@ -43,14 +43,35 @@ struct CatalogResource: Codable, Sendable {
     let name: String
     let kind: String
     let shape: String
+    let codec: String
     let defaultEnvKey: String?
     let entries: [CatalogEntry]
     let source: CatalogResourceSource
     let detail: String?
 
     enum CodingKeys: String, CodingKey {
-        case id, name, kind, shape, entries, source, detail
+        case id, name, kind, shape, codec, entries, source, detail
         case defaultEnvKey = "default_env_key"
+    }
+}
+
+struct CatalogSurfaceInput: Codable, Sendable {
+    let type: String
+    let bindingIDs: [String]?
+    let resourceID: String?
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case bindingIDs = "binding_ids"
+        case resourceID = "resource_id"
+    }
+
+    static func bindings(_ ids: [String]) -> CatalogSurfaceInput {
+        CatalogSurfaceInput(type: "bindings", bindingIDs: ids, resourceID: nil)
+    }
+
+    static func resource(_ id: String) -> CatalogSurfaceInput {
+        CatalogSurfaceInput(type: "resource", bindingIDs: nil, resourceID: id)
     }
 }
 
@@ -107,13 +128,12 @@ struct CatalogSurface: Codable, Sendable {
     let name: String
     let kind: String
     let path: String
-    let resourceID: String?
+    let input: CatalogSurfaceInput
     let position: Int64
 
     enum CodingKeys: String, CodingKey {
-        case id, name, kind, path, position
+        case id, name, kind, path, input, position
         case environmentID = "environment_id"
-        case resourceID = "resource_id"
     }
 }
 

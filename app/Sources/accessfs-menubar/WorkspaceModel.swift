@@ -39,6 +39,11 @@ enum WorkspaceValueShape: String, Sendable {
     case socket
 }
 
+enum WorkspaceResourceCodec: String, Sendable {
+    case opaque
+    case dotenv
+}
+
 struct WorkspaceExport: Identifiable, Hashable, Sendable {
     var id: String { key }
     let key: String
@@ -71,12 +76,14 @@ struct WorkspaceResource: Identifiable, Hashable, Sendable {
     let name: String
     let kind: WorkspaceResourceKind
     let shape: WorkspaceValueShape
+    let codec: WorkspaceResourceCodec
     let entries: [WorkspaceEntry]
     let detail: String
     let usageCount: Int
 
     init(
         id: String, name: String, kind: WorkspaceResourceKind, shape: WorkspaceValueShape,
+        codec: WorkspaceResourceCodec? = nil,
         exports: [WorkspaceExport], entries: [WorkspaceEntry] = [], detail: String,
         usageCount: Int
     ) {
@@ -84,6 +91,7 @@ struct WorkspaceResource: Identifiable, Hashable, Sendable {
         self.name = name
         self.kind = kind
         self.shape = shape
+        self.codec = codec ?? (kind == .envFile ? .dotenv : .opaque)
         self.entries = entries.isEmpty
             ? exports.map {
                 WorkspaceEntry(
@@ -213,7 +221,22 @@ struct WorkspaceSurface: Identifiable, Hashable, Sendable {
     let kind: WorkspaceSurfaceKind
     let path: String
     let status: WorkspaceSurfaceStatus
-    let resourceID: WorkspaceResource.ID?
+    let input: WorkspaceSurfaceInput
+
+    var bindingIDs: [WorkspaceBinding.ID] {
+        guard case .bindings(let ids) = input else { return [] }
+        return ids
+    }
+
+    var resourceID: WorkspaceResource.ID? {
+        guard case .resource(let id) = input else { return nil }
+        return id
+    }
+}
+
+enum WorkspaceSurfaceInput: Hashable, Sendable {
+    case bindings([WorkspaceBinding.ID])
+    case resource(WorkspaceResource.ID)
 }
 
 struct WorkspaceEnvironment: Identifiable, Hashable, Sendable {
@@ -297,8 +320,23 @@ final class WorkspaceStore {
         (commonBindings + environmentBindings).filter(\.isEnabled)
     }
 
+    var selectedSurfaceBindings: [WorkspaceBinding] {
+        bindings(for: selectedSurfaceID)
+    }
+
+    func bindings(for surfaceID: WorkspaceSurface.ID) -> [WorkspaceBinding] {
+        guard let surface = selectedEnvironment?.surfaces.first(where: { $0.id == surfaceID })
+        else { return [] }
+        let members = Set(surface.bindingIDs)
+        return activeBindings.filter { members.contains($0.id) }
+    }
+
     var resolvedExports: [ResolvedWorkspaceExport] {
-        activeBindings.flatMap { binding -> [ResolvedWorkspaceExport] in
+        resolvedExports(for: selectedSurfaceID)
+    }
+
+    func resolvedExports(for surfaceID: WorkspaceSurface.ID) -> [ResolvedWorkspaceExport] {
+        bindings(for: surfaceID).flatMap { binding -> [ResolvedWorkspaceExport] in
             guard let resource = resource(binding.resourceID) else { return [] }
             let selected = Set(binding.selection.addresses(in: resource))
             return resource.entries.compactMap { entry in
@@ -317,7 +355,7 @@ final class WorkspaceStore {
     }
 
     var resolvedLineEntries: [ResolvedWorkspaceEntry] {
-        activeBindings.flatMap { binding -> [ResolvedWorkspaceEntry] in
+        selectedSurfaceBindings.flatMap { binding -> [ResolvedWorkspaceEntry] in
             guard let resource = resource(binding.resourceID),
                 resource.shape == .scalar, binding.keyOverride == nil
             else { return [] }
@@ -343,7 +381,39 @@ final class WorkspaceStore {
     }
 
     var envFileResources: [WorkspaceResource] {
-        resources.filter { $0.kind == .envFile }
+        resources.filter { $0.kind == .envFile && $0.codec == .dotenv }
+    }
+
+    func compatibleBindings(for kind: WorkspaceSurfaceKind) -> [WorkspaceBinding] {
+        (commonBindings + environmentBindings).filter { bindingIsCompatible($0, with: kind) }
+    }
+
+    func bindingIsCompatible(
+        _ binding: WorkspaceBinding, with kind: WorkspaceSurfaceKind
+    ) -> Bool {
+        guard let resource = resource(binding.resourceID) else { return false }
+        let selected = Set(binding.selection.addresses(in: resource))
+        let entries = resource.entries.filter { selected.contains($0.address) }
+        switch kind {
+        case .dotenvFile:
+            guard resource.codec == (resource.shape == .keyValueSet ? .dotenv : .opaque)
+            else { return false }
+            if resource.shape == .scalar {
+                guard resource.kind == .sharedSecret || resource.kind == .secret
+                    || resource.kind == .literal
+                else { return false }
+                return entries.allSatisfy { (binding.keyOverride ?? $0.key) != nil }
+            }
+            return resource.kind == .envFile && resource.shape == .keyValueSet
+                && entries.allSatisfy { $0.key != nil }
+        case .linesFile:
+            return resource.shape == .scalar && resource.codec == .opaque
+                && (resource.kind == .sharedSecret || resource.kind == .secret
+                    || resource.kind == .literal)
+                && binding.keyOverride == nil && entries.count == 1 && entries[0].key == nil
+        case .envFileDirect, .regularFile, .unixSocket:
+            return false
+        }
     }
 
     func resource(_ id: WorkspaceResource.ID) -> WorkspaceResource? {
@@ -412,7 +482,7 @@ final class WorkspaceStore {
                     id: environmentID, projectID: projectID, name: "Development", position: 0),
                 surface: CatalogSurface(
                     id: surfaceID, environmentID: environmentID, name: ".env",
-                    kind: "dotenv_file", path: dotenvPath, resourceID: nil, position: 0))
+                    kind: "dotenv_file", path: dotenvPath, input: .bindings([]), position: 0))
             apply(try await controlClient.snapshot(), selectingProject: projectID)
             lastError = nil
             return projectID
@@ -485,6 +555,9 @@ final class WorkspaceStore {
         let output = try newSurfaceOutput(fileName: fileName, in: project)
         let environmentID = Self.newID("environment")
         let surfaceID = Self.newID("dotenv")
+        let commonBindingIDs = project.commonBindings
+            .filter { bindingIsCompatible($0, with: .dotenvFile) }
+            .map(\.id)
         try await controlClient.upsertEnvironment(
             CatalogEnvironment(
                 id: environmentID, projectID: project.id, name: name,
@@ -493,7 +566,8 @@ final class WorkspaceStore {
             try await controlClient.upsertSurface(
                 CatalogSurface(
                     id: surfaceID, environmentID: environmentID, name: output.name,
-                    kind: "dotenv_file", path: output.path, resourceID: nil, position: 0))
+                    kind: "dotenv_file", path: output.path,
+                    input: .bindings(commonBindingIDs), position: 0))
         } catch {
             try? await controlClient.removeEnvironment(environmentID)
             await reload()
@@ -507,7 +581,9 @@ final class WorkspaceStore {
     }
 
     @discardableResult
-    func createDotenvSurface(fileName: String) async throws -> WorkspaceSurface.ID {
+    func createDotenvSurface(
+        fileName: String, bindingIDs: [WorkspaceBinding.ID]
+    ) async throws -> WorkspaceSurface.ID {
         guard let controlClient else {
             throw WorkspaceStoreError.controlUnavailable
         }
@@ -519,7 +595,7 @@ final class WorkspaceStore {
         try await controlClient.upsertSurface(
             CatalogSurface(
                 id: surfaceID, environmentID: environment.id, name: output.name,
-                kind: "dotenv_file", path: output.path, resourceID: nil,
+                kind: "dotenv_file", path: output.path, input: .bindings(bindingIDs),
                 position: Int64(environment.surfaces.count)))
         apply(try await controlClient.snapshot())
         selectedSurfaceID = surfaceID
@@ -528,7 +604,9 @@ final class WorkspaceStore {
     }
 
     @discardableResult
-    func createLinesSurface(fileName: String) async throws -> WorkspaceSurface.ID {
+    func createLinesSurface(
+        fileName: String, bindingIDs: [WorkspaceBinding.ID]
+    ) async throws -> WorkspaceSurface.ID {
         guard let controlClient else {
             throw WorkspaceStoreError.controlUnavailable
         }
@@ -540,7 +618,7 @@ final class WorkspaceStore {
         try await controlClient.upsertSurface(
             CatalogSurface(
                 id: surfaceID, environmentID: environment.id, name: output.name,
-                kind: "lines_file", path: output.path, resourceID: nil,
+                kind: "lines_file", path: output.path, input: .bindings(bindingIDs),
                 position: Int64(environment.surfaces.count)))
         apply(try await controlClient.snapshot())
         selectedSurfaceID = surfaceID
@@ -567,7 +645,7 @@ final class WorkspaceStore {
         try await controlClient.upsertSurface(
             CatalogSurface(
                 id: surfaceID, environmentID: environment.id, name: output.name,
-                kind: "env_file_direct", path: output.path, resourceID: resourceID,
+                kind: "env_file_direct", path: output.path, input: .resource(resourceID),
                 position: Int64(environment.surfaces.count)))
         apply(try await controlClient.snapshot())
         selectedSurfaceID = surfaceID
@@ -601,17 +679,19 @@ final class WorkspaceStore {
 
     func addResource(
         _ resourceID: WorkspaceResource.ID, target: WorkspaceBindingTarget = .environment,
-        selectedEntries: Set<String>? = nil
+        selectedEntries: Set<String>? = nil, surfaceID requestedSurfaceID: WorkspaceSurface.ID? = nil
     ) async throws {
         guard let resource = availableResources.first(where: { $0.id == resourceID }) else {
             return
         }
-        guard let controlClient else {
-            addResourceLocally(resourceID)
-            return
-        }
         guard let project = selectedProject, let environment = selectedEnvironment else {
             throw WorkspaceStoreError.invalid("Select a project environment first")
+        }
+        let surfaceID = requestedSurfaceID ?? selectedSurfaceID
+        guard let surface = environment.surfaces.first(where: { $0.id == surfaceID }),
+            surface.kind == .dotenvFile || surface.kind == .linesFile
+        else {
+            throw WorkspaceStoreError.invalid("Choose a composed output for this binding")
         }
 
         let scope: WorkspaceBindingScope =
@@ -630,12 +710,38 @@ final class WorkspaceStore {
             }
             selection = .entries(addresses)
         }
+        let bindingID = Self.newID("binding")
+        let workspaceBinding = WorkspaceBinding(
+            id: bindingID, resourceID: resourceID,
+            selection: WorkspaceEntrySelection(selection), keyOverride: nil, isEnabled: true,
+            scope: scope, allowOverride: false, position: position)
+        guard bindingIsCompatible(workspaceBinding, with: surface.kind) else {
+            throw WorkspaceStoreError.invalid(
+                "This resource cannot feed the selected \(surface.kind.title) output")
+        }
+        guard let controlClient else {
+            addResourceLocally(resourceID, binding: workspaceBinding, surfaceID: surfaceID)
+            return
+        }
         try await controlClient.upsertBinding(
             CatalogBinding(
-                id: Self.newID("binding"), projectID: project.id, scope: scope.catalogScope,
+                id: bindingID, projectID: project.id, scope: scope.catalogScope,
                 resourceID: resourceID, selection: selection, keyOverride: nil, enabled: true,
                 allowOverride: false, position: position))
+        do {
+            try await controlClient.upsertSurface(
+                CatalogSurface(
+                    id: surface.id, environmentID: environment.id, name: surface.name,
+                    kind: surface.kind.catalogValue, path: surface.path,
+                    input: .bindings(surface.bindingIDs + [bindingID]),
+                    position: Int64(
+                        environment.surfaces.firstIndex(where: { $0.id == surface.id }) ?? 0)))
+        } catch {
+            try? await controlClient.removeBinding(bindingID)
+            throw error
+        }
         apply(try await controlClient.snapshot())
+        selectedSurfaceID = surfaceID
         lastError = nil
     }
 
@@ -670,6 +776,31 @@ final class WorkspaceStore {
         lastError = nil
     }
 
+    func updateSurfaceBindings(
+        _ id: WorkspaceSurface.ID, bindingIDs: [WorkspaceBinding.ID]
+    ) async throws {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        guard let environment = selectedEnvironment,
+            let position = environment.surfaces.firstIndex(where: { $0.id == id }),
+            let surface = environment.surfaces.first(where: { $0.id == id }),
+            surface.kind == .dotenvFile || surface.kind == .linesFile
+        else {
+            throw WorkspaceStoreError.invalid("Choose a composed output first")
+        }
+        let allowed = Set(compatibleBindings(for: surface.kind).map(\.id))
+        guard bindingIDs.allSatisfy(allowed.contains) else {
+            throw WorkspaceStoreError.invalid("One or more bindings cannot feed this output")
+        }
+        try await controlClient.upsertSurface(
+            CatalogSurface(
+                id: surface.id, environmentID: environment.id, name: surface.name,
+                kind: surface.kind.catalogValue, path: surface.path,
+                input: .bindings(bindingIDs), position: Int64(position)))
+        apply(try await controlClient.snapshot())
+        selectedSurfaceID = id
+        lastError = nil
+    }
+
     func repairSurfaceLink(_ id: WorkspaceSurface.ID) async throws {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
         guard let environment = selectedEnvironment,
@@ -682,7 +813,7 @@ final class WorkspaceStore {
             CatalogSurface(
                 id: surface.id, environmentID: environment.id, name: surface.name,
                 kind: surface.kind.catalogValue, path: surface.path,
-                resourceID: surface.resourceID, position: Int64(position)))
+                input: surface.input.catalogInput, position: Int64(position)))
         apply(try await controlClient.snapshot())
         selectedSurfaceID = id
         guard managedLinkTarget(for: surface) == expectedLinkTarget(for: surface) else {
@@ -744,7 +875,10 @@ final class WorkspaceStore {
         projects[projectIndex].environments[environmentIndex].bindings[bindingIndex].isEnabled.toggle()
     }
 
-    private func addResourceLocally(_ resourceID: WorkspaceResource.ID) {
+    private func addResourceLocally(
+        _ resourceID: WorkspaceResource.ID, binding: WorkspaceBinding,
+        surfaceID: WorkspaceSurface.ID
+    ) {
         guard
             availableResources.contains(where: { $0.id == resourceID }),
             let projectIndex = projects.firstIndex(where: { $0.id == selectedProjectID }),
@@ -753,12 +887,20 @@ final class WorkspaceStore {
             })
         else { return }
 
-        projects[projectIndex].environments[environmentIndex].bindings.append(
-            WorkspaceBinding(
-                id: "\(selectedProjectID)-\(selectedEnvironmentID)-\(resourceID)",
-                resourceID: resourceID,
-                keyOverride: nil,
-                isEnabled: true))
+        switch binding.scope {
+        case .common:
+            projects[projectIndex].commonBindings.append(binding)
+        case .environment:
+            projects[projectIndex].environments[environmentIndex].bindings.append(binding)
+        }
+        guard let surfaceIndex = projects[projectIndex].environments[environmentIndex].surfaces
+            .firstIndex(where: { $0.id == surfaceID })
+        else { return }
+        let surface = projects[projectIndex].environments[environmentIndex].surfaces[surfaceIndex]
+        projects[projectIndex].environments[environmentIndex].surfaces[surfaceIndex] =
+            WorkspaceSurface(
+                id: surface.id, name: surface.name, kind: surface.kind, path: surface.path,
+                status: surface.status, input: .bindings(surface.bindingIDs + [binding.id]))
     }
 
     private func apply(_ snapshot: CatalogSnapshot, selectingProject: String? = nil) {
@@ -771,7 +913,8 @@ final class WorkspaceStore {
         resources = snapshot.resources.compactMap { resource in
             guard
                 let kind = WorkspaceResourceKind(catalogValue: resource.kind),
-                let shape = WorkspaceValueShape(catalogValue: resource.shape)
+                let shape = WorkspaceValueShape(catalogValue: resource.shape),
+                let codec = WorkspaceResourceCodec(rawValue: resource.codec)
             else { return nil }
             let preview: String
             switch resource.source.type {
@@ -786,7 +929,7 @@ final class WorkspaceStore {
                     sensitive: $0.sensitive)
             }
             return WorkspaceResource(
-                id: resource.id, name: resource.name, kind: kind, shape: shape,
+                id: resource.id, name: resource.name, kind: kind, shape: shape, codec: codec,
                 exports: [],
                 entries: entries,
                 detail: resource.detail ?? resource.defaultEnvKey ?? kind.title,
@@ -880,6 +1023,14 @@ private extension WorkspaceBindingScope {
 private extension WorkspaceSurface {
     init?(_ surface: CatalogSurface) {
         guard let kind = WorkspaceSurfaceKind(catalogValue: surface.kind) else { return nil }
+        let input: WorkspaceSurfaceInput
+        switch surface.input.type {
+        case "bindings": input = .bindings(surface.input.bindingIDs ?? [])
+        case "resource":
+            guard let resourceID = surface.input.resourceID else { return nil }
+            input = .resource(resourceID)
+        default: return nil
+        }
         let expectedTarget = (NSHomeDirectory() as NSString).appendingPathComponent(
             ".accessfs/surfaces/\(surface.id)")
         let linkTarget = try? FileManager.default.destinationOfSymbolicLink(atPath: surface.path)
@@ -887,8 +1038,16 @@ private extension WorkspaceSurface {
             ? .listening : (linkTarget == expectedTarget ? .linked : .stopped)
         self.init(
             id: surface.id, name: surface.name, kind: kind, path: surface.path,
-            status: status,
-            resourceID: surface.resourceID)
+            status: status, input: input)
+    }
+}
+
+private extension WorkspaceSurfaceInput {
+    var catalogInput: CatalogSurfaceInput {
+        switch self {
+        case .bindings(let ids): .bindings(ids)
+        case .resource(let id): .resource(id)
+        }
     }
 }
 
@@ -1020,10 +1179,13 @@ extension WorkspaceStore {
             WorkspaceBinding(id: id, resourceID: resourceID, keyOverride: nil, isEnabled: true)
         }
 
-        func dotenv(_ prefix: String, _ project: String) -> WorkspaceSurface {
+        func dotenv(
+            _ prefix: String, _ project: String, bindingIDs: [WorkspaceBinding.ID]
+        ) -> WorkspaceSurface {
             WorkspaceSurface(
                 id: "\(prefix)-dotenv", name: ".env", kind: .dotenvFile,
-                path: "~/workspace/\(project)/.env", status: .linked, resourceID: nil)
+                path: "~/workspace/\(project)/.env", status: .linked,
+                input: .bindings(bindingIDs))
         }
 
         let floria = WorkspaceProject(
@@ -1041,20 +1203,39 @@ extension WorkspaceStore {
                         binding("floria-dev-ssh", "developer-ssh-agent"),
                     ],
                     surfaces: [
-                        dotenv("floria-dev", "floria-web"),
+                        dotenv(
+                            "floria-dev", "floria-web",
+                            bindingIDs: [
+                                "floria-common-cloudflare", "floria-common-team",
+                                "floria-dev-db", "floria-dev-app-env",
+                            ]),
                         WorkspaceSurface(
                             id: "floria-dev-ssh-socket", name: "SSH Agent", kind: .unixSocket,
                             path: socketPath, status: .listening,
-                            resourceID: "developer-ssh-agent"),
+                            input: .resource("developer-ssh-agent")),
                     ]),
                 WorkspaceEnvironment(
                     id: "floria-staging", name: "Staging",
                     bindings: [binding("floria-staging-app-env", "app-env")],
-                    surfaces: [dotenv("floria-staging", "floria-web")]),
+                    surfaces: [
+                        dotenv(
+                            "floria-staging", "floria-web",
+                            bindingIDs: [
+                                "floria-common-cloudflare", "floria-common-team",
+                                "floria-staging-app-env",
+                            ])
+                    ]),
                 WorkspaceEnvironment(
                     id: "floria-production", name: "Production",
                     bindings: [binding("floria-prod-sentry", "sentry-dsn")],
-                    surfaces: [dotenv("floria-production", "floria-web")]),
+                    surfaces: [
+                        dotenv(
+                            "floria-production", "floria-web",
+                            bindingIDs: [
+                                "floria-common-cloudflare", "floria-common-team",
+                                "floria-prod-sentry",
+                            ])
+                    ]),
             ])
 
         let billing = WorkspaceProject(
@@ -1064,10 +1245,18 @@ extension WorkspaceStore {
                 WorkspaceEnvironment(
                     id: "billing-development", name: "Development",
                     bindings: [binding("billing-dev-db", "local-database")],
-                    surfaces: [dotenv("billing-dev", "billing-api")]),
+                    surfaces: [
+                        dotenv(
+                            "billing-dev", "billing-api",
+                            bindingIDs: ["billing-cloudflare", "billing-dev-db"])
+                    ]),
                 WorkspaceEnvironment(
                     id: "billing-production", name: "Production", bindings: [],
-                    surfaces: [dotenv("billing-prod", "billing-api")]),
+                    surfaces: [
+                        dotenv(
+                            "billing-prod", "billing-api",
+                            bindingIDs: ["billing-cloudflare"])
+                    ]),
             ])
 
         let workers = WorkspaceProject(
@@ -1076,7 +1265,11 @@ extension WorkspaceStore {
             environments: [
                 WorkspaceEnvironment(
                     id: "workers-development", name: "Development", bindings: [],
-                    surfaces: [dotenv("workers-dev", "worker-jobs")])
+                    surfaces: [
+                        dotenv(
+                            "workers-dev", "worker-jobs",
+                            bindingIDs: ["workers-github"])
+                    ])
             ])
 
         return WorkspaceStore(

@@ -78,12 +78,13 @@ final class ControlProtocolTests: XCTestCase {
 
     func testDecodesResourceEntriesWithoutLegacyExportMetadata() throws {
         let data = Data(
-            #"{"projects":[],"environments":[],"resources":[{"id":"fixture-line","name":"Fixture Line","kind":"shared_secret","shape":"scalar","default_env_key":null,"entries":[{"address":"value","label":"Fixture Line","key":null,"sensitive":true}],"source":{"type":"secret_ref","secret_id":"fixture-secret"},"detail":null}],"bindings":[],"surfaces":[]}"#.utf8)
+            #"{"projects":[],"environments":[],"resources":[{"id":"fixture-line","name":"Fixture Line","kind":"shared_secret","shape":"scalar","codec":"opaque","default_env_key":null,"entries":[{"address":"value","label":"Fixture Line","key":null,"sensitive":true}],"source":{"type":"secret_ref","secret_id":"fixture-secret"},"detail":null}],"bindings":[],"surfaces":[]}"#.utf8)
 
         let snapshot = try JSONDecoder().decode(CatalogSnapshot.self, from: data)
 
         XCTAssertEqual(snapshot.resources.first?.entries.first?.address, "value")
         XCTAssertNil(snapshot.resources.first?.entries.first?.key)
+        XCTAssertEqual(snapshot.resources.first?.codec, "opaque")
     }
 
     func testProjectCreateRequestCarriesCompleteWorkspace() throws {
@@ -95,7 +96,7 @@ final class ControlProtocolTests: XCTestCase {
                 name: "Development", position: 0),
             CatalogSurface(
                 id: "fixture-dotenv", environmentID: "fixture-development", name: ".env",
-                kind: "dotenv_file", path: "/tmp/fixture-project/.env", resourceID: nil,
+                kind: "dotenv_file", path: "/tmp/fixture-project/.env", input: .bindings([]),
                 position: 0))
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
@@ -109,6 +110,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(value["method"] as? String, "project_create")
         XCTAssertEqual(environment["project_id"] as? String, "fixture-project")
         XCTAssertEqual(surface["environment_id"] as? String, "fixture-development")
+        XCTAssertEqual((surface["input"] as? [String: Any])?["type"] as? String, "bindings")
     }
 
     func testLifecycleRemoveCommandsMatchRustWireShape() throws {
@@ -146,7 +148,7 @@ final class ControlProtocolTests: XCTestCase {
 
     func testDecodesCatalogForeignKeysFromRustSnapshot() throws {
         let data = Data(
-            #"{"projects":[],"environments":[{"id":"fixture-development","project_id":"fixture-project","name":"Development","position":0}],"resources":[],"bindings":[],"surfaces":[{"id":"fixture-dotenv","environment_id":"fixture-development","name":".env","kind":"dotenv_file","path":"/tmp/fixture/.env","resource_id":null,"position":0}]}"#.utf8)
+            #"{"projects":[],"environments":[{"id":"fixture-development","project_id":"fixture-project","name":"Development","position":0}],"resources":[],"bindings":[],"surfaces":[{"id":"fixture-dotenv","environment_id":"fixture-development","name":".env","kind":"dotenv_file","path":"/tmp/fixture/.env","input":{"type":"bindings","binding_ids":[]},"position":0}]}"#.utf8)
         let decoder = JSONDecoder()
 
         let snapshot = try decoder.decode(CatalogSnapshot.self, from: data)
@@ -157,10 +159,10 @@ final class ControlProtocolTests: XCTestCase {
 
     func testDecodesDirectEnvFileSurfaceFromRustSnapshot() throws {
         let data = Data(
-            #"{"projects":[],"environments":[],"resources":[],"bindings":[],"surfaces":[{"id":"fixture-direct","environment_id":"fixture-development","name":".env.local","kind":"env_file_direct","path":"/tmp/fixture/.env.local","resource_id":"fixture-env-file","position":1}]}"#.utf8)
+            #"{"projects":[],"environments":[],"resources":[],"bindings":[],"surfaces":[{"id":"fixture-direct","environment_id":"fixture-development","name":".env.local","kind":"env_file_direct","path":"/tmp/fixture/.env.local","input":{"type":"resource","resource_id":"fixture-env-file"},"position":1}]}"#.utf8)
         let snapshot = try JSONDecoder().decode(CatalogSnapshot.self, from: data)
 
         XCTAssertEqual(snapshot.surfaces.first?.kind, "env_file_direct")
-        XCTAssertEqual(snapshot.surfaces.first?.resourceID, "fixture-env-file")
+        XCTAssertEqual(snapshot.surfaces.first?.input.resourceID, "fixture-env-file")
     }
 }

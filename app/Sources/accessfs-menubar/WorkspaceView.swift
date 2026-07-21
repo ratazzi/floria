@@ -1011,10 +1011,19 @@ private struct ManageSurfaceSheet: View {
     @State private var isWorking = false
     @State private var confirmingRemoval = false
     @State private var errorMessage: String?
+    @State private var selectedBindingIDs: Set<WorkspaceBinding.ID> = []
 
     private var isFileSurface: Bool {
         surface.kind == .dotenvFile || surface.kind == .envFileDirect
             || surface.kind == .linesFile
+    }
+
+    private var isComposedSurface: Bool {
+        surface.kind == .dotenvFile || surface.kind == .linesFile
+    }
+
+    private var bindingCandidates: [WorkspaceBinding] {
+        store.compatibleBindings(for: surface.kind)
     }
 
     private var expectedTarget: String {
@@ -1046,6 +1055,25 @@ private struct ManageSurfaceSheet: View {
                 Text(surface.path)
                     .font(.callout.monospaced())
                     .textSelection(.enabled)
+            }
+
+            if isComposedSurface {
+                InspectorSection(title: "Included bindings") {
+                    ForEach(bindingCandidates) { binding in
+                        Toggle(
+                            store.resource(binding.resourceID)?.name ?? binding.resourceID,
+                            isOn: bindingSelection(binding.id)
+                        )
+                        .toggleStyle(.checkbox)
+                    }
+                    if bindingCandidates.isEmpty {
+                        Text("No compatible bindings")
+                            .foregroundStyle(.secondary)
+                    }
+                    Button("Save Members", action: saveMembers)
+                        .buttonStyle(.borderedProminent)
+                        .disabled(isWorking)
+                }
             }
 
             if isFileSurface {
@@ -1092,6 +1120,9 @@ private struct ManageSurfaceSheet: View {
         }
         .padding(24)
         .frame(width: 620)
+        .onAppear {
+            selectedBindingIDs = Set(surface.bindingIDs)
+        }
         .alert("Remove output?", isPresented: $confirmingRemoval) {
             Button("Cancel", role: .cancel) { }
             Button("Remove", role: .destructive, action: removeSurface)
@@ -1120,6 +1151,28 @@ private struct ManageSurfaceSheet: View {
                 errorMessage = error.localizedDescription
             }
         }
+    }
+
+    private func saveMembers() {
+        Task {
+            isWorking = true
+            defer { isWorking = false }
+            do {
+                let ordered = bindingCandidates.map(\.id).filter(selectedBindingIDs.contains)
+                try await store.updateSurfaceBindings(surface.id, bindingIDs: ordered)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func bindingSelection(_ id: WorkspaceBinding.ID) -> Binding<Bool> {
+        Binding(
+            get: { selectedBindingIDs.contains(id) },
+            set: { selected in
+                if selected { selectedBindingIDs.insert(id) }
+                else { selectedBindingIDs.remove(id) }
+            })
     }
 
     private func removeSurface() {
@@ -1299,9 +1352,16 @@ private struct AddBindingSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var search = ""
     @State private var target = WorkspaceBindingTarget.environment
+    @State private var outputSurfaceID = ""
     @State private var isSaving = false
     @State private var errorMessage: String?
     @State private var selectedEntries: [WorkspaceResource.ID: Set<String>] = [:]
+
+    private var outputs: [WorkspaceSurface] {
+        (store.selectedEnvironment?.surfaces ?? []).filter {
+            $0.kind == .dotenvFile || $0.kind == .linesFile
+        }
+    }
 
     private var filtered: [WorkspaceResource] {
         guard !search.isEmpty else { return store.availableResources }
@@ -1341,6 +1401,16 @@ private struct AddBindingSheet: View {
             .padding(.vertical, 12)
 
             Divider()
+            Picker("Output", selection: $outputSurfaceID) {
+                ForEach(outputs) { surface in
+                    Label(surface.name, systemImage: surface.kind.systemImage).tag(surface.id)
+                }
+            }
+            .pickerStyle(.menu)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 10)
+
+            Divider()
             List(filtered) { resource in
                 let conflicts = prospectiveConflicts(resource)
                 VStack(alignment: .leading, spacing: 10) {
@@ -1368,7 +1438,8 @@ private struct AddBindingSheet: View {
                                 do {
                                     try await store.addResource(
                                         resource.id, target: target,
-                                        selectedEntries: selectedAddressSet(for: resource))
+                                        selectedEntries: selectedAddressSet(for: resource),
+                                        surfaceID: outputSurfaceID)
                                 } catch {
                                     errorMessage = error.localizedDescription
                                 }
@@ -1376,7 +1447,7 @@ private struct AddBindingSheet: View {
                         }
                             .buttonStyle(.bordered)
                             .disabled(
-                                !conflicts.isEmpty || isSaving
+                                !conflicts.isEmpty || !isCompatible(resource) || isSaving
                                     || (resource.entries.count > 1
                                         && selectedAddressSet(for: resource).isEmpty))
                     }
@@ -1410,6 +1481,12 @@ private struct AddBindingSheet: View {
         }
         .searchable(text: $search, prompt: "Search resources and entries")
         .frame(minWidth: 580, minHeight: 460)
+        .onAppear {
+            if outputSurfaceID.isEmpty {
+                outputSurfaceID = outputs.contains(where: { $0.id == store.selectedSurfaceID })
+                    ? store.selectedSurfaceID : outputs.first?.id ?? ""
+            }
+        }
         .alert(
             "Could not add binding",
             isPresented: Binding(
@@ -1423,13 +1500,32 @@ private struct AddBindingSheet: View {
     }
 
     private func prospectiveConflicts(_ resource: WorkspaceResource) -> [String] {
-        let current = Set(store.resolvedExports.map(\.key))
+        guard outputs.first(where: { $0.id == outputSurfaceID })?.kind == .dotenvFile else {
+            return []
+        }
+        let current = Set(store.resolvedExports(for: outputSurfaceID).map(\.key))
         let selected = selectedAddressSet(for: resource)
         return resource.entries
             .filter { selected.contains($0.address) }
             .compactMap(\.key)
             .filter(current.contains)
             .sorted()
+    }
+
+    private func isCompatible(_ resource: WorkspaceResource) -> Bool {
+        guard let surface = outputs.first(where: { $0.id == outputSurfaceID }) else { return false }
+        let addresses = resource.entries.map(\.address).filter {
+            selectedAddressSet(for: resource).contains($0)
+        }
+        let selection: WorkspaceEntrySelection = addresses.count == resource.entries.count
+            ? .all : .entries(addresses)
+        let scope: WorkspaceBindingScope = target == .common
+            ? .common : .environment(store.selectedEnvironmentID)
+        return store.bindingIsCompatible(
+            WorkspaceBinding(
+                id: "prospective-binding", resourceID: resource.id, selection: selection,
+                keyOverride: nil, isEnabled: true, scope: scope),
+            with: surface.kind)
     }
 
     private func selectedAddressSet(for resource: WorkspaceResource) -> Set<String> {
@@ -1834,8 +1930,13 @@ private struct AddDotenvSurfaceSheet: View {
 
     @Environment(\.dismiss) private var dismiss
     @State private var fileName = ""
+    @State private var selectedBindingIDs: Set<WorkspaceBinding.ID> = []
     @State private var isSaving = false
     @State private var errorMessage: String?
+
+    private var candidates: [WorkspaceBinding] {
+        store.compatibleBindings(for: .dotenvFile)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -1851,6 +1952,28 @@ private struct AddDotenvSurfaceSheet: View {
                 TextField(".env.generated", text: $fileName)
                     .textFieldStyle(.roundedBorder)
                     .font(.body.monospaced())
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Included bindings").font(.callout.weight(.medium))
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(candidates) { binding in
+                            Toggle(
+                                store.resource(binding.resourceID)?.name ?? binding.resourceID,
+                                isOn: bindingSelection(binding.id)
+                            )
+                            .toggleStyle(.checkbox)
+                        }
+                        if candidates.isEmpty {
+                            Text("No compatible bindings yet. You can add them later.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 170)
             }
 
             HStack(alignment: .top) {
@@ -1878,6 +2001,9 @@ private struct AddDotenvSurfaceSheet: View {
                 fileName = availableEnvironmentFileName(
                     store.selectedEnvironment?.name ?? "generated", in: store.selectedProject)
             }
+            if selectedBindingIDs.isEmpty {
+                selectedBindingIDs = Set(candidates.map(\.id))
+            }
         }
         .alert(
             "Could not create output",
@@ -1896,12 +2022,23 @@ private struct AddDotenvSurfaceSheet: View {
             isSaving = true
             defer { isSaving = false }
             do {
-                try await store.createDotenvSurface(fileName: fileName)
+                try await store.createDotenvSurface(
+                    fileName: fileName,
+                    bindingIDs: candidates.map(\.id).filter(selectedBindingIDs.contains))
                 dismiss()
             } catch {
                 errorMessage = error.localizedDescription
             }
         }
+    }
+
+    private func bindingSelection(_ id: WorkspaceBinding.ID) -> Binding<Bool> {
+        Binding(
+            get: { selectedBindingIDs.contains(id) },
+            set: { selected in
+                if selected { selectedBindingIDs.insert(id) }
+                else { selectedBindingIDs.remove(id) }
+            })
     }
 }
 
@@ -1910,8 +2047,13 @@ private struct AddLinesSurfaceSheet: View {
 
     @Environment(\.dismiss) private var dismiss
     @State private var fileName = ".pgpass"
+    @State private var selectedBindingIDs: Set<WorkspaceBinding.ID> = []
     @State private var isSaving = false
     @State private var errorMessage: String?
+
+    private var candidates: [WorkspaceBinding] {
+        store.compatibleBindings(for: .linesFile)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
@@ -1927,6 +2069,28 @@ private struct AddLinesSurfaceSheet: View {
                 TextField(".pgpass", text: $fileName)
                     .textFieldStyle(.roundedBorder)
                     .font(.body.monospaced())
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Included bindings").font(.callout.weight(.medium))
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        ForEach(candidates) { binding in
+                            Toggle(
+                                store.resource(binding.resourceID)?.name ?? binding.resourceID,
+                                isOn: bindingSelection(binding.id)
+                            )
+                            .toggleStyle(.checkbox)
+                        }
+                        if candidates.isEmpty {
+                            Text("Add a keyless scalar binding first, or create an empty output.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 170)
             }
 
             HStack(alignment: .top) {
@@ -1949,6 +2113,11 @@ private struct AddLinesSurfaceSheet: View {
         }
         .padding(24)
         .frame(width: 560)
+        .onAppear {
+            if selectedBindingIDs.isEmpty {
+                selectedBindingIDs = Set(candidates.map(\.id))
+            }
+        }
         .alert(
             "Could not create Lines output",
             isPresented: Binding(
@@ -1966,12 +2135,23 @@ private struct AddLinesSurfaceSheet: View {
             isSaving = true
             defer { isSaving = false }
             do {
-                try await store.createLinesSurface(fileName: fileName)
+                try await store.createLinesSurface(
+                    fileName: fileName,
+                    bindingIDs: candidates.map(\.id).filter(selectedBindingIDs.contains))
                 dismiss()
             } catch {
                 errorMessage = error.localizedDescription
             }
         }
+    }
+
+    private func bindingSelection(_ id: WorkspaceBinding.ID) -> Binding<Bool> {
+        Binding(
+            get: { selectedBindingIDs.contains(id) },
+            set: { selected in
+                if selected { selectedBindingIDs.insert(id) }
+                else { selectedBindingIDs.remove(id) }
+            })
     }
 }
 
