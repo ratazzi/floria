@@ -89,6 +89,7 @@ pub enum DiscoveredFileAction {
     Compose,
     Protect,
     ImportSshIdentity,
+    Review,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -571,7 +572,7 @@ fn discover_mise(root: &Path, path: &Path, bytes: &[u8]) -> InternalFile {
         entries,
         warnings,
     );
-    file.action = DiscoveredFileAction::Protect;
+    file.action = DiscoveredFileAction::Review;
     file.entry_disposition = EntryDisposition::ProtectedFile;
     file
 }
@@ -662,7 +663,7 @@ fn warning_file(root: &Path, path: &Path, message: String) -> InternalFile {
         tags: Vec::new(),
         entries: Vec::new(),
         warnings: vec![DiscoveryWarning { line: None, message }],
-        action: DiscoveredFileAction::Protect,
+        action: DiscoveredFileAction::Review,
         entry_disposition: EntryDisposition::ProtectedFile,
     }
 }
@@ -832,6 +833,13 @@ mod tests {
             .collect::<HashSet<_>>();
         assert_eq!(keys, HashSet::from(["SAFE"]));
         assert_eq!(plan.summary.warnings, 2);
+        assert_eq!(
+            plan.files
+                .iter()
+                .find(|file| file.kind == DiscoveredFileKind::Mise)
+                .map(|file| file.action),
+            Some(DiscoveredFileAction::Review)
+        );
     }
 
     #[test]

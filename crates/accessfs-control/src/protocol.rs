@@ -60,7 +60,10 @@ pub enum ControlCommand {
     AccessHistory { limit: usize },
     Snapshot,
     Discover { path: PathBuf },
-    DiscoverApply { path: PathBuf },
+    DiscoverApply {
+        path: PathBuf,
+        files: Option<Vec<PathBuf>>,
+    },
     SshAgentDiscover { endpoint: PathBuf },
     SshIdentityImport {
         resource_id: String,
@@ -241,6 +244,7 @@ pub enum DiscoveryApplyOutcome {
     Imported,
     Protected,
     Skipped,
+    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -420,12 +424,17 @@ mod tests {
             request_id: 13,
             command: ControlCommand::DiscoverApply {
                 path: PathBuf::from("/fixture/project"),
+                files: Some(vec![PathBuf::from("/fixture/project/.env")]),
             },
         };
         let value = serde_json::to_value(request).unwrap();
 
         assert_eq!(value["method"], "discover_apply");
         assert_eq!(value["params"]["path"], "/fixture/project");
+        assert_eq!(
+            value["params"]["files"],
+            serde_json::json!(["/fixture/project/.env"])
+        );
     }
 
     #[test]

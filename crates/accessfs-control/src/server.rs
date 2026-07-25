@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
@@ -434,11 +435,12 @@ fn dispatch(
             let existing = existing_discovery_secrets(catalog, store)?;
             Ok(ControlResult::Discovery(discovery.plan(&existing)))
         }
-        ControlCommand::DiscoverApply { path } => apply_discovery(
+        ControlCommand::DiscoverApply { path, files } => apply_discovery(
             catalog,
             store.ok_or(DispatchError::StoreUnavailable)?,
             mount_path.ok_or(DispatchError::StoreUnavailable)?,
             &path,
+            files.as_deref(),
         ),
         ControlCommand::SshAgentDiscover { endpoint } => {
             if !endpoint.is_absolute() {
@@ -781,19 +783,40 @@ fn apply_discovery(
     store: &dyn SecretStore,
     mount_path: &Path,
     path: &Path,
+    selected_files: Option<&[PathBuf]>,
 ) -> Result<ControlResult, DispatchError> {
     let discovery =
         discover(path).map_err(|error| DispatchError::Validation(error.to_string()))?;
     let mut existing = existing_discovery_secrets(catalog, store)?;
     let plan = discovery.plan(&existing);
-    let contents = discovery.into_contents();
+    let mut contents = discovery.into_contents();
+    if let Some(selected_files) = selected_files {
+        if selected_files.is_empty() {
+            return Err(DispatchError::Validation(
+                "select at least one discovered file to import".to_string(),
+            ));
+        }
+        let mut selected = selected_files.iter().cloned().collect::<HashSet<_>>();
+        contents.retain(|file| selected.remove(&file.path));
+        if !selected.is_empty() {
+            return Err(DispatchError::Validation(format!(
+                "selected file was not part of the reviewed discovery: {}",
+                selected
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+    }
     let needs_project = contents
         .iter()
         .any(|file| file.action == DiscoveredFileAction::Compose);
-    let project_id = if needs_project {
-        Some(ensure_discovered_project(catalog, &plan.project)?)
+    let (project_id, project_created) = if needs_project {
+        let (id, created) = ensure_discovered_project(catalog, &plan.project)?;
+        (Some(id), created)
     } else {
-        None
+        (None, false)
     };
     let mut result = DiscoveryApplyResult {
         project_id: project_id.clone(),
@@ -803,6 +826,7 @@ fn apply_discovery(
         imported_ssh_identities: 0,
         files: Vec::new(),
     };
+    let mut composed_success = false;
 
     for file in contents {
         if file.action == DiscoveredFileAction::Compose && !file.warnings.is_empty() {
@@ -815,67 +839,100 @@ fn apply_discovery(
             continue;
         }
 
-        match file.action {
-            DiscoveredFileAction::Protect => {
-                let applied = protect_file(catalog, store, mount_path, &file.path)?;
-                if !matches!(applied, ControlResult::FileProtected { .. }) {
-                    return Err(DispatchError::Validation(
-                        "protecting a discovered file returned an unexpected result".to_string(),
-                    ));
+        let file_path = file.path.clone();
+        let existing_len = existing.len();
+        let applied = (|| -> Result<bool, DispatchError> {
+            match file.action {
+                DiscoveredFileAction::Protect => {
+                    let protected = protect_file(catalog, store, mount_path, &file.path)?;
+                    if !matches!(protected, ControlResult::FileProtected { .. }) {
+                        Err(DispatchError::Validation(
+                            "protecting a discovered file returned an unexpected result".to_string(),
+                        ))
+                    } else {
+                        result.protected_files += 1;
+                        result.files.push(DiscoveryAppliedFile {
+                            path: file.path,
+                            outcome: DiscoveryApplyOutcome::Protected,
+                            detail: "Protected as a read-only audited file".to_string(),
+                        });
+                        Ok(false)
+                    }
                 }
-                result.protected_files += 1;
-                result.files.push(DiscoveryAppliedFile {
-                    path: file.path,
-                    outcome: DiscoveryApplyOutcome::Protected,
-                    detail: "Protected as a read-only audited file".to_string(),
-                });
-            }
-            DiscoveredFileAction::ImportSshIdentity => {
-                let resource_id = generated_id("ssh-identity");
-                let name = file
-                    .path
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or("SSH identity")
-                    .to_string();
-                import_ssh_identity(
-                    catalog,
-                    store,
-                    resource_id,
-                    name,
-                    &file.path,
-                    None,
-                    ManagedItemSettings {
-                        enforcement: Enforcement::Prompt,
-                        metadata: discovered_metadata(&file),
-                    },
-                )?;
-                result.imported_ssh_identities += 1;
-                result.files.push(DiscoveryAppliedFile {
-                    path: file.path,
-                    outcome: DiscoveryApplyOutcome::Imported,
-                    detail: "Imported as a managed SSH identity".to_string(),
-                });
-            }
+                DiscoveredFileAction::ImportSshIdentity => {
+                    let resource_id = generated_id("ssh-identity");
+                    let name = file
+                        .path
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or("SSH identity")
+                        .to_string();
+                    import_ssh_identity(
+                        catalog,
+                        store,
+                        resource_id,
+                        name,
+                        &file.path,
+                        None,
+                        ManagedItemSettings {
+                            enforcement: Enforcement::Prompt,
+                            metadata: discovered_metadata(&file),
+                        },
+                    )?;
+                    result.imported_ssh_identities += 1;
+                    result.files.push(DiscoveryAppliedFile {
+                        path: file.path,
+                        outcome: DiscoveryApplyOutcome::Imported,
+                        detail: "Imported as a managed SSH identity".to_string(),
+                    });
+                    Ok(false)
+                }
             DiscoveredFileAction::Compose => {
-                let Some(project_id) = project_id.as_deref() else {
-                    return Err(DispatchError::Validation(
-                        "discovery composition requires a project".to_string(),
-                    ));
-                };
-                apply_composed_discovery(
-                    catalog,
-                    store,
-                    mount_path,
-                    project_id,
-                    &mut existing,
-                    &mut result,
-                    file,
-                )?;
+                    let Some(project_id) = project_id.as_deref() else {
+                        return Err(DispatchError::Validation(
+                            "discovery composition requires a project".to_string(),
+                        ));
+                    };
+                    apply_composed_discovery(
+                        catalog,
+                        store,
+                        mount_path,
+                        project_id,
+                        &mut existing,
+                        &mut result,
+                        file,
+                    )
+                }
+                DiscoveredFileAction::Review => {
+                    result.files.push(DiscoveryAppliedFile {
+                        path: file.path,
+                        outcome: DiscoveryApplyOutcome::Skipped,
+                        detail: "Detected for review; automatic import is not supported yet"
+                            .to_string(),
+                    });
+                    Ok(false)
+                }
+            }
+        })();
+        match applied {
+            Ok(imported_composed_file) => composed_success |= imported_composed_file,
+            Err(error) => {
+                existing.truncate(existing_len);
+                result.files.push(DiscoveryAppliedFile {
+                    path: file_path,
+                    outcome: DiscoveryApplyOutcome::Failed,
+                    detail: error.body().message,
+                });
             }
         }
     }
 
+    if project_created && !composed_success {
+        if let Some(project_id) = project_id {
+            catalog.remove_project(&project_id)?;
+            result.project_id = None;
+        }
+    }
     Ok(ControlResult::DiscoveryApplied(result))
 }
 
@@ -887,20 +944,24 @@ fn apply_composed_discovery(
     existing: &mut Vec<ExistingSecret>,
     result: &mut DiscoveryApplyResult,
     file: DiscoveredContent,
-) -> Result<(), DispatchError> {
+) -> Result<bool, DispatchError> {
     if file.entries.is_empty() {
         result.files.push(DiscoveryAppliedFile {
             path: file.path,
             outcome: DiscoveryApplyOutcome::Skipped,
             detail: "No statically importable values were found".to_string(),
         });
-        return Ok(());
+        return Ok(false);
     }
 
     let environment_name = file.environment.as_deref().unwrap_or("development");
-    let environment_id = ensure_discovered_environment(catalog, project_id, environment_name)?;
     let mut binding_ids = Vec::new();
     let mut mutation = DiscoveryMutationGuard::new(catalog, store);
+    let (environment_id, environment_created) =
+        ensure_discovered_environment(catalog, project_id, environment_name)?;
+    if environment_created {
+        mutation.created_environments.push(environment_id.clone());
+    }
 
     match file.kind {
         DiscoveredFileKind::Dotenv | DiscoveredFileKind::Direnv => {
@@ -1004,7 +1065,7 @@ fn apply_composed_discovery(
                 outcome: DiscoveryApplyOutcome::Skipped,
                 detail: "This discovered format is not composable yet".to_string(),
             });
-            return Ok(());
+            return Ok(false);
         }
     }
 
@@ -1041,7 +1102,7 @@ fn apply_composed_discovery(
             _ => "Imported as reusable secrets and a composed output".to_string(),
         },
     });
-    Ok(())
+    Ok(true)
 }
 
 struct DiscoveryMutationGuard<'a> {
@@ -1049,6 +1110,7 @@ struct DiscoveryMutationGuard<'a> {
     store: &'a dyn SecretStore,
     created_resources: Vec<String>,
     created_bindings: Vec<String>,
+    created_environments: Vec<String>,
     committed: bool,
 }
 
@@ -1059,6 +1121,7 @@ impl<'a> DiscoveryMutationGuard<'a> {
             store,
             created_resources: Vec::new(),
             created_bindings: Vec::new(),
+            created_environments: Vec::new(),
             committed: false,
         }
     }
@@ -1072,6 +1135,15 @@ impl Drop for DiscoveryMutationGuard<'_> {
         for binding_id in self.created_bindings.iter().rev() {
             if let Err(error) = self.catalog.remove_binding(binding_id) {
                 tracing::warn!(%binding_id, %error, "discovery rollback could not remove binding");
+            }
+        }
+        for environment_id in self.created_environments.iter().rev() {
+            if let Err(error) = self.catalog.remove_environment(environment_id) {
+                tracing::warn!(
+                    %environment_id,
+                    %error,
+                    "discovery rollback could not remove environment"
+                );
             }
         }
         for resource_id in self.created_resources.iter().rev() {
@@ -1105,14 +1177,14 @@ impl Drop for DiscoveryMutationGuard<'_> {
 fn ensure_discovered_project(
     catalog: &Catalog,
     project: &accessfs_discover::DiscoveredProject,
-) -> Result<String, DispatchError> {
+) -> Result<(String, bool), DispatchError> {
     if let Some(existing) = catalog
         .snapshot()?
         .projects
         .into_iter()
         .find(|candidate| candidate.path == project.path)
     {
-        return Ok(existing.id);
+        return Ok((existing.id, false));
     }
     let id = generated_id("project");
     catalog.upsert_project(&Project {
@@ -1120,19 +1192,19 @@ fn ensure_discovered_project(
         name: project.name.clone(),
         path: project.path.clone(),
     })?;
-    Ok(id)
+    Ok((id, true))
 }
 
 fn ensure_discovered_environment(
     catalog: &Catalog,
     project_id: &str,
     name: &str,
-) -> Result<String, DispatchError> {
+) -> Result<(String, bool), DispatchError> {
     let snapshot = catalog.snapshot()?;
     if let Some(existing) = snapshot.environments.iter().find(|candidate| {
         candidate.project_id == project_id && candidate.name.eq_ignore_ascii_case(name)
     }) {
-        return Ok(existing.id.clone());
+        return Ok((existing.id.clone(), false));
     }
     let id = generated_id("environment");
     let display_name = name
@@ -1153,7 +1225,7 @@ fn ensure_discovered_environment(
         name: display_name,
         position: snapshot.environments.len() as i64,
     })?;
-    Ok(id)
+    Ok((id, true))
 }
 
 fn replace_discovered_file_with_surface(
@@ -2502,6 +2574,7 @@ mod tests {
             },
             ControlCommand::DiscoverApply {
                 path: project_path.clone(),
+                files: Some(vec![source_path.clone()]),
             },
         )
         .unwrap();
@@ -2537,6 +2610,135 @@ mod tests {
     }
 
     #[test]
+    fn discovery_apply_mutates_only_reviewed_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("fixture-project");
+        let development_path = project_path.join(".env");
+        let production_path = project_path.join(".env.production");
+        let mount_path = dir.path().join("mount");
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
+        std::fs::create_dir_all(mount_path.join(accessfs_core::config::SURFACES_DIR)).unwrap();
+        std::fs::write(&development_path, "DEVELOPMENT_TOKEN=fixture-development\n").unwrap();
+        std::fs::write(&production_path, "DISCOVERED_TOKEN=fixture-production\n").unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let store = FixtureStore::new();
+
+        let applied = dispatch(
+            &catalog,
+            DispatchServices {
+                store: Some(&store),
+                mount_path: Some(&mount_path),
+                ..DispatchServices::default()
+            },
+            ControlCommand::DiscoverApply {
+                path: project_path,
+                files: Some(vec![production_path.clone()]),
+            },
+        )
+        .unwrap();
+
+        let ControlResult::DiscoveryApplied(result) = applied else {
+            panic!("expected discovery apply result");
+        };
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].path, production_path);
+        assert!(std::fs::symlink_metadata(&development_path).unwrap().is_file());
+        assert!(std::fs::symlink_metadata(&production_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let snapshot = catalog.snapshot().unwrap();
+        assert_eq!(snapshot.surfaces.len(), 1);
+        assert_eq!(snapshot.environments[0].name, "Production");
+    }
+
+    #[test]
+    fn discovery_apply_rejects_unreviewed_files_before_mutating_catalog() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("fixture-project");
+        let source_path = project_path.join(".env");
+        let mount_path = dir.path().join("mount");
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
+        std::fs::create_dir_all(mount_path.join(accessfs_core::config::SURFACES_DIR)).unwrap();
+        std::fs::write(&source_path, "DISCOVERED_TOKEN=fixture-value\n").unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let store = FixtureStore::new();
+
+        let error = dispatch(
+            &catalog,
+            DispatchServices {
+                store: Some(&store),
+                mount_path: Some(&mount_path),
+                ..DispatchServices::default()
+            },
+            ControlCommand::DiscoverApply {
+                path: project_path.clone(),
+                files: Some(vec![project_path.join(".env.not-reviewed")]),
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.body().message.contains("not part of the reviewed discovery"));
+        let snapshot = catalog.snapshot().unwrap();
+        assert!(snapshot.projects.is_empty());
+        assert!(snapshot.resources.is_empty());
+        assert!(std::fs::symlink_metadata(source_path).unwrap().is_file());
+    }
+
+    #[test]
+    fn discovery_apply_reports_a_later_file_failure_without_hiding_successes() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("fixture-project");
+        let dotenv_path = project_path.join(".env");
+        let ssh_path = project_path.join(".ssh/id_fixture");
+        let mount_path = dir.path().join("mount");
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
+        std::fs::create_dir_all(ssh_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(mount_path.join(accessfs_core::config::SURFACES_DIR)).unwrap();
+        std::fs::write(&dotenv_path, "DISCOVERED_TOKEN=fixture-value\n").unwrap();
+        std::fs::write(
+            &ssh_path,
+            "-----BEGIN OPENSSH FIXTURE MATERIAL-----\ninvalid\n-----END OPENSSH FIXTURE MATERIAL-----\n",
+        )
+        .unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let store = FixtureStore::new();
+
+        let applied = dispatch(
+            &catalog,
+            DispatchServices {
+                store: Some(&store),
+                mount_path: Some(&mount_path),
+                ..DispatchServices::default()
+            },
+            ControlCommand::DiscoverApply {
+                path: project_path,
+                files: Some(vec![dotenv_path.clone(), ssh_path.clone()]),
+            },
+        )
+        .unwrap();
+
+        let ControlResult::DiscoveryApplied(result) = applied else {
+            panic!("expected discovery apply result");
+        };
+        assert_eq!(result.files.len(), 2);
+        assert!(result
+            .files
+            .iter()
+            .any(|file| file.path == dotenv_path
+                && file.outcome == DiscoveryApplyOutcome::Imported));
+        assert!(result
+            .files
+            .iter()
+            .any(|file| file.path == ssh_path
+                && file.outcome == DiscoveryApplyOutcome::Failed));
+        assert!(result.project_id.is_some());
+        let snapshot = catalog.snapshot().unwrap();
+        assert_eq!(snapshot.resources.len(), 1);
+        assert_eq!(snapshot.surfaces.len(), 1);
+    }
+
+    #[test]
     fn discovery_apply_keeps_aws_credentials_section_aware() {
         let dir = tempfile::tempdir().unwrap();
         let project_path = dir.path().join("fixture-project");
@@ -2564,6 +2766,7 @@ mod tests {
             },
             ControlCommand::DiscoverApply {
                 path: project_path,
+                files: Some(vec![source_path.clone()]),
             },
         )
         .unwrap();
