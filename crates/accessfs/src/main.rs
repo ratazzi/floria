@@ -867,17 +867,7 @@ impl DaemonInstance {
             .custom_flags(libc::O_NOFOLLOW)
             .open(&lock_path)
             .with_context(|| format!("opening daemon lock {}", lock_path.display()))?;
-        let metadata =
-            lock.metadata().with_context(|| format!("inspecting daemon lock {}", lock_path.display()))?;
-        if !metadata.is_file()
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.mode() & 0o077 != 0
-        {
-            anyhow::bail!(
-                "daemon lock must be a private regular file owned by the current user: {}",
-                lock_path.display()
-            );
-        }
+        validate_daemon_lock(&lock, &lock_path)?;
 
         match lock.try_lock() {
             Ok(()) => Ok(Self { _lock: lock }),
@@ -891,10 +881,64 @@ impl DaemonInstance {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonLockState {
+    Free,
+    Held,
+}
+
+fn daemon_lock_state(support_dir: &Path) -> Result<DaemonLockState> {
+    let lock_path = support_dir.join("daemon.lock");
+    let lock = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&lock_path)
+    {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(DaemonLockState::Free);
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("opening daemon lock {}", lock_path.display()));
+        }
+    };
+    validate_daemon_lock(&lock, &lock_path)?;
+    match lock.try_lock() {
+        Ok(()) => Ok(DaemonLockState::Free),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(DaemonLockState::Held),
+        Err(std::fs::TryLockError::Error(error)) => {
+            Err(error).with_context(|| format!("inspecting daemon lock {}", lock_path.display()))
+        }
+    }
+}
+
+fn validate_daemon_lock(lock: &File, path: &Path) -> Result<()> {
+    let metadata = lock
+        .metadata()
+        .with_context(|| format!("inspecting daemon lock {}", path.display()))?;
+    if metadata.is_file()
+        && metadata.uid() == unsafe { libc::geteuid() }
+        && metadata.mode() & 0o077 == 0
+    {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "daemon lock must be a private regular file owned by the current user: {}",
+        path.display()
+    )
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct MountedFilesystem {
     source: OsString,
     fs_type: OsString,
+}
+
+impl MountedFilesystem {
+    fn is_accessfs(&self) -> bool {
+        self.source == "accessfs" && self.fs_type == "macfuse"
+    }
 }
 
 fn exact_mount(path: &Path) -> Result<Option<MountedFilesystem>> {
@@ -924,7 +968,7 @@ fn recover_stale_mount(path: &Path) -> Result<()> {
     let Some(mount) = exact_mount(path)? else {
         return Ok(());
     };
-    if mount.source != "accessfs" || mount.fs_type != "macfuse" {
+    if !mount.is_accessfs() {
         anyhow::bail!(
             "mount point {} is occupied by {:?} ({:?}); refusing to unmount it",
             path.display(),
@@ -963,6 +1007,54 @@ fn cmd_doctor(config: &Path) -> Result<()> {
                 &format!("parent directory of {} does not exist", cfg.mount_path.display()),
             );
             ok &= mp_ok;
+
+            match (support_dir(&cfg), exact_mount(&cfg.mount_path)) {
+                (Ok(support_dir), Ok(mount)) => {
+                    match (daemon_lock_state(support_dir), mount) {
+                        (Ok(DaemonLockState::Held), Some(mount)) if mount.is_accessfs() => {
+                            report("daemon lifecycle (running)", true, "");
+                        }
+                        (Ok(DaemonLockState::Free), None) => {
+                            report("daemon lifecycle (not running; mount available)", true, "");
+                        }
+                        (Ok(DaemonLockState::Free), Some(mount)) if mount.is_accessfs() => {
+                            report(
+                                "daemon lifecycle",
+                                false,
+                                "stale Floria macFUSE mount found without a live daemon",
+                            );
+                            ok = false;
+                        }
+                        (Ok(DaemonLockState::Held), None) => {
+                            report(
+                                "daemon lifecycle",
+                                false,
+                                "daemon lock is held but the configured mount is absent",
+                            );
+                            ok = false;
+                        }
+                        (Ok(_), Some(mount)) => {
+                            report(
+                                "daemon lifecycle",
+                                false,
+                                &format!(
+                                    "mount point is occupied by {:?} ({:?})",
+                                    mount.source, mount.fs_type
+                                ),
+                            );
+                            ok = false;
+                        }
+                        (Err(error), _) => {
+                            report("daemon lifecycle", false, &format!("{error:#}"));
+                            ok = false;
+                        }
+                    }
+                }
+                (Err(error), _) | (_, Err(error)) => {
+                    report("daemon lifecycle", false, &format!("{error:#}"));
+                    ok = false;
+                }
+            }
 
             println!("  resolved {} virtual file(s):", cfg.files.len());
             for f in &cfg.files {
@@ -1075,11 +1167,13 @@ mod tests {
     fn daemon_instance_lock_refuses_a_second_live_daemon() {
         let dir = tempfile::tempdir().unwrap();
         let first = DaemonInstance::acquire(dir.path()).unwrap();
+        assert_eq!(daemon_lock_state(dir.path()).unwrap(), DaemonLockState::Held);
 
         let error = DaemonInstance::acquire(dir.path()).err().unwrap();
         assert!(error.to_string().contains("already running"));
 
         drop(first);
+        assert_eq!(daemon_lock_state(dir.path()).unwrap(), DaemonLockState::Free);
         DaemonInstance::acquire(dir.path()).unwrap();
     }
 
