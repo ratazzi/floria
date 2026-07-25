@@ -43,7 +43,9 @@ final class ControlProtocolTests: XCTestCase {
     func testDiscoverApplyRequestAndResultMatchRustWireShape() throws {
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
-        let data = try ControlCommand.discoverApply(path: "/fixture/project")
+        let data = try ControlCommand.discoverApply(
+            path: "/fixture/project",
+            files: ["/fixture/project/.env", "/fixture/project/.env.production"])
             .requestData(requestID: 9, encoder: encoder)
         let request = try XCTUnwrap(
             JSONSerialization.jsonObject(with: data) as? [String: Any])
@@ -51,6 +53,9 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(
             (request["params"] as? [String: Any])?["path"] as? String,
             "/fixture/project")
+        XCTAssertEqual(
+            (request["params"] as? [String: Any])?["files"] as? [String],
+            ["/fixture/project/.env", "/fixture/project/.env.production"])
 
         let response = Data(
             #"{"request_id":9,"status":"ok","result":{"type":"discovery_applied","value":{"project_id":"fixture-project","created_resources":2,"reused_resources":1,"protected_files":1,"imported_ssh_identities":0,"files":[{"path":"/fixture/project/.env","outcome":"imported","detail":"Imported as reusable secrets and a composed output"}]}}}"#.utf8)
@@ -60,6 +65,15 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(result.projectID, "fixture-project")
         XCTAssertEqual(result.createdResources, 2)
         XCTAssertEqual(result.files.first?.outcome, "imported")
+    }
+
+    func testDiscoveryReviewOnlyActionMatchesRustWireShape() throws {
+        let file = try JSONDecoder().decode(
+            DiscoveredFile.self,
+            from: Data(
+                #"{"path":"/fixture/project/mise.toml","relative_path":"mise.toml","kind":"mise","codec":"dotenv","environment":"development","tags":["mise","development"],"entries":[],"warnings":[],"action":"review"}"#.utf8))
+
+        XCTAssertEqual(file.action, .review)
     }
 
     func testPolicyModeRequestsMatchRustWireShape() throws {

@@ -285,6 +285,7 @@ enum DiscoveredFileAction: String, Codable, Hashable, Sendable {
     case compose
     case protect
     case importSshIdentity = "import_ssh_identity"
+    case review
 }
 
 struct DiscoveredFile: Codable, Hashable, Sendable, Identifiable {
@@ -413,7 +414,7 @@ enum ControlCommand: Sendable {
     case accessHistory(limit: Int)
     case snapshot
     case discover(path: String)
-    case discoverApply(path: String)
+    case discoverApply(path: String, files: [String])
     case sshAgentDiscover(endpoint: String)
     case sshIdentityImport(
         resourceID: String, name: String, path: String, passphrase: String?,
@@ -513,11 +514,11 @@ enum ControlCommand: Sendable {
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: DiscoverParams(path: path)))
-        case .discoverApply(let path):
+        case .discoverApply(let path, let files):
             return try encoder.encode(
                 ControlRequest(
                     requestID: requestID, method: method,
-                    params: DiscoverParams(path: path)))
+                    params: DiscoverApplyParams(path: path, files: files)))
         case .sshAgentDiscover(let endpoint):
             return try encoder.encode(
                 ControlRequest(
@@ -640,6 +641,10 @@ private struct PolicyModeSetParams: Encodable {
 
 private struct AccessHistoryParams: Encodable { let limit: Int }
 private struct DiscoverParams: Encodable { let path: String }
+private struct DiscoverApplyParams: Encodable {
+    let path: String
+    let files: [String]
+}
 private struct SshAgentDiscoverParams: Encodable { let endpoint: String }
 
 private struct SshIdentityImportParams: Encodable {

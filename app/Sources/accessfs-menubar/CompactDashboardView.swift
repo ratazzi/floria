@@ -99,9 +99,16 @@ struct DashboardView: View {
             return true
         } isTargeted: { isDropTargeted = $0 }
         .sheet(item: $discovery) { presentation in
-            DiscoveryReviewSheet(plan: presentation.plan) {
-                try await state.workspace.applyDiscovery(at: presentation.plan.path)
-            }
+            DiscoveryReviewSheet(
+                plan: presentation.plan,
+                apply: { files in
+                    try await state.workspace.applyDiscovery(
+                        at: presentation.plan.path, files: files)
+                },
+                openProject: { projectID in
+                    selectedProjectID = projectID
+                    search = ""
+                })
         }
         .sheet(item: $workspacePresentation) { presentation in
             AdvancedWorkspaceView(state: state, initialSelection: presentation.selection)
@@ -1323,10 +1330,24 @@ private struct CompactBindingRow: View {
 private struct DiscoveryReviewSheet: View {
     @Environment(\.dismiss) private var dismiss
     let plan: DiscoveryPlan
-    let apply: () async throws -> DiscoveryApplyResult
+    let apply: ([String]) async throws -> DiscoveryApplyResult
+    let openProject: (String) -> Void
     @State private var isApplying = false
     @State private var appliedResult: DiscoveryApplyResult?
     @State private var applyError: String?
+    @State private var selectedFilePaths: Set<String>
+
+    init(
+        plan: DiscoveryPlan,
+        apply: @escaping ([String]) async throws -> DiscoveryApplyResult,
+        openProject: @escaping (String) -> Void
+    ) {
+        self.plan = plan
+        self.apply = apply
+        self.openProject = openProject
+        _selectedFilePaths = State(
+            initialValue: Set(plan.files.filter(\.canApplyDiscovery).map(\.path)))
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1369,7 +1390,19 @@ private struct DiscoveryReviewSheet: View {
                             .background(Color.green.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
                     }
                     ForEach(plan.files) { file in
-                        DiscoveryFileCard(file: file)
+                        DiscoveryFileCard(
+                            file: file,
+                            selected: Binding(
+                                get: { selectedFilePaths.contains(file.path) },
+                                set: { selected in
+                                    if selected {
+                                        selectedFilePaths.insert(file.path)
+                                    } else {
+                                        selectedFilePaths.remove(file.path)
+                                    }
+                                }),
+                            result: appliedResult?.files.first { $0.path == file.path },
+                            locked: appliedResult != nil)
                     }
                     if plan.files.isEmpty {
                         ContentUnavailableView(
@@ -1390,10 +1423,15 @@ private struct DiscoveryReviewSheet: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
-                Button("Cancel") { dismiss() }
-                    .disabled(isApplying || appliedResult != nil)
+                if appliedResult == nil {
+                    Button("Cancel") { dismiss() }
+                        .disabled(isApplying)
+                }
                 Button {
-                    if appliedResult != nil {
+                    if let appliedResult {
+                        if let projectID = appliedResult.projectID {
+                            openProject(projectID)
+                        }
                         dismiss()
                     } else {
                         applyDiscovery()
@@ -1405,10 +1443,13 @@ private struct DiscoveryReviewSheet: View {
                             Text("Importing…")
                         }
                     } else {
-                        Text(appliedResult == nil ? importButtonTitle : "Done")
+                        Text(
+                            appliedResult == nil
+                                ? importButtonTitle
+                                : (appliedResult?.projectID == nil ? "Done" : "Open Project"))
                     }
                 }
-                .disabled(isApplying || plan.files.isEmpty)
+                .disabled(isApplying || (appliedResult == nil && selectedFilePaths.isEmpty))
                 .keyboardShortcut(.defaultAction)
             }
             .padding(.horizontal, 22)
@@ -1428,9 +1469,11 @@ private struct DiscoveryReviewSheet: View {
     }
 
     private var importButtonTitle: String {
-        let count = plan.files.count
+        let files = plan.files.filter { selectedFilePaths.contains($0.path) }
+        let count = files.count
+        guard count > 0 else { return "Select Items" }
         let suffix = count == 1 ? "" : "s"
-        let actions = Set(plan.files.map(\.action))
+        let actions = Set(files.map(\.action))
         if actions == [.protect] {
             return "Protect \(count) File\(suffix)"
         }
@@ -1445,9 +1488,12 @@ private struct DiscoveryReviewSheet: View {
 
     private var discoveryNote: String {
         let base = "Static scan only; project code was not executed."
+        if selectedFilePaths.isEmpty {
+            return "\(base) Select at least one importable item."
+        }
         guard plan.summary.warnings > 0 else { return base }
         let suffix = plan.summary.warnings == 1 ? "" : "s"
-        return "\(base) Review \(plan.summary.warnings) warning\(suffix) before continuing."
+        return "\(selectedFilePaths.count) selected. \(plan.summary.warnings) warning\(suffix) require review."
     }
 
     private func applyDiscovery() {
@@ -1456,7 +1502,7 @@ private struct DiscoveryReviewSheet: View {
         Task {
             defer { isApplying = false }
             do {
-                appliedResult = try await apply()
+                appliedResult = try await apply(selectedFilePaths.sorted())
             } catch {
                 applyError = error.localizedDescription
             }
@@ -1464,11 +1510,15 @@ private struct DiscoveryReviewSheet: View {
     }
 
     private func appliedSummary(_ result: DiscoveryApplyResult) -> String {
-        let imported = result.files.filter { $0.outcome != "skipped" }.count
-        let skipped = result.files.count - imported
-        return skipped == 0
-            ? "\(imported) file\(imported == 1 ? "" : "s") imported."
-            : "\(imported) imported, \(skipped) skipped with warnings."
+        let completed = result.files.filter {
+            $0.outcome == "imported" || $0.outcome == "protected"
+        }.count
+        let failed = result.files.filter { $0.outcome == "failed" }.count
+        let skipped = result.files.filter { $0.outcome == "skipped" }.count
+        var parts = ["\(completed) completed"]
+        if skipped > 0 { parts.append("\(skipped) skipped") }
+        if failed > 0 { parts.append("\(failed) failed") }
+        return parts.joined(separator: ", ") + "."
     }
 }
 
@@ -1490,10 +1540,18 @@ private struct SummaryMetric: View {
 
 private struct DiscoveryFileCard: View {
     let file: DiscoveredFile
+    @Binding var selected: Bool
+    let result: DiscoveryAppliedFile?
+    let locked: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 11) {
             HStack(spacing: 10) {
+                Toggle("", isOn: $selected)
+                    .labelsHidden()
+                    .toggleStyle(.checkbox)
+                    .disabled(locked || !file.canApplyDiscovery)
+                    .help(selectionHelp)
                 Image(systemName: icon)
                     .foregroundStyle(color)
                     .frame(width: 28, height: 28)
@@ -1506,9 +1564,9 @@ private struct DiscoveryFileCard: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Text(actionTitle)
+                Text(statusTitle)
                     .font(.caption.weight(.medium))
-                    .foregroundStyle(color)
+                    .foregroundStyle(statusColor)
             }
             if !file.entries.isEmpty {
                 VStack(spacing: 6) {
@@ -1534,7 +1592,13 @@ private struct DiscoveryFileCard: View {
                     systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
                     .foregroundStyle(.orange)
-                    .padding(.leading, 38)
+                    .padding(.leading, 60)
+            }
+            if let result, result.outcome == "failed" {
+                Label(result.detail, systemImage: "xmark.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .padding(.leading, 60)
             }
         }
         .padding(14)
@@ -1557,11 +1621,49 @@ private struct DiscoveryFileCard: View {
         case .compose: "\(file.entries.count) value\(file.entries.count == 1 ? "" : "s")"
         case .protect: "Protect in place"
         case .importSshIdentity: "Import identity"
+        case .review: "Review only"
         }
     }
 
+    private var statusTitle: String {
+        guard let result else {
+            return locked && !selected ? "Not selected" : actionTitle
+        }
+        return switch result.outcome {
+        case "imported": "Imported"
+        case "protected": "Protected"
+        case "failed": "Failed"
+        default: "Skipped"
+        }
+    }
+
+    private var statusColor: Color {
+        guard let result else { return file.action == .review ? .secondary : color }
+        return switch result.outcome {
+        case "imported", "protected": .green
+        case "failed": .red
+        default: .secondary
+        }
+    }
+
+    private var selectionHelp: String {
+        if file.action == .review {
+            return "Detected for review; automatic import is not supported yet."
+        }
+        if file.action == .compose && !file.warnings.isEmpty {
+            return "Resolve unsupported content before importing this file."
+        }
+        if file.action == .compose && file.entries.isEmpty {
+            return "No statically importable values were found."
+        }
+        return selected ? "Include in this import" : "Leave this file unchanged"
+    }
+
     private func entryActionTitle(_ type: String) -> String {
-        switch type {
+        if file.action == .review {
+            return "Detected"
+        }
+        return switch type {
         case "reuse_shared_secret": "Reuse"
         case "create_shared_secret": "New secret"
         case "create_env_file_entry": "Keep section"
@@ -1585,6 +1687,20 @@ private struct DiscoveryFileCard: View {
         case .compose: .blue
         case .protect: .orange
         case .importSshIdentity: .green
+        case .review: .secondary
+        }
+    }
+}
+
+private extension DiscoveredFile {
+    var canApplyDiscovery: Bool {
+        switch action {
+        case .review:
+            false
+        case .compose:
+            !entries.isEmpty && warnings.isEmpty
+        case .protect, .importSshIdentity:
+            true
         }
     }
 }
