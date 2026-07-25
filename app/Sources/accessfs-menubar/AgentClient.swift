@@ -12,6 +12,9 @@ final class AgentClient {
     /// may be sending a decision — an unguarded close would race a write onto a dead (or
     /// kernel-reused) descriptor.
     private var fd: Int32 = -1
+    /// (dev, inode) of the socket path when the current connection was made; guarded by
+    /// `writeLock`. Used to notice a daemon restart re-binding the path (see watchdog).
+    private var connectedIdentity: (dev: dev_t, ino: ino_t)?
     /// Serializes writes and fd lifecycle: decisions come from the main thread while hello
     /// and close/reconnect come from the reconnect thread — interleaved bytes would corrupt
     /// the frame stream.
@@ -27,6 +30,7 @@ final class AgentClient {
 
     func start() {
         Thread.detachNewThread { [weak self] in self?.runForever() }
+        Thread.detachNewThread { [weak self] in self?.watchSocketIdentity() }
     }
 
     private func runForever() {
@@ -40,13 +44,46 @@ final class AgentClient {
                 onStateChange?(false)
                 writeLock.lock()
                 if fd >= 0 { close(fd); fd = -1 }
+                connectedIdentity = nil
                 writeLock.unlock()
             }
             Thread.sleep(forTimeInterval: 1.0) // retry backoff
         }
     }
 
+    /// A restarted daemon re-binds the socket path to a fresh inode, while a lingering old
+    /// process (e.g. blocked in its shutdown path) can keep the established connection open
+    /// with no EOF — the app then sits "connected" to a daemon that will never send prompts.
+    /// Compare the path's identity with the one recorded at connect time and shut the stale
+    /// connection down so the normal reconnect loop takes over.
+    private func watchSocketIdentity() {
+        while true {
+            Thread.sleep(forTimeInterval: 2.0)
+            writeLock.lock()
+            let f = fd
+            let recorded = connectedIdentity
+            writeLock.unlock()
+            guard f >= 0, let recorded, let current = pathIdentity() else { continue }
+            if current.dev != recorded.dev || current.ino != recorded.ino {
+                Self.log.warning("agent socket was re-bound by a new daemon; dropping stale connection")
+                // shutdown (not close) wakes the blocked read without freeing the fd number,
+                // so a concurrent send cannot race onto a reused descriptor.
+                shutdown(f, SHUT_RDWR)
+            }
+        }
+    }
+
+    private func pathIdentity() -> (dev: dev_t, ino: ino_t)? {
+        var st = stat()
+        guard stat(socketPath, &st) == 0 else { return nil }
+        return (st.st_dev, st.st_ino)
+    }
+
     private func connectOnce() -> Bool {
+        // Capture the path identity before connecting: if a re-bind races in between, the
+        // watchdog sees a mismatch and forces one harmless reconnect. Sampling after the
+        // connect could record the new inode for an old connection and mask the staleness.
+        let identity = pathIdentity()
         let f = socket(AF_UNIX, SOCK_STREAM, 0)
         if f < 0 { return false }
 
@@ -69,6 +106,7 @@ final class AgentClient {
         if rc != 0 { close(f); return false }
         writeLock.lock()
         fd = f
+        connectedIdentity = identity
         writeLock.unlock()
         return true
     }
