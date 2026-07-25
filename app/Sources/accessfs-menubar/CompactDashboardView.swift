@@ -601,14 +601,12 @@ struct DashboardView: View {
         let secrets = state.workspace.resources.filter {
             $0.kind == .sharedSecret || $0.kind == .secret
         }.count
-        let envFiles = state.workspace.projects.flatMap(\.environments).flatMap(\.surfaces).filter {
-            $0.kind != .unixSocket
-        }.count
+        let envFiles = state.workspace.resources.filter { $0.kind == .envFile }.count
         let sshIdentities = state.workspace.resources.filter { $0.kind == .sshIdentity }.count
         let protected = state.workspace.protectedFiles.count
         var parts = [
             "\(secrets) Secret\(secrets == 1 ? "" : "s")",
-            "\(envFiles) Environment File\(envFiles == 1 ? "" : "s")",
+            "\(envFiles) Env File\(envFiles == 1 ? "" : "s")",
             "\(sshIdentities) SSH Identit\(sshIdentities == 1 ? "y" : "ies")",
         ]
         if protected > 0 {
