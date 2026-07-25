@@ -7,14 +7,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use accessfs_catalog::{
-    Binding, BindingScope, Catalog, CatalogError, CatalogSnapshot, EntrySelection, EntrySpec,
-    Environment, ItemMetadata, Project, Resource, ResourceCodec, ResourceKind, ResourceSource,
-    Surface, SurfaceInput, SurfaceKind, ValueShape,
+    resolve_catalog_snapshot, Binding, BindingScope, Catalog, CatalogError, CatalogSnapshot,
+    EntrySelection, EntrySpec, Environment, ItemMetadata, Project, Resource, ResourceCodec,
+    ResourceKind, ResourceSource, Surface, SurfaceInput, SurfaceKind, ValueShape,
 };
 use accessfs_core::audit::{read_recent_access, AuditAccessRecord};
 use accessfs_core::authz::{Enforcement, PolicyMode, PolicyModeStatus};
 use accessfs_discover::{
-    discover, DiscoveredContent, DiscoveredFileAction, DiscoveredFileKind, ExistingSecret,
+    discover, DiscoveredContent, DiscoveredFileAction, DiscoveredFileKind, ExistingEnvironment,
+    ExistingProject, ExistingSecret,
 };
 use accessfs_ssh::ManagedKeyError;
 use accessfs_store::{NewSecret, SecretId, SecretOrigin, SecretRecord, SecretStore, StoreError};
@@ -433,7 +434,10 @@ fn dispatch(
             let discovery =
                 discover(&path).map_err(|error| DispatchError::Validation(error.to_string()))?;
             let existing = existing_discovery_secrets(catalog, store)?;
-            Ok(ControlResult::Discovery(discovery.plan(&existing)))
+            let managed_project = existing_discovery_project(catalog, discovery.project())?;
+            Ok(ControlResult::Discovery(
+                discovery.plan_with_project(&existing, managed_project.as_ref()),
+            ))
         }
         ControlCommand::DiscoverApply { path, files, separate_entries } => apply_discovery(
             catalog,
@@ -1329,6 +1333,40 @@ fn discovered_metadata(file: &DiscoveredContent) -> ItemMetadata {
 
 fn generated_id(prefix: &str) -> String {
     format!("{prefix}-{}", SecretId::generate())
+}
+
+fn existing_discovery_project(
+    catalog: &Catalog,
+    discovered: &accessfs_discover::DiscoveredProject,
+) -> Result<Option<ExistingProject>, DispatchError> {
+    let snapshot = catalog.snapshot()?;
+    let Some(project) = snapshot
+        .projects
+        .iter()
+        .find(|project| project.path == discovered.path)
+    else {
+        return Ok(None);
+    };
+    let environments = snapshot
+        .environments
+        .iter()
+        .filter(|environment| environment.project_id == project.id)
+        .map(|environment| {
+            let resolved = resolve_catalog_snapshot(&snapshot, &project.id, &environment.id)?;
+            Ok(ExistingEnvironment {
+                name: environment.name.clone(),
+                keys: resolved
+                    .exports
+                    .into_iter()
+                    .map(|export| export.key)
+                    .collect(),
+            })
+        })
+        .collect::<Result<Vec<_>, CatalogError>>()?;
+    Ok(Some(ExistingProject {
+        id: project.id.clone(),
+        environments,
+    }))
 }
 
 fn existing_discovery_secrets(
@@ -2728,7 +2766,8 @@ mod tests {
         std::fs::create_dir_all(project_path.join(".git")).unwrap();
         std::fs::create_dir_all(mount_path.join(accessfs_core::config::SURFACES_DIR)).unwrap();
         std::fs::write(&source_path, "DISCOVERED_TOKEN=fixture-real-value\n").unwrap();
-        let reference_bytes = b"DISCOVERED_TOKEN=replace-me\n";
+        let reference_bytes =
+            b"DISCOVERED_TOKEN=replace-me\nOPTIONAL_DISCOVERED_TOKEN=replace-me\n";
         std::fs::write(&reference_path, reference_bytes).unwrap();
         let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
         let store = FixtureStore::new();
@@ -2741,7 +2780,7 @@ mod tests {
                 ..DispatchServices::default()
             },
             ControlCommand::DiscoverApply {
-                path: project_path,
+                path: project_path.clone(),
                 files: None,
                 separate_entries: Vec::new(),
             },
@@ -2763,6 +2802,36 @@ mod tests {
         let snapshot = catalog.snapshot().unwrap();
         assert_eq!(snapshot.resources.len(), 1);
         assert_eq!(snapshot.surfaces.len(), 1);
+
+        let rediscovered = dispatch(
+            &catalog,
+            DispatchServices { store: Some(&store), ..DispatchServices::default() },
+            ControlCommand::Discover { path: project_path },
+        )
+        .unwrap();
+        let ControlResult::Discovery(plan) = rediscovered else {
+            panic!("expected discovery result");
+        };
+        assert_eq!(
+            plan.project.managed_project_id.as_deref(),
+            Some(snapshot.projects[0].id.as_str())
+        );
+        assert_eq!(plan.summary.missing_reference_entries, 1);
+        let reference = plan
+            .files
+            .iter()
+            .find(|file| file.path == reference_path)
+            .expect("reference file");
+        assert!(reference.entries.iter().any(|entry| {
+            entry.key == "DISCOVERED_TOKEN"
+                && entry.action
+                    == accessfs_discover::DiscoveredEntryAction::ReferenceEntry { matched: true }
+        }));
+        assert!(reference.entries.iter().any(|entry| {
+            entry.key == "OPTIONAL_DISCOVERED_TOKEN"
+                && entry.action
+                    == accessfs_discover::DiscoveredEntryAction::ReferenceEntry { matched: false }
+        }));
     }
 
     #[test]

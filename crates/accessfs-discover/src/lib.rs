@@ -49,6 +49,8 @@ pub struct DiscoveryPlan {
 pub struct DiscoveredProject {
     pub name: String,
     pub path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_project_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,6 +139,17 @@ pub struct ExistingSecret {
     pub value: Zeroizing<Vec<u8>>,
 }
 
+/// Existing managed outputs used to compare reference declarations without decrypting values.
+pub struct ExistingProject {
+    pub id: String,
+    pub environments: Vec<ExistingEnvironment>,
+}
+
+pub struct ExistingEnvironment {
+    pub name: String,
+    pub keys: Vec<String>,
+}
+
 pub struct Discovery {
     requested_path: PathBuf,
     project: DiscoveredProject,
@@ -215,6 +228,7 @@ pub fn discover(path: &Path) -> Result<Discovery, DiscoverError> {
             .unwrap_or("Project")
             .to_string(),
         path: project_path,
+        managed_project_id: None,
     };
 
     let candidates = collect_candidates(path)?;
@@ -236,21 +250,42 @@ pub fn discover(path: &Path) -> Result<Discovery, DiscoverError> {
 }
 
 impl Discovery {
+    pub fn project(&self) -> &DiscoveredProject {
+        &self.project
+    }
+
     /// Produce the review-safe plan. No plaintext candidate value is serialized or returned.
     pub fn plan(&self, existing: &[ExistingSecret]) -> DiscoveryPlan {
+        self.plan_with_project(existing, None)
+    }
+
+    /// Produce a review-safe plan with the keys already exported by a managed project.
+    pub fn plan_with_project(
+        &self,
+        existing: &[ExistingSecret],
+        managed_project: Option<&ExistingProject>,
+    ) -> DiscoveryPlan {
         let mut reused_secrets = 0;
         let mut new_secrets = 0;
         let mut missing_reference_entries = 0;
         let mut discovered_groups = Vec::<(&str, &[u8], String)>::new();
-        let mut discovered_dotenv_keys = HashMap::<Option<&str>, HashSet<&str>>::new();
+        let mut discovered_dotenv_keys = HashMap::<String, HashSet<String>>::new();
         for file in self.files.iter().filter(|file| {
             file.kind == DiscoveredFileKind::Dotenv
                 && file.action == DiscoveredFileAction::Compose
         }) {
             let keys = discovered_dotenv_keys
-                .entry(file.environment.as_deref())
+                .entry(normalize_environment(file.environment.as_deref()))
                 .or_default();
-            keys.extend(file.entries.iter().map(|entry| entry.key.as_str()));
+            keys.extend(file.entries.iter().map(|entry| entry.key.clone()));
+        }
+        if let Some(project) = managed_project {
+            for environment in &project.environments {
+                discovered_dotenv_keys
+                    .entry(normalize_environment(Some(&environment.name)))
+                    .or_default()
+                    .extend(environment.keys.iter().cloned());
+            }
         }
         let mut files = Vec::with_capacity(self.files.len());
         for file in &self.files {
@@ -292,8 +327,9 @@ impl Discovery {
                         DiscoveredEntryAction::KeepInProtectedFile
                     }
                     EntryDisposition::Reference => {
+                        let environment = normalize_environment(file.environment.as_deref());
                         let matched = discovered_dotenv_keys
-                            .get(&file.environment.as_deref())
+                            .get(&environment)
                             .is_some_and(|keys| keys.contains(entry.key.as_str()));
                         if !matched {
                             missing_reference_entries += 1;
@@ -323,9 +359,11 @@ impl Discovery {
         let entries = files.iter().map(|file| file.entries.len()).sum();
         let warnings = files.iter().map(|file| file.warnings.len()).sum();
 
+        let mut project = self.project.clone();
+        project.managed_project_id = managed_project.map(|existing| existing.id.clone());
         DiscoveryPlan {
             path: self.requested_path.clone(),
-            project: self.project.clone(),
+            project,
             summary: DiscoverySummary {
                 files: files.len(),
                 entries,
@@ -749,6 +787,21 @@ fn dotenv_environment(path: &Path) -> Option<String> {
         .or_else(|| Some("development".to_string()))
 }
 
+fn normalize_environment(environment: Option<&str>) -> String {
+    let normalized = environment
+        .unwrap_or("development")
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|part| !part.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect::<Vec<_>>()
+        .join("-");
+    if normalized.is_empty() {
+        "development".to_string()
+    } else {
+        normalized
+    }
+}
+
 const DOTENV_REFERENCE_MARKERS: &[&str] = &["example", "sample", "template", "dist"];
 
 fn dotenv_reference_marker(path: &Path) -> Option<&'static str> {
@@ -1011,5 +1064,39 @@ mod tests {
             .unwrap();
         assert_eq!(production.action, DiscoveredFileAction::Reference);
         assert_eq!(production.environment.as_deref(), Some("production"));
+    }
+
+    #[test]
+    fn managed_environment_outputs_cover_reference_keys_without_source_files() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        fs::write(
+            root.join(".env.qa-west.example"),
+            "MANAGED_TOKEN=replace-me\nMISSING_TOKEN=replace-me\n",
+        )
+        .unwrap();
+        let managed = ExistingProject {
+            id: "fixture-project".to_string(),
+            environments: vec![ExistingEnvironment {
+                name: "QA West".to_string(),
+                keys: vec!["MANAGED_TOKEN".to_string()],
+            }],
+        };
+
+        let plan = discover(root).unwrap().plan_with_project(&[], Some(&managed));
+
+        assert_eq!(plan.project.managed_project_id.as_deref(), Some("fixture-project"));
+        assert_eq!(plan.summary.missing_reference_entries, 1);
+        let entries = &plan.files[0].entries;
+        assert!(entries.iter().any(|entry| {
+            entry.key == "MANAGED_TOKEN"
+                && entry.action
+                    == DiscoveredEntryAction::ReferenceEntry { matched: true }
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.key == "MISSING_TOKEN"
+                && entry.action
+                    == DiscoveredEntryAction::ReferenceEntry { matched: false }
+        }));
     }
 }

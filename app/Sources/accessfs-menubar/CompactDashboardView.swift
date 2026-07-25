@@ -1361,7 +1361,10 @@ private struct DiscoveryReviewSheet: View {
                     .frame(width: 42, height: 42)
                     .background(Color.blue.opacity(0.10), in: RoundedRectangle(cornerRadius: 11))
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Review Discovery")
+                    Text(
+                        plan.project.managedProjectID == nil
+                            ? "Review Discovery"
+                            : "Review Changes")
                         .font(.title2.bold())
                     Text(plan.project.path)
                         .font(.caption)
@@ -1431,33 +1434,35 @@ private struct DiscoveryReviewSheet: View {
                     .foregroundStyle(.secondary)
                 Spacer()
                 if appliedResult == nil {
-                    Button("Cancel") { dismiss() }
+                    Button(hasImportableItems ? "Cancel" : "Done") { dismiss() }
                         .disabled(isApplying)
                 }
-                Button {
-                    if let appliedResult {
-                        if let projectID = appliedResult.projectID {
-                            openProject(projectID)
+                if appliedResult != nil || hasImportableItems {
+                    Button {
+                        if let appliedResult {
+                            if let projectID = appliedResult.projectID {
+                                openProject(projectID)
+                            }
+                            dismiss()
+                        } else {
+                            applyDiscovery()
                         }
-                        dismiss()
-                    } else {
-                        applyDiscovery()
-                    }
-                } label: {
-                    if isApplying {
-                        HStack(spacing: 7) {
-                            ProgressView().controlSize(.small)
-                            Text("Importing…")
+                    } label: {
+                        if isApplying {
+                            HStack(spacing: 7) {
+                                ProgressView().controlSize(.small)
+                                Text("Importing…")
+                            }
+                        } else {
+                            Text(
+                                appliedResult == nil
+                                    ? importButtonTitle
+                                    : (appliedResult?.projectID == nil ? "Done" : "Open Project"))
                         }
-                    } else {
-                        Text(
-                            appliedResult == nil
-                                ? importButtonTitle
-                                : (appliedResult?.projectID == nil ? "Done" : "Open Project"))
                     }
+                    .disabled(isApplying || (appliedResult == nil && selectedFilePaths.isEmpty))
+                    .keyboardShortcut(.defaultAction)
                 }
-                .disabled(isApplying || (appliedResult == nil && selectedFilePaths.isEmpty))
-                .keyboardShortcut(.defaultAction)
             }
             .padding(.horizontal, 22)
             .frame(height: 58)
@@ -1493,6 +1498,10 @@ private struct DiscoveryReviewSheet: View {
         return "Protect & Import \(count) Item\(suffix)"
     }
 
+    private var hasImportableItems: Bool {
+        plan.files.contains(where: \.canApplyDiscovery)
+    }
+
     private var discoveryNote: String {
         var notes = ["Static scan only; project code was not executed."]
         let referenceCount = plan.files.filter { $0.action == .reference }.count
@@ -1509,13 +1518,17 @@ private struct DiscoveryReviewSheet: View {
         }
         let base = notes.joined(separator: " ")
         if selectedFilePaths.isEmpty {
-            return plan.files.contains(where: \.canApplyDiscovery)
+            return hasImportableItems
                 ? "\(base) Select at least one importable item."
-                : "\(base) No importable items were found."
+                : "\(base) No importable \(emptyResultKind) were found."
         }
         guard plan.summary.warnings > 0 else { return base }
         let suffix = plan.summary.warnings == 1 ? "" : "s"
         return "\(selectedFilePaths.count) selected. \(plan.summary.warnings) warning\(suffix) require review."
+    }
+
+    private var emptyResultKind: String {
+        plan.project.managedProjectID == nil ? "items" : "changes"
     }
 
     private func applyDiscovery() {

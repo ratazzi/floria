@@ -256,6 +256,12 @@ struct DiscoveryPlan: Codable, Hashable, Sendable {
 struct DiscoveredProject: Codable, Hashable, Sendable {
     let name: String
     let path: String
+    let managedProjectID: String?
+
+    enum CodingKeys: String, CodingKey {
+        case name, path
+        case managedProjectID = "managed_project_id"
+    }
 }
 
 struct DiscoverySummary: Codable, Hashable, Sendable {

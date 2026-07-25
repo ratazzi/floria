@@ -59,6 +59,15 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(reuse.groupID, create.groupID)
     }
 
+    func testManagedDiscoveryProjectMatchesRustWireShape() throws {
+        let project = try JSONDecoder().decode(
+            DiscoveredProject.self,
+            from: Data(
+                #"{"name":"project","path":"/fixture/project","managed_project_id":"fixture-project"}"#.utf8))
+
+        XCTAssertEqual(project.managedProjectID, "fixture-project")
+    }
+
     func testDiscoverApplyRequestAndResultMatchRustWireShape() throws {
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
