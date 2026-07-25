@@ -234,6 +234,7 @@ enum WorkspaceSidebarSelection: Hashable {
 /// Main product workspace: choose a project and environment, compose typed bindings,
 /// then inspect the concrete file/socket surfaces exposed to local processes.
 struct AdvancedWorkspaceView: View {
+    @Environment(\.dismiss) private var dismiss
     @Bindable var state: AppState
     private let initialSelection: WorkspaceSidebarSelection
     @State private var selection: WorkspaceSidebarSelection?
@@ -339,7 +340,7 @@ struct AdvancedWorkspaceView: View {
                     .focused($searchIsFocused)
                     .onExitCommand {
                         if search.isEmpty {
-                            searchIsFocused = false
+                            dismiss()
                         } else {
                             search = ""
                         }

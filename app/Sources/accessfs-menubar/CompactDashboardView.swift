@@ -287,6 +287,8 @@ struct DashboardView: View {
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .focusable(false)
+        .accessibilityLabel("Project filter")
+        .accessibilityValue(selectedProject?.name ?? "All Projects")
     }
 
     private var policyMenu: some View {
@@ -341,6 +343,13 @@ struct DashboardView: View {
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .fixedSize()
+        .accessibilityLabel("Security mode")
+        .accessibilityValue(
+            auditOnly
+                ? "Audit Only"
+                : (state.connected
+                    ? "Protected; using each item's security level"
+                    : "Daemon offline"))
     }
 
     private var projectsSection: some View {
@@ -966,7 +975,9 @@ private struct CompactProjectDetailView: View {
                     }
                     .buttonStyle(.bordered)
 
-                    Button("Advanced", action: openAdvanced)
+                    Button(action: openAdvanced) {
+                        Label("Manage Project", systemImage: "slider.horizontal.3")
+                    }
                         .buttonStyle(.bordered)
                 }
                 Text(
@@ -1012,6 +1023,8 @@ private struct CompactProjectDetailView: View {
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .disabled(project.environments.isEmpty)
+        .accessibilityLabel("Environment")
+        .accessibilityValue(selectedEnvironment?.name ?? "No environment")
     }
 
     private var outputsSection: some View {
@@ -1025,7 +1038,7 @@ private struct CompactProjectDetailView: View {
                     icon: search.isEmpty ? "doc.badge.plus" : "magnifyingglass",
                     title: search.isEmpty ? "No outputs in this environment" : "No matching outputs",
                     detail: search.isEmpty
-                        ? "Use Advanced to add an environment file or socket."
+                        ? "Choose Manage Project to add an environment file or socket."
                         : "Try a different search.")
             } else {
                 VStack(spacing: 0) {
@@ -1052,7 +1065,7 @@ private struct CompactProjectDetailView: View {
                     icon: search.isEmpty ? "link.badge.plus" : "magnifyingglass",
                     title: search.isEmpty ? "No bindings in this environment" : "No matching bindings",
                     detail: search.isEmpty
-                        ? "Use Advanced to compose resources into this project."
+                        ? "Choose Manage Project to compose resources into this project."
                         : "Try a different search.")
             } else {
                 VStack(spacing: 0) {
@@ -1062,7 +1075,8 @@ private struct CompactProjectDetailView: View {
                             state: state,
                             binding: binding,
                             resource: state.workspace.resource(binding.resourceID),
-                            scope: bindingScope(binding))
+                            scope: bindingScope(binding),
+                            openAdvanced: openAdvanced)
                         if index != filteredBindings.count - 1 {
                             Divider().padding(.leading, 58)
                         }
@@ -1198,7 +1212,7 @@ private struct CompactSurfaceRow: View {
                         URL(fileURLWithPath: surface.path)
                     ])
                 }
-                Button("Manage in Advanced Workspace", systemImage: "slider.horizontal.3") {
+                Button("Manage Output…", systemImage: "slider.horizontal.3") {
                     openAdvanced()
                 }
             } label: {
@@ -1220,6 +1234,7 @@ private struct CompactBindingRow: View {
     let binding: WorkspaceBinding
     let resource: WorkspaceResource?
     let scope: String
+    let openAdvanced: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
@@ -1266,6 +1281,15 @@ private struct CompactBindingRow: View {
             .controlSize(.small)
             .accessibilityLabel("Enable \(resource?.name ?? "binding")")
             .accessibilityValue(binding.isEnabled ? "Enabled" : "Disabled")
+
+            Button(action: openAdvanced) {
+                Image(systemName: "slider.horizontal.3")
+                    .frame(width: 26, height: 26)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.borderless)
+            .help("Manage binding")
+            .accessibilityLabel("Manage \(resource?.name ?? "binding") binding")
         }
         .padding(.horizontal, 14)
         .frame(minHeight: 54)
