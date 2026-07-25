@@ -1778,18 +1778,14 @@ private struct DiscoveryFileCard: View {
                     }
                 }
             } label: {
-                HStack(spacing: 3) {
-                    Text(
-                        isSeparate
-                            ? "Separate"
-                            : automaticEntryActionTitle(entry, selectionID: selectionID))
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 8, weight: .semibold))
-                }
+                Text(
+                    isSeparate
+                        ? "Separate"
+                        : automaticEntryActionTitle(entry, selectionID: selectionID))
                 .font(.caption)
                 .foregroundStyle(isSeparate ? Color.orange : Color.green)
+                .lineLimit(1)
+                .truncationMode(.tail)
                 .frame(maxWidth: 220, alignment: .trailing)
             }
             .menuStyle(.borderlessButton)
