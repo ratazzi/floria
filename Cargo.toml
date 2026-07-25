@@ -25,7 +25,7 @@ globset = "0.4"
 humantime = "2"
 clap = { version = "4", features = ["derive"] }
 wait-timeout = "0.2"
-ctrlc = "3"
+ctrlc = { version = "3", features = ["termination"] }
 threadpool = "1"
 sha2 = "0.10"
 base64 = "0.22"
