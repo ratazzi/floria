@@ -40,6 +40,16 @@ final class ControlClient: @unchecked Sendable {
         return snapshot
     }
 
+    func discoverSshIdentities(endpoint: String) async throws -> [DiscoveredSshIdentity] {
+        guard let identities: [DiscoveredSshIdentity] = try await request(
+            .sshAgentDiscover(endpoint: endpoint), expecting: "ssh_agent_identities",
+            as: [DiscoveredSshIdentity].self)
+        else {
+            throw ControlClientError.missingResult("ssh_agent_identities")
+        }
+        return identities
+    }
+
     func protectedFiles() async throws -> [CatalogProtectedFile] {
         guard let files: [CatalogProtectedFile] = try await request(
             .protectedFiles, expecting: "protected_files", as: [CatalogProtectedFile].self)
@@ -140,6 +150,14 @@ final class ControlClient: @unchecked Sendable {
             .resourceMetadataUpdate(
                 resourceID: resourceID, name: name, enforcement: enforcement,
                 metadata: metadata))
+    }
+
+    func upsertResource(_ resource: CatalogResource) async throws {
+        try await requestEmpty(.resourceUpsert(resource))
+    }
+
+    func removeResource(_ id: String) async throws {
+        try await requestEmpty(.resourceRemove(id))
     }
 
     func upsertProject(_ project: CatalogProject) async throws {

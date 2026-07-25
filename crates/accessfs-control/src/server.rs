@@ -15,7 +15,7 @@ use accessfs_surface::{decode_source, validate_secret_bytes};
 
 use crate::protocol::{
     read_msg, write_msg, ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest,
-    ControlResponse, ControlResult, ProtectedFile, ProtectedFileVersion,
+    ControlResponse, ControlResult, ProtectedFile, ProtectedFileVersion, SshIdentity,
 };
 
 pub struct ControlServer {
@@ -37,11 +37,17 @@ pub trait RuntimePolicyController: Send + Sync + 'static {
     ) -> io::Result<PolicyModeStatus>;
 }
 
+/// Read-only seam for enumerating public keys from an upstream SSH agent. The protocol and server
+/// own the public DTO while production delegates SSH framing to `accessfs-agent`.
+pub trait SshIdentityDiscovery: Send + Sync + 'static {
+    fn discover(&self, endpoint: &Path) -> io::Result<Vec<SshIdentity>>;
+}
+
 impl ControlServer {
     /// Start the catalog control socket. Each connection gets a dedicated request loop;
     /// authorization prompts continue to use the separate agent socket.
     pub fn start(path: &Path, catalog: Catalog) -> io::Result<Self> {
-        Self::start_inner(path, catalog, None, None, None, None)
+        Self::start_inner(path, catalog, None, None, None, None, None)
     }
 
     pub fn start_observed(
@@ -49,7 +55,7 @@ impl ControlServer {
         catalog: Catalog,
         observer: Arc<dyn CatalogObserver>,
     ) -> io::Result<Self> {
-        Self::start_inner(path, catalog, None, None, Some(observer), None)
+        Self::start_inner(path, catalog, None, None, Some(observer), None, None)
     }
 
     pub fn start_runtime(
@@ -59,7 +65,15 @@ impl ControlServer {
         mount_path: PathBuf,
         observer: Arc<dyn CatalogObserver>,
     ) -> io::Result<Self> {
-        Self::start_inner(path, catalog, Some(store), Some(mount_path), Some(observer), None)
+        Self::start_inner(
+            path,
+            catalog,
+            Some(store),
+            Some(mount_path),
+            Some(observer),
+            None,
+            None,
+        )
     }
 
     pub fn start_runtime_with_policy(
@@ -77,6 +91,28 @@ impl ControlServer {
             Some(mount_path),
             Some(observer),
             Some(policy),
+            None,
+        )
+    }
+
+
+    pub fn start_runtime_with_services(
+        path: &Path,
+        catalog: Catalog,
+        store: Arc<dyn SecretStore>,
+        mount_path: PathBuf,
+        observer: Arc<dyn CatalogObserver>,
+        policy: Arc<dyn RuntimePolicyController>,
+        ssh_discovery: Arc<dyn SshIdentityDiscovery>,
+    ) -> io::Result<Self> {
+        Self::start_inner(
+            path,
+            catalog,
+            Some(store),
+            Some(mount_path),
+            Some(observer),
+            Some(policy),
+            Some(ssh_discovery),
         )
     }
 
@@ -87,6 +123,7 @@ impl ControlServer {
         mount_path: Option<PathBuf>,
         observer: Option<Arc<dyn CatalogObserver>>,
         policy: Option<Arc<dyn RuntimePolicyController>>,
+        ssh_discovery: Option<Arc<dyn SshIdentityDiscovery>>,
     ) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -98,7 +135,17 @@ impl ControlServer {
         let catalog = Arc::new(catalog);
         std::thread::Builder::new()
             .name("accessfs-control-accept".to_string())
-            .spawn(move || accept_loop(listener, catalog, store, mount_path, observer, policy))?;
+            .spawn(move || {
+                accept_loop(
+                    listener,
+                    catalog,
+                    store,
+                    mount_path,
+                    observer,
+                    policy,
+                    ssh_discovery,
+                )
+            })?;
 
         Ok(ControlServer { socket_path: path.to_path_buf() })
     }
@@ -115,6 +162,7 @@ fn accept_loop(
     mount_path: Option<PathBuf>,
     observer: Option<Arc<dyn CatalogObserver>>,
     policy: Option<Arc<dyn RuntimePolicyController>>,
+    ssh_discovery: Option<Arc<dyn SshIdentityDiscovery>>,
 ) {
     for stream in listener.incoming() {
         let stream = match stream {
@@ -133,10 +181,19 @@ fn accept_loop(
         let mount_path = mount_path.clone();
         let observer = observer.clone();
         let policy = policy.clone();
+        let ssh_discovery = ssh_discovery.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("accessfs-control-conn".to_string())
             .spawn(move || {
-                handle_connection(stream, catalog, store, mount_path, observer, policy)
+                handle_connection(
+                    stream,
+                    catalog,
+                    store,
+                    mount_path,
+                    observer,
+                    policy,
+                    ssh_discovery,
+                )
             })
         {
             tracing::warn!(%error, "spawning control connection failed");
@@ -151,6 +208,7 @@ fn handle_connection(
     mount_path: Option<PathBuf>,
     observer: Option<Arc<dyn CatalogObserver>>,
     policy: Option<Arc<dyn RuntimePolicyController>>,
+    ssh_discovery: Option<Arc<dyn SshIdentityDiscovery>>,
 ) {
     loop {
         let request: ControlRequest = match read_msg(&mut stream) {
@@ -167,6 +225,7 @@ fn handle_connection(
             store.as_deref(),
             mount_path.as_deref(),
             policy.as_deref(),
+            ssh_discovery.as_deref(),
             request.command,
         ) {
             Ok(result) => {
@@ -281,6 +340,7 @@ fn dispatch(
     store: Option<&dyn SecretStore>,
     mount_path: Option<&Path>,
     policy: Option<&dyn RuntimePolicyController>,
+    ssh_discovery: Option<&dyn SshIdentityDiscovery>,
     command: ControlCommand,
 ) -> Result<ControlResult, DispatchError> {
     match command {
@@ -306,6 +366,22 @@ fn dispatch(
                 .map_err(DispatchError::Policy)
         }
         ControlCommand::Snapshot => Ok(ControlResult::Snapshot(catalog.snapshot()?)),
+        ControlCommand::SshAgentDiscover { endpoint } => {
+            if !endpoint.is_absolute() {
+                return Err(DispatchError::Validation(
+                    "SSH agent endpoint must be absolute".to_string(),
+                ));
+            }
+            let discovery = ssh_discovery.ok_or_else(|| {
+                DispatchError::Validation(
+                    "SSH agent discovery is unavailable on this control server".to_string(),
+                )
+            })?;
+            discovery
+                .discover(&endpoint)
+                .map(ControlResult::SshAgentIdentities)
+                .map_err(|source| DispatchError::Io { path: endpoint, source })
+        }
         ControlCommand::ProtectedFiles => protected_files(
             store.ok_or(DispatchError::StoreUnavailable)?,
             mount_path.ok_or(DispatchError::StoreUnavailable)?,
@@ -1384,6 +1460,18 @@ mod tests {
         status: Mutex<PolicyModeStatus>,
     }
 
+    struct FixtureSshDiscovery;
+
+    impl SshIdentityDiscovery for FixtureSshDiscovery {
+        fn discover(&self, endpoint: &Path) -> io::Result<Vec<SshIdentity>> {
+            Ok(vec![SshIdentity {
+                address: "ssh/sha256/fixture-address".to_string(),
+                fingerprint: "SHA256:fixture-fingerprint".to_string(),
+                comment: endpoint.display().to_string(),
+            }])
+        }
+    }
+
     impl RuntimePolicyController for FixturePolicy {
         fn policy_mode(&self) -> PolicyModeStatus {
             *self.status.lock().unwrap()
@@ -1418,6 +1506,7 @@ mod tests {
             None,
             None,
             Some(policy),
+            None,
         )
         .unwrap();
         let mut client = ControlClient::connect(&socket).unwrap();
@@ -1437,6 +1526,37 @@ mod tests {
                 mode: PolicyMode::AuditOnly,
                 expires_at: Some(1_800_003_600),
             })
+        );
+    }
+
+    #[test]
+    fn ssh_identity_discovery_roundtrips_public_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let socket = dir.path().join("control.sock");
+        let discovery: Arc<dyn SshIdentityDiscovery> = Arc::new(FixtureSshDiscovery);
+        let _server = ControlServer::start_inner(
+            &socket,
+            catalog,
+            None,
+            None,
+            None,
+            None,
+            Some(discovery),
+        )
+        .unwrap();
+        let mut client = ControlClient::connect(&socket).unwrap();
+        let endpoint = dir.path().join("upstream.sock");
+
+        assert_eq!(
+            client
+                .request(ControlCommand::SshAgentDiscover { endpoint: endpoint.clone() })
+                .unwrap(),
+            ControlResult::SshAgentIdentities(vec![SshIdentity {
+                address: "ssh/sha256/fixture-address".to_string(),
+                fingerprint: "SHA256:fixture-fingerprint".to_string(),
+                comment: endpoint.display().to_string(),
+            }])
         );
     }
 

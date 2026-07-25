@@ -42,6 +42,38 @@ const SSH_AGENT_SIGN_RESPONSE: u8 = 14;
 const SSH_AGENTC_EXTENSION: u8 = 27;
 const SSH_AGENT_EXTENSION_FAILURE: u8 = 28;
 
+/// Public metadata advertised by an upstream SSH agent. Key blobs are intentionally converted to
+/// stable addresses/fingerprints here so callers never need to persist protocol payloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredSshIdentity {
+    pub address: String,
+    pub fingerprint: String,
+    pub comment: String,
+}
+
+/// Query one upstream agent without changing it. This is the discovery seam used by the control
+/// plane before a Resource and its selectable identity entries are persisted in the catalog.
+pub fn discover_identities(endpoint: &Path) -> io::Result<Vec<DiscoveredSshIdentity>> {
+    if !endpoint.is_absolute() {
+        return Err(invalid("SSH agent endpoint must be absolute"));
+    }
+    let mut stream = UnixStream::connect(endpoint)?;
+    stream.set_read_timeout(Some(UPSTREAM_TIMEOUT))?;
+    stream.set_write_timeout(Some(UPSTREAM_TIMEOUT))?;
+    write_frame(&mut stream, &[SSH_AGENTC_REQUEST_IDENTITIES])?;
+    decode_identities_answer(&read_frame(&mut stream)?)
+        .map(|identities| {
+            identities
+                .into_iter()
+                .map(|identity| DiscoveredSshIdentity {
+                    address: identity.address,
+                    fingerprint: identity.fingerprint,
+                    comment: String::from_utf8_lossy(&identity.comment).into_owned(),
+                })
+                .collect()
+        })
+}
+
 /// Live manager for every catalog-backed SSH Agent Surface.
 pub struct SshAgentRuntime {
     runtime_dir: PathBuf,
@@ -93,6 +125,12 @@ impl SshAgentRuntime {
         let mut first_error = None;
         for spec in desired {
             if running.get(&spec.id).is_some_and(|server| server.spec == spec) {
+                if let Err(error) = ensure_project_link(&spec.project_path, &spec.socket_path) {
+                    tracing::warn!(surface = %spec.id, path = %spec.project_path.display(), %error, "SSH agent project link needs attention");
+                    if first_error.is_none() {
+                        first_error = Some(error);
+                    }
+                }
                 continue;
             }
             if let Some(mut previous) = running.remove(&spec.id) {
@@ -648,24 +686,51 @@ struct ParsedIdentity {
 }
 
 fn parse_identities_answer(response: &[u8]) -> io::Result<HashMap<String, ParsedIdentity>> {
+    let decoded = decode_identities_answer(response)?;
+    Ok(decoded
+        .into_iter()
+        .map(|identity| {
+            (
+                identity.address,
+                ParsedIdentity {
+                    key_blob: identity.key_blob,
+                    fingerprint: identity.fingerprint,
+                },
+            )
+        })
+        .collect())
+}
+
+struct DecodedIdentity {
+    key_blob: Vec<u8>,
+    address: String,
+    fingerprint: String,
+    comment: Vec<u8>,
+}
+
+fn decode_identities_answer(response: &[u8]) -> io::Result<Vec<DecodedIdentity>> {
     let mut reader = WireReader::new(response);
     if reader.byte()? != SSH_AGENT_IDENTITIES_ANSWER {
         return Err(invalid("upstream did not return an identities answer"));
     }
     let count = reader.u32()? as usize;
-    let mut identities = HashMap::with_capacity(count);
+    let mut identities = Vec::with_capacity(count);
+    let mut addresses = HashSet::with_capacity(count);
     for _ in 0..count {
         let key_blob = reader.string()?.to_vec();
-        let _comment = reader.string()?;
+        let comment = reader.string()?.to_vec();
         let (address, fingerprint) = identity_names(&key_blob);
-        if identities
-            .insert(address.clone(), ParsedIdentity { key_blob, fingerprint })
-            .is_some()
-        {
+        if !addresses.insert(address.clone()) {
             return Err(invalid(format!(
                 "upstream returned duplicate identity {address:?}"
             )));
         }
+        identities.push(DecodedIdentity {
+            key_blob,
+            address,
+            fingerprint,
+            comment,
+        });
     }
     reader.finish()?;
     Ok(identities)
@@ -1076,6 +1141,11 @@ mod tests {
         let project = dir.path().join("project");
         fs::create_dir(&project).unwrap();
         let upstream = FakeUpstream::start(dir.path().join("upstream.sock"));
+        let discovered = discover_identities(&upstream.path).unwrap();
+        assert_eq!(discovered.len(), 2);
+        assert_eq!(discovered[0].comment, "upstream-a");
+        assert_eq!(discovered[0].address, identity_names(KEY_A).0);
+        assert_eq!(discovered[0].fingerprint, identity_names(KEY_A).1);
         let audit_path = dir.path().join("audit.jsonl");
         let audit = Arc::new(AuditLog::open(&audit_path).unwrap());
         let policy = Arc::new(RecordingAuthorizer::allowing());
@@ -1087,6 +1157,12 @@ mod tests {
         .unwrap();
         runtime.replace(&snapshot(&project, &upstream.path)).unwrap();
 
+        assert_eq!(
+            fs::read_link(project.join("agent.sock")).unwrap(),
+            runtime.socket_path("fixture-agent")
+        );
+        fs::remove_file(project.join("agent.sock")).unwrap();
+        runtime.replace(&snapshot(&project, &upstream.path)).unwrap();
         assert_eq!(
             fs::read_link(project.join("agent.sock")).unwrap(),
             runtime.socket_path("fixture-agent")

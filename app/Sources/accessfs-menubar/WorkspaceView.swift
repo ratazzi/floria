@@ -223,6 +223,7 @@ private enum WorkspaceSidebarSelection: Hashable {
     case protectedFiles
     case sharedSecrets
     case envFiles
+    case sshAgents
     case accessLog
 }
 
@@ -236,6 +237,7 @@ struct DashboardView: View {
     @State private var showingProtectFile = false
     @State private var showingNewSharedSecret = false
     @State private var showingNewEnvFile = false
+    @State private var showingNewSshAgent = false
     @State private var pendingAuditWindow: AuditOnlyWindow?
     @State private var showingAuditConfirmation = false
 
@@ -269,6 +271,9 @@ struct DashboardView: View {
         }
         .sheet(isPresented: $showingNewEnvFile) {
             NewEnvFileSheet(store: state.workspace)
+        }
+        .sheet(isPresented: $showingNewSshAgent) {
+            NewSshAgentSheet(store: state.workspace)
         }
         .alert(
             "Floria could not update the workspace",
@@ -326,6 +331,9 @@ struct DashboardView: View {
                 }
                 Button("New Env File", systemImage: "doc.badge.plus") {
                     showingNewEnvFile = true
+                }
+                Button("Connect SSH Agent", systemImage: "network") {
+                    showingNewSshAgent = true
                 }
             } label: {
                 Image(systemName: "plus")
@@ -406,6 +414,7 @@ struct DashboardView: View {
                             tag: .protectedFiles)
                         sidebarRow("Shared Secrets", systemImage: "key", tag: .sharedSecrets)
                         sidebarRow("Env Files", systemImage: "doc.badge.gearshape", tag: .envFiles)
+                        sidebarRow("SSH Agents", systemImage: "network", tag: .sshAgents)
                         sidebarRow(
                             "Access Log",
                             systemImage: "clock.arrow.trianglehead.counterclockwise.rotate.90",
@@ -535,6 +544,12 @@ struct DashboardView: View {
                 subtitle: "Reusable groups of environment variables",
                 kinds: [.envFile], search: search,
                 addResourceTitle: "Add Env File", addResource: { showingNewEnvFile = true })
+        case .sshAgents:
+            ResourceCatalogView(
+                store: state.workspace, title: "SSH Agents",
+                subtitle: "Public identities discovered from existing agent sockets",
+                kinds: [.sshAgent], search: search,
+                addResourceTitle: "Connect Agent", addResource: { showingNewSshAgent = true })
         case .accessLog:
             AccessLogView(state: state)
         case nil:
@@ -569,6 +584,7 @@ private struct ProjectWorkspaceView: View {
     @State private var showingAddIniFile = false
     @State private var showingAddDirectEnvFile = false
     @State private var showingAddLinesFile = false
+    @State private var showingAddSshAgent = false
     @State private var confirmingRemoveProject = false
     @State private var confirmingRemoveEnvironment = false
 
@@ -596,7 +612,8 @@ private struct ProjectWorkspaceView: View {
                 addDirenvFile: { showingAddDirenvFile = true },
                 addIniFile: { showingAddIniFile = true },
                 addDirectEnvFile: { showingAddDirectEnvFile = true },
-                addLinesFile: { showingAddLinesFile = true })
+                addLinesFile: { showingAddLinesFile = true },
+                addSshAgent: { showingAddSshAgent = true })
                 .frame(width: 390)
         }
         .sheet(isPresented: $showingAddBinding) {
@@ -616,6 +633,9 @@ private struct ProjectWorkspaceView: View {
         }
         .sheet(isPresented: $showingAddLinesFile) {
             AddLinesSurfaceSheet(store: store)
+        }
+        .sheet(isPresented: $showingAddSshAgent) {
+            AddSshAgentSurfaceSheet(store: store)
         }
         .sheet(isPresented: $showingNewEnvironment) {
             NewEnvironmentSheet(store: store)
@@ -979,6 +999,7 @@ private struct SurfaceInspector: View {
     let addIniFile: () -> Void
     let addDirectEnvFile: () -> Void
     let addLinesFile: () -> Void
+    let addSshAgent: () -> Void
     @State private var showingManageSurface = false
     @State private var confirmingRemoval = false
     @State private var errorMessage: String?
@@ -1019,6 +1040,9 @@ private struct SurfaceInspector: View {
                                 }
                                 Button("Lines Output", systemImage: "text.line.first.and.arrowtriangle.forward") {
                                     addLinesFile()
+                                }
+                                Button("SSH Agent Socket", systemImage: "network") {
+                                    addSshAgent()
                                 }
                             } label: {
                                 Image(systemName: "plus")
@@ -1105,6 +1129,7 @@ private struct SurfaceInspector: View {
                         Button("INI Output", action: addIniFile)
                         Button("Direct EnvFile Output", action: addDirectEnvFile)
                         Button("Lines Output", action: addLinesFile)
+                        Button("SSH Agent Socket", action: addSshAgent)
                     }
                     .buttonStyle(.borderedProminent)
                 }
@@ -1459,8 +1484,12 @@ private struct ManageSurfaceSheet: View {
             || surface.kind == .linesFile
     }
 
+    private var isSocketSurface: Bool { surface.kind == .unixSocket }
+
+    private var isManagedSurface: Bool { isFileSurface || isSocketSurface }
+
     private var isComposedSurface: Bool {
-        selectedKind.isComposed
+        selectedKind.isComposed || selectedKind == .unixSocket
     }
 
     private var bindingCandidates: [WorkspaceBinding] {
@@ -1476,7 +1505,6 @@ private struct ManageSurfaceSheet: View {
     }
 
     private var linkSummary: String {
-        guard isFileSurface else { return "Socket lifecycle is not implemented yet" }
         guard let actualTarget else { return "Missing — repair will recreate the link" }
         return actualTarget == expectedTarget
             ? "Managed link is healthy"
@@ -1486,13 +1514,13 @@ private struct ManageSurfaceSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Edit Output").font(.title2.bold())
+                Text(isSocketSurface ? "Edit SSH Agent Socket" : "Edit Output").font(.title2.bold())
                 Text(linkSummary)
                     .font(.callout)
                     .foregroundStyle(actualTarget == expectedTarget ? Color.green : Color.orange)
             }
 
-            if isFileSurface {
+            if isManagedSurface {
                 InspectorSection(title: "Output") {
                     TextField("File name", text: $fileName)
                         .textFieldStyle(.roundedBorder)
@@ -1535,7 +1563,7 @@ private struct ManageSurfaceSheet: View {
                 }
             }
 
-            if isFileSurface {
+            if isManagedSurface {
                 InspectorSection(title: "Mounted target") {
                     Text(expectedTarget)
                         .font(.callout.monospaced())
@@ -1558,14 +1586,14 @@ private struct ManageSurfaceSheet: View {
                     NSWorkspace.shared.activateFileViewerSelecting(
                         [URL(fileURLWithPath: surface.path)])
                 }
-                if isFileSurface {
+                if isManagedSurface {
                     Button("Repair Link", systemImage: "wrench.and.screwdriver", action: repairLink)
                         .disabled(isWorking)
                 }
                 Spacer()
                 Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
-                if isFileSurface {
+                if isManagedSurface {
                     Button("Save Changes", action: saveChanges)
                         .buttonStyle(.borderedProminent)
                         .disabled(
@@ -2113,6 +2141,279 @@ private struct ProtectedFileHistorySheet: View {
     }
 }
 
+private struct NewSshAgentSheet: View {
+    @Bindable var store: WorkspaceStore
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = "SSH Agent"
+    @State private var endpoint: String
+    @State private var identities: [DiscoveredSshIdentity] = []
+    @State private var discoveredEndpoint: String?
+    @State private var note = ""
+    @State private var links: [EditableItemLink] = []
+    @State private var isDiscovering = false
+    @State private var isSaving = false
+    @State private var errorMessage: String?
+
+    init(store: WorkspaceStore) {
+        self.store = store
+        _endpoint = State(initialValue: ProcessInfo.processInfo.environment["SSH_AUTH_SOCK"] ?? "")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Connect SSH Agent").font(.title2.bold())
+                Text("Import only public identity metadata from an existing agent socket.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Name").font(.callout.weight(.medium))
+                TextField("Work SSH Agent", text: $name)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Agent socket").font(.callout.weight(.medium))
+                HStack {
+                    TextField("/absolute/path/to/agent.sock", text: $endpoint)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.body.monospaced())
+                    Button("Discover", action: discover)
+                        .disabled(isDiscovering || endpoint.isEmpty)
+                }
+                Text("Floria never imports private keys; signatures continue to be produced by this agent.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            GroupBox("Advertised identities") {
+                if isDiscovering {
+                    ProgressView("Querying agent…")
+                        .frame(maxWidth: .infinity, minHeight: 110)
+                } else if identities.isEmpty {
+                    ContentUnavailableView(
+                        "Discover an agent first", systemImage: "key.horizontal",
+                        description: Text("Its public keys and comments will appear here."))
+                        .frame(maxWidth: .infinity, minHeight: 110)
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 10) {
+                            ForEach(identities, id: \.address) { identity in
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(identity.comment.isEmpty ? "Unnamed identity" : identity.comment)
+                                        .font(.callout.weight(.medium))
+                                    Text(identity.fingerprint)
+                                        .font(.caption.monospaced())
+                                        .foregroundStyle(.secondary)
+                                        .textSelection(.enabled)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                        .padding(8)
+                    }
+                    .frame(maxHeight: 150)
+                }
+            }
+
+            ItemMetadataEditor(note: $note, links: $links)
+
+            Divider()
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Connect Agent", action: create)
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(
+                        isSaving || identities.isEmpty || discoveredEndpoint != endpoint
+                            || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(width: 620)
+        .onChange(of: endpoint) { _, value in
+            if value != discoveredEndpoint { identities = [] }
+        }
+        .alert(
+            "Could not connect SSH agent",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } })
+        ) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
+    }
+
+    private func discover() {
+        Task {
+            isDiscovering = true
+            defer { isDiscovering = false }
+            do {
+                identities = try await store.discoverSshIdentities(endpoint: endpoint)
+                discoveredEndpoint = endpoint
+                if identities.isEmpty {
+                    errorMessage = "The agent is reachable but advertises no identities."
+                }
+            } catch {
+                identities = []
+                discoveredEndpoint = nil
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func create() {
+        Task {
+            isSaving = true
+            defer { isSaving = false }
+            do {
+                try await store.createSshAgentResource(
+                    name: name, endpoint: endpoint, identities: identities,
+                    metadata: itemMetadata(note: note, links: links))
+                dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+}
+
+private struct AddSshAgentSurfaceSheet: View {
+    @Bindable var store: WorkspaceStore
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var resourceID = ""
+    @State private var selectedEntries: Set<String> = []
+    @State private var socketName = "agent.sock"
+    @State private var securityLevel = WorkspaceSecurityLevel.confirmation
+    @State private var isSaving = false
+    @State private var errorMessage: String?
+
+    private var resource: WorkspaceResource? {
+        store.sshAgentResources.first { $0.id == resourceID }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Add SSH Agent Socket").font(.title2.bold())
+                Text("Expose a project-specific set of identities through one filtered socket.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            if store.sshAgentResources.isEmpty {
+                ContentUnavailableView(
+                    "No SSH Agents", systemImage: "network",
+                    description: Text("Connect an upstream SSH agent from the SSH Agents section first."))
+                    .frame(maxWidth: .infinity, minHeight: 180)
+            } else {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("Upstream agent").font(.callout.weight(.medium))
+                    Picker("Upstream agent", selection: $resourceID) {
+                        ForEach(store.sshAgentResources) { resource in
+                            Text("\(resource.name) · \(resource.entries.count) identities")
+                                .tag(resource.id)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(maxWidth: .infinity)
+                }
+
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("Project socket name").font(.callout.weight(.medium))
+                    TextField("agent.sock", text: $socketName)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.body.monospaced())
+                }
+
+                if let resource {
+                    GroupBox("Exposed identities") {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 7) {
+                                ForEach(resource.entries) { entry in
+                                    Toggle(entry.label, isOn: entrySelection(entry.address))
+                                        .toggleStyle(.checkbox)
+                                }
+                            }
+                            .padding(8)
+                        }
+                        .frame(maxHeight: 160)
+                    }
+                }
+
+                SecurityLevelPicker(selection: $securityLevel)
+            }
+
+            Divider()
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Create Socket", action: create)
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(
+                        isSaving || resourceID.isEmpty || selectedEntries.isEmpty
+                            || socketName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(width: 580)
+        .onAppear {
+            if resourceID.isEmpty { selectResource(store.sshAgentResources.first?.id ?? "") }
+        }
+        .onChange(of: resourceID) { _, value in selectResource(value) }
+        .alert(
+            "Could not create SSH agent socket",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } })
+        ) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
+    }
+
+    private func selectResource(_ id: String) {
+        resourceID = id
+        selectedEntries = Set(
+            store.sshAgentResources.first(where: { $0.id == id })?.entries.map(\.address) ?? [])
+    }
+
+    private func entrySelection(_ address: String) -> Binding<Bool> {
+        Binding(
+            get: { selectedEntries.contains(address) },
+            set: { selected in
+                if selected { selectedEntries.insert(address) }
+                else { selectedEntries.remove(address) }
+            })
+    }
+
+    private func create() {
+        Task {
+            isSaving = true
+            defer { isSaving = false }
+            do {
+                try await store.createSshAgentSurface(
+                    resourceID: resourceID, selectedEntries: selectedEntries,
+                    socketName: socketName, securityLevel: securityLevel)
+                dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+}
+
 private struct ResourceCatalogView: View {
     @Bindable var store: WorkspaceStore
     let title: String
@@ -2124,6 +2425,7 @@ private struct ResourceCatalogView: View {
     @State private var editingSharedSecret: WorkspaceResource?
     @State private var editingResourceInfo: WorkspaceResource?
     @State private var deletingSharedSecret: WorkspaceResource?
+    @State private var deletingSshAgent: WorkspaceResource?
 
     private var filtered: [WorkspaceResource] {
         store.resources.filter { resource in
@@ -2173,17 +2475,25 @@ private struct ResourceCatalogView: View {
                     VStack(alignment: .trailing, spacing: 3) {
                         HStack(spacing: 7) {
                             ResourceKindBadge(kind: resource.kind)
-                            SecurityLevelMenu(level: resource.securityLevel) { securityLevel in
-                                try await store.updateResourceMetadata(
-                                    resource.id, name: resource.name,
-                                    securityLevel: securityLevel, metadata: resource.metadata)
+                            if resource.kind == .sshAgent {
+                                Text("Public keys")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                SecurityLevelMenu(level: resource.securityLevel) { securityLevel in
+                                    try await store.updateResourceMetadata(
+                                        resource.id, name: resource.name,
+                                        securityLevel: securityLevel, metadata: resource.metadata)
+                                }
                             }
                         }
                         Text("Used by \(resource.usageCount) projects")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
-                    if resource.kind == .sharedSecret || resource.kind == .envFile {
+                    if resource.kind == .sharedSecret || resource.kind == .envFile
+                        || resource.kind == .sshAgent
+                    {
                         Menu {
                             if resource.kind == .sharedSecret {
                                 Button("Edit Secret…", systemImage: "pencil") {
@@ -2206,6 +2516,11 @@ private struct ResourceCatalogView: View {
                                 Divider()
                                 Button("Delete Secret…", systemImage: "trash", role: .destructive) {
                                     deletingSharedSecret = resource
+                                }
+                            } else if resource.kind == .sshAgent {
+                                Divider()
+                                Button("Disconnect Agent…", systemImage: "trash", role: .destructive) {
+                                    deletingSshAgent = resource
                                 }
                             }
                         } label: {
@@ -2266,6 +2581,28 @@ private struct ResourceCatalogView: View {
                 }
             }
         }
+        .alert(
+            deletingSshAgent?.usageCount == 0
+                ? "Disconnect SSH Agent?" : "SSH Agent Is In Use",
+            isPresented: Binding(
+                get: { deletingSshAgent != nil },
+                set: { if !$0 { deletingSshAgent = nil } })
+        ) {
+            if let resource = deletingSshAgent, resource.usageCount == 0 {
+                Button("Cancel", role: .cancel) { deletingSshAgent = nil }
+                Button("Disconnect", role: .destructive) {
+                    deleteSshAgent(resource)
+                }
+            } else {
+                Button("OK") { deletingSshAgent = nil }
+            }
+        } message: {
+            if let resource = deletingSshAgent {
+                Text(resource.usageCount == 0
+                    ? "Floria removes only the saved public identity metadata. The upstream agent is not changed."
+                    : "Remove this agent from its project bindings first.")
+            }
+        }
     }
 
     private func deleteSharedSecret(_ resource: WorkspaceResource) {
@@ -2273,6 +2610,17 @@ private struct ResourceCatalogView: View {
         Task {
             do {
                 try await store.deleteSharedSecret(resource.id)
+            } catch {
+                store.lastError = error.localizedDescription
+            }
+        }
+    }
+
+    private func deleteSshAgent(_ resource: WorkspaceResource) {
+        deletingSshAgent = nil
+        Task {
+            do {
+                try await store.removeSshAgentResource(resource.id)
             } catch {
                 store.lastError = error.localizedDescription
             }
@@ -2304,8 +2652,11 @@ private struct EditResourceMetadataSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Edit Env File Info").font(.title2.bold())
-                Text("Change how this encrypted document is identified in Floria.")
+                Text(resource.kind == .sshAgent ? "Edit SSH Agent Info" : "Edit Env File Info")
+                    .font(.title2.bold())
+                Text(resource.kind == .sshAgent
+                    ? "Change how this upstream agent is identified in Floria."
+                    : "Change how this encrypted document is identified in Floria.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -2315,7 +2666,9 @@ private struct EditResourceMetadataSheet: View {
                 TextField("Team defaults", text: $name)
                     .textFieldStyle(.roundedBorder)
             }
-            SecurityLevelPicker(selection: $securityLevel)
+            if resource.kind != .sshAgent {
+                SecurityLevelPicker(selection: $securityLevel)
+            }
             ItemMetadataEditor(note: $note, links: $links)
 
             Divider()
@@ -2334,7 +2687,7 @@ private struct EditResourceMetadataSheet: View {
         .padding(24)
         .frame(width: 560)
         .alert(
-            "Could not update Env File",
+            resource.kind == .sshAgent ? "Could not update SSH Agent" : "Could not update Env File",
             isPresented: Binding(
                 get: { errorMessage != nil },
                 set: { if !$0 { errorMessage = nil } })
@@ -2495,7 +2848,7 @@ private struct AddBindingSheet: View {
     private var outputs: [WorkspaceSurface] {
         (store.selectedEnvironment?.surfaces ?? []).filter {
             $0.kind == .dotenvFile || $0.kind == .direnvFile || $0.kind == .iniFile
-                || $0.kind == .linesFile
+                || $0.kind == .linesFile || $0.kind == .unixSocket
         }
     }
 

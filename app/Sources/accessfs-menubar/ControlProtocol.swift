@@ -93,6 +93,12 @@ struct CatalogResourceSource: Codable, Sendable {
         case type, value, argv, endpoint
         case secretID = "secret_id"
     }
+
+
+    static func socket(_ endpoint: String) -> CatalogResourceSource {
+        CatalogResourceSource(
+            type: "socket", secretID: nil, value: nil, argv: nil, endpoint: endpoint)
+    }
 }
 
 struct CatalogResource: Codable, Sendable {
@@ -219,6 +225,12 @@ struct CatalogSnapshot: Codable, Sendable {
     let surfaces: [CatalogSurface]
 }
 
+struct DiscoveredSshIdentity: Codable, Hashable, Sendable {
+    let address: String
+    let fingerprint: String
+    let comment: String
+}
+
 struct CatalogProtectedFile: Codable, Sendable {
     let id: String
     let sourcePath: String
@@ -248,6 +260,7 @@ enum ControlCommand: Sendable {
     case policyModeGet
     case policyModeSet(mode: RuntimePolicyMode, durationSecs: UInt64?)
     case snapshot
+    case sshAgentDiscover(endpoint: String)
     case protectedFiles
     case fileProtect(String)
     case protectedFileHistory(String)
@@ -268,6 +281,8 @@ enum ControlCommand: Sendable {
         enforcement: String, metadata: ItemMetadata)
     case resourceMetadataUpdate(
         resourceID: String, name: String, enforcement: String, metadata: ItemMetadata)
+    case resourceUpsert(CatalogResource)
+    case resourceRemove(String)
     case projectCreate(CatalogProject, CatalogEnvironment, CatalogSurface)
     case projectUpsert(CatalogProject)
     case projectRemove(String)
@@ -283,6 +298,7 @@ enum ControlCommand: Sendable {
         case .policyModeGet: "policy_mode_get"
         case .policyModeSet: "policy_mode_set"
         case .snapshot: "snapshot"
+        case .sshAgentDiscover: "ssh_agent_discover"
         case .protectedFiles: "protected_files"
         case .fileProtect: "file_protect"
         case .protectedFileHistory: "protected_file_history"
@@ -294,6 +310,8 @@ enum ControlCommand: Sendable {
         case .sharedSecretRemove: "shared_secret_remove"
         case .envFileCreate: "env_file_create"
         case .resourceMetadataUpdate: "resource_metadata_update"
+        case .resourceUpsert: "resource_upsert"
+        case .resourceRemove: "resource_remove"
         case .projectCreate: "project_create"
         case .projectUpsert: "project_upsert"
         case .projectRemove: "project_remove"
@@ -315,6 +333,11 @@ enum ControlCommand: Sendable {
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: PolicyModeSetParams(mode: mode, durationSecs: durationSecs)))
+        case .sshAgentDiscover(let endpoint):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: SshAgentDiscoverParams(endpoint: endpoint)))
         case .fileProtect(let path):
             return try encoder.encode(
                 ControlRequest(
@@ -372,6 +395,11 @@ enum ControlCommand: Sendable {
                     params: ResourceMetadataUpdateParams(
                         resourceID: resourceID, name: name, enforcement: enforcement,
                         metadata: metadata)))
+        case .resourceUpsert(let resource):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: ResourceUpsertParams(resource: resource)))
         case .projectCreate(let project, let environment, let surface):
             return try encoder.encode(
                 ControlRequest(
@@ -383,8 +411,8 @@ enum ControlCommand: Sendable {
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: ProjectUpsertParams(project: project)))
-        case .projectRemove(let id), .environmentRemove(let id), .bindingRemove(let id),
-            .surfaceRemove(let id):
+        case .projectRemove(let id), .environmentRemove(let id), .resourceRemove(let id),
+            .bindingRemove(let id), .surfaceRemove(let id):
             return try encoder.encode(
                 ControlRequest(
                     requestID: requestID, method: method, params: RemoveParams(id: id)))
@@ -411,6 +439,8 @@ private struct PolicyModeSetParams: Encodable {
     let mode: RuntimePolicyMode
     let durationSecs: UInt64?
 }
+
+private struct SshAgentDiscoverParams: Encodable { let endpoint: String }
 
 private struct ControlRequestWithoutParams: Encodable {
     let requestID: UInt64
@@ -470,6 +500,8 @@ private struct ResourceMetadataUpdateParams: Encodable {
     let enforcement: String
     let metadata: ItemMetadata
 }
+
+private struct ResourceUpsertParams: Encodable { let resource: CatalogResource }
 
 private struct ProjectUpsertParams: Encodable { let project: CatalogProject }
 private struct RemoveParams: Encodable { let id: String }

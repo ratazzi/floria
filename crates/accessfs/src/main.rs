@@ -10,7 +10,7 @@ use accessfs_catalog::{
 };
 use accessfs_control::{
     CatalogObserver, ControlClient, ControlCommand, ControlResult, ControlServer,
-    RuntimePolicyController,
+    RuntimePolicyController, SshIdentity, SshIdentityDiscovery,
 };
 use accessfs_core::audit::AuditLog;
 use accessfs_core::authz::{Authorizer, Enforcement, PolicyMode, PolicyModeStatus};
@@ -134,6 +134,8 @@ enum ControlCmd {
     },
     /// Show every binding and surface affected by a resource.
     Usage { resource_id: String },
+    /// List the public identities advertised by an upstream SSH agent.
+    SshDiscover { endpoint: PathBuf },
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -405,13 +407,15 @@ fn cmd_mount(config: &Path) -> Result<()> {
     let policy: Arc<dyn RuntimePolicyController> = Arc::new(AgentPolicyController {
         agent: Arc::clone(&agent),
     });
-    let _control = ControlServer::start_runtime_with_policy(
+    let ssh_discovery: Arc<dyn SshIdentityDiscovery> = Arc::new(AgentSshIdentityDiscovery);
+    let _control = ControlServer::start_runtime_with_services(
         &control_path,
         catalog.clone(),
         Arc::clone(&store),
         cfg.mount_path.clone(),
         observer,
         policy,
+        ssh_discovery,
     )
         .with_context(|| format!("starting control socket at {}", control_path.display()))?;
     tracing::info!(socket = %control_path.display(), "control socket listening");
@@ -428,6 +432,23 @@ fn cmd_mount(config: &Path) -> Result<()> {
 
 struct AgentPolicyController {
     agent: Arc<accessfs_agent::SocketAgent>,
+}
+
+struct AgentSshIdentityDiscovery;
+
+impl SshIdentityDiscovery for AgentSshIdentityDiscovery {
+    fn discover(&self, endpoint: &Path) -> std::io::Result<Vec<SshIdentity>> {
+        accessfs_agent::discover_identities(endpoint).map(|identities| {
+            identities
+                .into_iter()
+                .map(|identity| SshIdentity {
+                    address: identity.address,
+                    fingerprint: identity.fingerprint,
+                    comment: identity.comment,
+                })
+                .collect()
+        })
+    }
 }
 
 impl RuntimePolicyController for AgentPolicyController {
@@ -614,6 +635,7 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
             ControlCommand::ResolveEnvironment { project_id, environment_id }
         }
         ControlCmd::Usage { resource_id } => ControlCommand::ResourceUsage { resource_id },
+        ControlCmd::SshDiscover { endpoint } => ControlCommand::SshAgentDiscover { endpoint },
     };
     match client.request(command)? {
         ControlResult::Pong { schema_version } => {
@@ -624,6 +646,9 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
         }
         ControlResult::Snapshot(snapshot) => {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        }
+        ControlResult::SshAgentIdentities(identities) => {
+            println!("{}", serde_json::to_string_pretty(&identities)?);
         }
         ControlResult::ProtectedFiles(files) => {
             println!("{}", serde_json::to_string_pretty(&files)?);

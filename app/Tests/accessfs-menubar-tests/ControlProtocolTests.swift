@@ -38,6 +38,47 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(normal, .normal)
     }
 
+    func testSshAgentDiscoveryAndResourceRequestsMatchRustWireShape() throws {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let discover = try ControlCommand.sshAgentDiscover(
+            endpoint: "/private/tmp/fixture-agent.sock"
+        ).requestData(requestID: 72, encoder: encoder)
+        let discoverValue = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: discover) as? [String: Any])
+        XCTAssertEqual(discoverValue["method"] as? String, "ssh_agent_discover")
+        XCTAssertEqual(
+            (discoverValue["params"] as? [String: Any])?["endpoint"] as? String,
+            "/private/tmp/fixture-agent.sock")
+
+        let resource = CatalogResource(
+            id: "fixture-agent", name: "Fixture Agent", kind: "ssh_agent", shape: "socket",
+            codec: "opaque", defaultEnvKey: nil,
+            entries: [
+                CatalogEntry(
+                    address: "ssh/sha256/fixture-address", label: "Fixture key", key: nil,
+                    sensitive: false)
+            ], source: .socket("/private/tmp/fixture-agent.sock"), enforcement: "prompt",
+            metadata: .empty)
+        let upsert = try ControlCommand.resourceUpsert(resource)
+            .requestData(requestID: 73, encoder: encoder)
+        let upsertValue = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: upsert) as? [String: Any])
+        let encodedResource = try XCTUnwrap(
+            (upsertValue["params"] as? [String: Any])?["resource"] as? [String: Any])
+        XCTAssertEqual(upsertValue["method"] as? String, "resource_upsert")
+        XCTAssertEqual(encodedResource["kind"] as? String, "ssh_agent")
+        XCTAssertEqual(
+            (encodedResource["source"] as? [String: Any])?["endpoint"] as? String,
+            "/private/tmp/fixture-agent.sock")
+
+        let response = try JSONDecoder().decode(
+            ControlResponseEnvelope<[DiscoveredSshIdentity]>.self,
+            from: Data(
+                #"{"request_id":72,"status":"ok","result":{"type":"ssh_agent_identities","value":[{"address":"ssh/sha256/fixture-address","fingerprint":"SHA256:fixture","comment":"Fixture key"}]}}"#.utf8))
+        XCTAssertEqual(response.result?.value?.first?.comment, "Fixture key")
+    }
+
     func testFileProtectRequestCarriesOnlyTheSelectedPath() throws {
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
@@ -253,6 +294,7 @@ final class ControlProtocolTests: XCTestCase {
         let commands: [(ControlCommand, String)] = [
             (.projectRemove("fixture-project"), "project_remove"),
             (.environmentRemove("fixture-environment"), "environment_remove"),
+            (.resourceRemove("fixture-resource"), "resource_remove"),
             (.bindingRemove("fixture-binding"), "binding_remove"),
             (.surfaceRemove("fixture-surface"), "surface_remove"),
         ]

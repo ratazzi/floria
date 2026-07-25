@@ -47,7 +47,8 @@ pub struct SocketAgent {
     managed_enforcement: RwLock<HashMap<String, Enforcement>>,
     /// Daemon-wide runtime override, persisted independently from per-item catalog settings.
     policy_mode: PolicyModeState,
-    /// (grant_key, path, operation) -> grant expiry. Operation is part of the key so a read
+    /// (grant_key, object, operation) -> grant expiry. The object is the path for file access and
+    /// path + public-key fingerprint for SSH signatures. Operation is part of the key so a read
     /// grant never authorizes a write (and vice versa) — approving "read .env" must not let
     /// the same subject silently rewrite it within the TTL.
     grants: DashMap<(String, String, Operation), Instant>,
@@ -112,7 +113,7 @@ impl SocketAgent {
         enforcement: Enforcement,
         grant_key: String,
     ) -> Decision {
-        let key = (grant_key, req.path.to_string(), req.operation);
+        let key = (grant_key, grant_object(req), req.operation);
 
         if self.grant_valid(&key) {
             return Decision::allow("cached grant").with_rule("grant");
@@ -162,6 +163,15 @@ impl SocketAgent {
             }
             None => false,
         }
+    }
+}
+
+fn grant_object(req: &AuthRequest<'_>) -> String {
+    match req.context {
+        Some(accessfs_core::authz::AccessContext::SshSign(context)) => {
+            format!("{}#{}", req.path, context.key_fingerprint)
+        }
+        None => req.path.to_string(),
     }
 }
 
@@ -261,6 +271,7 @@ fn grant_ttl(d: &crate::protocol::ClientDecision) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use accessfs_core::authz::{AccessContext, SshSignContext};
     use accessfs_core::rules::{any_path_glob, Rule, RuleOps, SubjectMatch};
 
     fn agent_with_rules(dir: &std::path::Path, rules: Vec<Rule>) -> SocketAgent {
@@ -326,6 +337,60 @@ mod tests {
         let d = agent.authorize(&req(&id, Operation::Write));
         assert!(!d.is_allowed());
         assert_eq!(d.rule_id.as_deref(), Some("fail-closed"));
+    }
+
+    #[test]
+    fn ssh_grant_is_scoped_to_one_public_identity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = agent_with_rules(
+            tmp.path(),
+            vec![Rule {
+                id: "prompt-sign".into(),
+                priority: 0,
+                subject: SubjectMatch::default(),
+                path_glob: any_path_glob(),
+                ops: RuleOps::SIGN,
+                enforcement: Enforcement::Prompt,
+                enabled: true,
+            }],
+        );
+        let id = ProcessIdentity::bare(1234, 501, 20);
+        let first = SshSignContext {
+            surface_id: "fixture-agent",
+            surface_name: "Fixture Agent",
+            resource_id: "fixture-provider",
+            key_fingerprint: "SHA256:fixture-first",
+            key_label: "First key",
+        };
+        let second = SshSignContext {
+            key_fingerprint: "SHA256:fixture-second",
+            key_label: "Second key",
+            ..first
+        };
+        let first_request = AuthRequest {
+            path: "surfaces/fixture-agent",
+            display: Some("Fixture Agent"),
+            operation: Operation::Sign,
+            context: Some(AccessContext::SshSign(first)),
+            identity: &id,
+        };
+        agent.grants.insert(
+            (
+                grant_key(&id, None),
+                grant_object(&first_request),
+                Operation::Sign,
+            ),
+            Instant::now() + Duration::from_secs(600),
+        );
+
+        assert!(agent.authorize(&first_request).is_allowed());
+        let second_request = AuthRequest {
+            context: Some(AccessContext::SshSign(second)),
+            ..first_request
+        };
+        let decision = agent.authorize(&second_request);
+        assert!(!decision.is_allowed());
+        assert_eq!(decision.rule_id.as_deref(), Some("fail-closed"));
     }
 
     #[test]

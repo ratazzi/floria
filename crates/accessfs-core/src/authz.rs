@@ -18,8 +18,8 @@ pub struct AuthRequest<'a> {
     /// grants, and audit all keep keying on the stable `path`.
     pub display: Option<&'a str>,
     pub operation: Operation,
-    /// Operation-specific public metadata for prompts and audit. Policy continues to key on the
-    /// stable path + operation; callers must never place payloads or bytes-to-sign here.
+    /// Operation-specific public metadata for prompts, grant scoping, and audit. Rules continue
+    /// to key on stable path + operation; callers must never place payloads or bytes-to-sign here.
     pub context: Option<AccessContext<'a>>,
     /// Enriched identity of the reader.
     pub identity: &'a ProcessIdentity,

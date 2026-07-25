@@ -224,6 +224,7 @@ struct WorkspaceResource: Identifiable, Hashable, Sendable {
     }
 
     var exportSummary: String {
+        if kind == .sshAgent { return "\(entries.count) identit\(entries.count == 1 ? "y" : "ies")" }
         if exports.isEmpty, entries.count == 1 { return "Keyless value" }
         if exports.count == 1, let key = exports.first?.key { return key }
         return "\(entries.count) entries"
@@ -615,6 +616,10 @@ final class WorkspaceStore {
         resources.filter { $0.kind == .envFile && $0.codec == .dotenv }
     }
 
+    var sshAgentResources: [WorkspaceResource] {
+        resources.filter { $0.kind == .sshAgent && $0.shape == .socket }
+    }
+
     func compatibleBindings(for kind: WorkspaceSurfaceKind) -> [WorkspaceBinding] {
         (commonBindings + environmentBindings).filter { bindingIsCompatible($0, with: kind) }
     }
@@ -652,7 +657,11 @@ final class WorkspaceStore {
                 && (resource.kind == .sharedSecret || resource.kind == .secret
                     || resource.kind == .literal)
                 && binding.keyOverride == nil && entries.count == 1 && entries[0].key == nil
-        case .envFileDirect, .regularFile, .unixSocket:
+        case .unixSocket:
+            return resource.kind == .sshAgent && resource.shape == .socket
+                && resource.codec == .opaque && binding.keyOverride == nil
+                && !entries.isEmpty && entries.allSatisfy { $0.key == nil && !$0.sensitive }
+        case .envFileDirect, .regularFile:
             return false
         }
     }
@@ -915,6 +924,60 @@ final class WorkspaceStore {
         lastError = nil
     }
 
+    func discoverSshIdentities(endpoint: String) async throws -> [DiscoveredSshIdentity] {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        let endpoint = (endpoint as NSString).expandingTildeInPath
+        guard (endpoint as NSString).isAbsolutePath else {
+            throw WorkspaceStoreError.invalid("SSH agent socket path must be absolute")
+        }
+        return try await controlClient.discoverSshIdentities(endpoint: endpoint)
+    }
+
+    @discardableResult
+    func createSshAgentResource(
+        name: String, endpoint: String, identities: [DiscoveredSshIdentity],
+        metadata: ItemMetadata = .empty
+    ) async throws -> WorkspaceResource.ID {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let endpoint = (endpoint as NSString).expandingTildeInPath
+        guard !name.isEmpty else { throw WorkspaceStoreError.invalid("Agent name is required") }
+        guard (endpoint as NSString).isAbsolutePath else {
+            throw WorkspaceStoreError.invalid("SSH agent socket path must be absolute")
+        }
+        guard !identities.isEmpty else {
+            throw WorkspaceStoreError.invalid("The SSH agent did not advertise any identities")
+        }
+        let metadata = try Self.validatedMetadata(metadata)
+        let resourceID = Self.newID("ssh-agent")
+        try await controlClient.upsertResource(
+            CatalogResource(
+                id: resourceID, name: name, kind: "ssh_agent", shape: "socket",
+                codec: "opaque", defaultEnvKey: nil,
+                entries: identities.map { identity in
+                    let comment = identity.comment.trimmingCharacters(in: .whitespacesAndNewlines)
+                    return CatalogEntry(
+                        address: identity.address,
+                        label: comment.isEmpty ? identity.fingerprint : comment,
+                        key: nil, sensitive: false)
+                },
+                source: .socket(endpoint), enforcement: WorkspaceSecurityLevel.confirmation.rawValue,
+                metadata: metadata))
+        apply(try await controlClient.snapshot())
+        lastError = nil
+        return resourceID
+    }
+
+    func removeSshAgentResource(_ id: WorkspaceResource.ID) async throws {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        guard resources.contains(where: { $0.id == id && $0.kind == .sshAgent }) else {
+            throw WorkspaceStoreError.invalid("Choose an SSH agent first")
+        }
+        try await controlClient.removeResource(id)
+        apply(try await controlClient.snapshot())
+        lastError = nil
+    }
+
     @discardableResult
     func createEnvironment(name: String, fileName: String) async throws -> WorkspaceEnvironment.ID {
         guard let controlClient else {
@@ -1079,6 +1142,49 @@ final class WorkspaceStore {
         return surfaceID
     }
 
+    @discardableResult
+    func createSshAgentSurface(
+        resourceID: WorkspaceResource.ID, selectedEntries: Set<String>, socketName: String,
+        securityLevel: WorkspaceSecurityLevel
+    ) async throws -> WorkspaceSurface.ID {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        guard let project = selectedProject, let environment = selectedEnvironment else {
+            throw WorkspaceStoreError.invalid("Select a project environment first")
+        }
+        guard let resource = sshAgentResources.first(where: { $0.id == resourceID }) else {
+            throw WorkspaceStoreError.invalid("Choose an SSH agent")
+        }
+        let addresses = resource.entries.map(\.address).filter(selectedEntries.contains)
+        guard !addresses.isEmpty else {
+            throw WorkspaceStoreError.invalid("Select at least one SSH identity")
+        }
+        let output = try newSurfaceOutput(fileName: socketName, in: project)
+        let bindingID = Self.newID("binding")
+        let surfaceID = Self.newID("ssh-agent")
+        let selection: CatalogEntrySelection = addresses.count == resource.entries.count
+            ? .all : .entries(addresses)
+        try await controlClient.upsertBinding(
+            CatalogBinding(
+                id: bindingID, projectID: project.id, scope: .environment(environment.id),
+                resourceID: resource.id, selection: selection, keyOverride: nil, enabled: true,
+                allowOverride: false, position: Int64(environment.bindings.count)))
+        do {
+            try await controlClient.upsertSurface(
+                CatalogSurface(
+                    id: surfaceID, environmentID: environment.id, name: output.name,
+                    kind: "unix_socket", path: output.path, input: .bindings([bindingID]),
+                    enforcement: securityLevel.rawValue,
+                    position: Int64(environment.surfaces.count)))
+        } catch {
+            try? await controlClient.removeBinding(bindingID)
+            throw error
+        }
+        apply(try await controlClient.snapshot())
+        selectedSurfaceID = surfaceID
+        lastError = nil
+        return surfaceID
+    }
+
     func toggleBinding(_ id: WorkspaceBinding.ID) async {
         guard let binding = (commonBindings + environmentBindings).first(where: { $0.id == id })
         else { return }
@@ -1116,7 +1222,7 @@ final class WorkspaceStore {
         let surfaceID = requestedSurfaceID ?? selectedSurfaceID
         guard let surface = environment.surfaces.first(where: { $0.id == surfaceID }),
             surface.kind == .dotenvFile || surface.kind == .direnvFile || surface.kind == .iniFile
-                || surface.kind == .linesFile
+                || surface.kind == .linesFile || surface.kind == .unixSocket
         else {
             throw WorkspaceStoreError.invalid("Choose a composed output for this binding")
         }
@@ -1246,7 +1352,7 @@ final class WorkspaceStore {
         let input: CatalogSurfaceInput
         switch surface.input {
         case .bindings:
-            guard kind.isComposed else {
+            guard kind.isComposed || (surface.kind == .unixSocket && kind == .unixSocket) else {
                 throw WorkspaceStoreError.invalid("Choose a composed output format")
             }
             let allowed = Set(compatibleBindings(for: kind).map(\.id))
@@ -1281,7 +1387,7 @@ final class WorkspaceStore {
             let position = environment.surfaces.firstIndex(where: { $0.id == id }),
             let surface = environment.surfaces.first(where: { $0.id == id }),
             surface.kind == .dotenvFile || surface.kind == .direnvFile || surface.kind == .iniFile
-                || surface.kind == .linesFile
+                || surface.kind == .linesFile || surface.kind == .unixSocket
         else {
             throw WorkspaceStoreError.invalid("Choose a composed output first")
         }
@@ -1324,7 +1430,11 @@ final class WorkspaceStore {
     }
 
     func expectedLinkTarget(for surface: WorkspaceSurface) -> String {
-        (NSHomeDirectory() as NSString).appendingPathComponent(
+        if surface.kind == .unixSocket {
+            return (NSHomeDirectory() as NSString).appendingPathComponent(
+                "Library/Application Support/floria/runtime/sockets/\(surface.id).sock")
+        }
+        return (NSHomeDirectory() as NSString).appendingPathComponent(
             ".accessfs/surfaces/\(surface.id)")
     }
 
@@ -1583,10 +1693,12 @@ private extension WorkspaceSurface {
         default: return nil
         }
         let expectedTarget = (NSHomeDirectory() as NSString).appendingPathComponent(
-            ".accessfs/surfaces/\(surface.id)")
+            kind == .unixSocket
+                ? "Library/Application Support/floria/runtime/sockets/\(surface.id).sock"
+                : ".accessfs/surfaces/\(surface.id)")
         let linkTarget = try? FileManager.default.destinationOfSymbolicLink(atPath: surface.path)
-        let status: WorkspaceSurfaceStatus = kind == .unixSocket
-            ? .listening : (linkTarget == expectedTarget ? .linked : .stopped)
+        let status: WorkspaceSurfaceStatus = linkTarget == expectedTarget
+            ? (kind == .unixSocket ? .listening : .linked) : .stopped
         self.init(
             id: surface.id, name: surface.name, kind: kind, path: surface.path,
             status: status, input: input,

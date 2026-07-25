@@ -185,6 +185,29 @@ final class WorkspaceModelTests: XCTestCase {
         XCTAssertNil(WorkspaceIniPreset.generic.pathEnvironmentKey)
     }
 
+    func testSshAgentBindingsOnlyFeedSocketSurfaces() {
+        let resource = WorkspaceResource(
+            id: "fixture-agent", name: "Fixture Agent", kind: .sshAgent, shape: .socket,
+            exports: [],
+            entries: [
+                WorkspaceEntry(
+                    address: "ssh/sha256/fixture-address", label: "Fleet key", key: nil,
+                    sensitive: false)
+            ], usageCount: 0)
+        let binding = WorkspaceBinding(
+            id: "fixture-binding", resourceID: resource.id, keyOverride: nil, isEnabled: true)
+        let store = WorkspaceStore(projects: [], resources: [resource])
+
+        XCTAssertTrue(store.bindingIsCompatible(binding, with: .unixSocket))
+        XCTAssertFalse(store.bindingIsCompatible(binding, with: .dotenvFile))
+        XCTAssertEqual(resource.exportSummary, "1 identity")
+
+        let preview = WorkspaceStore.preview()
+        preview.selectedSurfaceID = "floria-dev-ssh-socket"
+        let socket = preview.selectedSurface!
+        XCTAssertTrue(preview.expectedLinkTarget(for: socket).hasSuffix(".sock"))
+    }
+
     func testProtectedFileKindsAreInferredWithoutParsingContent() {
         XCTAssertEqual(WorkspaceProtectedFileKind.infer(from: "/fixture/project/.env"), .dotenv)
         XCTAssertEqual(

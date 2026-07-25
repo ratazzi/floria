@@ -57,6 +57,7 @@ pub enum ControlCommand {
     PolicyModeGet,
     PolicyModeSet { mode: PolicyMode, duration_secs: Option<u64> },
     Snapshot,
+    SshAgentDiscover { endpoint: PathBuf },
     ProtectedFiles,
     FileProtect { path: PathBuf },
     ProtectedFileHistory { id: String },
@@ -134,6 +135,7 @@ pub enum ControlResult {
     Pong { schema_version: i64 },
     PolicyMode(PolicyModeStatus),
     Snapshot(CatalogSnapshot),
+    SshAgentIdentities(Vec<SshIdentity>),
     ProtectedFiles(Vec<ProtectedFile>),
     FileProtected { file: ProtectedFile, created: bool },
     ProtectedFileHistory { id: String, versions: Vec<ProtectedFileVersion> },
@@ -145,6 +147,13 @@ pub enum ControlResult {
     SharedSecretRotated { resource_id: String, version: u32 },
     EnvFileCreated { resource: Resource, version: u32 },
     Empty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshIdentity {
+    pub address: String,
+    pub fingerprint: String,
+    pub comment: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -295,6 +304,20 @@ mod tests {
         assert_eq!(value["method"], "env_file_create");
         assert_eq!(value["params"]["codec"], "ini");
         assert_eq!(value["params"]["resource_id"], "fixture-ini");
+    }
+
+    #[test]
+    fn ssh_agent_discovery_carries_only_the_public_endpoint() {
+        let request = ControlRequest {
+            request_id: 10,
+            command: ControlCommand::SshAgentDiscover {
+                endpoint: PathBuf::from("/private/tmp/fixture-agent.sock"),
+            },
+        };
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["method"], "ssh_agent_discover");
+        assert_eq!(value["params"]["endpoint"], "/private/tmp/fixture-agent.sock");
     }
 
     #[test]

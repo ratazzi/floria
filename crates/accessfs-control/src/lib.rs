@@ -10,6 +10,8 @@ mod server;
 pub use client::ControlClient;
 pub use protocol::{
     ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest, ControlResponse,
-    ControlResult, ProtectedFile, ProtectedFileVersion, SecretValue,
+    ControlResult, ProtectedFile, ProtectedFileVersion, SecretValue, SshIdentity,
 };
-pub use server::{CatalogObserver, ControlServer, RuntimePolicyController};
+pub use server::{
+    CatalogObserver, ControlServer, RuntimePolicyController, SshIdentityDiscovery,
+};
