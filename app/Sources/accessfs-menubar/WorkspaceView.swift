@@ -2484,6 +2484,10 @@ private struct AddSshAgentSurfaceSheet: View {
         store.sshIdentityProviders.first { $0.id == resourceID }
     }
 
+    private var reusableSurface: WorkspaceSurface? {
+        store.reusableEmptySshAgentSurface(socketName: socketName)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 4) {
@@ -2516,6 +2520,16 @@ private struct AddSshAgentSurfaceSheet: View {
                     TextField("agent.sock", text: $socketName)
                         .textFieldStyle(.roundedBorder)
                         .font(.body.monospaced())
+                }
+
+                if let reusableSurface {
+                    Label("Attach to existing empty socket", systemImage: "arrow.trianglehead.merge")
+                        .font(.callout.weight(.medium))
+                    Text(
+                        "\(reusableSurface.name) already owns this project path. Floria will keep the socket and attach the selected identity."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 }
 
                 if let resource {
@@ -2564,7 +2578,7 @@ private struct AddSshAgentSurfaceSheet: View {
                 Spacer()
                 Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
-                Button("Create Socket", action: create)
+                Button(reusableSurface == nil ? "Create Socket" : "Attach Identity", action: create)
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
                     .disabled(
@@ -2576,8 +2590,10 @@ private struct AddSshAgentSurfaceSheet: View {
         .frame(width: 580)
         .onAppear {
             if resourceID.isEmpty { selectResource(store.sshIdentityProviders.first?.id ?? "") }
+            adoptReusableSurfaceSettings()
         }
         .onChange(of: resourceID) { _, value in selectResource(value) }
+        .onChange(of: socketName) { _, _ in adoptReusableSurfaceSettings() }
         .alert(
             "Could not create SSH agent socket",
             isPresented: Binding(
@@ -2594,6 +2610,16 @@ private struct AddSshAgentSurfaceSheet: View {
         resourceID = id
         selectedEntries = Set(
             store.sshIdentityProviders.first(where: { $0.id == id })?.entries.map(\.address) ?? [])
+    }
+
+    private func adoptReusableSurfaceSettings() {
+        guard let surface = reusableSurface else { return }
+        securityLevel = surface.securityLevel
+        hostPatterns = surface.sshRoute?.hostPatterns.joined(separator: " ") ?? ""
+        hostname = surface.sshRoute?.hostname ?? ""
+        user = surface.sshRoute?.user ?? ""
+        port = surface.sshRoute?.port.map(String.init) ?? ""
+        forwardAgent = surface.sshRoute?.forwardAgent ?? false
     }
 
     private func entrySelection(_ address: String) -> Binding<Bool> {

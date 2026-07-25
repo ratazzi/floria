@@ -670,6 +670,28 @@ final class WorkspaceStore {
         }
     }
 
+    func reusableEmptySshAgentSurface(socketName: String) -> WorkspaceSurface? {
+        guard let project = selectedProject, let environment = selectedEnvironment else {
+            return nil
+        }
+        let name = socketName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name != ".", name != "..",
+            (name as NSString).lastPathComponent == name
+        else {
+            return nil
+        }
+        let path = (project.path as NSString).appendingPathComponent(name)
+        return environment.surfaces.first { surface in
+            guard surface.kind == .unixSocket, surface.path == path,
+                surface.bindingIDs.isEmpty
+            else {
+                return false
+            }
+            guard case .sshAgent = surface.input else { return false }
+            return true
+        }
+    }
+
     func compatibleBindings(for kind: WorkspaceSurfaceKind) -> [WorkspaceBinding] {
         (commonBindings + environmentBindings).filter { bindingIsCompatible($0, with: kind) }
     }
@@ -1255,9 +1277,14 @@ final class WorkspaceStore {
         guard !addresses.isEmpty else {
             throw WorkspaceStoreError.invalid("Select at least one SSH identity")
         }
-        let output = try newSurfaceOutput(fileName: socketName, in: project)
+        let reusableSurface = reusableEmptySshAgentSurface(socketName: socketName)
+        let output = try reusableSurface.map { (name: $0.name, path: $0.path) }
+            ?? newSurfaceOutput(fileName: socketName, in: project)
         let bindingID = Self.newID("binding")
-        let surfaceID = Self.newID("ssh-agent")
+        let surfaceID = reusableSurface?.id ?? Self.newID("ssh-agent")
+        let surfacePosition = reusableSurface.flatMap { surface in
+            environment.surfaces.firstIndex(where: { $0.id == surface.id })
+        } ?? environment.surfaces.count
         let selection: CatalogEntrySelection = addresses.count == resource.entries.count
             ? .all : .entries(addresses)
         try await controlClient.upsertBinding(
@@ -1272,7 +1299,7 @@ final class WorkspaceStore {
                     kind: "unix_socket", path: output.path,
                     input: .sshAgent([bindingID], route: route?.catalogValue),
                     enforcement: securityLevel.rawValue,
-                    position: Int64(environment.surfaces.count)))
+                    position: Int64(surfacePosition)))
         } catch {
             try? await controlClient.removeBinding(bindingID)
             throw error

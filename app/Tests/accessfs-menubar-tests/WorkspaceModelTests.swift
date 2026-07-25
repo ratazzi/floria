@@ -247,6 +247,35 @@ final class WorkspaceModelTests: XCTestCase {
             104)
     }
 
+    func testEmptySshAgentSocketCanBeReusedForANewIdentityBinding() throws {
+        let route = WorkspaceSshRoute(
+            hostPatterns: ["ec2-*.example.invalid"], hostname: nil,
+            user: "fixture-user", port: nil, forwardAgent: false)
+        let emptySocket = WorkspaceSurface(
+            id: "fixture-agent", name: "agent.sock", kind: .unixSocket,
+            path: "/tmp/fixture-project/agent.sock", status: .listening,
+            input: .sshAgent([], route), securityLevel: .touchID)
+        let store = WorkspaceStore(
+            projects: [
+                WorkspaceProject(
+                    id: "fixture-project", name: "Fixture", path: "/tmp/fixture-project",
+                    commonBindings: [],
+                    environments: [
+                        WorkspaceEnvironment(
+                            id: "fixture-environment", name: "Development", bindings: [],
+                            surfaces: [emptySocket])
+                    ])
+            ], resources: [])
+
+        let reusable = try XCTUnwrap(
+            store.reusableEmptySshAgentSurface(socketName: "agent.sock"))
+
+        XCTAssertEqual(reusable.id, emptySocket.id)
+        XCTAssertEqual(reusable.sshRoute, route)
+        XCTAssertEqual(reusable.securityLevel, .touchID)
+        XCTAssertNil(store.reusableEmptySshAgentSurface(socketName: "other.sock"))
+    }
+
     func testProtectedFileKindsAreInferredWithoutParsingContent() {
         XCTAssertEqual(WorkspaceProtectedFileKind.infer(from: "/fixture/project/.env"), .dotenv)
         XCTAssertEqual(
