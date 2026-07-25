@@ -1337,7 +1337,7 @@ private struct DiscoveryReviewSheet: View {
             HStack {
                 Text(
                     appliedResult == nil
-                        ? "Discovery is static; project code was not executed."
+                        ? discoveryNote
                         : "The managed inventory has been refreshed.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -1380,7 +1380,26 @@ private struct DiscoveryReviewSheet: View {
     }
 
     private var importButtonTitle: String {
-        "Protect & Import \(plan.files.count)"
+        let count = plan.files.count
+        let suffix = count == 1 ? "" : "s"
+        let actions = Set(plan.files.map(\.action))
+        if actions == [.protect] {
+            return "Protect \(count) File\(suffix)"
+        }
+        if actions == [.compose] {
+            return "Import \(count) File\(suffix)"
+        }
+        if actions == [.importSshIdentity] {
+            return "Import \(count) Identit\(count == 1 ? "y" : "ies")"
+        }
+        return "Protect & Import \(count) Item\(suffix)"
+    }
+
+    private var discoveryNote: String {
+        let base = "Static scan only; project code was not executed."
+        guard plan.summary.warnings > 0 else { return base }
+        let suffix = plan.summary.warnings == 1 ? "" : "s"
+        return "\(base) Review \(plan.summary.warnings) warning\(suffix) before continuing."
     }
 
     private func applyDiscovery() {
@@ -1488,7 +1507,7 @@ private struct DiscoveryFileCard: View {
     private var actionTitle: String {
         switch file.action {
         case .compose: "\(file.entries.count) value\(file.entries.count == 1 ? "" : "s")"
-        case .protect: "Protect file"
+        case .protect: "Protect in place"
         case .importSshIdentity: "Import identity"
         }
     }

@@ -332,6 +332,7 @@ private struct AccessRow: View {
 private struct MenuBarFooter: View {
     @Bindable var state: AppState
     @Environment(\.openWindow) private var openWindow
+    @State private var showingClearConfirmation = false
 
     var body: some View {
         VStack(spacing: 1) {
@@ -354,16 +355,28 @@ private struct MenuBarFooter: View {
                 NSApp.activate(ignoringOtherApps: true)
             }
             .keyboardShortcut("d")
-            MenuItemButton(title: "Clear Recent", icon: "trash", shortcut: "K") {
-                state.clearRecents()
+            MenuItemButton(title: "Clear Recent…", icon: "trash", shortcut: "K") {
+                showingClearConfirmation = true
             }
             .keyboardShortcut("k")
+            .disabled(state.recents.isEmpty)
             MenuItemButton(title: "Quit floria", icon: "power", shortcut: "Q") {
                 NSApp.terminate(nil)
             }
             .keyboardShortcut("q")
         }
         .padding(6)
+        .confirmationDialog(
+            "Clear recent activity?",
+            isPresented: $showingClearConfirmation
+        ) {
+            Button("Clear \(state.recents.count) Events", role: .destructive) {
+                state.clearRecents()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This clears only the activity shown in Floria. The daemon audit log on disk is not deleted.")
+        }
     }
 }
 

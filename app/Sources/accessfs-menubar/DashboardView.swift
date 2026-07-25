@@ -7,6 +7,7 @@ struct AccessLogView: View {
     @State private var grouping: Grouping = .client
     @State private var selection: SidebarFilter? = SidebarFilter.all
     @State private var search = ""
+    @State private var showingClearConfirmation = false
 
     enum Grouping: String, CaseIterable {
         case client = "By Client"
@@ -52,6 +53,18 @@ struct AccessLogView: View {
         }
         .searchable(text: $search, placement: .toolbar, prompt: "Filter")
         .navigationTitle("Recent Access")
+        .confirmationDialog(
+            "Clear recent activity?",
+            isPresented: $showingClearConfirmation
+        ) {
+            Button("Clear \(state.recents.count) Events", role: .destructive) {
+                state.clearRecents()
+                selection = .all
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This clears only the activity shown in Floria. The daemon audit log on disk is not deleted.")
+        }
     }
 
     private var sidebar: some View {
@@ -158,7 +171,9 @@ struct AccessLogView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
             Spacer()
-            Button("Clear") { state.clearRecents() }
+            Button("Clear…") { showingClearConfirmation = true }
+                .disabled(state.recents.isEmpty)
+                .help("Clear the recent activity shown in this window")
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
