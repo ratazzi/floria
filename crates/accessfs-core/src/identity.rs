@@ -1,11 +1,11 @@
 use std::path::PathBuf;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Stable-enough identity of one process lifetime. A PID alone can be reused while a macFUSE
 /// vnode is still alive, so access-session caches also include the process start timestamp when
 /// libproc can provide it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ProcessInstance {
     pub pid: i32,
     pub started_at_micros: Option<u64>,
@@ -16,7 +16,7 @@ pub struct ProcessInstance {
 ///
 /// `uid/gid/pid` come from the FUSE request; the rest come from libproc, best-effort, `None` on
 /// failure. `open()` must never fail just because forensics collection failed.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessIdentity {
     pub pid: i32,
     /// Unix timestamp of process start, with microsecond precision. Used with `pid` to prevent
@@ -74,7 +74,7 @@ impl ProcessIdentity {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcSummary {
     pub pid: i32,
     pub ppid: i32,

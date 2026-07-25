@@ -10,6 +10,7 @@ use accessfs_catalog::{
     Environment, ItemMetadata, Project, Resource, ResourceCodec, ResourceKind, ResourceSource,
     Surface, SurfaceInput, SurfaceKind, ValueShape,
 };
+use accessfs_core::audit::{read_recent_access, AuditAccessRecord};
 use accessfs_core::authz::{Enforcement, PolicyMode, PolicyModeStatus};
 use accessfs_discover::{
     discover, DiscoveredContent, DiscoveredFileAction, DiscoveredFileKind, ExistingSecret,
@@ -19,7 +20,8 @@ use accessfs_store::{NewSecret, SecretId, SecretOrigin, SecretRecord, SecretStor
 use accessfs_surface::{decode_source, ensure_file_surface_link, validate_secret_bytes};
 
 use crate::protocol::{
-    read_msg, write_msg, ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest,
+    read_msg, write_msg, AccessHistoryEvent, AccessHistoryIdentity, AccessHistoryProcess,
+    AccessHistorySsh, ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest,
     ControlResponse, ControlResult, DiscoveryAppliedFile, DiscoveryApplyOutcome,
     DiscoveryApplyResult, ProtectedFile, ProtectedFileVersion, SecretValue, SshConfigStatus,
     SshIdentity,
@@ -62,6 +64,7 @@ pub struct ControlRuntimeServices {
     pub policy: Arc<dyn RuntimePolicyController>,
     pub ssh_discovery: Arc<dyn SshIdentityDiscovery>,
     pub ssh_config: Arc<dyn SshConfigManager>,
+    pub audit_log: PathBuf,
 }
 
 #[derive(Clone, Default)]
@@ -72,6 +75,7 @@ struct ControlDependencies {
     policy: Option<Arc<dyn RuntimePolicyController>>,
     ssh_discovery: Option<Arc<dyn SshIdentityDiscovery>>,
     ssh_config: Option<Arc<dyn SshConfigManager>>,
+    audit_log: Option<PathBuf>,
 }
 
 impl ControlServer {
@@ -151,6 +155,7 @@ impl ControlServer {
                 policy: Some(services.policy),
                 ssh_discovery: Some(services.ssh_discovery),
                 ssh_config: Some(services.ssh_config),
+                audit_log: Some(services.audit_log),
             },
         )
     }
@@ -227,15 +232,15 @@ fn handle_connection(
             }
         };
         let changes_runtime = changes_runtime(&request.command);
-        let outcome = match dispatch(
-            &catalog,
-            dependencies.store.as_deref(),
-            dependencies.mount_path.as_deref(),
-            dependencies.policy.as_deref(),
-            dependencies.ssh_discovery.as_deref(),
-            dependencies.ssh_config.as_deref(),
-            request.command,
-        ) {
+        let services = DispatchServices {
+            store: dependencies.store.as_deref(),
+            mount_path: dependencies.mount_path.as_deref(),
+            policy: dependencies.policy.as_deref(),
+            ssh_discovery: dependencies.ssh_discovery.as_deref(),
+            ssh_config: dependencies.ssh_config.as_deref(),
+            audit_log: dependencies.audit_log.as_deref(),
+        };
+        let outcome = match dispatch(&catalog, services, request.command) {
             Ok(result) => {
                 if changes_runtime {
                     notify_observer(&catalog, dependencies.observer.as_deref());
@@ -307,6 +312,16 @@ struct ManagedItemSettings {
     metadata: ItemMetadata,
 }
 
+#[derive(Clone, Copy, Default)]
+struct DispatchServices<'a> {
+    store: Option<&'a dyn SecretStore>,
+    mount_path: Option<&'a Path>,
+    policy: Option<&'a dyn RuntimePolicyController>,
+    ssh_discovery: Option<&'a dyn SshIdentityDiscovery>,
+    ssh_config: Option<&'a dyn SshConfigManager>,
+    audit_log: Option<&'a Path>,
+}
+
 impl DispatchError {
     fn body(&self) -> ControlErrorBody {
         match self {
@@ -368,13 +383,17 @@ impl From<ManagedKeyError> for DispatchError {
 
 fn dispatch(
     catalog: &Catalog,
-    store: Option<&dyn SecretStore>,
-    mount_path: Option<&Path>,
-    policy: Option<&dyn RuntimePolicyController>,
-    ssh_discovery: Option<&dyn SshIdentityDiscovery>,
-    ssh_config: Option<&dyn SshConfigManager>,
+    services: DispatchServices<'_>,
     command: ControlCommand,
 ) -> Result<ControlResult, DispatchError> {
+    let DispatchServices {
+        store,
+        mount_path,
+        policy,
+        ssh_discovery,
+        ssh_config,
+        audit_log,
+    } = services;
     match command {
         ControlCommand::Ping => {
             Ok(ControlResult::Pong { schema_version: catalog.schema_version() })
@@ -397,6 +416,16 @@ fn dispatch(
                 .map(ControlResult::PolicyMode)
                 .map_err(DispatchError::Policy)
         }
+        ControlCommand::AccessHistory { limit } => access_history(
+            catalog,
+            store,
+            audit_log.ok_or_else(|| {
+                DispatchError::Validation(
+                    "access history is unavailable on this control server".to_string(),
+                )
+            })?,
+            limit.min(500),
+        ),
         ControlCommand::Snapshot => Ok(ControlResult::Snapshot(catalog.snapshot()?)),
         ControlCommand::Discover { path } => {
             let store = store.ok_or(DispatchError::StoreUnavailable)?;
@@ -636,6 +665,114 @@ fn dispatch(
             catalog.remove_surface(&id)?;
             Ok(ControlResult::Empty)
         }
+    }
+}
+
+fn access_history(
+    catalog: &Catalog,
+    store: Option<&dyn SecretStore>,
+    audit_log: &Path,
+    limit: usize,
+) -> Result<ControlResult, DispatchError> {
+    let records = read_recent_access(audit_log, limit).map_err(|source| DispatchError::Io {
+        path: audit_log.to_path_buf(),
+        source,
+    })?;
+    let snapshot = catalog.snapshot()?;
+    let stored = match store {
+        Some(store) => store.list()?,
+        None => Vec::new(),
+    };
+    let events = records
+        .into_iter()
+        .map(|record| {
+            let display = history_display(&record.path, &snapshot, &stored);
+            let ssh = history_ssh(&record, &snapshot);
+            AccessHistoryEvent {
+                ts: record.ts,
+                path: record.path,
+                display,
+                operation: record.operation,
+                decision: record.decision,
+                rule_id: record.rule_id,
+                policy: record.policy,
+                ssh,
+                identity: history_identity(&record.identity),
+            }
+        })
+        .collect();
+    Ok(ControlResult::AccessHistory(events))
+}
+
+fn history_display(
+    path: &str,
+    snapshot: &CatalogSnapshot,
+    stored: &[SecretRecord],
+) -> Option<String> {
+    if let Some(surface_id) = path.strip_prefix("surfaces/") {
+        return snapshot
+            .surfaces
+            .iter()
+            .find(|surface| surface.id == surface_id)
+            .map(|surface| surface.path.display().to_string());
+    }
+    path.strip_prefix("secrets/").and_then(|secret_id| {
+        stored
+            .iter()
+            .find(|record| record.id.as_str() == secret_id)
+            .map(SecretRecord::display_name)
+    })
+}
+
+fn history_ssh(record: &AuditAccessRecord, snapshot: &CatalogSnapshot) -> Option<AccessHistorySsh> {
+    let surface_id = record.surface_id.as_ref()?;
+    let resource_id = record.resource_id.as_ref()?;
+    let key_fingerprint = record.key_fingerprint.as_ref()?;
+    let session = record.ssh_session.as_ref();
+    Some(AccessHistorySsh {
+        surface_id: surface_id.clone(),
+        surface_name: snapshot
+            .surfaces
+            .iter()
+            .find(|surface| surface.id == *surface_id)
+            .map(|surface| surface.name.clone())
+            .unwrap_or_else(|| surface_id.clone()),
+        resource_id: resource_id.clone(),
+        key_fingerprint: key_fingerprint.clone(),
+        key_label: snapshot
+            .resources
+            .iter()
+            .find(|resource| resource.id == *resource_id)
+            .map(|resource| resource.name.clone())
+            .unwrap_or_else(|| resource_id.clone()),
+        requested_destination: session.and_then(|value| value.requested_destination.clone()),
+        verified_host_key_fingerprint: session
+            .and_then(|value| value.verified_host_key_fingerprint.clone()),
+        ssh_user: session.and_then(|value| value.ssh_user.clone()),
+        forwarding_hops: session.map_or(0, |value| value.forwarding_hops),
+    })
+}
+
+fn history_identity(identity: &accessfs_core::identity::ProcessIdentity) -> AccessHistoryIdentity {
+    AccessHistoryIdentity {
+        pid: identity.pid,
+        uid: identity.uid,
+        exe: identity.exe_path.as_ref().map(|path| path.display().to_string()),
+        cwd: identity.cwd.as_ref().map(|path| path.display().to_string()),
+        cmdline: identity.cmdline.clone(),
+        bundle_id: identity.bundle_id.clone(),
+        team_id: identity.team_id.clone(),
+        parent_chain: identity
+            .parent_chain
+            .iter()
+            .rev()
+            .map(|process| AccessHistoryProcess {
+                pid: process.pid,
+                name: process.name.clone(),
+                exe: process.exe_path.as_ref().map(|path| path.display().to_string()),
+            })
+            .collect(),
+        chain: identity.chain_display(),
     }
 }
 
@@ -1947,6 +2084,8 @@ fn same_uid(stream: &UnixStream) -> bool {
 mod tests {
     use super::*;
     use accessfs_catalog::SurfaceInput;
+    use accessfs_core::audit::AuditLog;
+    use accessfs_core::identity::{ProcSummary, ProcessIdentity};
     use crate::client::ControlClient;
     use accessfs_catalog::{
         Binding, BindingScope, EntrySelection, Environment, ItemLink, Project, Surface, SurfaceKind,
@@ -2201,6 +2340,95 @@ mod tests {
     }
 
     #[test]
+    fn access_history_returns_persisted_reader_metadata_with_surface_display_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        catalog
+            .upsert_project(&Project {
+                id: "fixture-project".to_string(),
+                name: "Fixture Project".to_string(),
+                path: dir.path().join("project"),
+            })
+            .unwrap();
+        catalog
+            .upsert_environment(&Environment {
+                id: "fixture-environment".to_string(),
+                project_id: "fixture-project".to_string(),
+                name: "Development".to_string(),
+                position: 0,
+            })
+            .unwrap();
+        let display_path = dir.path().join("project/.env");
+        catalog
+            .upsert_surface(&Surface {
+                id: "fixture-surface".to_string(),
+                environment_id: "fixture-environment".to_string(),
+                name: ".env".to_string(),
+                kind: SurfaceKind::DotenvFile,
+                path: display_path.clone(),
+                input: SurfaceInput::Bindings { binding_ids: Vec::new() },
+                enforcement: Enforcement::Prompt,
+                position: 0,
+            })
+            .unwrap();
+
+        let audit_path = dir.path().join("audit.jsonl");
+        let audit = AuditLog::open(&audit_path).unwrap();
+        let mut identity = ProcessIdentity::bare(42, 501, 20);
+        identity.exe_path = Some(PathBuf::from("/usr/bin/fixture-reader"));
+        identity.cwd = Some(dir.path().join("project"));
+        identity.parent_chain = vec![
+            ProcSummary {
+                pid: 42,
+                ppid: 41,
+                name: "fixture-reader".to_string(),
+                exe_path: Some(PathBuf::from("/usr/bin/fixture-reader")),
+            },
+            ProcSummary {
+                pid: 41,
+                ppid: 1,
+                name: "fixture-shell".to_string(),
+                exe_path: Some(PathBuf::from("/bin/sh")),
+            },
+        ];
+        audit.log_open(
+            "surfaces/fixture-surface",
+            "read",
+            &identity,
+            "allowed",
+            Some("fixture-rule"),
+            None,
+            "sha256:fixture-content",
+            7,
+            32,
+            None,
+        );
+
+        let result = dispatch(
+            &catalog,
+            DispatchServices { audit_log: Some(&audit_path), ..DispatchServices::default() },
+            ControlCommand::AccessHistory { limit: 500 },
+        )
+        .unwrap();
+        let ControlResult::AccessHistory(events) = result else {
+            panic!("expected access history");
+        };
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].display.as_deref(), display_path.to_str());
+        assert_eq!(events[0].identity.exe.as_deref(), Some("/usr/bin/fixture-reader"));
+        assert_eq!(events[0].identity.chain, "fixture-shell -> fixture-reader");
+        assert_eq!(
+            events[0]
+                .identity
+                .parent_chain
+                .iter()
+                .map(|process| process.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fixture-shell", "fixture-reader"]
+        );
+    }
+
+    #[test]
     fn discovery_reuses_only_an_exact_shared_secret_without_returning_plaintext() {
         let dir = tempfile::tempdir().unwrap();
         let project_path = dir.path().join("fixture-project");
@@ -2215,11 +2443,7 @@ mod tests {
 
         dispatch(
             &catalog,
-            Some(&store),
-            None,
-            None,
-            None,
-            None,
+            DispatchServices { store: Some(&store), ..DispatchServices::default() },
             ControlCommand::SharedSecretCreate {
                 resource_id: "fixture-shared-api-token".to_string(),
                 name: "Fixture Shared Secret".to_string(),
@@ -2233,11 +2457,7 @@ mod tests {
 
         let result = dispatch(
             &catalog,
-            Some(&store),
-            None,
-            None,
-            None,
-            None,
+            DispatchServices { store: Some(&store), ..DispatchServices::default() },
             ControlCommand::Discover { path: project_path },
         )
         .unwrap();
@@ -2275,11 +2495,11 @@ mod tests {
 
         let applied = dispatch(
             &catalog,
-            Some(&store),
-            Some(&mount_path),
-            None,
-            None,
-            None,
+            DispatchServices {
+                store: Some(&store),
+                mount_path: Some(&mount_path),
+                ..DispatchServices::default()
+            },
             ControlCommand::DiscoverApply {
                 path: project_path.clone(),
             },
@@ -2337,11 +2557,11 @@ mod tests {
 
         let applied = dispatch(
             &catalog,
-            Some(&store),
-            Some(&mount_path),
-            None,
-            None,
-            None,
+            DispatchServices {
+                store: Some(&store),
+                mount_path: Some(&mount_path),
+                ..DispatchServices::default()
+            },
             ControlCommand::DiscoverApply {
                 path: project_path,
             },

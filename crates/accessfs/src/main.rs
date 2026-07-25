@@ -430,7 +430,13 @@ fn cmd_mount(config: &Path) -> Result<()> {
         catalog.clone(),
         Arc::clone(&store),
         cfg.mount_path.clone(),
-        ControlRuntimeServices { observer, policy, ssh_discovery, ssh_config },
+        ControlRuntimeServices {
+            observer,
+            policy,
+            ssh_discovery,
+            ssh_config,
+            audit_log: cfg.audit_log.clone(),
+        },
     )
         .with_context(|| format!("starting control socket at {}", control_path.display()))?;
     tracing::info!(socket = %control_path.display(), "control socket listening");
@@ -685,6 +691,9 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
         }
         ControlResult::PolicyMode(status) => {
             println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        ControlResult::AccessHistory(events) => {
+            println!("{}", serde_json::to_string_pretty(&events)?);
         }
         ControlResult::Snapshot(snapshot) => {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);

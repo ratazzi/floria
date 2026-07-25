@@ -1,9 +1,9 @@
-use std::fs::OpenOptions;
-use std::io::{BufWriter, Write};
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Mutex;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::authz::PolicyEvaluation;
 use crate::error::Result;
@@ -37,6 +37,35 @@ pub struct SshSessionAudit<'a> {
     pub verified_host_key_fingerprint: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ssh_user: Option<&'a str>,
+    pub forwarding_hops: usize,
+}
+
+/// One persisted authorization event projected from the append-only JSONL log.
+///
+/// Close and write-commit rows intentionally do not deserialize into this shape because they
+/// carry no reader identity. Callers receive only the events meaningful to access-history UI.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AuditAccessRecord {
+    pub ts: String,
+    pub event: String,
+    pub path: String,
+    pub operation: String,
+    pub decision: String,
+    pub rule_id: Option<String>,
+    pub policy: Option<PolicyEvaluation>,
+    pub identity: ProcessIdentity,
+    pub surface_id: Option<String>,
+    pub resource_id: Option<String>,
+    pub key_fingerprint: Option<String>,
+    pub ssh_session: Option<OwnedSshSessionAudit>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OwnedSshSessionAudit {
+    pub requested_destination: Option<String>,
+    pub verified_host_key_fingerprint: Option<String>,
+    pub ssh_user: Option<String>,
+    #[serde(default)]
     pub forwarding_hops: usize,
 }
 
@@ -208,6 +237,64 @@ impl AuditLog {
     }
 }
 
+/// Read the newest access/sign events without loading an unbounded audit file into memory.
+///
+/// The reader walks backward in fixed-size chunks, tolerates malformed/partial rows, and returns
+/// newest first. The active writer may append concurrently; the file length captured at open is
+/// treated as a consistent snapshot boundary.
+pub fn read_recent_access(path: &Path, limit: usize) -> std::io::Result<Vec<AuditAccessRecord>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut cursor = file.metadata()?.len();
+    let mut suffix = Vec::new();
+    let mut records = Vec::with_capacity(limit);
+    const CHUNK_SIZE: u64 = 64 * 1024;
+
+    while cursor > 0 && records.len() < limit {
+        let read_len = cursor.min(CHUNK_SIZE);
+        cursor -= read_len;
+        file.seek(SeekFrom::Start(cursor))?;
+        let mut data = vec![0; read_len as usize];
+        file.read_exact(&mut data)?;
+        data.extend_from_slice(&suffix);
+
+        let complete_start = if cursor == 0 {
+            suffix.clear();
+            0
+        } else if let Some(first_newline) = data.iter().position(|byte| *byte == b'\n') {
+            suffix = data[..first_newline].to_vec();
+            first_newline + 1
+        } else {
+            suffix = data;
+            continue;
+        };
+
+        for line in data[complete_start..].rsplit(|byte| *byte == b'\n') {
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(record) = serde_json::from_slice::<AuditAccessRecord>(line) else {
+                continue;
+            };
+            if !matches!(record.event.as_str(), "open" | "ssh_sign") {
+                continue;
+            }
+            records.push(record);
+            if records.len() == limit {
+                break;
+            }
+        }
+    }
+
+    Ok(records)
+}
+
 fn now_rfc3339() -> String {
     chrono::Utc::now()
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
@@ -375,5 +462,65 @@ mod tests {
         assert!(line.contains("\"forwarding_hops\":1"));
         assert!(!line.contains("fixture-bytes-to-sign"));
         assert!(!line.contains("fixture-signature"));
+    }
+
+    #[test]
+    fn recent_access_reads_newest_authorizations_and_skips_lifecycle_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let audit = AuditLog::open(&path).unwrap();
+        audit.log_open(
+            "surfaces/fixture-env",
+            "read",
+            &ProcessIdentity::bare(41, 501, 20),
+            "allowed",
+            Some("fixture-allow"),
+            None,
+            "sha256:fixture-content",
+            7,
+            32,
+            None,
+        );
+        audit.log_close("surfaces/fixture-env", 7, 4, 32, None);
+        audit.log_denied(
+            "secrets/00000000-0000-0000-0000-000000000001",
+            "read",
+            &ProcessIdentity::bare(42, 501, 20),
+            Some("fixture-deny"),
+            "denied by fixture",
+            None,
+        );
+
+        let newest = read_recent_access(&path, 1).unwrap();
+        assert_eq!(newest.len(), 1);
+        assert_eq!(newest[0].identity.pid, 42);
+        assert_eq!(newest[0].decision, "denied");
+
+        let all = read_recent_access(&path, 10).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].identity.pid, 42);
+        assert_eq!(all[1].identity.pid, 41);
+    }
+
+    #[test]
+    fn recent_access_handles_rows_larger_than_one_reverse_read_chunk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let audit = AuditLog::open(&path).unwrap();
+        let mut identity = ProcessIdentity::bare(42, 501, 20);
+        identity.cmdline = Some(vec!["fixture-reader".repeat(8_000)]);
+        audit.log_denied(
+            "surfaces/fixture-large-row",
+            "read",
+            &identity,
+            Some("fixture-deny"),
+            "denied by fixture",
+            None,
+        );
+
+        let records = read_recent_access(&path, 1).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].path, "surfaces/fixture-large-row");
+        assert_eq!(records[0].identity.cmdline, identity.cmdline);
     }
 }

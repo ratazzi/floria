@@ -5,7 +5,7 @@ use accessfs_catalog::{
     Binding, CatalogError, CatalogSnapshot, Environment, Project, ResolvedEnvironment, Resource,
     ItemMetadata, ResourceCodec, ResourceUsage, Surface,
 };
-use accessfs_core::authz::{Enforcement, PolicyMode, PolicyModeStatus};
+use accessfs_core::authz::{Enforcement, PolicyEvaluation, PolicyMode, PolicyModeStatus};
 use accessfs_discover::DiscoveryPlan;
 use accessfs_store::StoreError;
 use serde::de::DeserializeOwned;
@@ -57,6 +57,7 @@ pub enum ControlCommand {
     Ping,
     PolicyModeGet,
     PolicyModeSet { mode: PolicyMode, duration_secs: Option<u64> },
+    AccessHistory { limit: usize },
     Snapshot,
     Discover { path: PathBuf },
     DiscoverApply { path: PathBuf },
@@ -149,6 +150,7 @@ pub enum ControlOutcome {
 pub enum ControlResult {
     Pong { schema_version: i64 },
     PolicyMode(PolicyModeStatus),
+    AccessHistory(Vec<AccessHistoryEvent>),
     Snapshot(CatalogSnapshot),
     Discovery(DiscoveryPlan),
     DiscoveryApplied(DiscoveryApplyResult),
@@ -166,6 +168,54 @@ pub enum ControlResult {
     SharedSecretRotated { resource_id: String, version: u32 },
     EnvFileCreated { resource: Resource, version: u32 },
     Empty,
+}
+
+/// Metadata-only persisted access event. Its JSON shape mirrors the agent's live `access_event`
+/// payload so GUI clients can merge history and live updates without a second presentation model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessHistoryEvent {
+    pub ts: String,
+    pub path: String,
+    pub display: Option<String>,
+    pub operation: String,
+    pub decision: String,
+    pub rule_id: Option<String>,
+    pub policy: Option<PolicyEvaluation>,
+    pub ssh: Option<AccessHistorySsh>,
+    pub identity: AccessHistoryIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessHistoryIdentity {
+    pub pid: i32,
+    pub uid: u32,
+    pub exe: Option<String>,
+    pub cwd: Option<String>,
+    pub cmdline: Option<Vec<String>>,
+    pub bundle_id: Option<String>,
+    pub team_id: Option<String>,
+    pub parent_chain: Vec<AccessHistoryProcess>,
+    pub chain: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessHistoryProcess {
+    pub pid: i32,
+    pub name: String,
+    pub exe: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessHistorySsh {
+    pub surface_id: String,
+    pub surface_name: String,
+    pub resource_id: String,
+    pub key_fingerprint: String,
+    pub key_label: String,
+    pub requested_destination: Option<String>,
+    pub verified_host_key_fingerprint: Option<String>,
+    pub ssh_user: Option<String>,
+    pub forwarding_hops: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -331,6 +381,22 @@ mod tests {
         assert_eq!(value["method"], "policy_mode_set");
         assert_eq!(value["params"]["mode"], "audit_only");
         assert_eq!(value["params"]["duration_secs"], 3600);
+    }
+
+    #[test]
+    fn access_history_wire_shape_is_stable_for_swift_client() {
+        let request = ControlRequest {
+            request_id: 14,
+            command: ControlCommand::AccessHistory { limit: 500 },
+        };
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({
+                "request_id": 14,
+                "method": "access_history",
+                "params": { "limit": 500 }
+            })
+        );
     }
 
     #[test]
