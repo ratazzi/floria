@@ -6,7 +6,7 @@
 //! as an access event.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use accessfs_core::authz::{
@@ -53,6 +53,38 @@ pub struct SocketAgent {
     /// grant never authorizes a write (and vice versa) — approving "read .env" must not let
     /// the same subject silently rewrite it within the TTL.
     grants: DashMap<(String, String, Operation), Instant>,
+    /// Concurrent requests for the same grant key share one interactive prompt. The map contains
+    /// only unresolved prompts; each access still receives and audits its own final decision.
+    prompt_flights: Mutex<HashMap<GrantCacheKey, Arc<PromptFlight>>>,
+}
+
+type GrantCacheKey = (String, String, Operation);
+
+struct PromptFlight {
+    result: Mutex<Option<Decision>>,
+    ready: Condvar,
+}
+
+impl PromptFlight {
+    fn pending() -> Self {
+        Self { result: Mutex::new(None), ready: Condvar::new() }
+    }
+
+    fn wait(&self) -> Decision {
+        let mut result = self.result.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        while result.is_none() {
+            result = self
+                .ready
+                .wait(result)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        result.as_ref().expect("completed prompt flight").clone()
+    }
+
+    fn complete(&self, decision: Decision) {
+        *self.result.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(decision);
+        self.ready.notify_all();
+    }
 }
 
 impl SocketAgent {
@@ -75,6 +107,7 @@ impl SocketAgent {
                 cfg.agent_socket.with_file_name("policy-mode.json"),
             ),
             grants: DashMap::new(),
+            prompt_flights: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -133,6 +166,50 @@ impl SocketAgent {
             return Decision::allow("cached grant").with_rule("grant");
         }
 
+        let (flight, is_leader) = {
+            let mut flights = self
+                .prompt_flights
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            // A previous leader may have installed a grant after our optimistic check but before
+            // we acquired the coordinator lock.
+            if self.grant_valid(&key) {
+                return Decision::allow("cached grant").with_rule("grant");
+            }
+
+            match flights.get(&key) {
+                Some(flight) => (Arc::clone(flight), false),
+                None => {
+                    let flight = Arc::new(PromptFlight::pending());
+                    flights.insert(key.clone(), Arc::clone(&flight));
+                    (flight, true)
+                }
+            }
+        };
+
+        if !is_leader {
+            return flight.wait();
+        }
+
+        let decision = self.perform_prompt(req, enforcement, &key);
+        flight.complete(decision.clone());
+        let mut flights = self
+            .prompt_flights
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if flights.get(&key).is_some_and(|current| Arc::ptr_eq(current, &flight)) {
+            flights.remove(&key);
+        }
+        decision
+    }
+
+    fn perform_prompt(
+        &self,
+        req: &AuthRequest,
+        enforcement: Enforcement,
+        key: &GrantCacheKey,
+    ) -> Decision {
         let result = self.server.prompt_and_wait(
             |req_id| DaemonMsg::Prompt {
                 req_id,
@@ -149,7 +226,7 @@ impl SocketAgent {
         match result {
             PromptResult::Decision(d) if d.allow => {
                 if let Some(ttl) = grant_ttl(&d) {
-                    self.grants.insert(key, Instant::now() + ttl);
+                    self.grants.insert(key.clone(), Instant::now() + ttl);
                 }
                 Decision::allow("prompt: allowed").with_rule("prompt")
             }
@@ -285,9 +362,13 @@ fn grant_ttl(d: &crate::protocol::ClientDecision) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{read_msg, write_msg};
     use accessfs_core::authz::{AccessContext, SshSignContext};
     use accessfs_core::rules::{any_path_glob, Rule, RuleOps, SubjectMatch};
     use accessfs_platform::SameUserPeerVerifier;
+    use serde_json::{json, Value};
+    use std::os::unix::net::UnixStream;
+    use std::sync::Barrier;
 
     fn agent_with_rules(dir: &std::path::Path, rules: Vec<Rule>) -> SocketAgent {
         let server =
@@ -298,6 +379,7 @@ mod tests {
             managed_enforcement: RwLock::new(HashMap::new()),
             policy_mode: PolicyModeState::open(dir.join("policy-mode.json")),
             grants: DashMap::new(),
+            prompt_flights: Mutex::new(HashMap::new()),
         }
     }
 
@@ -326,6 +408,113 @@ mod tests {
             context: None,
             identity: id,
         }
+    }
+
+    fn concurrent_prompt_roundtrip(
+        operations: &[Operation],
+        outcome: &str,
+    ) -> (usize, Vec<bool>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket_path = tmp.path().join("agent.sock");
+        let agent = Arc::new(prompt_only_agent(tmp.path()));
+        let mut app = UnixStream::connect(&socket_path).unwrap();
+        app.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        write_msg(&mut app, &json!({"type": "hello", "version": 1})).unwrap();
+        let connected_deadline = Instant::now() + Duration::from_secs(5);
+        while !agent.server.has_connection() {
+            assert!(
+                Instant::now() < connected_deadline,
+                "test app connection was not accepted"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let barrier = Arc::new(Barrier::new(operations.len() + 1));
+        let workers = operations
+            .iter()
+            .copied()
+            .map(|operation| {
+                let agent = Arc::clone(&agent);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let identity = ProcessIdentity::bare(4242, 501, 20);
+                    barrier.wait();
+                    agent.authorize(&req(&identity, operation)).is_allowed()
+                })
+            })
+            .collect::<Vec<_>>();
+
+        barrier.wait();
+        let first: Value = read_msg(&mut app).unwrap();
+        assert_eq!(first["type"], "prompt");
+        // Keep the leader unresolved long enough for every concurrent request to join its flight.
+        std::thread::sleep(Duration::from_millis(100));
+        write_msg(
+            &mut app,
+            &json!({
+                "type": "decision",
+                "req_id": first["req_id"],
+                "outcome": outcome,
+                "scope": "once"
+            }),
+        )
+        .unwrap();
+
+        let mut prompt_count = 1;
+        let mut access_count = 0;
+        while access_count < operations.len() {
+            let message: Value = read_msg(&mut app).unwrap();
+            match message["type"].as_str() {
+                Some("prompt") => {
+                    prompt_count += 1;
+                    write_msg(
+                        &mut app,
+                        &json!({
+                            "type": "decision",
+                            "req_id": message["req_id"],
+                            "outcome": outcome,
+                            "scope": "once"
+                        }),
+                    )
+                    .unwrap();
+                }
+                Some("access_event") => access_count += 1,
+                other => panic!("unexpected daemon message: {other:?}"),
+            }
+        }
+
+        let decisions = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        (prompt_count, decisions)
+    }
+
+    #[test]
+    fn concurrent_matching_requests_share_one_allowed_prompt() {
+        let (prompt_count, decisions) =
+            concurrent_prompt_roundtrip(&[Operation::Read; 8], "allow");
+
+        assert_eq!(prompt_count, 1);
+        assert!(decisions.into_iter().all(|allowed| allowed));
+    }
+
+    #[test]
+    fn concurrent_matching_requests_share_one_denied_prompt() {
+        let (prompt_count, decisions) =
+            concurrent_prompt_roundtrip(&[Operation::Read; 8], "deny");
+
+        assert_eq!(prompt_count, 1);
+        assert!(decisions.into_iter().all(|allowed| !allowed));
+    }
+
+    #[test]
+    fn concurrent_read_and_write_requests_do_not_share_a_prompt() {
+        let (prompt_count, decisions) =
+            concurrent_prompt_roundtrip(&[Operation::Read, Operation::Write], "allow");
+
+        assert_eq!(prompt_count, 2);
+        assert!(decisions.into_iter().all(|allowed| allowed));
     }
 
     #[test]

@@ -198,6 +198,11 @@ impl SocketServer {
         let _ = self.send(msg);
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_connection(&self) -> bool {
+        self.conn.lock().expect("conn poisoned").is_some()
+    }
+
     /// Write a message to the app. Returns false if no app is connected or the write failed
     /// (in which case the connection is dropped so the next attempt also reports no-app).
     fn send(&self, msg: &impl Serialize) -> bool {
