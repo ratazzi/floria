@@ -40,6 +40,25 @@ final class ControlClient: @unchecked Sendable {
         return snapshot
     }
 
+    func discover(path: String) async throws -> DiscoveryPlan {
+        guard let plan: DiscoveryPlan = try await request(
+            .discover(path: path), expecting: "discovery", as: DiscoveryPlan.self)
+        else {
+            throw ControlClientError.missingResult("discovery")
+        }
+        return plan
+    }
+
+    func applyDiscovery(path: String) async throws -> DiscoveryApplyResult {
+        guard let result: DiscoveryApplyResult = try await request(
+            .discoverApply(path: path), expecting: "discovery_applied",
+            as: DiscoveryApplyResult.self)
+        else {
+            throw ControlClientError.missingResult("discovery_applied")
+        }
+        return result
+    }
+
     func discoverSshIdentities(endpoint: String) async throws -> [DiscoveredSshIdentity] {
         guard let identities: [DiscoveredSshIdentity] = try await request(
             .sshAgentDiscover(endpoint: endpoint), expecting: "ssh_agent_identities",

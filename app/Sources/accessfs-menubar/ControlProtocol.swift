@@ -246,6 +246,114 @@ struct CatalogSnapshot: Codable, Sendable {
     let surfaces: [CatalogSurface]
 }
 
+struct DiscoveryPlan: Codable, Hashable, Sendable {
+    let path: String
+    let project: DiscoveredProject
+    let files: [DiscoveredFile]
+    let summary: DiscoverySummary
+}
+
+struct DiscoveredProject: Codable, Hashable, Sendable {
+    let name: String
+    let path: String
+}
+
+struct DiscoverySummary: Codable, Hashable, Sendable {
+    let files: Int
+    let entries: Int
+    let newSecrets: Int
+    let reusedSecrets: Int
+    let warnings: Int
+
+    enum CodingKeys: String, CodingKey {
+        case files, entries, warnings
+        case newSecrets = "new_secrets"
+        case reusedSecrets = "reused_secrets"
+    }
+}
+
+enum DiscoveredFileKind: String, Codable, Hashable, Sendable {
+    case dotenv
+    case direnv
+    case mise
+    case awsCredentials = "aws_credentials"
+    case pgpass
+    case sshPrivateKey = "ssh_private_key"
+}
+
+enum DiscoveredFileAction: String, Codable, Hashable, Sendable {
+    case compose
+    case protect
+    case importSshIdentity = "import_ssh_identity"
+}
+
+struct DiscoveredFile: Codable, Hashable, Sendable, Identifiable {
+    var id: String { path }
+    let path: String
+    let relativePath: String
+    let kind: DiscoveredFileKind
+    let codec: String
+    let environment: String?
+    let tags: [String]
+    let entries: [DiscoveredEntry]
+    let warnings: [DiscoveryWarning]
+    let action: DiscoveredFileAction
+
+    enum CodingKeys: String, CodingKey {
+        case path, kind, codec, environment, tags, entries, warnings, action
+        case relativePath = "relative_path"
+    }
+}
+
+struct DiscoveredEntry: Codable, Hashable, Sendable, Identifiable {
+    var id: String { "\(address):\(key)" }
+    let address: String
+    let key: String
+    let section: String?
+    let action: DiscoveredEntryAction
+}
+
+struct DiscoveredEntryAction: Codable, Hashable, Sendable {
+    let type: String
+    let resourceID: String?
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case resourceID = "resource_id"
+    }
+}
+
+struct DiscoveryWarning: Codable, Hashable, Sendable, Identifiable {
+    var id: String { "\(line ?? 0):\(message)" }
+    let line: Int?
+    let message: String
+}
+
+struct DiscoveryApplyResult: Codable, Hashable, Sendable {
+    let projectID: String?
+    let createdResources: Int
+    let reusedResources: Int
+    let protectedFiles: Int
+    let importedSshIdentities: Int
+    let files: [DiscoveryAppliedFile]
+
+    enum CodingKeys: String, CodingKey {
+        case files
+        case projectID = "project_id"
+        case createdResources = "created_resources"
+        case reusedResources = "reused_resources"
+        case protectedFiles = "protected_files"
+        case importedSshIdentities = "imported_ssh_identities"
+    }
+}
+
+struct DiscoveryAppliedFile: Codable, Hashable, Sendable, Identifiable {
+    var id: String { path }
+    let path: String
+    let outcome: String
+    let detail: String
+}
+
 struct DiscoveredSshIdentity: Codable, Hashable, Sendable {
     let address: String
     let fingerprint: String
@@ -303,6 +411,8 @@ enum ControlCommand: Sendable {
     case policyModeGet
     case policyModeSet(mode: RuntimePolicyMode, durationSecs: UInt64?)
     case snapshot
+    case discover(path: String)
+    case discoverApply(path: String)
     case sshAgentDiscover(endpoint: String)
     case sshIdentityImport(
         resourceID: String, name: String, path: String, passphrase: String?,
@@ -348,6 +458,8 @@ enum ControlCommand: Sendable {
         case .policyModeGet: "policy_mode_get"
         case .policyModeSet: "policy_mode_set"
         case .snapshot: "snapshot"
+        case .discover: "discover"
+        case .discoverApply: "discover_apply"
         case .sshAgentDiscover: "ssh_agent_discover"
         case .sshIdentityImport: "ssh_identity_import"
         case .sshIdentityRemove: "ssh_identity_remove"
@@ -389,6 +501,16 @@ enum ControlCommand: Sendable {
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: PolicyModeSetParams(mode: mode, durationSecs: durationSecs)))
+        case .discover(let path):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: DiscoverParams(path: path)))
+        case .discoverApply(let path):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: DiscoverParams(path: path)))
         case .sshAgentDiscover(let endpoint):
             return try encoder.encode(
                 ControlRequest(
@@ -509,6 +631,7 @@ private struct PolicyModeSetParams: Encodable {
     let durationSecs: UInt64?
 }
 
+private struct DiscoverParams: Encodable { let path: String }
 private struct SshAgentDiscoverParams: Encodable { let endpoint: String }
 
 private struct SshIdentityImportParams: Encodable {

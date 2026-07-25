@@ -775,6 +775,24 @@ final class WorkspaceStore {
         }
     }
 
+    func discover(at path: String) async throws -> DiscoveryPlan {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        let standardized = (path as NSString).standardizingPath
+        let plan = try await controlClient.discover(path: standardized)
+        lastError = nil
+        return plan
+    }
+
+    func applyDiscovery(at path: String) async throws -> DiscoveryApplyResult {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        let result = try await controlClient.applyDiscovery(
+            path: (path as NSString).standardizingPath)
+        apply(try await controlClient.snapshot(), selectingProject: result.projectID)
+        protectedFiles = try await controlClient.protectedFiles().map(WorkspaceProtectedFile.init)
+        lastError = nil
+        return result
+    }
+
     func protectFile(at path: String) async throws {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
         let file = try await controlClient.protectFile(at: path)

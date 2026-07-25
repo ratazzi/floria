@@ -38,7 +38,7 @@ struct FloriaMenuBarApp: App {
         Window("floria", id: "dashboard") {
             DashboardView(state: state)
         }
-        .defaultSize(width: 1240, height: 760)
+        .defaultSize(width: 880, height: 720)
         .windowStyle(.hiddenTitleBar)
         .defaultLaunchBehavior(.presented)
     }

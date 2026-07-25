@@ -233,9 +233,10 @@ private enum WorkspaceSidebarSelection: Hashable {
 
 /// Main product workspace: choose a project and environment, compose typed bindings,
 /// then inspect the concrete file/socket surfaces exposed to local processes.
-struct DashboardView: View {
+struct AdvancedWorkspaceView: View {
     @Bindable var state: AppState
-    @State private var selection: WorkspaceSidebarSelection? = .projects
+    private let initialProjectID: WorkspaceProject.ID?
+    @State private var selection: WorkspaceSidebarSelection?
     @State private var search = ""
     @State private var showingNewProject = false
     @State private var showingProtectFile = false
@@ -245,6 +246,13 @@ struct DashboardView: View {
     @State private var showingConnectExternalAgent = false
     @State private var pendingAuditWindow: AuditOnlyWindow?
     @State private var showingAuditConfirmation = false
+
+    init(state: AppState, initialProjectID: WorkspaceProject.ID? = nil) {
+        self.state = state
+        self.initialProjectID = initialProjectID
+        _selection = State(
+            initialValue: initialProjectID.map(WorkspaceSidebarSelection.project) ?? .projects)
+    }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -259,6 +267,11 @@ struct DashboardView: View {
             }
         }
         .ignoresSafeArea(.container, edges: .top)
+        .onAppear {
+            guard let initialProjectID else { return }
+            state.workspace.selectProject(initialProjectID)
+            selection = .project(initialProjectID)
+        }
         .onChange(of: selection) {
             guard case .project(let id) = selection else { return }
             state.workspace.selectProject(id)
