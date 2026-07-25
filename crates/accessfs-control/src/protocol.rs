@@ -56,6 +56,9 @@ pub enum ControlCommand {
     Snapshot,
     ProtectedFiles,
     FileProtect { path: PathBuf },
+    ProtectedFileHistory { id: String },
+    ProtectedFileRollback { id: String, version: u32 },
+    FileRestore { id: String },
     ResolveEnvironment { project_id: String, environment_id: String },
     ResourceUsage { resource_id: String },
     SharedSecretCreate {
@@ -105,6 +108,9 @@ pub enum ControlResult {
     Snapshot(CatalogSnapshot),
     ProtectedFiles(Vec<ProtectedFile>),
     FileProtected { file: ProtectedFile, created: bool },
+    ProtectedFileHistory { id: String, versions: Vec<ProtectedFileVersion> },
+    ProtectedFileRolledBack { file: ProtectedFile },
+    FileRestored { path: PathBuf, storage_deleted: bool },
     ResolvedEnvironment(ResolvedEnvironment),
     ResourceUsage(ResourceUsage),
     SharedSecretCreated { resource: Resource, version: u32 },
@@ -120,6 +126,16 @@ pub struct ProtectedFile {
     pub mode: u32,
     pub size: u64,
     pub current_version: u32,
+    pub linked: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtectedFileVersion {
+    pub version: u32,
+    pub size: u64,
+    pub created: String,
+    pub note: Option<String>,
+    pub current: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

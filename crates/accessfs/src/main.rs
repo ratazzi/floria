@@ -498,6 +498,15 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
             let action = if created { "protected" } else { "already protected" };
             println!("{action} {} as {}", file.source_path.display(), file.id);
         }
+        ControlResult::ProtectedFileHistory { id, versions } => {
+            println!("{}", serde_json::to_string_pretty(&(id, versions))?);
+        }
+        ControlResult::ProtectedFileRolledBack { file } => {
+            println!("{} now points to version {}", file.id, file.current_version);
+        }
+        ControlResult::FileRestored { path, storage_deleted } => {
+            println!("restored {} (history deleted: {storage_deleted})", path.display());
+        }
         ControlResult::ResolvedEnvironment(resolved) => {
             println!("{}", serde_json::to_string_pretty(&resolved)?);
         }
