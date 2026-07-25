@@ -187,6 +187,7 @@ mod tests {
             kind: SurfaceKind::DotenvFile,
             path,
             input: SurfaceInput::Bindings { binding_ids: Vec::new() },
+            enforcement: accessfs_core::authz::Enforcement::Prompt,
             position: 0,
         }
     }

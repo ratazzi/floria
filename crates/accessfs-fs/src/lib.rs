@@ -1664,6 +1664,7 @@ mod tests {
             kind: SurfaceKind::DotenvFile,
             path: tmp.path().join("project/.env"),
             input: SurfaceInput::Bindings { binding_ids: Vec::new() },
+            enforcement: accessfs_core::authz::Enforcement::Prompt,
             position: 0,
         };
         let registry = Arc::new(SurfaceRegistry::from_snapshot(&CatalogSnapshot {
@@ -1693,6 +1694,7 @@ mod tests {
             kind: SurfaceKind::DotenvFile,
             path: tmp.path().join("project/.env.local"),
             input: SurfaceInput::Bindings { binding_ids: Vec::new() },
+            enforcement: accessfs_core::authz::Enforcement::Prompt,
             position: 0,
         };
         registry.replace(&CatalogSnapshot {
@@ -1750,10 +1752,11 @@ mod tests {
         fn get_by_path(&self, _source_path: &Path) -> StoreResult<Option<SecretRecord>> {
             unimplemented!()
         }
-        fn update_metadata(
+        fn update_settings(
             &self,
             _id: &SecretId,
             _metadata: accessfs_core::metadata::ItemMetadata,
+            _enforcement: accessfs_core::authz::Enforcement,
         ) -> StoreResult<()> {
             unimplemented!()
         }

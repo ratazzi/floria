@@ -802,6 +802,7 @@ mod tests {
                 size: versions[(*head - 1) as usize].len() as u64,
                 created: "fixture-time".to_string(),
                 current_version: *head,
+                enforcement: Default::default(),
                 metadata: Default::default(),
             }))
         }
@@ -833,10 +834,11 @@ mod tests {
         fn get_by_path(&self, _source_path: &Path) -> StoreResult<Option<SecretRecord>> {
             unimplemented!()
         }
-        fn update_metadata(
+        fn update_settings(
             &self,
             _id: &SecretId,
             _metadata: accessfs_core::metadata::ItemMetadata,
+            _enforcement: accessfs_core::authz::Enforcement,
         ) -> StoreResult<()> {
             unimplemented!()
         }
@@ -901,6 +903,7 @@ mod tests {
                     sensitive: true,
                 }],
                 source: ResourceSource::SecretRef { secret_id: TOKEN_ID.to_string() },
+                enforcement: Default::default(),
                 metadata: Default::default(),
             },
         );
@@ -928,6 +931,7 @@ mod tests {
                     },
                 ],
                 source: ResourceSource::SecretRef { secret_id: ENV_FILE_ID.to_string() },
+                enforcement: Default::default(),
                 metadata: Default::default(),
             },
         );
@@ -947,6 +951,7 @@ mod tests {
                     sensitive: false,
                 }],
                 source: ResourceSource::Literal { value: "development".to_string() },
+                enforcement: Default::default(),
                 metadata: Default::default(),
             },
         );
@@ -967,6 +972,7 @@ mod tests {
                         "fixture-mode-binding".to_string(),
                     ],
                 },
+                enforcement: accessfs_core::authz::Enforcement::Prompt,
                 position: 0,
             })
             .unwrap();
@@ -980,6 +986,7 @@ mod tests {
                 input: SurfaceInput::Resource {
                     resource_id: "fixture-env-file".to_string(),
                 },
+                enforcement: accessfs_core::authz::Enforcement::Prompt,
                 position: 1,
             })
             .unwrap();
@@ -1004,6 +1011,7 @@ mod tests {
                         "fixture-mode-binding".to_string(),
                     ],
                 },
+                enforcement: accessfs_core::authz::Enforcement::Prompt,
                 position: 2,
             })
             .unwrap();
@@ -1118,6 +1126,7 @@ mod tests {
                     },
                 ],
                 source: ResourceSource::SecretRef { secret_id: INI_FILE_ID.to_string() },
+                enforcement: Default::default(),
                 metadata: Default::default(),
             },
         );
@@ -1151,6 +1160,7 @@ mod tests {
                 input: SurfaceInput::Bindings {
                     binding_ids: vec!["fixture-ini-binding".to_string()],
                 },
+                enforcement: accessfs_core::authz::Enforcement::Prompt,
                 position: 2,
             })
             .unwrap();
@@ -1164,6 +1174,7 @@ mod tests {
                 input: SurfaceInput::Bindings {
                     binding_ids: vec!["fixture-ini-binding".to_string()],
                 },
+                enforcement: accessfs_core::authz::Enforcement::Prompt,
                 position: 3,
             })
             .unwrap();
@@ -1212,6 +1223,7 @@ mod tests {
                         sensitive: true,
                     }],
                     source: ResourceSource::SecretRef { secret_id: secret_id.to_string() },
+                    enforcement: Default::default(),
                     metadata: Default::default(),
                 },
             );
@@ -1231,6 +1243,7 @@ mod tests {
                         "fixture-line-two-binding".to_string(),
                     ],
                 },
+                enforcement: accessfs_core::authz::Enforcement::Prompt,
                 position: 2,
             })
             .unwrap();
@@ -1244,6 +1257,7 @@ mod tests {
                 input: SurfaceInput::Bindings {
                     binding_ids: vec!["fixture-line-two-binding".to_string()],
                 },
+                enforcement: accessfs_core::authz::Enforcement::Prompt,
                 position: 3,
             })
             .unwrap();

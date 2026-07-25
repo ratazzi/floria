@@ -78,10 +78,11 @@ struct CatalogResource: Codable, Sendable {
     let defaultEnvKey: String?
     let entries: [CatalogEntry]
     let source: CatalogResourceSource
+    let enforcement: String
     let metadata: ItemMetadata
 
     enum CodingKeys: String, CodingKey {
-        case id, name, kind, shape, codec, entries, source, metadata
+        case id, name, kind, shape, codec, entries, source, enforcement, metadata
         case defaultEnvKey = "default_env_key"
     }
 }
@@ -160,10 +161,26 @@ struct CatalogSurface: Codable, Sendable {
     let kind: String
     let path: String
     let input: CatalogSurfaceInput
+    let enforcement: String
     let position: Int64
 
+    init(
+        id: String, environmentID: String, name: String, kind: String, path: String,
+        input: CatalogSurfaceInput, enforcement: String = WorkspaceSecurityLevel.confirmation.rawValue,
+        position: Int64
+    ) {
+        self.id = id
+        self.environmentID = environmentID
+        self.name = name
+        self.kind = kind
+        self.path = path
+        self.input = input
+        self.enforcement = enforcement
+        self.position = position
+    }
+
     enum CodingKeys: String, CodingKey {
-        case id, name, kind, path, input, position
+        case id, name, kind, path, input, enforcement, position
         case environmentID = "environment_id"
     }
 }
@@ -183,10 +200,11 @@ struct CatalogProtectedFile: Codable, Sendable {
     let size: UInt64
     let currentVersion: UInt32
     let linked: Bool
+    let enforcement: String
     let metadata: ItemMetadata
 
     enum CodingKeys: String, CodingKey {
-        case id, mode, size, linked, metadata
+        case id, mode, size, linked, enforcement, metadata
         case sourcePath = "source_path"
         case currentVersion = "current_version"
     }
@@ -206,20 +224,22 @@ enum ControlCommand: Sendable {
     case fileProtect(String)
     case protectedFileHistory(String)
     case protectedFileRollback(id: String, version: UInt32)
-    case protectedFileMetadataUpdate(id: String, metadata: ItemMetadata)
+    case protectedFileMetadataUpdate(
+        id: String, enforcement: String, metadata: ItemMetadata)
     case fileRestore(String)
     case sharedSecretCreate(
         resourceID: String, name: String, defaultEnvKey: String?, value: String,
-        metadata: ItemMetadata)
+        enforcement: String, metadata: ItemMetadata)
     case sharedSecretUpdate(
         resourceID: String, name: String, defaultEnvKey: String?, value: String?,
-        metadata: ItemMetadata
+        enforcement: String, metadata: ItemMetadata
     )
     case sharedSecretRemove(resourceID: String)
     case envFileCreate(
         resourceID: String, name: String, codec: String, value: String,
-        metadata: ItemMetadata)
-    case resourceMetadataUpdate(resourceID: String, name: String, metadata: ItemMetadata)
+        enforcement: String, metadata: ItemMetadata)
+    case resourceMetadataUpdate(
+        resourceID: String, name: String, enforcement: String, metadata: ItemMetadata)
     case projectCreate(CatalogProject, CatalogEnvironment, CatalogSurface)
     case projectUpsert(CatalogProject)
     case projectRemove(String)
@@ -275,44 +295,48 @@ enum ControlCommand: Sendable {
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: ProtectedFileRollbackParams(id: id, version: version)))
-        case .protectedFileMetadataUpdate(let id, let metadata):
+        case .protectedFileMetadataUpdate(let id, let enforcement, let metadata):
             return try encoder.encode(
                 ControlRequest(
                     requestID: requestID, method: method,
-                    params: ProtectedFileMetadataUpdateParams(id: id, metadata: metadata)))
-        case .sharedSecretCreate(let resourceID, let name, let defaultEnvKey, let value, let metadata):
+                    params: ProtectedFileMetadataUpdateParams(
+                        id: id, enforcement: enforcement, metadata: metadata)))
+        case .sharedSecretCreate(
+            let resourceID, let name, let defaultEnvKey, let value, let enforcement, let metadata):
             return try encoder.encode(
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: SharedSecretCreateParams(
                         resourceID: resourceID, name: name, defaultEnvKey: defaultEnvKey,
-                        value: value, metadata: metadata)))
+                        value: value, enforcement: enforcement, metadata: metadata)))
         case .sharedSecretUpdate(
-            let resourceID, let name, let defaultEnvKey, let value, let metadata):
+            let resourceID, let name, let defaultEnvKey, let value, let enforcement, let metadata):
             return try encoder.encode(
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: SharedSecretUpdateParams(
                         resourceID: resourceID, name: name, defaultEnvKey: defaultEnvKey,
-                        value: value, metadata: metadata)))
+                        value: value, enforcement: enforcement, metadata: metadata)))
         case .sharedSecretRemove(let resourceID):
             return try encoder.encode(
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: SharedSecretRemoveParams(resourceID: resourceID)))
-        case .envFileCreate(let resourceID, let name, let codec, let value, let metadata):
+        case .envFileCreate(
+            let resourceID, let name, let codec, let value, let enforcement, let metadata):
             return try encoder.encode(
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: EnvFileCreateParams(
                         resourceID: resourceID, name: name, codec: codec, value: value,
-                        metadata: metadata)))
-        case .resourceMetadataUpdate(let resourceID, let name, let metadata):
+                        enforcement: enforcement, metadata: metadata)))
+        case .resourceMetadataUpdate(let resourceID, let name, let enforcement, let metadata):
             return try encoder.encode(
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: ResourceMetadataUpdateParams(
-                        resourceID: resourceID, name: name, metadata: metadata)))
+                        resourceID: resourceID, name: name, enforcement: enforcement,
+                        metadata: metadata)))
         case .projectCreate(let project, let environment, let surface):
             return try encoder.encode(
                 ControlRequest(
@@ -364,6 +388,7 @@ private struct SharedSecretCreateParams: Encodable {
     let name: String
     let defaultEnvKey: String?
     let value: String
+    let enforcement: String
     let metadata: ItemMetadata
 }
 
@@ -372,6 +397,7 @@ private struct SharedSecretUpdateParams: Encodable {
     let name: String
     let defaultEnvKey: String?
     let value: String?
+    let enforcement: String
     let metadata: ItemMetadata
 }
 
@@ -385,6 +411,7 @@ private struct ProtectedFileRollbackParams: Encodable {
 }
 private struct ProtectedFileMetadataUpdateParams: Encodable {
     let id: String
+    let enforcement: String
     let metadata: ItemMetadata
 }
 
@@ -393,12 +420,14 @@ private struct EnvFileCreateParams: Encodable {
     let name: String
     let codec: String
     let value: String
+    let enforcement: String
     let metadata: ItemMetadata
 }
 
 private struct ResourceMetadataUpdateParams: Encodable {
     let resourceID: String
     let name: String
+    let enforcement: String
     let metadata: ItemMetadata
 }
 

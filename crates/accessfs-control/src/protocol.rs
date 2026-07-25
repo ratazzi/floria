@@ -5,6 +5,7 @@ use accessfs_catalog::{
     Binding, CatalogError, CatalogSnapshot, Environment, Project, ResolvedEnvironment, Resource,
     ItemMetadata, ResourceCodec, ResourceUsage, Surface,
 };
+use accessfs_core::authz::Enforcement;
 use accessfs_store::StoreError;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -58,7 +59,11 @@ pub enum ControlCommand {
     FileProtect { path: PathBuf },
     ProtectedFileHistory { id: String },
     ProtectedFileRollback { id: String, version: u32 },
-    ProtectedFileMetadataUpdate { id: String, metadata: ItemMetadata },
+    ProtectedFileMetadataUpdate {
+        id: String,
+        enforcement: Enforcement,
+        metadata: ItemMetadata,
+    },
     FileRestore { id: String },
     ResolveEnvironment { project_id: String, environment_id: String },
     ResourceUsage { resource_id: String },
@@ -67,6 +72,7 @@ pub enum ControlCommand {
         name: String,
         default_env_key: Option<String>,
         value: SecretValue,
+        enforcement: Enforcement,
         metadata: ItemMetadata,
     },
     SharedSecretUpdate {
@@ -74,6 +80,7 @@ pub enum ControlCommand {
         name: String,
         default_env_key: Option<String>,
         value: Option<SecretValue>,
+        enforcement: Enforcement,
         metadata: ItemMetadata,
     },
     SharedSecretRemove { resource_id: String },
@@ -83,9 +90,15 @@ pub enum ControlCommand {
         name: String,
         codec: ResourceCodec,
         value: SecretValue,
+        enforcement: Enforcement,
         metadata: ItemMetadata,
     },
-    ResourceMetadataUpdate { resource_id: String, name: String, metadata: ItemMetadata },
+    ResourceMetadataUpdate {
+        resource_id: String,
+        name: String,
+        enforcement: Enforcement,
+        metadata: ItemMetadata,
+    },
     ProjectCreate { project: Project, environment: Environment, surface: Surface },
     ProjectUpsert { project: Project },
     ProjectRemove { id: String },
@@ -139,6 +152,7 @@ pub struct ProtectedFile {
     pub size: u64,
     pub current_version: u32,
     pub linked: bool,
+    pub enforcement: Enforcement,
     pub metadata: ItemMetadata,
 }
 
@@ -253,6 +267,7 @@ mod tests {
                 name: "Fixture INI".to_string(),
                 codec: ResourceCodec::Ini,
                 value: SecretValue::new("[fixture]\nREGION=fixture-region\n"),
+                enforcement: Enforcement::Prompt,
                 metadata: ItemMetadata::default(),
             },
         };

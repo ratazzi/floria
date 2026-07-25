@@ -94,6 +94,110 @@ private struct ItemMetadataEditor: View {
     }
 }
 
+private struct SecurityLevelPicker: View {
+    @Binding var selection: WorkspaceSecurityLevel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Text("Security Level").font(.callout.weight(.medium))
+            Picker("Security Level", selection: $selection) {
+                ForEach(WorkspaceSecurityLevel.allCases, id: \.self) { level in
+                    Label(level.title, systemImage: level.systemImage).tag(level)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            Text(selection.detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct SecurityLevelBadge: View {
+    let level: WorkspaceSecurityLevel
+
+    private var color: Color {
+        switch level {
+        case .auditOnly: .secondary
+        case .confirmation: .blue
+        case .touchID: .orange
+        }
+    }
+
+    var body: some View {
+        Label(level.compactTitle, systemImage: level.systemImage)
+            .font(.caption.weight(.medium))
+            .foregroundStyle(color)
+            .padding(.horizontal, 7)
+            .padding(.vertical, 3)
+            .background(color.opacity(0.1), in: Capsule())
+    }
+}
+
+private struct SecurityLevelMenu: View {
+    let level: WorkspaceSecurityLevel
+    let update: (WorkspaceSecurityLevel) async throws -> Void
+    @State private var isSaving = false
+    @State private var errorMessage: String?
+
+    var body: some View {
+        Menu {
+            ForEach(WorkspaceSecurityLevel.allCases, id: \.self) { option in
+                Button {
+                    setLevel(option)
+                } label: {
+                    Label(
+                        option.title,
+                        systemImage: option == level ? "checkmark" : option.systemImage)
+                }
+                .disabled(option == level)
+            }
+        } label: {
+            Group {
+                if isSaving {
+                    ProgressView()
+                        .controlSize(.small)
+                        .frame(minWidth: 42)
+                } else {
+                    SecurityLevelBadge(level: level)
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .disabled(isSaving)
+        .help("Change Security Level")
+        .accessibilityLabel("Security Level")
+        .accessibilityValue(level.title)
+        .alert(
+            "Couldn't Change Security Level",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } })
+        ) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
+    }
+
+    private func setLevel(_ newLevel: WorkspaceSecurityLevel) {
+        guard newLevel != level, !isSaving else { return }
+        isSaving = true
+        Task {
+            defer { isSaving = false }
+            do {
+                try await update(newLevel)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+}
+
 private func defaultEnvironmentFileName(_ name: String) -> String {
     let slug = name
         .lowercased()
@@ -889,12 +993,19 @@ private struct SurfaceInspector: View {
                             .accessibilityLabel("Output actions")
                             SurfaceStatusBadge(status: surface.status)
                         }
-                        Text(surface.path)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
-                            .truncationMode(.middle)
-                            .textSelection(.enabled)
+                        HStack(spacing: 10) {
+                            Text(surface.path)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                                .truncationMode(.middle)
+                                .textSelection(.enabled)
+                            Spacer(minLength: 4)
+                            SecurityLevelMenu(level: surface.securityLevel) { securityLevel in
+                                try await store.updateSurfaceSecurityLevel(
+                                    surface.id, securityLevel: securityLevel)
+                            }
+                        }
                     }
                     .padding(20)
 
@@ -1650,8 +1761,14 @@ private struct ProtectedFilesView: View {
                     }
                     Spacer()
                     VStack(alignment: .trailing, spacing: 3) {
-                        Text(file.kind.title)
-                            .font(.caption.weight(.medium))
+                        HStack(spacing: 7) {
+                            Text(file.kind.title)
+                                .font(.caption.weight(.medium))
+                            SecurityLevelMenu(level: file.securityLevel) { securityLevel in
+                                try await store.updateProtectedFileMetadata(
+                                    file.id, securityLevel: securityLevel, metadata: file.metadata)
+                            }
+                        }
                         Text(
                             "\(file.linked ? "Linked" : "Stored only") · v\(file.currentVersion) · \(ByteCountFormatter.string(fromByteCount: Int64(file.size), countStyle: .file)) · \(String(format: "%04o", file.mode))"
                         )
@@ -1662,7 +1779,7 @@ private struct ProtectedFilesView: View {
                         Button("Version History", systemImage: "clock.arrow.circlepath") {
                             historyFile = file
                         }
-                        Button("Edit Info…", systemImage: "pencil") {
+                        Button("Edit Security & Info…", systemImage: "pencil") {
                             editingFile = file
                         }
                         if !file.metadata.links.isEmpty {
@@ -1695,6 +1812,7 @@ private struct ProtectedFilesView: View {
                             .contentShape(Rectangle())
                     }
                     .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
                     .fixedSize()
                     .accessibilityLabel("More")
                 }
@@ -1768,6 +1886,7 @@ private struct EditProtectedFileMetadataSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var note: String
     @State private var links: [EditableItemLink]
+    @State private var securityLevel: WorkspaceSecurityLevel
     @State private var isSaving = false
     @State private var errorMessage: String?
 
@@ -1776,6 +1895,7 @@ private struct EditProtectedFileMetadataSheet: View {
         self.file = file
         _note = State(initialValue: file.metadata.note ?? "")
         _links = State(initialValue: editableLinks(file.metadata))
+        _securityLevel = State(initialValue: file.securityLevel)
     }
 
     var body: some View {
@@ -1789,6 +1909,7 @@ private struct EditProtectedFileMetadataSheet: View {
                     .truncationMode(.middle)
             }
 
+            SecurityLevelPicker(selection: $securityLevel)
             ItemMetadataEditor(note: $note, links: $links)
 
             Divider()
@@ -1822,7 +1943,8 @@ private struct EditProtectedFileMetadataSheet: View {
             defer { isSaving = false }
             do {
                 try await store.updateProtectedFileMetadata(
-                    file.id, metadata: itemMetadata(note: note, links: links))
+                    file.id, securityLevel: securityLevel,
+                    metadata: itemMetadata(note: note, links: links))
                 dismiss()
             } catch {
                 errorMessage = error.localizedDescription
@@ -1994,7 +2116,14 @@ private struct ResourceCatalogView: View {
                     }
                     Spacer()
                     VStack(alignment: .trailing, spacing: 3) {
-                        ResourceKindBadge(kind: resource.kind)
+                        HStack(spacing: 7) {
+                            ResourceKindBadge(kind: resource.kind)
+                            SecurityLevelMenu(level: resource.securityLevel) { securityLevel in
+                                try await store.updateResourceMetadata(
+                                    resource.id, name: resource.name,
+                                    securityLevel: securityLevel, metadata: resource.metadata)
+                            }
+                        }
                         Text("Used by \(resource.usageCount) projects")
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -2006,7 +2135,7 @@ private struct ResourceCatalogView: View {
                                     editingSharedSecret = resource
                                 }
                             } else {
-                                Button("Edit Info…", systemImage: "pencil") {
+                                Button("Edit Security & Info…", systemImage: "pencil") {
                                     editingResourceInfo = resource
                                 }
                             }
@@ -2030,6 +2159,7 @@ private struct ResourceCatalogView: View {
                                 .contentShape(Rectangle())
                         }
                         .menuStyle(.borderlessButton)
+                        .menuIndicator(.hidden)
                         .fixedSize()
                         .accessibilityLabel("More actions for \(resource.name)")
                     }
@@ -2103,6 +2233,7 @@ private struct EditResourceMetadataSheet: View {
     @State private var name: String
     @State private var note: String
     @State private var links: [EditableItemLink]
+    @State private var securityLevel: WorkspaceSecurityLevel
     @State private var isSaving = false
     @State private var errorMessage: String?
 
@@ -2112,6 +2243,7 @@ private struct EditResourceMetadataSheet: View {
         _name = State(initialValue: resource.name)
         _note = State(initialValue: resource.metadata.note ?? "")
         _links = State(initialValue: editableLinks(resource.metadata))
+        _securityLevel = State(initialValue: resource.securityLevel)
     }
 
     var body: some View {
@@ -2128,6 +2260,7 @@ private struct EditResourceMetadataSheet: View {
                 TextField("Team defaults", text: $name)
                     .textFieldStyle(.roundedBorder)
             }
+            SecurityLevelPicker(selection: $securityLevel)
             ItemMetadataEditor(note: $note, links: $links)
 
             Divider()
@@ -2164,6 +2297,7 @@ private struct EditResourceMetadataSheet: View {
             do {
                 try await store.updateResourceMetadata(
                     resource.id, name: name,
+                    securityLevel: securityLevel,
                     metadata: itemMetadata(note: note, links: links))
                 dismiss()
             } catch {
@@ -2183,6 +2317,7 @@ private struct EditSharedSecretSheet: View {
     @State private var newValue = ""
     @State private var note: String
     @State private var links: [EditableItemLink]
+    @State private var securityLevel: WorkspaceSecurityLevel
     @State private var isSaving = false
     @State private var errorMessage: String?
 
@@ -2193,6 +2328,7 @@ private struct EditSharedSecretSheet: View {
         _defaultKey = State(initialValue: resource.defaultEnvKey ?? "")
         _note = State(initialValue: resource.metadata.note ?? "")
         _links = State(initialValue: editableLinks(resource.metadata))
+        _securityLevel = State(initialValue: resource.securityLevel)
     }
 
     var body: some View {
@@ -2210,6 +2346,7 @@ private struct EditSharedSecretSheet: View {
                     .textFieldStyle(.roundedBorder)
             }
 
+            SecurityLevelPicker(selection: $securityLevel)
             ItemMetadataEditor(note: $note, links: $links)
             VStack(alignment: .leading, spacing: 7) {
                 Text("Default environment key (optional)")
@@ -2273,6 +2410,7 @@ private struct EditSharedSecretSheet: View {
                 try await store.updateSharedSecret(
                     resource.id, name: name, defaultEnvKey: defaultKey.uppercased(),
                     newValue: submittedValue,
+                    securityLevel: securityLevel,
                     metadata: itemMetadata(note: note, links: links))
                 dismiss()
             } catch {
@@ -2847,6 +2985,7 @@ private struct NewSharedSecretSheet: View {
     @State private var value = ""
     @State private var note = ""
     @State private var links: [EditableItemLink] = []
+    @State private var securityLevel = WorkspaceSecurityLevel.confirmation
     @State private var isSaving = false
     @State private var errorMessage: String?
 
@@ -2876,6 +3015,7 @@ private struct NewSharedSecretSheet: View {
                     .textFieldStyle(.roundedBorder)
             }
 
+            SecurityLevelPicker(selection: $securityLevel)
             ItemMetadataEditor(note: $note, links: $links)
 
             HStack {
@@ -2926,6 +3066,7 @@ private struct NewSharedSecretSheet: View {
             do {
                 try await store.createSharedSecret(
                     name: name, defaultEnvKey: defaultKey.uppercased(), value: submittedValue,
+                    securityLevel: securityLevel,
                     metadata: itemMetadata(note: note, links: links))
                 dismiss()
             } catch {
@@ -2945,6 +3086,7 @@ private struct NewEnvFileSheet: View {
     @State private var value = ""
     @State private var note = ""
     @State private var links: [EditableItemLink] = []
+    @State private var securityLevel = WorkspaceSecurityLevel.confirmation
     @State private var isSaving = false
     @State private var errorMessage: String?
 
@@ -3025,6 +3167,7 @@ private struct NewEnvFileSheet: View {
                     .frame(minHeight: 230)
             }
 
+            SecurityLevelPicker(selection: $securityLevel)
             ItemMetadataEditor(note: $note, links: $links)
 
             HStack {
@@ -3086,6 +3229,7 @@ private struct NewEnvFileSheet: View {
             do {
                 try await store.createEnvFile(
                     name: name, codec: codec, value: submittedValue,
+                    securityLevel: securityLevel,
                     metadata: itemMetadata(note: note, links: links))
                 dismiss()
             } catch {

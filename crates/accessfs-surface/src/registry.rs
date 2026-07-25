@@ -111,6 +111,7 @@ mod tests {
             kind,
             path: PathBuf::from(format!("/fixture/project/{id}")),
             input: SurfaceInput::Bindings { binding_ids: Vec::new() },
+            enforcement: accessfs_core::authz::Enforcement::Prompt,
             position: 0,
         }
     }
@@ -137,6 +138,7 @@ mod tests {
                 sensitive: true,
             }],
             source: ResourceSource::SecretRef { secret_id: "fixture-secret".to_string() },
+            enforcement: Default::default(),
             metadata: Default::default(),
         };
         let registry = SurfaceRegistry::from_snapshot(&CatalogSnapshot {

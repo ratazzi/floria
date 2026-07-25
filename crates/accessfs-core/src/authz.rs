@@ -7,6 +7,7 @@
 //! may do IPC or wait on a user prompt, as long as it returns within `daemon_timeout`.
 
 use crate::identity::ProcessIdentity;
+use serde::{Deserialize, Serialize};
 
 /// A single authorization request at a process's first observable access boundary.
 pub struct AuthRequest<'a> {
@@ -40,7 +41,8 @@ impl Operation {
 
 /// The enforcement level configured for a path: how strictly its access is gated.
 /// Attached per-file in config; consumed by the policy engine (agent).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Enforcement {
     /// Allow silently, audit only (monitor mode). The default.
     #[default]

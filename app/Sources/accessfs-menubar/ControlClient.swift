@@ -59,8 +59,12 @@ final class ControlClient: @unchecked Sendable {
         return result.file
     }
 
-    func updateProtectedFileMetadata(_ id: String, metadata: ItemMetadata) async throws {
-        try await requestEmpty(.protectedFileMetadataUpdate(id: id, metadata: metadata))
+    func updateProtectedFileMetadata(
+        _ id: String, enforcement: String, metadata: ItemMetadata
+    ) async throws {
+        try await requestEmpty(
+            .protectedFileMetadataUpdate(
+                id: id, enforcement: enforcement, metadata: metadata))
     }
 
     func restoreFile(_ id: String) async throws -> Bool {
@@ -74,23 +78,23 @@ final class ControlClient: @unchecked Sendable {
 
     func createSharedSecret(
         resourceID: String, name: String, defaultEnvKey: String?, value: String,
-        metadata: ItemMetadata
+        enforcement: String, metadata: ItemMetadata
     ) async throws {
         let _: SharedSecretCreated? = try await request(
             .sharedSecretCreate(
                 resourceID: resourceID, name: name, defaultEnvKey: defaultEnvKey, value: value,
-                metadata: metadata),
+                enforcement: enforcement, metadata: metadata),
             expecting: "shared_secret_created", as: SharedSecretCreated.self)
     }
 
     func updateSharedSecret(
         resourceID: String, name: String, defaultEnvKey: String?, value: String?,
-        metadata: ItemMetadata
+        enforcement: String, metadata: ItemMetadata
     ) async throws {
         try await requestEmpty(
             .sharedSecretUpdate(
                 resourceID: resourceID, name: name, defaultEnvKey: defaultEnvKey,
-                value: value, metadata: metadata))
+                value: value, enforcement: enforcement, metadata: metadata))
     }
 
     func deleteSharedSecret(resourceID: String) async throws {
@@ -99,20 +103,22 @@ final class ControlClient: @unchecked Sendable {
 
     func createEnvFile(
         resourceID: String, name: String, codec: WorkspaceResourceCodec, value: String,
-        metadata: ItemMetadata
+        enforcement: String, metadata: ItemMetadata
     ) async throws {
         let _: EnvFileCreated? = try await request(
             .envFileCreate(
                 resourceID: resourceID, name: name, codec: codec.rawValue, value: value,
-                metadata: metadata),
+                enforcement: enforcement, metadata: metadata),
             expecting: "env_file_created", as: EnvFileCreated.self)
     }
 
     func updateResourceMetadata(
-        resourceID: String, name: String, metadata: ItemMetadata
+        resourceID: String, name: String, enforcement: String, metadata: ItemMetadata
     ) async throws {
         try await requestEmpty(
-            .resourceMetadataUpdate(resourceID: resourceID, name: name, metadata: metadata))
+            .resourceMetadataUpdate(
+                resourceID: resourceID, name: name, enforcement: enforcement,
+                metadata: metadata))
     }
 
     func upsertProject(_ project: CatalogProject) async throws {

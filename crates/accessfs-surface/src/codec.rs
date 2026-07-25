@@ -277,6 +277,7 @@ mod tests {
                 sensitive: true,
             }],
             source: ResourceSource::SecretRef { secret_id: "fixture-secret".to_string() },
+            enforcement: Default::default(),
             metadata: Default::default(),
         };
 
@@ -302,6 +303,7 @@ mod tests {
                 sensitive: true,
             }],
             source: ResourceSource::SecretRef { secret_id: "fixture-secret".to_string() },
+            enforcement: Default::default(),
             metadata: Default::default(),
         };
         let snapshot = CatalogSnapshot {
@@ -326,6 +328,7 @@ mod tests {
                 input: SurfaceInput::Bindings {
                     binding_ids: vec!["fixture-binding".to_string()],
                 },
+                enforcement: accessfs_core::authz::Enforcement::Prompt,
                 position: 0,
             }],
             ..CatalogSnapshot::default()

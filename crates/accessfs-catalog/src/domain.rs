@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use accessfs_core::authz::Enforcement;
 use serde::{Deserialize, Serialize};
 pub use accessfs_core::metadata::{ItemLink, ItemMetadata};
 
@@ -153,6 +154,8 @@ pub struct Resource {
     #[serde(default)]
     pub entries: Vec<EntrySpec>,
     pub source: ResourceSource,
+    /// Default authorization behavior when no explicit process rule matches this resource.
+    pub enforcement: Enforcement,
     #[serde(default)]
     pub metadata: ItemMetadata,
 }
@@ -241,6 +244,7 @@ pub struct Surface {
     pub kind: SurfaceKind,
     pub path: PathBuf,
     pub input: SurfaceInput,
+    pub enforcement: Enforcement,
     #[serde(default)]
     pub position: i64,
 }

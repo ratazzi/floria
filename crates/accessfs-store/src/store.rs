@@ -14,6 +14,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+use accessfs_core::authz::Enforcement;
 use accessfs_core::metadata::ItemMetadata;
 
 use crate::error::{StoreError, StoreResult};
@@ -87,6 +88,8 @@ pub struct SecretRecord {
     pub created: String,
     /// Head version number.
     pub current_version: u32,
+    /// Default authorization behavior when no explicit process rule matches this secret.
+    pub enforcement: Enforcement,
     /// Plaintext, non-secret context for display and navigation.
     pub metadata: ItemMetadata,
 }
@@ -137,8 +140,14 @@ pub trait SecretStore: Send + Sync {
     fn record(&self, id: &SecretId) -> StoreResult<Option<SecretRecord>>;
     fn list(&self) -> StoreResult<Vec<SecretRecord>>;
     fn get_by_path(&self, source_path: &Path) -> StoreResult<Option<SecretRecord>>;
-    /// Replace plaintext display metadata without creating a secret content version.
-    fn update_metadata(&self, id: &SecretId, metadata: ItemMetadata) -> StoreResult<()>;
+    /// Atomically replace display metadata and authorization behavior without creating a content
+    /// version.
+    fn update_settings(
+        &self,
+        id: &SecretId,
+        metadata: ItemMetadata,
+        enforcement: Enforcement,
+    ) -> StoreResult<()>;
     /// Delete a secret and all its versions.
     fn delete(&self, id: &SecretId) -> StoreResult<()>;
 }
@@ -157,8 +166,14 @@ struct MetaFile {
     mode: u32,
     created: String,
     current_version: u32,
+    #[serde(default = "default_secret_enforcement")]
+    enforcement: Enforcement,
     #[serde(default, skip_serializing_if = "ItemMetadata::is_empty")]
     metadata: ItemMetadata,
+}
+
+fn default_secret_enforcement() -> Enforcement {
+    Enforcement::Prompt
 }
 
 /// On-disk `<id>/v/NNNN.toml`: immutable per-version metadata.
@@ -397,6 +412,7 @@ impl SecretStore for AgeDirStore {
                 mode,
                 created: now_rfc3339(),
                 current_version: 1,
+                enforcement: Enforcement::Prompt,
                 metadata: ItemMetadata::default(),
             },
         )?;
@@ -487,6 +503,7 @@ impl SecretStore for AgeDirStore {
             size: vm.size,
             created: meta.created,
             current_version: meta.current_version,
+            enforcement: meta.enforcement,
             metadata: meta.metadata,
         }))
     }
@@ -529,11 +546,17 @@ impl SecretStore for AgeDirStore {
             }))
     }
 
-    fn update_metadata(&self, id: &SecretId, metadata: ItemMetadata) -> StoreResult<()> {
+    fn update_settings(
+        &self,
+        id: &SecretId,
+        metadata: ItemMetadata,
+        enforcement: Enforcement,
+    ) -> StoreResult<()> {
         metadata.validate().map_err(StoreError::Invalid)?;
         let _lock = self.lock_exclusive()?;
         let mut meta = self.read_meta(id)?;
         meta.metadata = metadata;
+        meta.enforcement = enforcement;
         self.write_meta(id, &meta)
     }
 
@@ -724,14 +747,16 @@ mod tests {
             }],
         };
 
-        s.update_metadata(&id, metadata.clone()).unwrap();
+        s.update_settings(&id, metadata.clone(), Enforcement::TouchId).unwrap();
 
         let record = s.record(&id).unwrap().unwrap();
         assert_eq!(record.metadata, metadata);
+        assert_eq!(record.enforcement, Enforcement::TouchId);
         assert_eq!(record.current_version, 1);
         assert_eq!(s.history(&id).unwrap().len(), 1);
         let sidecar = std::fs::read_to_string(s.entry_dir(&id).join("meta.toml")).unwrap();
         assert!(sidecar.contains("Local reporting database"));
+        assert!(sidecar.contains("enforcement = \"touchid\""));
         assert!(!sidecar.contains("fixture\n"));
     }
 

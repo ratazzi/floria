@@ -31,7 +31,7 @@ final class ControlProtocolTests: XCTestCase {
 
     func testDecodesProtectedFileMetadataWithoutPlaintext() throws {
         let data = Data(
-            #"{"id":"00000000-0000-0000-0000-000000000001","source_path":"/fixture/project/.env","mode":384,"size":42,"current_version":3,"linked":true,"metadata":{"note":"Local app environment","links":[]}}"#.utf8)
+            #"{"id":"00000000-0000-0000-0000-000000000001","source_path":"/fixture/project/.env","mode":384,"size":42,"current_version":3,"linked":true,"enforcement":"touchid","metadata":{"note":"Local app environment","links":[]}}"#.utf8)
 
         let file = try JSONDecoder().decode(CatalogProtectedFile.self, from: data)
 
@@ -40,6 +40,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(file.size, 42)
         XCTAssertEqual(file.currentVersion, 3)
         XCTAssertTrue(file.linked)
+        XCTAssertEqual(file.enforcement, "touchid")
     }
 
     func testProtectedFileMaintenanceRequestsMatchRustWireShape() throws {
@@ -64,6 +65,15 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(rollbackValue["method"] as? String, "protected_file_rollback")
         XCTAssertEqual(rollbackParams["id"] as? String, "fixture-secret")
         XCTAssertEqual(rollbackParams["version"] as? UInt32, 2)
+
+        let update = try ControlCommand.protectedFileMetadataUpdate(
+            id: "fixture-secret", enforcement: "allow", metadata: .empty
+        ).requestData(requestID: 731, encoder: encoder)
+        let updateValue = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: update) as? [String: Any])
+        let updateParams = try XCTUnwrap(updateValue["params"] as? [String: Any])
+        XCTAssertEqual(updateValue["method"] as? String, "protected_file_metadata_update")
+        XCTAssertEqual(updateParams["enforcement"] as? String, "allow")
 
         let restore = try ControlCommand.fileRestore("fixture-secret")
             .requestData(requestID: 74, encoder: encoder)
@@ -105,6 +115,7 @@ final class ControlProtocolTests: XCTestCase {
         let data = try ControlCommand.sharedSecretCreate(
             resourceID: "fixture-line", name: "Fixture Line", defaultEnvKey: nil,
             value: "fixture-host|5432|fixture-db|fixture-user|fixture-value",
+            enforcement: "allow",
             metadata: ItemMetadata(note: "Reporting database", links: [])
         ).requestData(requestID: 9, encoder: encoder)
         let value = try XCTUnwrap(
@@ -113,6 +124,7 @@ final class ControlProtocolTests: XCTestCase {
 
         XCTAssertEqual(value["method"] as? String, "shared_secret_create")
         XCTAssertNil(params["default_env_key"])
+        XCTAssertEqual(params["enforcement"] as? String, "allow")
         XCTAssertEqual(
             params["value"] as? String,
             "fixture-host|5432|fixture-db|fixture-user|fixture-value")
@@ -126,6 +138,7 @@ final class ControlProtocolTests: XCTestCase {
         let update = try ControlCommand.sharedSecretUpdate(
             resourceID: "fixture-secret", name: "Renamed Secret",
             defaultEnvKey: "RENAMED_TOKEN", value: "fixture-value-three",
+            enforcement: "touchid",
             metadata: .empty
         ).requestData(requestID: 91, encoder: encoder)
         let updateValue = try XCTUnwrap(
@@ -136,6 +149,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(updateParams["name"] as? String, "Renamed Secret")
         XCTAssertEqual(updateParams["default_env_key"] as? String, "RENAMED_TOKEN")
         XCTAssertEqual(updateParams["value"] as? String, "fixture-value-three")
+        XCTAssertEqual(updateParams["enforcement"] as? String, "touchid")
 
         let remove = try ControlCommand.sharedSecretRemove(resourceID: "fixture-secret")
             .requestData(requestID: 92, encoder: encoder)
@@ -153,6 +167,7 @@ final class ControlProtocolTests: XCTestCase {
             resourceID: "fixture-env-file", name: "Fixture Env File",
             codec: "dotenv",
             value: "API_HOST=http://127.0.0.1:8787\nLOG_LEVEL=debug\n",
+            enforcement: "prompt",
             metadata: .empty
         ).requestData(requestID: 12, encoder: encoder)
         let value = try XCTUnwrap(
@@ -163,6 +178,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(params["resource_id"] as? String, "fixture-env-file")
         XCTAssertEqual(params["name"] as? String, "Fixture Env File")
         XCTAssertEqual(params["codec"] as? String, "dotenv")
+        XCTAssertEqual(params["enforcement"] as? String, "prompt")
         XCTAssertEqual(
             params["value"] as? String,
             "API_HOST=http://127.0.0.1:8787\nLOG_LEVEL=debug\n")
@@ -170,13 +186,14 @@ final class ControlProtocolTests: XCTestCase {
 
     func testDecodesResourceEntriesWithoutLegacyExportMetadata() throws {
         let data = Data(
-            #"{"projects":[],"environments":[],"resources":[{"id":"fixture-line","name":"Fixture Line","kind":"shared_secret","shape":"scalar","codec":"opaque","default_env_key":null,"entries":[{"address":"value","label":"Fixture Line","key":null,"sensitive":true}],"source":{"type":"secret_ref","secret_id":"fixture-secret"},"metadata":{}}],"bindings":[],"surfaces":[]}"#.utf8)
+            #"{"projects":[],"environments":[],"resources":[{"id":"fixture-line","name":"Fixture Line","kind":"shared_secret","shape":"scalar","codec":"opaque","default_env_key":null,"entries":[{"address":"value","label":"Fixture Line","key":null,"sensitive":true}],"source":{"type":"secret_ref","secret_id":"fixture-secret"},"enforcement":"prompt","metadata":{}}],"bindings":[],"surfaces":[]}"#.utf8)
 
         let snapshot = try JSONDecoder().decode(CatalogSnapshot.self, from: data)
 
         XCTAssertEqual(snapshot.resources.first?.entries.first?.address, "value")
         XCTAssertNil(snapshot.resources.first?.entries.first?.key)
         XCTAssertEqual(snapshot.resources.first?.codec, "opaque")
+        XCTAssertEqual(snapshot.resources.first?.enforcement, "prompt")
         XCTAssertEqual(snapshot.resources.first?.metadata, .empty)
     }
 
@@ -204,6 +221,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(environment["project_id"] as? String, "fixture-project")
         XCTAssertEqual(surface["environment_id"] as? String, "fixture-development")
         XCTAssertEqual((surface["input"] as? [String: Any])?["type"] as? String, "bindings")
+        XCTAssertEqual(surface["enforcement"] as? String, "prompt")
     }
 
     func testLifecycleRemoveCommandsMatchRustWireShape() throws {
@@ -241,27 +259,29 @@ final class ControlProtocolTests: XCTestCase {
 
     func testDecodesCatalogForeignKeysFromRustSnapshot() throws {
         let data = Data(
-            #"{"projects":[],"environments":[{"id":"fixture-development","project_id":"fixture-project","name":"Development","position":0}],"resources":[],"bindings":[],"surfaces":[{"id":"fixture-dotenv","environment_id":"fixture-development","name":".env","kind":"dotenv_file","path":"/tmp/fixture/.env","input":{"type":"bindings","binding_ids":[]},"position":0}]}"#.utf8)
+            #"{"projects":[],"environments":[{"id":"fixture-development","project_id":"fixture-project","name":"Development","position":0}],"resources":[],"bindings":[],"surfaces":[{"id":"fixture-dotenv","environment_id":"fixture-development","name":".env","kind":"dotenv_file","path":"/tmp/fixture/.env","input":{"type":"bindings","binding_ids":[]},"enforcement":"allow","position":0}]}"#.utf8)
         let decoder = JSONDecoder()
 
         let snapshot = try decoder.decode(CatalogSnapshot.self, from: data)
 
         XCTAssertEqual(snapshot.environments.first?.projectID, "fixture-project")
         XCTAssertEqual(snapshot.surfaces.first?.environmentID, "fixture-development")
+        XCTAssertEqual(snapshot.surfaces.first?.enforcement, "allow")
     }
 
     func testDecodesDirectEnvFileSurfaceFromRustSnapshot() throws {
         let data = Data(
-            #"{"projects":[],"environments":[],"resources":[],"bindings":[],"surfaces":[{"id":"fixture-direct","environment_id":"fixture-development","name":".env.local","kind":"env_file_direct","path":"/tmp/fixture/.env.local","input":{"type":"resource","resource_id":"fixture-env-file"},"position":1}]}"#.utf8)
+            #"{"projects":[],"environments":[],"resources":[],"bindings":[],"surfaces":[{"id":"fixture-direct","environment_id":"fixture-development","name":".env.local","kind":"env_file_direct","path":"/tmp/fixture/.env.local","input":{"type":"resource","resource_id":"fixture-env-file"},"enforcement":"touchid","position":1}]}"#.utf8)
         let snapshot = try JSONDecoder().decode(CatalogSnapshot.self, from: data)
 
         XCTAssertEqual(snapshot.surfaces.first?.kind, "env_file_direct")
         XCTAssertEqual(snapshot.surfaces.first?.input.resourceID, "fixture-env-file")
+        XCTAssertEqual(snapshot.surfaces.first?.enforcement, "touchid")
     }
 
     func testDecodesIniSurfaceFromRustSnapshot() throws {
         let data = Data(
-            #"{"projects":[],"environments":[],"resources":[],"bindings":[],"surfaces":[{"id":"fixture-ini","environment_id":"fixture-development","name":"credentials.ini","kind":"ini_file","path":"/tmp/fixture/credentials.ini","input":{"type":"bindings","binding_ids":["fixture-binding"]},"position":1}]}"#.utf8)
+            #"{"projects":[],"environments":[],"resources":[],"bindings":[],"surfaces":[{"id":"fixture-ini","environment_id":"fixture-development","name":"credentials.ini","kind":"ini_file","path":"/tmp/fixture/credentials.ini","input":{"type":"bindings","binding_ids":["fixture-binding"]},"enforcement":"prompt","position":1}]}"#.utf8)
         let snapshot = try JSONDecoder().decode(CatalogSnapshot.self, from: data)
 
         XCTAssertEqual(snapshot.surfaces.first?.kind, "ini_file")
@@ -270,7 +290,7 @@ final class ControlProtocolTests: XCTestCase {
 
     func testDecodesDirenvSurfaceFromRustSnapshot() throws {
         let data = Data(
-            #"{"projects":[],"environments":[],"resources":[],"bindings":[],"surfaces":[{"id":"fixture-direnv","environment_id":"fixture-development","name":".envrc","kind":"direnv_file","path":"/tmp/fixture/.envrc","input":{"type":"bindings","binding_ids":["fixture-binding"]},"position":1}]}"#.utf8)
+            #"{"projects":[],"environments":[],"resources":[],"bindings":[],"surfaces":[{"id":"fixture-direnv","environment_id":"fixture-development","name":".envrc","kind":"direnv_file","path":"/tmp/fixture/.envrc","input":{"type":"bindings","binding_ids":["fixture-binding"]},"enforcement":"allow","position":1}]}"#.utf8)
         let snapshot = try JSONDecoder().decode(CatalogSnapshot.self, from: data)
 
         XCTAssertEqual(snapshot.surfaces.first?.kind, "direnv_file")

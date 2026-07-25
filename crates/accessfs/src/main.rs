@@ -1,14 +1,18 @@
+use std::collections::HashMap;
 use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use accessfs_catalog::{Catalog, CatalogSnapshot, Surface, SurfaceKind};
+use accessfs_catalog::{
+    Catalog, CatalogSnapshot, ResourceSource, Surface, SurfaceKind,
+};
 use accessfs_control::{
     CatalogObserver, ControlClient, ControlCommand, ControlResult, ControlServer,
 };
-use accessfs_core::config::{Config, ResolvedConfig};
+use accessfs_core::authz::Enforcement;
+use accessfs_core::config::{Config, ResolvedConfig, SECRETS_DIR, SURFACES_DIR};
 use accessfs_store::{AgeDirStore, NewSecret, SecretId, SecretRecord, SecretStore, SshKeyProvider};
 use accessfs_surface::{
     ensure_file_surface_link, remove_file_surface_link, validate_secret_bytes, SurfaceLinkRemoval,
@@ -350,11 +354,15 @@ fn cmd_mount(config: &Path) -> Result<()> {
     let snapshot = catalog.snapshot().context("loading initial surface registry")?;
     let surface_registry = Arc::new(SurfaceRegistry::from_snapshot(&snapshot));
     reconcile_file_links(&snapshot, &cfg.mount_path);
+    let store: Arc<dyn SecretStore> = Arc::new(open_store(&cfg)?);
+    let agent = accessfs_agent::SocketAgent::start(&cfg).context("starting agent socket")?;
+    agent.replace_managed_enforcement(managed_enforcement(&snapshot, &store.list()?));
     let observer: Arc<dyn CatalogObserver> = Arc::new(RuntimeCatalogObserver {
         surface_registry: Arc::clone(&surface_registry),
         mount_path: cfg.mount_path.clone(),
+        store: Arc::clone(&store),
+        agent: Arc::clone(&agent),
     });
-    let store: Arc<dyn SecretStore> = Arc::new(open_store(&cfg)?);
     let _control = ControlServer::start_runtime(
         &control_path,
         catalog.clone(),
@@ -364,7 +372,6 @@ fn cmd_mount(config: &Path) -> Result<()> {
     )
         .with_context(|| format!("starting control socket at {}", control_path.display()))?;
     tracing::info!(socket = %control_path.display(), "control socket listening");
-    let agent = accessfs_agent::SocketAgent::start(&cfg).context("starting agent socket")?;
     accessfs_fs::mount(
         cfg,
         agent,
@@ -378,6 +385,8 @@ fn cmd_mount(config: &Path) -> Result<()> {
 struct RuntimeCatalogObserver {
     surface_registry: Arc<SurfaceRegistry>,
     mount_path: PathBuf,
+    store: Arc<dyn SecretStore>,
+    agent: Arc<accessfs_agent::SocketAgent>,
 }
 
 impl CatalogObserver for RuntimeCatalogObserver {
@@ -391,7 +400,56 @@ impl CatalogObserver for RuntimeCatalogObserver {
         cleanup_removed_file_links(&previous, snapshot, &self.mount_path);
         self.surface_registry.replace(snapshot);
         reconcile_file_links(snapshot, &self.mount_path);
+        match self.store.list() {
+            Ok(records) => self
+                .agent
+                .replace_managed_enforcement(managed_enforcement(snapshot, &records)),
+            Err(error) => tracing::warn!(%error, "refreshing managed security levels failed"),
+        }
     }
+}
+
+fn managed_enforcement(
+    snapshot: &CatalogSnapshot,
+    records: &[SecretRecord],
+) -> HashMap<String, Enforcement> {
+    let mut paths = HashMap::new();
+
+    // File-origin secrets are independently managed items. Managed-origin secrets inherit from
+    // their Resource below so lowering a Resource to audit-only is not masked by the store default.
+    for record in records.iter().filter(|record| record.source_path().is_some()) {
+        paths.insert(
+            format!("{SECRETS_DIR}/{}", record.id),
+            record.enforcement,
+        );
+    }
+
+    for resource in &snapshot.resources {
+        let ResourceSource::SecretRef { secret_id } = &resource.source else { continue };
+        let path = format!("{SECRETS_DIR}/{secret_id}");
+        paths
+            .entry(path)
+            .and_modify(|current| *current = stricter(*current, resource.enforcement))
+            .or_insert(resource.enforcement);
+    }
+
+    for surface in &snapshot.surfaces {
+        paths.insert(format!("{SURFACES_DIR}/{}", surface.id), surface.enforcement);
+    }
+
+    paths
+}
+
+fn stricter(left: Enforcement, right: Enforcement) -> Enforcement {
+    fn rank(value: Enforcement) -> u8 {
+        match value {
+            Enforcement::Allow => 0,
+            Enforcement::Prompt => 1,
+            Enforcement::TouchId => 2,
+            Enforcement::Deny => 3,
+        }
+    }
+    if rank(left) >= rank(right) { left } else { right }
 }
 
 fn cleanup_removed_file_links(
@@ -615,4 +673,103 @@ fn run(program: &str, args: &[&str]) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use accessfs_catalog::{
+        Binding, BindingScope, EntrySelection, EntrySpec, Resource, ResourceCodec, ResourceKind,
+        SurfaceInput, ValueShape,
+    };
+    use accessfs_store::SecretOrigin;
+
+    fn resource(id: &str, secret_id: &str, enforcement: Enforcement) -> Resource {
+        Resource {
+            id: id.to_string(),
+            name: id.to_string(),
+            kind: ResourceKind::SharedSecret,
+            shape: ValueShape::Scalar,
+            codec: ResourceCodec::Opaque,
+            default_env_key: Some(id.to_uppercase()),
+            entries: vec![EntrySpec {
+                address: "value".to_string(),
+                label: id.to_string(),
+                key: Some(id.to_uppercase()),
+                sensitive: true,
+            }],
+            source: ResourceSource::SecretRef { secret_id: secret_id.to_string() },
+            enforcement,
+            metadata: Default::default(),
+        }
+    }
+
+    fn binding(id: &str, resource_id: &str) -> Binding {
+        Binding {
+            id: id.to_string(),
+            project_id: "fixture-project".to_string(),
+            scope: BindingScope::Common,
+            resource_id: resource_id.to_string(),
+            selection: EntrySelection::All,
+            key_override: None,
+            enabled: true,
+            allow_override: false,
+            position: 0,
+        }
+    }
+
+    #[test]
+    fn managed_enforcement_keeps_surface_and_resource_levels_independent() {
+        let audit_id = "00000000-0000-0000-0000-000000000201";
+        let biometric_id = "00000000-0000-0000-0000-000000000202";
+        let protected_id = "00000000-0000-0000-0000-000000000203";
+        let snapshot = CatalogSnapshot {
+            resources: vec![
+                resource("audit", audit_id, Enforcement::Allow),
+                resource("biometric", biometric_id, Enforcement::TouchId),
+            ],
+            bindings: vec![
+                binding("audit-binding", "audit"),
+                binding("bio-binding", "biometric"),
+            ],
+            surfaces: vec![Surface {
+                id: "combined".to_string(),
+                environment_id: "fixture-environment".to_string(),
+                name: ".env".to_string(),
+                kind: SurfaceKind::DotenvFile,
+                path: PathBuf::from("/fixture/.env"),
+                input: SurfaceInput::Bindings {
+                    binding_ids: vec!["audit-binding".to_string(), "bio-binding".to_string()],
+                },
+                enforcement: Enforcement::Allow,
+                position: 0,
+            }],
+            ..Default::default()
+        };
+        let records = vec![SecretRecord {
+            id: protected_id.parse().unwrap(),
+            origin: SecretOrigin::File { source_path: PathBuf::from("/fixture/.pgpass") },
+            mode: 0o600,
+            size: 1,
+            created: "fixture-time".to_string(),
+            current_version: 1,
+            enforcement: Enforcement::Allow,
+            metadata: Default::default(),
+        }];
+
+        let levels = managed_enforcement(&snapshot, &records);
+        assert_eq!(levels[&format!("{SECRETS_DIR}/{audit_id}")], Enforcement::Allow);
+        assert_eq!(
+            levels[&format!("{SECRETS_DIR}/{biometric_id}")],
+            Enforcement::TouchId
+        );
+        assert_eq!(
+            levels[&format!("{SECRETS_DIR}/{protected_id}")],
+            Enforcement::Allow
+        );
+        assert_eq!(
+            levels[&format!("{SURFACES_DIR}/combined")],
+            Enforcement::Allow
+        );
+    }
 }

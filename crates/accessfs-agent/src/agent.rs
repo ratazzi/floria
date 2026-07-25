@@ -5,7 +5,8 @@
 //! menubar app. Missing app or timeout fails closed. Every final decision is streamed to the app
 //! as an access event.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use accessfs_core::authz::{AuthRequest, Authorizer, Decision, Enforcement, Operation};
@@ -38,6 +39,9 @@ pub struct SocketAgent {
     server: Arc<SocketServer>,
     /// Policy rules, evaluated first-match by priority.
     rules: RuleSet,
+    /// Per-managed-path defaults supplied by the live catalog/store snapshot. Explicit process
+    /// rules still win; these values replace only the built-in secrets/surfaces defaults.
+    managed_enforcement: RwLock<HashMap<String, Enforcement>>,
     /// (grant_key, path, operation) -> grant expiry. Operation is part of the key so a read
     /// grant never authorizes a write (and vice versa) — approving "read .env" must not let
     /// the same subject silently rewrite it within the TTL.
@@ -56,8 +60,25 @@ impl SocketAgent {
         Ok(Arc::new(SocketAgent {
             server,
             rules: cfg.rules.clone(),
+            managed_enforcement: RwLock::new(HashMap::new()),
             grants: DashMap::new(),
         }))
+    }
+
+    /// Atomically replace the default enforcement for managed secret and surface paths.
+    pub fn replace_managed_enforcement(&self, values: HashMap<String, Enforcement>) {
+        match self.managed_enforcement.write() {
+            Ok(mut current) => *current = values,
+            Err(poisoned) => *poisoned.into_inner() = values,
+        }
+        self.grants.clear();
+    }
+
+    fn managed_enforcement(&self, path: &str) -> Option<Enforcement> {
+        match self.managed_enforcement.read() {
+            Ok(values) => values.get(path).copied(),
+            Err(poisoned) => poisoned.into_inner().get(path).copied(),
+        }
     }
 
     fn handle_prompt(
@@ -122,9 +143,15 @@ impl Authorizer for SocketAgent {
     fn authorize(&self, req: &AuthRequest) -> Decision {
         // Derive the reader's git checkout once; both rule matching and grant keying use it.
         let repo = req.identity.cwd.as_deref().and_then(repo_root);
-        let (enforcement, rule_id) =
+        let (mut enforcement, mut rule_id) =
             self.rules
                 .decide(req.identity, req.path, repo.as_deref(), req.operation);
+        if matches!(rule_id.as_deref(), Some("secrets-default" | "surfaces-default")) {
+            if let Some(level) = self.managed_enforcement(req.path) {
+                enforcement = level;
+                rule_id = Some(format!("security-level:{}", level.as_str()));
+            }
+        }
 
         let decision = match enforcement {
             Enforcement::Allow => attach(Decision::allow("allowed by rule"), rule_id),
@@ -207,6 +234,7 @@ mod tests {
         SocketAgent {
             server,
             rules: RuleSet::new(rules),
+            managed_enforcement: RwLock::new(HashMap::new()),
             grants: DashMap::new(),
         }
     }
@@ -290,6 +318,69 @@ mod tests {
         let d = agent.authorize(&req(&id, Operation::Write));
         assert!(!d.is_allowed());
         assert_eq!(d.rule_id.as_deref(), Some("default-deny"));
+    }
+
+    #[test]
+    fn managed_security_level_replaces_only_the_builtin_secret_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = agent_with_rules(
+            tmp.path(),
+            vec![Rule {
+                id: "secrets-default".into(),
+                priority: 0,
+                subject: SubjectMatch::default(),
+                path_glob: any_path_glob(),
+                ops: RuleOps::READ_WRITE,
+                enforcement: Enforcement::Prompt,
+                enabled: true,
+            }],
+        );
+        agent.replace_managed_enforcement(HashMap::from([(
+            "secrets/test-id".to_string(),
+            Enforcement::Allow,
+        )]));
+
+        let id = ProcessIdentity::bare(1234, 501, 20);
+        let decision = agent.authorize(&req(&id, Operation::Read));
+        assert!(decision.is_allowed());
+        assert_eq!(decision.rule_id.as_deref(), Some("security-level:allow"));
+    }
+
+    #[test]
+    fn explicit_process_rule_wins_over_managed_security_level() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = agent_with_rules(
+            tmp.path(),
+            vec![
+                Rule {
+                    id: "explicit-deny".into(),
+                    priority: 100,
+                    subject: SubjectMatch::default(),
+                    path_glob: any_path_glob(),
+                    ops: RuleOps::READ,
+                    enforcement: Enforcement::Deny,
+                    enabled: true,
+                },
+                Rule {
+                    id: "secrets-default".into(),
+                    priority: 0,
+                    subject: SubjectMatch::default(),
+                    path_glob: any_path_glob(),
+                    ops: RuleOps::READ_WRITE,
+                    enforcement: Enforcement::Prompt,
+                    enabled: true,
+                },
+            ],
+        );
+        agent.replace_managed_enforcement(HashMap::from([(
+            "secrets/test-id".to_string(),
+            Enforcement::Allow,
+        )]));
+
+        let id = ProcessIdentity::bare(1234, 501, 20);
+        let decision = agent.authorize(&req(&id, Operation::Read));
+        assert!(!decision.is_allowed());
+        assert_eq!(decision.rule_id.as_deref(), Some("explicit-deny"));
     }
 
     /// Regression: an EXPIRED grant used to deadlock `grant_valid` (dashmap remove while

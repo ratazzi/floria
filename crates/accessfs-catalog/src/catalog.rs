@@ -3,6 +3,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use accessfs_core::authz::Enforcement;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::domain::{
@@ -12,7 +13,7 @@ use crate::domain::{
 };
 use crate::error::{CatalogError, CatalogResult};
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 7;
 
 #[derive(Debug, Clone)]
 pub struct Catalog {
@@ -138,13 +139,14 @@ impl Catalog {
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO resources
-                (id, name, kind, shape, codec, default_env_key, entries_json, source_json, metadata_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                (id, name, kind, shape, codec, default_env_key, entries_json, source_json, enforcement, metadata_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(id) DO UPDATE SET name = excluded.name, kind = excluded.kind,
                  shape = excluded.shape, codec = excluded.codec,
                  default_env_key = excluded.default_env_key,
                  entries_json = excluded.entries_json,
-                 source_json = excluded.source_json, metadata_json = excluded.metadata_json,
+                 source_json = excluded.source_json, enforcement = excluded.enforcement,
+                 metadata_json = excluded.metadata_json,
                  updated_at = CURRENT_TIMESTAMP",
             params![
                 resource.id,
@@ -155,6 +157,7 @@ impl Catalog {
                 resource.default_env_key,
                 serde_json::to_string(&resource.entries)?,
                 serde_json::to_string(&resource.source)?,
+                resource.enforcement.as_str(),
                 serde_json::to_string(&resource.metadata)?,
             ],
         )?;
@@ -183,8 +186,8 @@ impl Catalog {
         }
         tx.execute(
             "INSERT INTO resources
-                (id, name, kind, shape, codec, default_env_key, entries_json, source_json, metadata_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                (id, name, kind, shape, codec, default_env_key, entries_json, source_json, enforcement, metadata_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 resource.id,
                 resource.name,
@@ -194,6 +197,7 @@ impl Catalog {
                 resource.default_env_key,
                 serde_json::to_string(&resource.entries)?,
                 serde_json::to_string(&resource.source)?,
+                resource.enforcement.as_str(),
                 serde_json::to_string(&resource.metadata)?,
             ],
         )?;
@@ -409,11 +413,12 @@ impl Catalog {
         }
         tx.execute(
             "INSERT INTO surfaces
-                (id, environment_id, name, kind, path, input_json, position)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                (id, environment_id, name, kind, path, input_json, enforcement, position)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(id) DO UPDATE SET environment_id = excluded.environment_id,
                  name = excluded.name, kind = excluded.kind, path = excluded.path,
-                 input_json = excluded.input_json, position = excluded.position,
+                 input_json = excluded.input_json, enforcement = excluded.enforcement,
+                 position = excluded.position,
                  updated_at = CURRENT_TIMESTAMP",
             params![
                 surface.id,
@@ -422,6 +427,7 @@ impl Catalog {
                 surface.kind.as_str(),
                 path_string(&surface.path),
                 serde_json::to_string(&surface.input)?,
+                surface.enforcement.as_str(),
                 surface.position,
             ],
         )?;
@@ -496,6 +502,7 @@ fn migrate(conn: &mut Connection) -> CatalogResult<()> {
             default_env_key TEXT,
             entries_json TEXT NOT NULL,
             source_json TEXT NOT NULL,
+            enforcement TEXT NOT NULL,
             metadata_json TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -524,12 +531,13 @@ fn migrate(conn: &mut Connection) -> CatalogResult<()> {
             kind TEXT NOT NULL,
             path TEXT NOT NULL,
             input_json TEXT NOT NULL,
+            enforcement TEXT NOT NULL,
             position INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         CREATE INDEX surfaces_environment_idx ON surfaces(environment_id, position);
-        PRAGMA user_version = 5;",
+        PRAGMA user_version = 7;",
     )?;
     tx.commit()?;
     Ok(())
@@ -568,13 +576,14 @@ fn snapshot_from(conn: &Connection) -> CatalogResult<CatalogSnapshot> {
 
     let resources = {
         let mut stmt = conn.prepare(
-            "SELECT id, name, kind, shape, codec, default_env_key, entries_json, source_json, metadata_json
+            "SELECT id, name, kind, shape, codec, default_env_key, entries_json, source_json, enforcement, metadata_json
              FROM resources ORDER BY name, id",
         )?;
         let values = stmt.query_map([], |row| {
             let kind: String = row.get(2)?;
             let shape: String = row.get(3)?;
             let codec: String = row.get(4)?;
+            let enforcement: String = row.get(8)?;
             Ok(Resource {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -584,7 +593,9 @@ fn snapshot_from(conn: &Connection) -> CatalogResult<CatalogSnapshot> {
                 default_env_key: row.get(5)?,
                 entries: decode_json(6, &row.get::<_, String>(6)?)?,
                 source: decode_json(7, &row.get::<_, String>(7)?)?,
-                metadata: decode_json(8, &row.get::<_, String>(8)?)?,
+                enforcement: Enforcement::parse(&enforcement)
+                    .ok_or_else(|| invalid_value(8, enforcement))?,
+                metadata: decode_json(9, &row.get::<_, String>(9)?)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -621,11 +632,12 @@ fn snapshot_from(conn: &Connection) -> CatalogResult<CatalogSnapshot> {
 
     let surfaces = {
         let mut stmt = conn.prepare(
-            "SELECT id, environment_id, name, kind, path, input_json, position
+            "SELECT id, environment_id, name, kind, path, input_json, enforcement, position
              FROM surfaces ORDER BY environment_id, position, name, id",
         )?;
         let values = stmt.query_map([], |row| {
             let kind: String = row.get(3)?;
+            let enforcement: String = row.get(6)?;
             Ok(Surface {
                 id: row.get(0)?,
                 environment_id: row.get(1)?,
@@ -633,7 +645,9 @@ fn snapshot_from(conn: &Connection) -> CatalogResult<CatalogSnapshot> {
                 kind: SurfaceKind::parse(&kind).ok_or_else(|| invalid_value(3, kind))?,
                 path: PathBuf::from(row.get::<_, String>(4)?),
                 input: decode_json(5, &row.get::<_, String>(5)?)?,
-                position: row.get(6)?,
+                enforcement: Enforcement::parse(&enforcement)
+                    .ok_or_else(|| invalid_value(6, enforcement))?,
+                position: row.get(7)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -1441,6 +1455,7 @@ mod tests {
                 sensitive: true,
             }],
             source: ResourceSource::SecretRef { secret_id: format!("secret-{id}") },
+            enforcement: Enforcement::Prompt,
             metadata: Default::default(),
         }
     }
@@ -1468,6 +1483,7 @@ mod tests {
                 },
             ],
             source: ResourceSource::SecretRef { secret_id: format!("secret-{id}") },
+            enforcement: Enforcement::Prompt,
             metadata: Default::default(),
         }
     }
@@ -1502,7 +1518,7 @@ mod tests {
         let error = migrate(&mut conn).unwrap_err();
         assert!(matches!(
             error,
-            CatalogError::UnsupportedSchema { found: 1, expected: 5 }
+            CatalogError::UnsupportedSchema { found: 1, expected: 7 }
         ));
     }
 
@@ -1564,6 +1580,7 @@ mod tests {
                 sensitive: true,
             }],
             source: ResourceSource::SecretRef { secret_id: "fixture-ini-secret".to_string() },
+            enforcement: Enforcement::Prompt,
             metadata: Default::default(),
         };
         catalog.upsert_resource(&resource).unwrap();
@@ -1585,6 +1602,7 @@ mod tests {
                 input: SurfaceInput::Bindings {
                     binding_ids: vec!["fixture-ini-binding".to_string()],
                 },
+                enforcement: Enforcement::Prompt,
                 position: 0,
             })
             .unwrap_err();
@@ -1600,6 +1618,7 @@ mod tests {
             input: SurfaceInput::Bindings {
                 binding_ids: vec!["fixture-ini-binding".to_string()],
             },
+            enforcement: Enforcement::Prompt,
             position: 0,
         };
         catalog.upsert_surface(&ini_surface).unwrap();
@@ -1634,6 +1653,7 @@ mod tests {
     fn snapshot_round_trips_typed_metadata_without_secret_values() {
         let (_dir, catalog) = catalog();
         let mut resource = scalar_resource("cloudflare", "CLOUDFLARE_API_TOKEN");
+        resource.enforcement = Enforcement::TouchId;
         resource.metadata.note = Some("Deployment token for the documentation zone".to_string());
         resource.metadata.links.push(crate::domain::ItemLink {
             label: "Cloudflare dashboard".to_string(),
@@ -1653,6 +1673,7 @@ mod tests {
                 input: SurfaceInput::Bindings {
                     binding_ids: vec!["common-cloudflare".to_string()],
                 },
+                enforcement: Enforcement::Allow,
                 position: 0,
             })
             .unwrap();
@@ -1663,6 +1684,8 @@ mod tests {
         assert_eq!(snapshot.resources, vec![resource]);
         assert_eq!(snapshot.bindings.len(), 1);
         assert_eq!(snapshot.surfaces.len(), 1);
+        assert_eq!(snapshot.surfaces[0].enforcement, Enforcement::Allow);
+        assert_eq!(snapshot.resources[0].enforcement, Enforcement::TouchId);
         let json = serde_json::to_string(&snapshot).unwrap();
         assert!(!json.contains("plaintext"));
     }
@@ -1712,6 +1735,7 @@ mod tests {
                     input: SurfaceInput::Bindings {
                         binding_ids: vec!["fixture-common".to_string()],
                     },
+                    enforcement: Enforcement::Prompt,
                     position: 0,
                 })
                 .unwrap();
@@ -1743,6 +1767,7 @@ mod tests {
                 kind: SurfaceKind::DotenvFile,
                 path: PathBuf::from("/workspace/other/.env"),
                 input: SurfaceInput::Bindings { binding_ids: vec![] },
+                enforcement: Enforcement::Prompt,
                 position: 0,
             })
             .unwrap_err();
@@ -1760,6 +1785,7 @@ mod tests {
                 kind: SurfaceKind::DotenvFile,
                 path: PathBuf::from("/workspace/floria/.env"),
                 input: SurfaceInput::Bindings { binding_ids: vec![] },
+                enforcement: Enforcement::Prompt,
                 position: 0,
             })
             .unwrap_err();
@@ -1779,6 +1805,7 @@ mod tests {
                 kind: SurfaceKind::EnvFileDirect,
                 path: PathBuf::from("/workspace/floria/.env.local"),
                 input: SurfaceInput::Resource { resource_id: resource.id.clone() },
+                enforcement: Enforcement::Prompt,
                 position: 1,
             })
             .unwrap();
@@ -1806,6 +1833,7 @@ mod tests {
             kind: SurfaceKind::EnvFileDirect,
             path: PathBuf::from("/workspace/floria/.env.local"),
             input: SurfaceInput::Bindings { binding_ids: vec![] },
+            enforcement: Enforcement::Prompt,
             position: 1,
         };
         assert!(matches!(
@@ -1848,6 +1876,7 @@ mod tests {
             input: SurfaceInput::Bindings {
                 binding_ids: vec!["first-binding".to_string()],
             },
+            enforcement: Enforcement::Prompt,
             position: 0,
         };
         catalog.upsert_surface(&surface).unwrap();
@@ -1905,6 +1934,7 @@ mod tests {
                     input: SurfaceInput::Bindings {
                         binding_ids: vec![binding_id.to_string()],
                     },
+                    enforcement: Enforcement::Prompt,
                     position: 0,
                 })
                 .unwrap();
@@ -1930,6 +1960,7 @@ mod tests {
             input: SurfaceInput::Bindings {
                 binding_ids: vec!["missing-binding".to_string()],
             },
+            enforcement: Enforcement::Prompt,
             position: 0,
         };
         assert!(matches!(
@@ -1996,6 +2027,7 @@ mod tests {
                     sensitive: false,
                 }],
                 source: ResourceSource::SecretRef { secret_id: "secret-defaults".to_string() },
+                enforcement: Enforcement::Prompt,
                 metadata: Default::default(),
             })
             .unwrap();

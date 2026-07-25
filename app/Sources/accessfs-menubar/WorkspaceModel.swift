@@ -2,6 +2,48 @@ import Darwin
 import Foundation
 import Observation
 
+enum WorkspaceSecurityLevel: String, CaseIterable, Hashable, Sendable {
+    case auditOnly = "allow"
+    case confirmation = "prompt"
+    case touchID = "touchid"
+
+    var title: String {
+        switch self {
+        case .auditOnly: "Audit Only"
+        case .confirmation: "Ask to Allow"
+        case .touchID: "Require Touch ID"
+        }
+    }
+
+    var compactTitle: String {
+        switch self {
+        case .auditOnly: "Audit"
+        case .confirmation: "Ask"
+        case .touchID: "Touch ID"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .auditOnly: "Allow reads immediately and record every access."
+        case .confirmation: "Ask in the menu bar before allowing access."
+        case .touchID: "Ask in the menu bar and authenticate before allowing access."
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .auditOnly: "eye"
+        case .confirmation: "hand.raised"
+        case .touchID: "touchid"
+        }
+    }
+
+    init(catalogValue: String) {
+        self = WorkspaceSecurityLevel(rawValue: catalogValue) ?? .confirmation
+    }
+}
+
 enum WorkspaceResourceKind: String, CaseIterable, Sendable {
     case sharedSecret
     case secret
@@ -140,6 +182,7 @@ struct WorkspaceResource: Identifiable, Hashable, Sendable {
     let codec: WorkspaceResourceCodec
     let defaultEnvKey: String?
     let entries: [WorkspaceEntry]
+    let securityLevel: WorkspaceSecurityLevel
     let metadata: ItemMetadata
     let usageCount: Int
 
@@ -148,6 +191,7 @@ struct WorkspaceResource: Identifiable, Hashable, Sendable {
         codec: WorkspaceResourceCodec? = nil,
         defaultEnvKey: String? = nil,
         exports: [WorkspaceExport], entries: [WorkspaceEntry] = [],
+        securityLevel: WorkspaceSecurityLevel = .confirmation,
         metadata: ItemMetadata = .empty,
         usageCount: Int
     ) {
@@ -165,6 +209,7 @@ struct WorkspaceResource: Identifiable, Hashable, Sendable {
                     sensitive: $0.sensitive)
             }
             : entries
+        self.securityLevel = securityLevel
         self.metadata = metadata
         self.usageCount = usageCount
     }
@@ -313,6 +358,21 @@ struct WorkspaceSurface: Identifiable, Hashable, Sendable {
     let path: String
     let status: WorkspaceSurfaceStatus
     let input: WorkspaceSurfaceInput
+    let securityLevel: WorkspaceSecurityLevel
+
+    init(
+        id: String, name: String, kind: WorkspaceSurfaceKind, path: String,
+        status: WorkspaceSurfaceStatus, input: WorkspaceSurfaceInput,
+        securityLevel: WorkspaceSecurityLevel = .confirmation
+    ) {
+        self.id = id
+        self.name = name
+        self.kind = kind
+        self.path = path
+        self.status = status
+        self.input = input
+        self.securityLevel = securityLevel
+    }
 
     var bindingIDs: [WorkspaceBinding.ID] {
         guard case .bindings(let ids) = input else { return [] }
@@ -410,6 +470,7 @@ struct WorkspaceProtectedFile: Identifiable, Hashable, Sendable {
     let size: UInt64
     let currentVersion: UInt32
     let linked: Bool
+    let securityLevel: WorkspaceSecurityLevel
     let metadata: ItemMetadata
 
     var kind: WorkspaceProtectedFileKind {
@@ -662,13 +723,16 @@ final class WorkspaceStore {
         lastError = nil
     }
 
-    func updateProtectedFileMetadata(_ id: String, metadata: ItemMetadata) async throws {
+    func updateProtectedFileMetadata(
+        _ id: String, securityLevel: WorkspaceSecurityLevel, metadata: ItemMetadata
+    ) async throws {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
         guard protectedFiles.contains(where: { $0.id == id }) else {
             throw WorkspaceStoreError.invalid("Choose a protected file first")
         }
         let metadata = try Self.validatedMetadata(metadata)
-        try await controlClient.updateProtectedFileMetadata(id, metadata: metadata)
+        try await controlClient.updateProtectedFileMetadata(
+            id, enforcement: securityLevel.rawValue, metadata: metadata)
         if let files = try? await controlClient.protectedFiles() {
             protectedFiles = files.map(WorkspaceProtectedFile.init)
         }
@@ -734,7 +798,8 @@ final class WorkspaceStore {
 
     @discardableResult
     func createSharedSecret(
-        name: String, defaultEnvKey: String, value: String, metadata: ItemMetadata
+        name: String, defaultEnvKey: String, value: String,
+        securityLevel: WorkspaceSecurityLevel, metadata: ItemMetadata
     ) async throws
         -> WorkspaceResource.ID
     {
@@ -755,7 +820,7 @@ final class WorkspaceStore {
         let resourceID = Self.newID("shared-secret")
         try await controlClient.createSharedSecret(
             resourceID: resourceID, name: name, defaultEnvKey: key, value: value,
-            metadata: metadata)
+            enforcement: securityLevel.rawValue, metadata: metadata)
         apply(try await controlClient.snapshot())
         lastError = nil
         return resourceID
@@ -763,7 +828,8 @@ final class WorkspaceStore {
 
     func updateSharedSecret(
         _ id: WorkspaceResource.ID, name: String, defaultEnvKey: String,
-        newValue: String = "", metadata: ItemMetadata
+        newValue: String = "", securityLevel: WorkspaceSecurityLevel,
+        metadata: ItemMetadata
     ) async throws {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
         guard resources.contains(where: { $0.id == id && $0.kind == .sharedSecret }) else {
@@ -781,7 +847,8 @@ final class WorkspaceStore {
 
         try await controlClient.updateSharedSecret(
             resourceID: id, name: name, defaultEnvKey: key,
-            value: newValue.isEmpty ? nil : newValue, metadata: metadata)
+            value: newValue.isEmpty ? nil : newValue,
+            enforcement: securityLevel.rawValue, metadata: metadata)
         apply(try await controlClient.snapshot())
         lastError = nil
     }
@@ -805,7 +872,8 @@ final class WorkspaceStore {
 
     @discardableResult
     func createEnvFile(
-        name: String, codec: WorkspaceResourceCodec, value: String, metadata: ItemMetadata
+        name: String, codec: WorkspaceResourceCodec, value: String,
+        securityLevel: WorkspaceSecurityLevel, metadata: ItemMetadata
     ) async throws -> WorkspaceResource.ID {
         guard let controlClient else {
             throw WorkspaceStoreError.controlUnavailable
@@ -823,14 +891,15 @@ final class WorkspaceStore {
         let resourceID = Self.newID("env-file")
         try await controlClient.createEnvFile(
             resourceID: resourceID, name: name, codec: codec, value: value,
-            metadata: metadata)
+            enforcement: securityLevel.rawValue, metadata: metadata)
         apply(try await controlClient.snapshot())
         lastError = nil
         return resourceID
     }
 
     func updateResourceMetadata(
-        _ id: WorkspaceResource.ID, name: String, metadata: ItemMetadata
+        _ id: WorkspaceResource.ID, name: String,
+        securityLevel: WorkspaceSecurityLevel, metadata: ItemMetadata
     ) async throws {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
         guard resources.contains(where: { $0.id == id }) else {
@@ -840,7 +909,8 @@ final class WorkspaceStore {
         guard !name.isEmpty else { throw WorkspaceStoreError.invalid("Resource name is required") }
         let metadata = try Self.validatedMetadata(metadata)
         try await controlClient.updateResourceMetadata(
-            resourceID: id, name: name, metadata: metadata)
+            resourceID: id, name: name, enforcement: securityLevel.rawValue,
+            metadata: metadata)
         apply(try await controlClient.snapshot())
         lastError = nil
     }
@@ -1091,6 +1161,7 @@ final class WorkspaceStore {
                     id: surface.id, environmentID: environment.id, name: surface.name,
                     kind: surface.kind.catalogValue, path: surface.path,
                     input: .bindings(surface.bindingIDs + [bindingID]),
+                    enforcement: surface.securityLevel.rawValue,
                     position: Int64(
                         environment.surfaces.firstIndex(where: { $0.id == surface.id }) ?? 0)))
         } catch {
@@ -1137,6 +1208,27 @@ final class WorkspaceStore {
         try await deleteSurface(id)
     }
 
+    func updateSurfaceSecurityLevel(
+        _ id: WorkspaceSurface.ID, securityLevel: WorkspaceSecurityLevel
+    ) async throws {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        guard let environment = selectedEnvironment,
+            let position = environment.surfaces.firstIndex(where: { $0.id == id }),
+            let surface = environment.surfaces.first(where: { $0.id == id })
+        else {
+            throw WorkspaceStoreError.invalid("Select an output first")
+        }
+        try await controlClient.upsertSurface(
+            CatalogSurface(
+                id: surface.id, environmentID: environment.id, name: surface.name,
+                kind: surface.kind.catalogValue, path: surface.path,
+                input: surface.input.catalogInput, enforcement: securityLevel.rawValue,
+                position: Int64(position)))
+        apply(try await controlClient.snapshot())
+        selectedSurfaceID = id
+        lastError = nil
+    }
+
     func updateSurface(
         _ id: WorkspaceSurface.ID, fileName: String, kind: WorkspaceSurfaceKind,
         bindingIDs: [WorkspaceBinding.ID]
@@ -1174,6 +1266,7 @@ final class WorkspaceStore {
             CatalogSurface(
                 id: id, environmentID: environment.id, name: output.name,
                 kind: kind.catalogValue, path: output.path, input: input,
+                enforcement: surface.securityLevel.rawValue,
                 position: Int64(position)))
         apply(try await controlClient.snapshot())
         selectedSurfaceID = id
@@ -1200,7 +1293,8 @@ final class WorkspaceStore {
             CatalogSurface(
                 id: surface.id, environmentID: environment.id, name: surface.name,
                 kind: surface.kind.catalogValue, path: surface.path,
-                input: .bindings(bindingIDs), position: Int64(position)))
+                input: .bindings(bindingIDs), enforcement: surface.securityLevel.rawValue,
+                position: Int64(position)))
         apply(try await controlClient.snapshot())
         selectedSurfaceID = id
         lastError = nil
@@ -1218,7 +1312,8 @@ final class WorkspaceStore {
             CatalogSurface(
                 id: surface.id, environmentID: environment.id, name: surface.name,
                 kind: surface.kind.catalogValue, path: surface.path,
-                input: surface.input.catalogInput, position: Int64(position)))
+                input: surface.input.catalogInput,
+                enforcement: surface.securityLevel.rawValue, position: Int64(position)))
         apply(try await controlClient.snapshot())
         selectedSurfaceID = id
         guard managedLinkTarget(for: surface) == expectedLinkTarget(for: surface) else {
@@ -1346,6 +1441,7 @@ final class WorkspaceStore {
                 defaultEnvKey: resource.defaultEnvKey,
                 exports: [],
                 entries: entries,
+                securityLevel: WorkspaceSecurityLevel(catalogValue: resource.enforcement),
                 metadata: resource.metadata,
                 usageCount: projectUsage[resource.id] ?? 0)
         }
@@ -1469,7 +1565,9 @@ private extension WorkspaceProtectedFile {
     init(_ file: CatalogProtectedFile) {
         self.init(
             id: file.id, path: file.sourcePath, mode: file.mode, size: file.size,
-            currentVersion: file.currentVersion, linked: file.linked, metadata: file.metadata)
+            currentVersion: file.currentVersion, linked: file.linked,
+            securityLevel: WorkspaceSecurityLevel(catalogValue: file.enforcement),
+            metadata: file.metadata)
     }
 }
 
@@ -1491,7 +1589,8 @@ private extension WorkspaceSurface {
             ? .listening : (linkTarget == expectedTarget ? .linked : .stopped)
         self.init(
             id: surface.id, name: surface.name, kind: kind, path: surface.path,
-            status: status, input: input)
+            status: status, input: input,
+            securityLevel: WorkspaceSecurityLevel(catalogValue: surface.enforcement))
     }
 }
 
