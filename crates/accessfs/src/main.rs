@@ -1,6 +1,9 @@
 use std::collections::HashMap;
+use std::ffi::{CStr, CString, OsString};
+use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -379,6 +382,11 @@ fn load(config: &Path) -> Result<ResolvedConfig> {
 
 fn cmd_mount(config: &Path) -> Result<()> {
     let cfg = load(config)?;
+    std::fs::create_dir_all(&cfg.mount_path)
+        .with_context(|| format!("creating mount point {}", cfg.mount_path.display()))?;
+    let support_dir = support_dir(&cfg)?.to_path_buf();
+    let _instance = DaemonInstance::acquire(&support_dir)?;
+    recover_stale_mount(&cfg.mount_path)?;
     let daemon_executable =
         std::env::current_exe().context("resolving daemon executable for peer policy")?;
     let gui_executable = trusted_gui_executable(&daemon_executable)?;
@@ -395,9 +403,6 @@ fn cmd_mount(config: &Path) -> Result<()> {
         daemon = %daemon_executable.display(),
         "loaded local socket code-signing policy"
     );
-    std::fs::create_dir_all(&cfg.mount_path)
-        .with_context(|| format!("creating mount point {}", cfg.mount_path.display()))?;
-    let support_dir = support_dir(&cfg)?;
     let catalog_path = support_dir.join("catalog.sqlite");
     let control_path = support_dir.join("control.sock");
     let catalog = Catalog::open(&catalog_path)
@@ -826,15 +831,113 @@ fn cmd_unmount(path: Option<PathBuf>, config: &Path) -> Result<()> {
         Some(p) => p,
         None => load(config)?.mount_path,
     };
+    unmount_target(&target)?;
+    println!("unmounted {}", target.display());
+    Ok(())
+}
+
+fn unmount_target(target: &Path) -> Result<()> {
     // Prefer diskutil (cleaner for macFUSE volumes), fall back to umount.
     let ok = run("diskutil", &["unmount", &target.to_string_lossy()])
         || run("umount", &[&target.to_string_lossy()]);
     if ok {
-        println!("unmounted {}", target.display());
         Ok(())
     } else {
         anyhow::bail!("failed to unmount {}", target.display())
     }
+}
+
+struct DaemonInstance {
+    _lock: File,
+}
+
+impl DaemonInstance {
+    fn acquire(support_dir: &Path) -> Result<Self> {
+        std::fs::create_dir_all(support_dir)
+            .with_context(|| format!("creating support directory {}", support_dir.display()))?;
+        std::fs::set_permissions(support_dir, std::fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("securing support directory {}", support_dir.display()))?;
+
+        let lock_path = support_dir.join("daemon.lock");
+        let lock = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&lock_path)
+            .with_context(|| format!("opening daemon lock {}", lock_path.display()))?;
+        let metadata =
+            lock.metadata().with_context(|| format!("inspecting daemon lock {}", lock_path.display()))?;
+        if !metadata.is_file()
+            || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o077 != 0
+        {
+            anyhow::bail!(
+                "daemon lock must be a private regular file owned by the current user: {}",
+                lock_path.display()
+            );
+        }
+
+        match lock.try_lock() {
+            Ok(()) => Ok(Self { _lock: lock }),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                anyhow::bail!("another accessfs daemon is already running")
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                Err(error).with_context(|| format!("locking daemon instance {}", lock_path.display()))
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct MountedFilesystem {
+    source: OsString,
+    fs_type: OsString,
+}
+
+fn exact_mount(path: &Path) -> Result<Option<MountedFilesystem>> {
+    let path_bytes = path.as_os_str().as_bytes();
+    let c_path = CString::new(path_bytes)
+        .with_context(|| format!("mount path contains a NUL byte: {}", path.display()))?;
+    let mut stats = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    if unsafe { libc::statfs(c_path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("inspecting mount point {}", path.display()));
+    }
+    let stats = unsafe { stats.assume_init() };
+    let mounted_at = unsafe { CStr::from_ptr(stats.f_mntonname.as_ptr()) };
+    if mounted_at.to_bytes() != path_bytes {
+        return Ok(None);
+    }
+
+    let source = unsafe { CStr::from_ptr(stats.f_mntfromname.as_ptr()) };
+    let fs_type = unsafe { CStr::from_ptr(stats.f_fstypename.as_ptr()) };
+    Ok(Some(MountedFilesystem {
+        source: OsString::from_vec(source.to_bytes().to_vec()),
+        fs_type: OsString::from_vec(fs_type.to_bytes().to_vec()),
+    }))
+}
+
+fn recover_stale_mount(path: &Path) -> Result<()> {
+    let Some(mount) = exact_mount(path)? else {
+        return Ok(());
+    };
+    if mount.source != "accessfs" || mount.fs_type != "macfuse" {
+        anyhow::bail!(
+            "mount point {} is occupied by {:?} ({:?}); refusing to unmount it",
+            path.display(),
+            mount.source,
+            mount.fs_type
+        );
+    }
+
+    tracing::warn!(
+        mount = %path.display(),
+        "recovering stale accessfs mount left by a previous daemon"
+    );
+    unmount_target(path).context("recovering stale accessfs mount")
 }
 
 fn cmd_doctor(config: &Path) -> Result<()> {
@@ -966,6 +1069,28 @@ mod tests {
             bundled_gui_executable(Path::new("/workspace/floria/target/release/accessfs")),
             None
         );
+    }
+
+    #[test]
+    fn daemon_instance_lock_refuses_a_second_live_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = DaemonInstance::acquire(dir.path()).unwrap();
+
+        let error = DaemonInstance::acquire(dir.path()).err().unwrap();
+        assert!(error.to_string().contains("already running"));
+
+        drop(first);
+        DaemonInstance::acquire(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn exact_mount_distinguishes_a_directory_from_its_containing_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(exact_mount(dir.path()).unwrap(), None);
+
+        let root = exact_mount(Path::new("/")).unwrap().unwrap();
+        assert!(!root.source.is_empty());
+        assert!(!root.fs_type.is_empty());
     }
 
     #[test]
