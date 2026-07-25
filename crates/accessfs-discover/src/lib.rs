@@ -143,6 +143,69 @@ pub struct DiscoveryWarning {
     pub message: String,
 }
 
+/// Default treatment of a discovered key, decided from its name alone.
+///
+/// The heuristic only picks the default; the review step may promote or demote
+/// individual entries before apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyClass {
+    Secret,
+    Plain,
+}
+
+const SECRET_KEY_SEGMENTS: &[&str] = &[
+    "SECRET",
+    "TOKEN",
+    "PASSWORD",
+    "PASSWD",
+    "PWD",
+    "PASSPHRASE",
+    "APIKEY",
+    "CREDENTIAL",
+    "CREDENTIALS",
+    "DSN",
+    "AUTH",
+    "BEARER",
+    "SALT",
+];
+
+const SECRET_KEY_SEGMENT_PAIRS: &[(&str, &str)] = &[
+    ("API", "KEY"),
+    ("ACCESS", "KEY"),
+    ("PRIVATE", "KEY"),
+    ("SIGNING", "KEY"),
+    ("ENCRYPTION", "KEY"),
+    ("LICENSE", "KEY"),
+    ("MASTER", "KEY"),
+];
+
+const SECRET_EXACT_KEYS: &[&str] = &["DATABASE_URL"];
+
+/// Classify a key name as a secret candidate or a plain configuration value.
+///
+/// Matching is segment-based, not substring-based: `FEISHU_OAUTH_ENABLED` does
+/// not match `AUTH`, and a lone `ID` or `KEY` segment never triggers.
+pub fn classify_key(key: &str) -> KeyClass {
+    let upper = key.to_ascii_uppercase();
+    if SECRET_EXACT_KEYS.contains(&upper.as_str()) {
+        return KeyClass::Secret;
+    }
+    let segments: Vec<&str> = upper
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    if segments.iter().any(|segment| SECRET_KEY_SEGMENTS.contains(segment)) {
+        return KeyClass::Secret;
+    }
+    if segments
+        .windows(2)
+        .any(|pair| SECRET_KEY_SEGMENT_PAIRS.contains(&(pair[0], pair[1])))
+    {
+        return KeyClass::Secret;
+    }
+    KeyClass::Plain
+}
+
 /// Existing scalar resource used only for exact, in-memory reuse matching.
 pub struct ExistingSecret {
     pub resource_id: String,
@@ -318,7 +381,9 @@ impl Discovery {
             for entry in &file.entries {
                 let action = match file.entry_disposition {
                     EntryDisposition::SharedSecret => {
-                        if let Some(candidate) = existing.iter().find(|candidate| {
+                        if classify_key(&entry.key) == KeyClass::Plain {
+                            DiscoveredEntryAction::CreateEnvFileEntry
+                        } else if let Some(candidate) = existing.iter().find(|candidate| {
                             candidate.key == entry.key
                                 && candidate.value.as_slice() == entry.value.as_bytes()
                         }) {
@@ -920,8 +985,15 @@ mod tests {
         assert_eq!(plan.project.path, root);
         assert_eq!(plan.summary.files, 5);
         assert_eq!(plan.summary.entries, 4);
-        assert_eq!(plan.summary.new_secrets, 2);
+        assert_eq!(plan.summary.new_secrets, 1);
         assert_eq!(plan.summary.warnings, 2);
+        assert!(plan.files.iter().any(|file| {
+            file.relative_path == Path::new(".envrc")
+                && file.entries.iter().any(|entry| {
+                    entry.key == "LOCAL_FLAG"
+                        && entry.action == DiscoveredEntryAction::CreateEnvFileEntry
+                })
+        }));
         assert_eq!(
             plan.files
                 .iter()
@@ -1048,6 +1120,65 @@ mod tests {
 
         assert_eq!(plan.files[0].environment.as_deref(), Some("development"));
         assert!(plan.files[0].tags.iter().any(|tag| tag == "local"));
+    }
+
+    #[test]
+    fn classifies_common_secret_names_by_segment_not_substring() {
+        for key in [
+            "FEISHU_OAUTH_APP_SECRET",
+            "CLOUDFLARE_API_TOKEN",
+            "CLOUDFLARE_BEARER_TOKEN",
+            "QUEBEC_DSN",
+            "DATABASE_URL",
+            "AWS_SECRET_ACCESS_KEY",
+            "STRIPE_API_KEY",
+            "SSH_PRIVATE_KEY",
+            "BASIC_AUTH",
+            "postgres_password",
+        ] {
+            assert_eq!(classify_key(key), KeyClass::Secret, "{key} should be a secret");
+        }
+        for key in [
+            "DEBUG",
+            "COMS_ENV",
+            "WEBAUTHN_RP_ID",
+            "WEBAUTHN_ORIGIN",
+            "LEGACY_SYNC_KAFKA_GROUP_ID",
+            "FEISHU_OAUTH_ENABLED",
+            "FEISHU_OAUTH_APP_ID",
+            "FEISHU_OAUTH_REDIRECT_BASE",
+            "CLOUDFLARE_ZONE_ID",
+            "SORT_KEY_NAME",
+            "MONKEY",
+        ] {
+            assert_eq!(classify_key(key), KeyClass::Plain, "{key} should be plain");
+        }
+    }
+
+    #[test]
+    fn plain_named_keys_become_env_file_entries_and_never_match_reuse() {
+        let directory = tempdir().unwrap();
+        let file = directory.path().join(".env");
+        fs::write(&file, "API_TOKEN=fixture-value\nDEBUG=true\n").unwrap();
+        let existing = [ExistingSecret {
+            resource_id: "shared-debug".to_string(),
+            name: "Debug".to_string(),
+            key: "DEBUG".to_string(),
+            value: Zeroizing::new(b"true".to_vec()),
+        }];
+
+        let plan = discover(&file).unwrap().plan(&existing);
+
+        assert_eq!(plan.summary.new_secrets, 1);
+        assert_eq!(plan.summary.reused_secrets, 0);
+        let entries = &plan.files[0].entries;
+        assert!(entries.iter().any(|entry| {
+            entry.key == "DEBUG" && entry.action == DiscoveredEntryAction::CreateEnvFileEntry
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.key == "API_TOKEN"
+                && matches!(entry.action, DiscoveredEntryAction::CreateSharedSecret { .. })
+        }));
     }
 
     #[test]

@@ -3143,7 +3143,7 @@ mod tests {
             panic!("expected discovery result");
         };
         assert_eq!(plan.summary.reused_secrets, 1);
-        assert_eq!(plan.summary.new_secrets, 1);
+        assert_eq!(plan.summary.new_secrets, 0);
         assert!(matches!(
             plan.files[0].entries[0].action,
             accessfs_discover::DiscoveredEntryAction::ReuseSharedSecret {
@@ -3152,6 +3152,10 @@ mod tests {
             }
                 if resource_id == "fixture-shared-api-token"
         ));
+        assert!(plan.files[0].entries.iter().any(|entry| {
+            entry.key == "OTHER"
+                && entry.action == accessfs_discover::DiscoveredEntryAction::CreateEnvFileEntry
+        }));
     }
 
     #[test]
