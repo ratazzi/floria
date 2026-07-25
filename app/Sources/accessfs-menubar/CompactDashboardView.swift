@@ -466,11 +466,11 @@ struct DashboardView: View {
                 }
             } else {
                 VStack(spacing: 0) {
-                    ForEach(Array(visibleAccess.enumerated()), id: \.element.id) { index, event in
+                    ForEach(Array(visibleAccess.enumerated()), id: \.element.id) { index, group in
                         Button {
                             showingAccessLog = true
                         } label: {
-                            AccessSummaryRow(event: event, relativeTime: relativeTime(event.date))
+                            AccessSummaryRow(group: group)
                         }
                         .buttonStyle(.plain)
                         if index != visibleAccess.count - 1 {
@@ -564,13 +564,12 @@ struct DashboardView: View {
         return Array(projects.prefix(4))
     }
 
-    private var visibleAccess: [RecentAccess] {
-        state.recents.filter { event in
+    private var visibleAccess: [RecentAccessGroup] {
+        let recents = state.recents.filter { event in
             (selectedProject.map { eventBelongs(event, to: $0) } ?? true)
                 && (search.isEmpty || accessMatchesSearch(event))
         }
-        .prefix(3)
-        .map { $0 }
+        return RecentAccessProjection.grouped(recents, maximumGroups: 3)
     }
 
     private var issues: [DashboardIssue] {
@@ -688,16 +687,11 @@ struct DashboardView: View {
         guard let event = state.recents.first(where: { eventBelongs($0, to: project) }) else {
             return nil
         }
-        return relativeTime(event.date)
+        return event.relativeTime(relativeTo: Date())
     }
 
     private func projectIsHealthy(_ project: WorkspaceProject) -> Bool {
         project.environments.flatMap(\.surfaces).allSatisfy(\.status.isHealthy)
-    }
-
-    private func relativeTime(_ date: Date?) -> String? {
-        guard let date else { return nil }
-        return Self.relativeDate.localizedString(for: date, relativeTo: Date())
     }
 
     private func open(_ project: WorkspaceProject) {
@@ -753,11 +747,6 @@ struct DashboardView: View {
         }
     }
 
-    private static let relativeDate: RelativeDateTimeFormatter = {
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .abbreviated
-        return formatter
-    }()
 }
 
 struct FloriaMark: View {
@@ -866,8 +855,8 @@ private struct ProjectRow: View {
 }
 
 private struct AccessSummaryRow: View {
-    let event: RecentAccess
-    let relativeTime: String?
+    let group: RecentAccessGroup
+    private var event: RecentAccess { group.latest }
 
     var body: some View {
         HStack(spacing: 11) {
@@ -896,7 +885,15 @@ private struct AccessSummaryRow: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
             Spacer()
-            Text(relativeTime ?? event.time)
+            if group.count > 1 {
+                Text("×\(group.count)")
+                    .font(.caption.monospacedDigit().weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(.tertiary.opacity(0.16), in: Capsule())
+            }
+            RecentAccessTimeText(event: event)
                 .font(.callout)
                 .foregroundStyle(.secondary)
         }
@@ -953,7 +950,7 @@ private struct CompactProjectDetailView: View {
     @Bindable var state: AppState
     let project: WorkspaceProject
     let search: String
-    let recentAccess: [RecentAccess]
+    let recentAccess: [RecentAccessGroup]
     let openAdvanced: () -> Void
     @State private var showingWorktrees = false
 
@@ -1161,8 +1158,8 @@ private struct CompactProjectDetailView: View {
                 }
             } else {
                 VStack(spacing: 0) {
-                    ForEach(Array(recentAccess.enumerated()), id: \.element.id) { index, event in
-                        AccessSummaryRow(event: event, relativeTime: relativeTime(event.date))
+                    ForEach(Array(recentAccess.enumerated()), id: \.element.id) { index, group in
+                        AccessSummaryRow(group: group)
                         if index != recentAccess.count - 1 {
                             Divider().padding(.leading, 50)
                         }
@@ -1224,16 +1221,6 @@ private struct CompactProjectDetailView: View {
         }
     }
 
-    private func relativeTime(_ date: Date?) -> String? {
-        guard let date else { return nil }
-        return Self.relativeDate.localizedString(for: date, relativeTo: Date())
-    }
-
-    private static let relativeDate: RelativeDateTimeFormatter = {
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .abbreviated
-        return formatter
-    }()
 }
 
 private struct ProjectCheckoutsSheet: View {

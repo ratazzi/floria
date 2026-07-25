@@ -65,6 +65,28 @@ final class MenuBarAccessFeedTests: XCTestCase {
         XCTAssertEqual(feed.groups.last?.latest.path, "surfaces/fixture-29")
     }
 
+    func testSharedProjectionGroupsBeforeApplyingDashboardLimit() {
+        let latest = makeRecent(secondsBeforeNow: 1, path: "surfaces/repeated")
+        let repeated = makeRecent(secondsBeforeNow: 2, path: "surfaces/repeated")
+        let second = makeRecent(secondsBeforeNow: 3, path: "surfaces/second")
+        let third = makeRecent(secondsBeforeNow: 4, path: "surfaces/third")
+
+        let groups = RecentAccessProjection.grouped(
+            [third, repeated, second, latest],
+            maximumGroups: 2)
+
+        XCTAssertEqual(groups.count, 2)
+        XCTAssertEqual(groups[0].latest.path, "surfaces/repeated")
+        XCTAssertEqual(groups[0].count, 2)
+        XCTAssertEqual(groups[1].latest.path, "surfaces/second")
+    }
+
+    func testSubsecondRelativeTimeUsesNowInsteadOfInZeroSeconds() {
+        let recent = makeRecent(secondsBeforeNow: 0.1, path: "surfaces/recent")
+
+        XCTAssertEqual(recent.relativeTime(relativeTo: now), "now")
+    }
+
     private func makeRecent(
         secondsBeforeNow: TimeInterval,
         path: String,

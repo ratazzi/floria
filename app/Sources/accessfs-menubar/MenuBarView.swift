@@ -1,30 +1,10 @@
 import SwiftUI
 
-struct MenuBarAccessGroup: Identifiable {
-    struct ID: Hashable {
-        let path: String
-        let shownPath: String
-        let operation: String
-        let decision: String
-        let exePath: String?
-        let chain: String
-        let ruleID: String?
-        let policyMode: String?
-        let policyConfiguredEnforcement: String?
-        let policyEffectiveEnforcement: String?
-        let sshFingerprint: String?
-    }
-
-    let id: ID
-    let latest: RecentAccess
-    var count: Int
-}
-
 struct MenuBarAccessFeed {
     static let recentWindow: TimeInterval = 60 * 60
     static let maximumGroups = 30
 
-    let groups: [MenuBarAccessGroup]
+    let groups: [RecentAccessGroup]
     let totalGroupCount: Int
     let isSearching: Bool
 
@@ -49,42 +29,12 @@ struct MenuBarAccessFeed {
                 guard let date = recent.date else { return false }
                 return date >= cutoff
             }
-            .sorted {
-                ($0.date ?? .distantPast) > ($1.date ?? .distantPast)
-            }
-
-        var groupIndexes: [MenuBarAccessGroup.ID: Int] = [:]
-        var groups: [MenuBarAccessGroup] = []
-        for recent in candidates {
-            let id = MenuBarAccessGroup.ID(recent)
-            if let index = groupIndexes[id] {
-                groups[index].count += 1
-            } else {
-                groupIndexes[id] = groups.count
-                groups.append(MenuBarAccessGroup(id: id, latest: recent, count: 1))
-            }
-        }
+        let groups = RecentAccessProjection.grouped(candidates)
 
         return MenuBarAccessFeed(
             groups: Array(groups.prefix(maximumGroups)),
             totalGroupCount: groups.count,
             isSearching: isSearching)
-    }
-}
-
-private extension MenuBarAccessGroup.ID {
-    init(_ recent: RecentAccess) {
-        path = recent.path
-        shownPath = recent.shownPath
-        operation = recent.operation
-        decision = recent.decision
-        exePath = recent.exePath
-        chain = recent.chain
-        ruleID = recent.ruleId
-        policyMode = recent.policy?.mode
-        policyConfiguredEnforcement = recent.policy?.configured_enforcement
-        policyEffectiveEnforcement = recent.policy?.effective_enforcement
-        sshFingerprint = recent.ssh?.key_fingerprint
     }
 }
 
@@ -626,7 +576,7 @@ private struct ActiveGrantRow: View {
 /// One access event: decision dot, read/write badge, exe + path, timestamp. Hover highlights
 /// and the tooltip carries the full path / rule / process chain.
 private struct AccessRow: View {
-    let group: MenuBarAccessGroup
+    let group: RecentAccessGroup
     @State private var hovered = false
     private var ev: RecentAccess { group.latest }
 
@@ -674,7 +624,7 @@ private struct AccessRow: View {
                     .background(.tertiary.opacity(0.18))
                     .clipShape(Capsule())
             }
-            Text(ev.time)
+            RecentAccessTimeText(event: ev)
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.tertiary)
         }
