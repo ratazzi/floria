@@ -10,10 +10,9 @@ mod ssh_config;
 
 pub use client::ControlClient;
 pub use protocol::{
-    AccessHistoryEvent, AccessHistoryIdentity, AccessHistoryProcess, AccessHistorySsh,
-    ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest, ControlResponse,
-    ControlResult, ProtectedFile, ProtectedFileVersion, SecretValue, SshConfigState,
-    SshConfigStatus, SshIdentity,
+    AccessHistoryEvent, AccessHistoryIdentity, AccessHistoryProcess, AccessHistorySsh, ActiveGrant,
+    ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest, ControlResponse, ControlResult,
+    ProtectedFile, ProtectedFileVersion, SecretValue, SshConfigState, SshConfigStatus, SshIdentity,
 };
 pub use server::{
     CatalogObserver, ControlRuntimeServices, ControlServer, RuntimePolicyController,

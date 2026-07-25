@@ -12,9 +12,9 @@ use accessfs_catalog::{
     Catalog, CatalogSnapshot, ResourceKind, ResourceSource, Surface, SurfaceKind,
 };
 use accessfs_control::{
-    CatalogObserver, ControlClient, ControlCommand, ControlResult, ControlRuntimeServices,
-    ControlServer, ManagedSshConfig, RuntimePolicyController, SshConfigManager,
-    SshIdentity, SshIdentityDiscovery,
+    ActiveGrant as ControlActiveGrant, CatalogObserver, ControlClient, ControlCommand,
+    ControlResult, ControlRuntimeServices, ControlServer, ManagedSshConfig,
+    RuntimePolicyController, SshConfigManager, SshIdentity, SshIdentityDiscovery,
 };
 use accessfs_core::audit::AuditLog;
 use accessfs_core::authz::{Authorizer, Enforcement, PolicyMode, PolicyModeStatus};
@@ -523,6 +523,34 @@ impl RuntimePolicyController for AgentPolicyController {
     ) -> std::io::Result<PolicyModeStatus> {
         self.agent.set_policy_mode(mode, duration_secs)
     }
+
+    fn active_grants(&self) -> std::io::Result<Vec<ControlActiveGrant>> {
+        self.agent.active_grants().map(|grants| {
+            grants
+                .into_iter()
+                .map(|grant| ControlActiveGrant {
+                    id: grant.id,
+                    subject: grant.subject,
+                    object: grant.object,
+                    operation: grant.operation.as_str().to_string(),
+                    enforcement: grant.enforcement,
+                    expires_at: grant.expires_at,
+                    client: grant.metadata.client,
+                    executable: grant.metadata.executable,
+                    bundle_id: grant.metadata.bundle_id,
+                    target: grant.metadata.target,
+                })
+                .collect()
+        })
+    }
+
+    fn revoke_grant(&self, id: &str) -> std::io::Result<bool> {
+        self.agent.revoke_grant(id)
+    }
+
+    fn clear_grants(&self) -> std::io::Result<()> {
+        self.agent.clear_grants()
+    }
 }
 
 struct RuntimeCatalogObserver {
@@ -719,6 +747,9 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
         }
         ControlResult::PolicyMode(status) => {
             println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        ControlResult::ActiveGrants(grants) => {
+            println!("{}", serde_json::to_string_pretty(&grants)?);
         }
         ControlResult::AccessHistory(events) => {
             println!("{}", serde_json::to_string_pretty(&events)?);

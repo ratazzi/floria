@@ -57,6 +57,9 @@ pub enum ControlCommand {
     Ping,
     PolicyModeGet,
     PolicyModeSet { mode: PolicyMode, duration_secs: Option<u64> },
+    GrantList,
+    GrantRevoke { id: String },
+    GrantClear,
     AccessHistory { limit: usize },
     Snapshot,
     Discover { path: PathBuf },
@@ -159,6 +162,7 @@ pub enum ControlOutcome {
 pub enum ControlResult {
     Pong { schema_version: i64 },
     PolicyMode(PolicyModeStatus),
+    ActiveGrants(Vec<ActiveGrant>),
     AccessHistory(Vec<AccessHistoryEvent>),
     Snapshot(CatalogSnapshot),
     Discovery(DiscoveryPlan),
@@ -178,6 +182,22 @@ pub enum ControlResult {
     SharedSecretRotated { resource_id: String, version: u32 },
     EnvFileCreated { resource: Resource, version: u32 },
     Empty,
+}
+
+/// Metadata-only view of one non-expired authorization grant. Matching continues to use the
+/// normalized subject/object; display fields explain the grant without exposing secret content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveGrant {
+    pub id: String,
+    pub subject: String,
+    pub object: String,
+    pub operation: String,
+    pub enforcement: Enforcement,
+    pub expires_at: i64,
+    pub client: String,
+    pub executable: Option<String>,
+    pub bundle_id: Option<String>,
+    pub target: String,
 }
 
 /// Metadata-only persisted access event. Its JSON shape mirrors the agent's live `access_event`
@@ -436,6 +456,49 @@ mod tests {
                 "params": { "limit": 500 }
             })
         );
+    }
+
+    #[test]
+    fn authorization_grant_wire_shapes_are_stable_for_swift_client() {
+        let list = serde_json::to_value(ControlRequest {
+            request_id: 15,
+            command: ControlCommand::GrantList,
+        })
+        .unwrap();
+        assert_eq!(list["method"], "grant_list");
+        assert!(list.get("params").is_none());
+        let clear = serde_json::to_value(ControlRequest {
+            request_id: 17,
+            command: ControlCommand::GrantClear,
+        })
+        .unwrap();
+        assert_eq!(clear["method"], "grant_clear");
+        assert!(clear.get("params").is_none());
+
+        let revoke = serde_json::to_value(ControlRequest {
+            request_id: 16,
+            command: ControlCommand::GrantRevoke { id: "fixture-grant".to_string() },
+        })
+        .unwrap();
+        assert_eq!(revoke["method"], "grant_revoke");
+        assert_eq!(revoke["params"]["id"], "fixture-grant");
+
+        let result = serde_json::to_value(ControlResult::ActiveGrants(vec![ActiveGrant {
+            id: "fixture-grant".to_string(),
+            subject: "exe:/usr/bin/cat".to_string(),
+            object: "secrets/fixture".to_string(),
+            operation: "read".to_string(),
+            enforcement: Enforcement::Prompt,
+            expires_at: 1_800_000_600,
+            client: "cat".to_string(),
+            executable: Some("/usr/bin/cat".to_string()),
+            bundle_id: None,
+            target: "~/.pgpass".to_string(),
+        }]))
+        .unwrap();
+        assert_eq!(result["type"], "active_grants");
+        assert_eq!(result["value"][0]["client"], "cat");
+        assert_eq!(result["value"][0]["enforcement"], "prompt");
     }
 
     #[test]

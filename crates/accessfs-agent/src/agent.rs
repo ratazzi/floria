@@ -18,7 +18,7 @@ use accessfs_core::identity::ProcessIdentity;
 use accessfs_core::rules::{repo_root, RuleSet};
 use accessfs_platform::SocketPeerVerifier;
 
-use crate::grant_cache::{GrantCache, GrantKey};
+use crate::grant_cache::{ActiveGrant, GrantCache, GrantKey, GrantMetadata};
 use crate::protocol::{DaemonMsg, IdentityView, SshSignView};
 use crate::policy_mode::PolicyModeState;
 use crate::socket::{PromptResult, SocketServer};
@@ -37,7 +37,7 @@ const PROMPT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default TTL for an "allow for a while" grant when the app doesn't specify one.
 const DEFAULT_TTL: Duration = Duration::from_secs(600);
 
-/// TTL used for "this app / this project" grants until the UI exposes explicit revocation.
+/// TTL used for the broader "this app / this project" scopes.
 const PERSISTENT_TTL: Duration = Duration::from_secs(24 * 3600);
 
 pub struct SocketAgent {
@@ -134,6 +134,20 @@ impl SocketAgent {
         let status = self.policy_mode.set(mode, duration_secs)?;
         tracing::info!(mode = ?status.mode, expires_at = ?status.expires_at, "policy mode changed");
         Ok(status)
+    }
+
+    pub fn active_grants(&self) -> std::io::Result<Vec<ActiveGrant>> {
+        self.grants.active()
+    }
+
+    pub fn revoke_grant(&self, id: &str) -> std::io::Result<bool> {
+        self.grant_generation.fetch_add(1, Ordering::AcqRel);
+        self.grants.revoke(id)
+    }
+
+    pub fn clear_grants(&self) -> std::io::Result<()> {
+        self.grant_generation.fetch_add(1, Ordering::AcqRel);
+        self.grants.clear()
     }
 
     /// Atomically replace the default enforcement for managed secret and surface paths.
@@ -247,7 +261,9 @@ impl SocketAgent {
             PromptResult::Decision(d) if d.allow => {
                 if self.grant_generation.load(Ordering::Acquire) == generation {
                     if let Some(ttl) = grant_ttl(&d) {
-                        if let Err(error) = self.grants.insert(key.clone(), ttl) {
+                        if let Err(error) =
+                            self.grants.insert(key.clone(), ttl, grant_metadata(req))
+                        {
                             tracing::warn!(%error, "persisting authorization grant failed");
                         }
                     }
@@ -276,6 +292,33 @@ fn grant_object(req: &AuthRequest<'_>) -> String {
             format!("{}#{}", req.path, context.key_fingerprint)
         }
         None => req.path.to_string(),
+    }
+}
+
+fn grant_metadata(req: &AuthRequest<'_>) -> GrantMetadata {
+    let client = req
+        .identity
+        .exe_path
+        .as_deref()
+        .and_then(|path| path.file_name())
+        .map(|name| name.to_string_lossy().into_owned())
+        .or_else(|| req.identity.parent_chain.first().map(|process| process.name.clone()))
+        .unwrap_or_else(|| format!("pid {}", req.identity.pid));
+    let target = match req.context {
+        Some(accessfs_core::authz::AccessContext::SshSign(context)) => {
+            context.key_label.to_string()
+        }
+        None => req.display.unwrap_or(req.path).to_string(),
+    };
+    GrantMetadata {
+        client,
+        executable: req
+            .identity
+            .exe_path
+            .as_deref()
+            .map(|path| path.to_string_lossy().into_owned()),
+        bundle_id: req.identity.bundle_id.clone(),
+        target,
     }
 }
 
@@ -383,6 +426,15 @@ mod tests {
     use std::os::unix::net::UnixStream;
     use std::sync::Barrier;
     use std::time::Instant;
+
+    fn fixture_grant_metadata() -> GrantMetadata {
+        GrantMetadata {
+            client: "fixture-client".to_string(),
+            executable: Some("/usr/bin/fixture-client".to_string()),
+            bundle_id: None,
+            target: "~/.fixture".to_string(),
+        }
+    }
 
     fn agent_with_rules(dir: &std::path::Path, rules: Vec<Rule>) -> SocketAgent {
         let server =
@@ -539,6 +591,51 @@ mod tests {
     }
 
     #[test]
+    fn ttl_prompt_creates_a_visible_revocable_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket_path = tmp.path().join("agent.sock");
+        let agent = Arc::new(prompt_only_agent(tmp.path()));
+        let mut app = connect_test_app(&agent, &socket_path);
+        let worker = {
+            let agent = Arc::clone(&agent);
+            std::thread::spawn(move || {
+                let mut identity = ProcessIdentity::bare(4242, 501, 20);
+                identity.exe_path = Some("/usr/bin/wc".into());
+                identity.bundle_id = Some("dev.fixture.client".to_string());
+                agent.authorize(&AuthRequest {
+                    path: "secrets/test-id",
+                    display: Some("/Users/fixture/.pgpass"),
+                    operation: Operation::Read,
+                    context: None,
+                    identity: &identity,
+                })
+            })
+        };
+
+        let prompt: Value = read_msg(&mut app).unwrap();
+        write_msg(
+            &mut app,
+            &json!({
+                "type": "decision",
+                "req_id": prompt["req_id"],
+                "outcome": "allow",
+                "scope": "ttl",
+                "ttl_secs": 600
+            }),
+        )
+        .unwrap();
+        assert!(worker.join().unwrap().is_allowed());
+
+        let active = agent.active_grants().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].metadata.client, "wc");
+        assert_eq!(active[0].metadata.target, "/Users/fixture/.pgpass");
+        assert_eq!(active[0].metadata.bundle_id.as_deref(), Some("dev.fixture.client"));
+        assert!(agent.revoke_grant(&active[0].id).unwrap());
+        assert!(agent.active_grants().unwrap().is_empty());
+    }
+
+    #[test]
     fn policy_change_during_prompt_prevents_a_stale_persistent_grant() {
         let tmp = tempfile::tempdir().unwrap();
         let socket_path = tmp.path().join("agent.sock");
@@ -589,6 +686,7 @@ mod tests {
                     Enforcement::Prompt,
                 ),
                 Duration::from_secs(600),
+                fixture_grant_metadata(),
             )
             .unwrap();
 
@@ -652,6 +750,7 @@ mod tests {
                     Enforcement::Prompt,
                 ),
                 Duration::from_secs(600),
+                fixture_grant_metadata(),
             )
             .unwrap();
 
@@ -734,6 +833,7 @@ mod tests {
                     Enforcement::Prompt,
                 ),
                 Duration::from_secs(600),
+                fixture_grant_metadata(),
             )
             .unwrap();
 
@@ -877,6 +977,7 @@ mod tests {
                     Enforcement::Prompt,
                 ),
                 Duration::from_secs(600),
+                fixture_grant_metadata(),
             )
             .unwrap();
 
@@ -919,6 +1020,7 @@ mod tests {
                     Enforcement::Prompt,
                 ),
                 Duration::from_secs(600),
+                fixture_grant_metadata(),
             )
             .unwrap();
 
@@ -939,7 +1041,10 @@ mod tests {
             Operation::Read,
             Enforcement::Prompt,
         );
-        agent.grants.insert(key.clone(), Duration::from_secs(600)).unwrap();
+        agent
+            .grants
+            .insert(key.clone(), Duration::from_secs(600), fixture_grant_metadata())
+            .unwrap();
 
         agent.replace_managed_enforcement(HashMap::from([(
             "secrets/test-id".to_string(),

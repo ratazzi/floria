@@ -23,7 +23,7 @@ use accessfs_surface::{decode_source, ensure_file_surface_link, validate_secret_
 
 use crate::protocol::{
     read_msg, write_msg, AccessHistoryEvent, AccessHistoryIdentity, AccessHistoryProcess,
-    AccessHistorySsh, ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest,
+    AccessHistorySsh, ActiveGrant, ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest,
     ControlResponse, ControlResult, DiscoveryAppliedFile, DiscoveryApplyOutcome,
     DiscoveryApplyResult, DiscoveryReferenceResolution, DiscoveryReferenceSource, ProtectedFile,
     ProtectedFileVersion, SecretValue, SshConfigStatus, SshIdentity,
@@ -46,6 +46,9 @@ pub trait RuntimePolicyController: Send + Sync + 'static {
         mode: PolicyMode,
         duration_secs: Option<u64>,
     ) -> io::Result<PolicyModeStatus>;
+    fn active_grants(&self) -> io::Result<Vec<ActiveGrant>>;
+    fn revoke_grant(&self, id: &str) -> io::Result<bool>;
+    fn clear_grants(&self) -> io::Result<()>;
 }
 
 /// Read-only seam for enumerating public keys from an upstream SSH agent. The protocol and server
@@ -438,6 +441,39 @@ fn dispatch(
             controller
                 .set_policy_mode(mode, duration_secs)
                 .map(ControlResult::PolicyMode)
+                .map_err(DispatchError::Policy)
+        }
+        ControlCommand::GrantList => policy
+            .ok_or_else(|| {
+                DispatchError::Validation(
+                    "authorization grants are unavailable on this control server".to_string(),
+                )
+            })?
+            .active_grants()
+            .map(ControlResult::ActiveGrants)
+            .map_err(DispatchError::Policy),
+        ControlCommand::GrantRevoke { id } => {
+            let controller = policy.ok_or_else(|| {
+                DispatchError::Validation(
+                    "authorization grants are unavailable on this control server".to_string(),
+                )
+            })?;
+            controller.revoke_grant(&id).map_err(DispatchError::Policy)?;
+            controller
+                .active_grants()
+                .map(ControlResult::ActiveGrants)
+                .map_err(DispatchError::Policy)
+        }
+        ControlCommand::GrantClear => {
+            let controller = policy.ok_or_else(|| {
+                DispatchError::Validation(
+                    "authorization grants are unavailable on this control server".to_string(),
+                )
+            })?;
+            controller.clear_grants().map_err(DispatchError::Policy)?;
+            controller
+                .active_grants()
+                .map(ControlResult::ActiveGrants)
                 .map_err(DispatchError::Policy)
         }
         ControlCommand::AccessHistory { limit } => access_history(
@@ -2648,6 +2684,7 @@ mod tests {
 
     struct FixturePolicy {
         status: Mutex<PolicyModeStatus>,
+        grants: Mutex<Vec<ActiveGrant>>,
     }
 
     struct FixtureSshDiscovery;
@@ -2679,6 +2716,22 @@ mod tests {
             *self.status.lock().unwrap() = status;
             Ok(status)
         }
+
+        fn active_grants(&self) -> io::Result<Vec<ActiveGrant>> {
+            Ok(self.grants.lock().unwrap().clone())
+        }
+
+        fn revoke_grant(&self, id: &str) -> io::Result<bool> {
+            let mut grants = self.grants.lock().unwrap();
+            let before = grants.len();
+            grants.retain(|grant| grant.id != id);
+            Ok(grants.len() != before)
+        }
+
+        fn clear_grants(&self) -> io::Result<()> {
+            self.grants.lock().unwrap().clear();
+            Ok(())
+        }
     }
 
     #[test]
@@ -2688,6 +2741,18 @@ mod tests {
         let socket = dir.path().join("control.sock");
         let policy: Arc<dyn RuntimePolicyController> = Arc::new(FixturePolicy {
             status: Mutex::new(PolicyModeStatus::default()),
+            grants: Mutex::new(vec![ActiveGrant {
+                id: "fixture-grant".to_string(),
+                subject: "exe:/usr/bin/cat".to_string(),
+                object: "secrets/fixture".to_string(),
+                operation: "read".to_string(),
+                enforcement: Enforcement::Prompt,
+                expires_at: 1_800_000_600,
+                client: "cat".to_string(),
+                executable: Some("/usr/bin/cat".to_string()),
+                bundle_id: None,
+                target: "~/.pgpass".to_string(),
+            }]),
         });
         let _server = ControlServer::start_inner(
             &socket,
@@ -2713,6 +2778,33 @@ mod tests {
                 mode: PolicyMode::AuditOnly,
                 expires_at: Some(1_800_003_600),
             })
+        );
+        assert_eq!(
+            client.request(ControlCommand::GrantList).unwrap(),
+            ControlResult::ActiveGrants(vec![ActiveGrant {
+                id: "fixture-grant".to_string(),
+                subject: "exe:/usr/bin/cat".to_string(),
+                object: "secrets/fixture".to_string(),
+                operation: "read".to_string(),
+                enforcement: Enforcement::Prompt,
+                expires_at: 1_800_000_600,
+                client: "cat".to_string(),
+                executable: Some("/usr/bin/cat".to_string()),
+                bundle_id: None,
+                target: "~/.pgpass".to_string(),
+            }])
+        );
+        assert_eq!(
+            client
+                .request(ControlCommand::GrantRevoke {
+                    id: "fixture-grant".to_string(),
+                })
+                .unwrap(),
+            ControlResult::ActiveGrants(Vec::new())
+        );
+        assert_eq!(
+            client.request(ControlCommand::GrantClear).unwrap(),
+            ControlResult::ActiveGrants(Vec::new())
         );
     }
 
