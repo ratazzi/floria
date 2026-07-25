@@ -87,11 +87,14 @@ final class ControlClient: @unchecked Sendable {
     }
 
     func applyDiscovery(
-        path: String, files: [String], separateEntries: [DiscoverySeparateEntry]
+        path: String, files: [String], separateEntries: [DiscoverySeparateEntry],
+        promoteEntries: [DiscoverySeparateEntry] = [],
+        demoteEntries: [DiscoverySeparateEntry] = []
     ) async throws -> DiscoveryApplyResult {
         guard let result: DiscoveryApplyResult = try await request(
             .discoverApply(
-                path: path, files: files, separateEntries: separateEntries),
+                path: path, files: files, separateEntries: separateEntries,
+                promoteEntries: promoteEntries, demoteEntries: demoteEntries),
             expecting: "discovery_applied",
             as: DiscoveryApplyResult.self)
         else {

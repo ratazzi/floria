@@ -104,10 +104,12 @@ struct DashboardView: View {
                 sharedSecrets: state.workspace.resources.filter {
                     $0.kind == .sharedSecret && $0.shape == .scalar
                 },
-                apply: { files, separateEntries in
+                apply: { files, separateEntries, promoteEntries, demoteEntries in
                     try await state.workspace.applyDiscovery(
                         at: presentation.plan.path, files: files,
-                        separateEntries: separateEntries)
+                        separateEntries: separateEntries,
+                        promoteEntries: promoteEntries,
+                        demoteEntries: demoteEntries)
                 },
                 resolveReference: { surfaceID, key, source in
                     try await state.workspace.resolveDiscoveryReference(
@@ -1665,7 +1667,9 @@ private struct DiscoveryReviewSheet: View {
     @Environment(\.dismiss) private var dismiss
     let plan: DiscoveryPlan
     let sharedSecrets: [WorkspaceResource]
-    let apply: ([String], [DiscoverySeparateEntry]) async throws -> DiscoveryApplyResult
+    let apply:
+        ([String], [DiscoverySeparateEntry], [DiscoverySeparateEntry], [DiscoverySeparateEntry])
+            async throws -> DiscoveryApplyResult
     let resolveReference:
         (String, String, DiscoveryReferenceSource) async throws
             -> DiscoveryReferenceResolution
@@ -1675,14 +1679,18 @@ private struct DiscoveryReviewSheet: View {
     @State private var applyError: String?
     @State private var selectedFilePaths: Set<String>
     @State private var separateEntryIDs: Set<String> = []
+    @State private var promotedEntryIDs: Set<String> = []
+    @State private var demotedEntryIDs: Set<String> = []
     @State private var resolvedReferenceEntryIDs: Set<String> = []
     @State private var referenceTarget: ReferenceResolutionTarget?
 
     init(
         plan: DiscoveryPlan,
         sharedSecrets: [WorkspaceResource],
-        apply: @escaping ([String], [DiscoverySeparateEntry]) async throws
-            -> DiscoveryApplyResult,
+        apply: @escaping (
+            [String], [DiscoverySeparateEntry], [DiscoverySeparateEntry],
+            [DiscoverySeparateEntry]
+        ) async throws -> DiscoveryApplyResult,
         resolveReference: @escaping
             (String, String, DiscoveryReferenceSource) async throws
                 -> DiscoveryReferenceResolution,
@@ -1755,6 +1763,8 @@ private struct DiscoveryReviewSheet: View {
                             result: appliedResult?.files.first { $0.path == file.path },
                             locked: appliedResult != nil,
                             separateEntryIDs: $separateEntryIDs,
+                            promotedEntryIDs: $promotedEntryIDs,
+                            demotedEntryIDs: $demotedEntryIDs,
                             sharedGroupCounts: sharedGroupCounts,
                             automaticGroupCounts: automaticGroupCounts,
                             automaticGroupPrimaryEntryIDs: automaticGroupPrimaryEntryIDs,
@@ -1901,15 +1911,20 @@ private struct DiscoveryReviewSheet: View {
                 let selectedFiles = plan.files.filter {
                     selectedFilePaths.contains($0.path)
                 }
-                let separateEntries = selectedFiles.flatMap { file in
-                    file.entries.compactMap { entry in
-                        separateEntryIDs.contains(entrySelectionID(file: file, entry: entry))
-                            ? DiscoverySeparateEntry(path: file.path, address: entry.address)
-                            : nil
+                let entriesMatching = { (ids: Set<String>) in
+                    selectedFiles.flatMap { file in
+                        file.entries.compactMap { entry in
+                            ids.contains(entrySelectionID(file: file, entry: entry))
+                                ? DiscoverySeparateEntry(path: file.path, address: entry.address)
+                                : nil
+                        }
                     }
                 }
                 appliedResult = try await apply(
-                    selectedFilePaths.sorted(), separateEntries)
+                    selectedFilePaths.sorted(),
+                    entriesMatching(separateEntryIDs),
+                    entriesMatching(promotedEntryIDs),
+                    entriesMatching(demotedEntryIDs))
             } catch {
                 applyError = error.localizedDescription
             }
@@ -1942,6 +1957,7 @@ private struct DiscoveryReviewSheet: View {
                 let selectionID = entrySelectionID(file: file, entry: entry)
                 guard
                     !separateEntryIDs.contains(selectionID),
+                    !demotedEntryIDs.contains(selectionID),
                     let groupID = entry.action.groupID
                 else { continue }
                 membership[groupID, default: []].append(selectionID)
@@ -1965,6 +1981,15 @@ private struct DiscoveryReviewSheet: View {
         for file in plan.files where selectedFilePaths.contains(file.path) {
             for entry in file.entries {
                 let selectionID = entrySelectionID(file: file, entry: entry)
+                if demotedEntryIDs.contains(selectionID) {
+                    continue
+                }
+                if entry.action.type == "create_env_file_entry" {
+                    if promotedEntryIDs.contains(selectionID) {
+                        new += 1
+                    }
+                    continue
+                }
                 if separateEntryIDs.contains(selectionID) {
                     new += 1
                     continue
@@ -2223,6 +2248,8 @@ private struct DiscoveryFileCard: View {
     let result: DiscoveryAppliedFile?
     let locked: Bool
     @Binding var separateEntryIDs: Set<String>
+    @Binding var promotedEntryIDs: Set<String>
+    @Binding var demotedEntryIDs: Set<String>
     let sharedGroupCounts: [String: Int]
     let automaticGroupCounts: [String: Int]
     let automaticGroupPrimaryEntryIDs: Set<String>
@@ -2301,11 +2328,20 @@ private struct DiscoveryFileCard: View {
 
     private var actionTitle: String {
         switch file.action {
-        case .compose: "\(file.entries.count) value\(file.entries.count == 1 ? "" : "s")"
-        case .protect: "Protect in place"
-        case .importSshIdentity: "Import identity"
-        case .reference: "Reference only"
-        case .review: "Review only"
+        case .compose:
+            let secrets = file.entries.filter { $0.action.type != "create_env_file_entry" }.count
+            let values = file.entries.count - secrets
+            if secrets > 0 && values > 0 {
+                return "\(secrets) secret\(secrets == 1 ? "" : "s") · \(values) value\(values == 1 ? "" : "s")"
+            }
+            if secrets > 0 && (file.kind == .dotenv || file.kind == .direnv) {
+                return "\(secrets) secret\(secrets == 1 ? "" : "s")"
+            }
+            return "\(file.entries.count) value\(file.entries.count == 1 ? "" : "s")"
+        case .protect: return "Protect in place"
+        case .importSshIdentity: return "Import identity"
+        case .reference: return "Reference only"
+        case .review: return "Review only"
         }
     }
 
@@ -2358,7 +2394,8 @@ private struct DiscoveryFileCard: View {
         return switch type {
         case "reuse_shared_secret": "Reuse"
         case "create_shared_secret": "New secret"
-        case "create_env_file_entry": "Keep section"
+        case "create_env_file_entry":
+            file.kind == .dotenv || file.kind == .direnv ? "Env value" : "Keep section"
         case "keep_in_protected_file": "Protect in place"
         default: "Include"
         }
@@ -2385,12 +2422,42 @@ private struct DiscoveryFileCard: View {
                     .font(.caption)
                     .foregroundStyle(.orange)
             }
-        } else if supportsIsolationChoice(entry) {
+        } else if isPlainEnvEntry(entry) {
+            let isPromoted = promotedEntryIDs.contains(selectionID)
+            Menu {
+                Button {
+                    promotedEntryIDs.remove(selectionID)
+                } label: {
+                    if isPromoted {
+                        Text("Keep as env value")
+                    } else {
+                        Label("Keep as env value", systemImage: "checkmark")
+                    }
+                }
+                Button {
+                    promotedEntryIDs.insert(selectionID)
+                } label: {
+                    if isPromoted {
+                        Label("Import as secret", systemImage: "checkmark")
+                    } else {
+                        Text("Import as secret")
+                    }
+                }
+            } label: {
+                Text(isPromoted ? "New secret" : "Env value")
+                    .font(.caption)
+                    .foregroundStyle(isPromoted ? Color.green : Color.secondary)
+            }
+            .menuStyle(.borderlessButton)
+            .disabled(locked || !selected || !file.canApplyDiscovery)
+        } else if supportsReclassification && isSecretActionEntry(entry) {
+            let isDemoted = demotedEntryIDs.contains(selectionID)
             Menu {
                 Button {
                     separateEntryIDs.remove(selectionID)
+                    demotedEntryIDs.remove(selectionID)
                 } label: {
-                    if isSeparate {
+                    if isSeparate || isDemoted {
                         Text(automaticEntryActionTitle(entry, selectionID: selectionID))
                     } else {
                         Label(
@@ -2398,22 +2465,38 @@ private struct DiscoveryFileCard: View {
                             systemImage: "checkmark")
                     }
                 }
+                if supportsIsolationChoice(entry) {
+                    Button {
+                        separateEntryIDs.insert(selectionID)
+                        demotedEntryIDs.remove(selectionID)
+                    } label: {
+                        if isSeparate && !isDemoted {
+                            Label("Create separate secret", systemImage: "checkmark")
+                        } else {
+                            Text("Create separate secret")
+                        }
+                    }
+                }
                 Button {
-                    separateEntryIDs.insert(selectionID)
+                    demotedEntryIDs.insert(selectionID)
+                    separateEntryIDs.remove(selectionID)
                 } label: {
-                    if isSeparate {
-                        Label("Create separate secret", systemImage: "checkmark")
+                    if isDemoted {
+                        Label("Keep as env value", systemImage: "checkmark")
                     } else {
-                        Text("Create separate secret")
+                        Text("Keep as env value")
                     }
                 }
             } label: {
                 Text(
-                    isSeparate
-                        ? "Separate"
-                        : automaticEntryActionTitle(entry, selectionID: selectionID))
+                    isDemoted
+                        ? "Env value"
+                        : (isSeparate
+                            ? "Separate"
+                            : automaticEntryActionTitle(entry, selectionID: selectionID)))
                 .font(.caption)
-                .foregroundStyle(isSeparate ? Color.orange : Color.green)
+                .foregroundStyle(
+                    isDemoted ? Color.secondary : (isSeparate ? Color.orange : Color.green))
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .frame(maxWidth: 220, alignment: .trailing)
@@ -2424,6 +2507,23 @@ private struct DiscoveryFileCard: View {
             Text(automaticEntryActionTitle(entry, selectionID: selectionID))
                 .font(.caption)
                 .foregroundStyle(entryActionColor(entry))
+        }
+    }
+
+    private var supportsReclassification: Bool {
+        file.action == .compose && (file.kind == .dotenv || file.kind == .direnv)
+    }
+
+    private func isPlainEnvEntry(_ entry: DiscoveredEntry) -> Bool {
+        supportsReclassification && entry.action.type == "create_env_file_entry"
+    }
+
+    private func isSecretActionEntry(_ entry: DiscoveredEntry) -> Bool {
+        switch entry.action.type {
+        case "create_shared_secret", "reuse_shared_secret", "reuse_discovered_secret":
+            true
+        default:
+            false
         }
     }
 

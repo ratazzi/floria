@@ -145,6 +145,37 @@ struct CatalogResourceSource: Codable, Sendable {
     }
 }
 
+struct CatalogOriginSource: Codable, Hashable, Sendable {
+    let path: String
+    let projectID: String?
+    let environment: String?
+    let importedAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case path, environment
+        case projectID = "project_id"
+        case importedAt = "imported_at"
+    }
+}
+
+struct CatalogResourceOrigin: Codable, Hashable, Sendable {
+    let kind: String
+    let sources: [CatalogOriginSource]
+
+    private enum CodingKeys: String, CodingKey { case kind, sources }
+
+    init(kind: String, sources: [CatalogOriginSource]) {
+        self.kind = kind
+        self.sources = sources
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        kind = try container.decodeIfPresent(String.self, forKey: .kind) ?? "unknown"
+        sources = try container.decodeIfPresent([CatalogOriginSource].self, forKey: .sources) ?? []
+    }
+}
+
 struct CatalogResource: Codable, Sendable {
     let id: String
     let name: String
@@ -156,9 +187,10 @@ struct CatalogResource: Codable, Sendable {
     let source: CatalogResourceSource
     let enforcement: String
     let metadata: ItemMetadata
+    let origin: CatalogResourceOrigin?
 
     enum CodingKeys: String, CodingKey {
-        case id, name, kind, shape, codec, entries, source, enforcement, metadata
+        case id, name, kind, shape, codec, entries, source, enforcement, metadata, origin
         case defaultEnvKey = "default_env_key"
     }
 }
@@ -580,7 +612,8 @@ enum ControlCommand: Sendable {
     case snapshot
     case discover(path: String)
     case discoverApply(
-        path: String, files: [String], separateEntries: [DiscoverySeparateEntry])
+        path: String, files: [String], separateEntries: [DiscoverySeparateEntry],
+        promoteEntries: [DiscoverySeparateEntry], demoteEntries: [DiscoverySeparateEntry])
     case discoverReferenceResolve(
         surfaceID: String, key: String, source: DiscoveryReferenceSource)
     case projectCheckoutInventory
@@ -699,12 +732,14 @@ enum ControlCommand: Sendable {
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: DiscoverParams(path: path)))
-        case .discoverApply(let path, let files, let separateEntries):
+        case .discoverApply(
+            let path, let files, let separateEntries, let promoteEntries, let demoteEntries):
             return try encoder.encode(
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: DiscoverApplyParams(
-                        path: path, files: files, separateEntries: separateEntries)))
+                        path: path, files: files, separateEntries: separateEntries,
+                        promoteEntries: promoteEntries, demoteEntries: demoteEntries)))
         case .discoverReferenceResolve(let surfaceID, let key, let source):
             return try encoder.encode(
                 ControlRequest(
@@ -853,6 +888,8 @@ private struct DiscoverApplyParams: Encodable {
     let path: String
     let files: [String]
     let separateEntries: [DiscoverySeparateEntry]
+    let promoteEntries: [DiscoverySeparateEntry]
+    let demoteEntries: [DiscoverySeparateEntry]
 }
 private struct DiscoverReferenceResolveParams: Encodable {
     let surfaceID: String

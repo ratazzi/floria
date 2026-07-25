@@ -2943,6 +2943,13 @@ private struct ResourceCatalogView: View {
                     ResourceIcon(kind: resource.kind)
                     VStack(alignment: .leading, spacing: 3) {
                         Text(resource.name).font(.body.weight(.medium))
+                        if let originSummary = resource.originSummary {
+                            Text(originSummary)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
                         if let note = resource.metadata.note {
                             Text(note)
                                 .font(.caption)
@@ -3275,6 +3282,26 @@ private struct EditSharedSecretSheet: View {
                 Text("Saving a new value appends an encrypted version; existing history is kept.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+
+            if !resource.originSources.isEmpty {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Sources").font(.callout.weight(.medium))
+                    ForEach(resource.originSources, id: \.self) { source in
+                        HStack(spacing: 6) {
+                            Image(systemName: "doc.text")
+                            Text((source.path as NSString).abbreviatingWithTildeInPath)
+                                .font(.caption.monospaced())
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            if let environment = source.environment {
+                                Text(environment)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .font(.caption)
+                    }
+                }
             }
 
             HStack(spacing: 7) {

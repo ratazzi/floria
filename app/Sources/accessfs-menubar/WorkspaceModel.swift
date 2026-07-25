@@ -207,6 +207,7 @@ struct WorkspaceResource: Identifiable, Hashable, Sendable {
     let entries: [WorkspaceEntry]
     let securityLevel: WorkspaceSecurityLevel
     let metadata: ItemMetadata
+    let origin: CatalogResourceOrigin?
     let usageCount: Int
 
     init(
@@ -216,6 +217,7 @@ struct WorkspaceResource: Identifiable, Hashable, Sendable {
         exports: [WorkspaceExport], entries: [WorkspaceEntry] = [],
         securityLevel: WorkspaceSecurityLevel = .confirmation,
         metadata: ItemMetadata = .empty,
+        origin: CatalogResourceOrigin? = nil,
         usageCount: Int
     ) {
         self.id = id
@@ -234,7 +236,20 @@ struct WorkspaceResource: Identifiable, Hashable, Sendable {
             : entries
         self.securityLevel = securityLevel
         self.metadata = metadata
+        self.origin = origin
         self.usageCount = usageCount
+    }
+
+    /// Discovery/import provenance, tilde-abbreviated for one-line display.
+    var originSummary: String? {
+        let sources = origin?.sources ?? []
+        guard let first = sources.first else { return nil }
+        let path = (first.path as NSString).abbreviatingWithTildeInPath
+        return sources.count > 1 ? "\(path) +\(sources.count - 1)" : path
+    }
+
+    var originSources: [CatalogOriginSource] {
+        origin?.sources ?? []
     }
 
     var exports: [WorkspaceExport] {
@@ -798,17 +813,24 @@ final class WorkspaceStore {
     }
 
     func applyDiscovery(
-        at path: String, files: [String], separateEntries: [DiscoverySeparateEntry]
+        at path: String, files: [String], separateEntries: [DiscoverySeparateEntry],
+        promoteEntries: [DiscoverySeparateEntry] = [],
+        demoteEntries: [DiscoverySeparateEntry] = []
     ) async throws -> DiscoveryApplyResult {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
-        let result = try await controlClient.applyDiscovery(
-            path: (path as NSString).standardizingPath,
-            files: files.map { ($0 as NSString).standardizingPath },
-            separateEntries: separateEntries.map {
+        let standardized = { (entries: [DiscoverySeparateEntry]) in
+            entries.map {
                 DiscoverySeparateEntry(
                     path: ($0.path as NSString).standardizingPath,
                     address: $0.address)
-            })
+            }
+        }
+        let result = try await controlClient.applyDiscovery(
+            path: (path as NSString).standardizingPath,
+            files: files.map { ($0 as NSString).standardizingPath },
+            separateEntries: standardized(separateEntries),
+            promoteEntries: standardized(promoteEntries),
+            demoteEntries: standardized(demoteEntries))
         apply(try await controlClient.snapshot(), selectingProject: result.projectID)
         protectedFiles = try await controlClient.protectedFiles().map(WorkspaceProtectedFile.init)
         lastError = nil
@@ -1192,7 +1214,8 @@ final class WorkspaceStore {
                         key: nil, sensitive: false)
                 },
                 source: .socket(endpoint), enforcement: WorkspaceSecurityLevel.confirmation.rawValue,
-                metadata: metadata))
+                metadata: metadata,
+                origin: CatalogResourceOrigin(kind: "manual", sources: [])))
         apply(try await controlClient.snapshot())
         lastError = nil
         return resourceID
@@ -1809,6 +1832,7 @@ final class WorkspaceStore {
                 entries: entries,
                 securityLevel: WorkspaceSecurityLevel(catalogValue: resource.enforcement),
                 metadata: resource.metadata,
+                origin: resource.origin,
                 usageCount: projectUsage[resource.id] ?? 0)
         }
 
