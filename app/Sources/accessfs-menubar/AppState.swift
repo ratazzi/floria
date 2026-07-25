@@ -68,6 +68,9 @@ struct RecentAccess: Identifiable {
 @Observable @MainActor
 final class AppState {
     var connected = false
+    /// Non-nil while macFUSE setup is incomplete; drives the setup sheet.
+    var macFuseSetupStage: MacFuseSetupStage?
+    var macFuseRechecking = false
     var recents: [RecentAccess] = []
     var workspace: WorkspaceStore
     var policyMode = RuntimePolicyStatus.normal
@@ -83,6 +86,9 @@ final class AppState {
     @ObservationIgnored private let prompter = PromptPresenter()
     @ObservationIgnored private let daemonManager = DaemonManager()
     @ObservationIgnored private var accessHistoryLoaded = false
+    @ObservationIgnored private var macFuseProbeTask: Task<Void, Never>?
+    @ObservationIgnored private let macFusePreview =
+        ProcessInfo.processInfo.environment["FLORIA_MACFUSE_SETUP_PREVIEW"] != nil
 
     // Sized for the dashboard table; the dropdown only ever renders a screenful.
     private static let maxRecents = 500
@@ -101,6 +107,12 @@ final class AppState {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.connected = up
+                if up, !self.macFusePreview {
+                    // A live agent connection is definitive proof the mount is up; any
+                    // pending macFUSE setup guidance is obsolete.
+                    self.macFuseSetupStage = nil
+                    self.macFuseProbeTask?.cancel()
+                }
                 if up {
                     Task {
                         await self.workspace.reload()
@@ -121,6 +133,17 @@ final class AppState {
                 self.prompter.show(p) { decision in self.client.send(decision) }
             }
         }
+        // Preview hook for the setup UI on machines where macFUSE is healthy:
+        // FLORIA_MACFUSE_SETUP_PREVIEW=install|approve forces a stage (dev + prod builds).
+        // The agent/control plumbing stays off so the background doesn't flap between
+        // connection states while previewing.
+        if macFusePreview {
+            macFuseSetupStage =
+                ProcessInfo.processInfo.environment["FLORIA_MACFUSE_SETUP_PREVIEW"] == "install"
+                    ? .installMacFuse : .approveKext
+            return
+        }
+
         client.start()
         Task {
             await workspace.reload()
@@ -145,18 +168,55 @@ final class AppState {
             }
         }
 
-        // A packaged app always reconciles the LaunchAgent definition. DaemonManager makes
-        // the same bundle revision a no-op, while a newly installed bundle must replace an
-        // older but still-connectable daemon so new control-plane capabilities become live.
         if DaemonManager.isProductionApp {
+            // A packaged app always reconciles the LaunchAgent definition. DaemonManager makes
+            // the same bundle revision a no-op, while a newly installed bundle must replace an
+            // older but still-connectable daemon so new control-plane capabilities become live.
+            // macFUSE readiness gates the whole ladder: without it the daemon can only crash-loop.
             Task { @MainActor [weak self] in
                 try? await Task.sleep(nanoseconds: 500_000_000)
-                guard let self else { return }
-                let manager = self.daemonManager
-                DispatchQueue.global(qos: .utility).async {
-                    manager.ensureRunning()
+                self?.evaluateMacFuseSetup(timeoutSeconds: 15)
+            }
+        }
+    }
+
+    /// Run the macFUSE readiness ladder: not installed → stop the daemon (no crash loop)
+    /// and show install guidance; installed → start the daemon and treat an agent
+    /// connection within the timeout as proof the mount works, otherwise assume the
+    /// system extension still needs approval.
+    private func evaluateMacFuseSetup(timeoutSeconds: Int) {
+        macFuseProbeTask?.cancel()
+        guard DaemonManager.isProductionApp else { return }
+        let manager = daemonManager
+        guard MacFuseSetupStage.isInstalled else {
+            macFuseSetupStage = .installMacFuse
+            DispatchQueue.global(qos: .utility).async { manager.stop() }
+            return
+        }
+        DispatchQueue.global(qos: .utility).async { manager.ensureRunning() }
+        macFuseProbeTask = Task { @MainActor [weak self] in
+            for _ in 0..<timeoutSeconds {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard let self, !Task.isCancelled else { return }
+                if self.connected {
+                    self.macFuseSetupStage = nil
+                    return
                 }
             }
+            guard let self, !Task.isCancelled else { return }
+            self.macFuseSetupStage = .approveKext
+        }
+    }
+
+    func recheckMacFuseSetup() {
+        guard !macFusePreview else { return }
+        guard !macFuseRechecking else { return }
+        macFuseRechecking = true
+        evaluateMacFuseSetup(timeoutSeconds: 12)
+        let probe = macFuseProbeTask
+        Task { @MainActor [weak self] in
+            await probe?.value
+            self?.macFuseRechecking = false
         }
     }
 

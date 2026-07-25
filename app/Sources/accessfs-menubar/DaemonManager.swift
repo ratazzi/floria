@@ -71,6 +71,12 @@ struct DaemonManager: Sendable {
         }
     }
 
+    /// Stop the managed daemon. Used while macFUSE setup is incomplete: without the kext the
+    /// daemon can only fail to mount, and KeepAlive would keep it in a restart loop.
+    func stop() {
+        _ = try? runLaunchctl(["bootout", serviceTarget])
+    }
+
     /// Install the LaunchAgent plist and bootstrap it with launchd. Existing user config is
     /// preserved; only a missing config and bundled example handler are seeded.
     private func install(daemonURL: URL) throws {

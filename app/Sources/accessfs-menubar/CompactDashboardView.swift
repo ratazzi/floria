@@ -90,6 +90,9 @@ struct DashboardView: View {
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .sheet(item: $state.macFuseSetupStage) { stage in
+            MacFuseSetupView(state: state, stage: stage)
+        }
         .focusedSceneValue(\.focusAppSearch) {
             searchIsFocused = true
         }

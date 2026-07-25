@@ -100,6 +100,10 @@ struct MenuBarView: View {
     var body: some View {
         VStack(spacing: 0) {
             MenuBarHeader(searchText: $searchText, countLabel: countLabel)
+            if state.macFuseSetupStage != nil {
+                MacFuseSetupBanner()
+                Divider()
+            }
             PolicyModeControl(state: state) { window in
                 pendingConfirmation = .auditOnly(window)
             }
