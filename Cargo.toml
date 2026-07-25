@@ -33,6 +33,7 @@ chrono = { version = "0.4", features = ["clock"], default-features = false }
 age = { version = "0.10", features = ["ssh"] }
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
+notify = "8.2"
 rusqlite = { version = "0.40", features = ["bundled"] }
 signature = "2"
 rsa = "0.9.10"

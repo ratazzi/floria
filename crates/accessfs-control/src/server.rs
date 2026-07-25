@@ -13,8 +13,8 @@ use accessfs_catalog::{
 use accessfs_core::audit::{read_recent_access, AuditAccessRecord};
 use accessfs_core::authz::{Enforcement, PolicyMode, PolicyModeStatus};
 use accessfs_discover::{
-    discover, discover_git_checkouts, DiscoveredContent, DiscoveredFileAction,
-    DiscoveredFileKind, ExistingEnvironment, ExistingProject, ExistingSecret, ExistingSurface,
+    discover, discover_git_checkouts, DiscoveredContent, DiscoveredFileAction, DiscoveredFileKind,
+    ExistingEnvironment, ExistingProject, ExistingSecret, ExistingSurface, GitCheckoutMonitor,
 };
 use accessfs_platform::SocketPeerVerifier;
 use accessfs_ssh::ManagedKeyError;
@@ -67,6 +67,7 @@ pub trait SshConfigManager: Send + Sync + 'static {
 
 pub struct ControlRuntimeServices {
     pub observer: Arc<dyn CatalogObserver>,
+    pub checkout_monitor: Arc<GitCheckoutMonitor>,
     pub policy: Arc<dyn RuntimePolicyController>,
     pub ssh_discovery: Arc<dyn SshIdentityDiscovery>,
     pub ssh_config: Arc<dyn SshConfigManager>,
@@ -79,6 +80,7 @@ struct ControlDependencies {
     store: Option<Arc<dyn SecretStore>>,
     mount_path: Option<PathBuf>,
     observer: Option<Arc<dyn CatalogObserver>>,
+    checkout_monitor: Option<Arc<GitCheckoutMonitor>>,
     policy: Option<Arc<dyn RuntimePolicyController>>,
     ssh_discovery: Option<Arc<dyn SshIdentityDiscovery>>,
     ssh_config: Option<Arc<dyn SshConfigManager>>,
@@ -168,6 +170,7 @@ impl ControlServer {
                 store: Some(store),
                 mount_path: Some(mount_path),
                 observer: Some(services.observer),
+                checkout_monitor: Some(services.checkout_monitor),
                 policy: Some(services.policy),
                 ssh_discovery: Some(services.ssh_discovery),
                 ssh_config: Some(services.ssh_config),
@@ -265,6 +268,7 @@ fn handle_connection(
             policy: dependencies.policy.as_deref(),
             ssh_discovery: dependencies.ssh_discovery.as_deref(),
             ssh_config: dependencies.ssh_config.as_deref(),
+            checkout_monitor: dependencies.checkout_monitor.as_deref(),
             audit_log: dependencies.audit_log.as_deref(),
         };
         let outcome = match dispatch(&catalog, services, request.command) {
@@ -349,6 +353,7 @@ struct DispatchServices<'a> {
     policy: Option<&'a dyn RuntimePolicyController>,
     ssh_discovery: Option<&'a dyn SshIdentityDiscovery>,
     ssh_config: Option<&'a dyn SshConfigManager>,
+    checkout_monitor: Option<&'a GitCheckoutMonitor>,
     audit_log: Option<&'a Path>,
 }
 
@@ -422,6 +427,7 @@ fn dispatch(
         policy,
         ssh_discovery,
         ssh_config,
+        checkout_monitor,
         audit_log,
     } = services;
     match command {
@@ -518,7 +524,7 @@ fn dispatch(
             )
         }
         ControlCommand::ProjectCheckoutDiscover { project_id } => {
-            discover_project_checkouts(catalog, &project_id)
+            discover_project_checkouts(catalog, &project_id, checkout_monitor)
         }
         ControlCommand::ProjectCheckoutUpsert { checkout } => {
             catalog.upsert_checkout(&checkout)?;
@@ -1318,6 +1324,7 @@ impl Drop for DiscoveryMutationGuard<'_> {
 fn discover_project_checkouts(
     catalog: &Catalog,
     project_id: &str,
+    monitor: Option<&GitCheckoutMonitor>,
 ) -> Result<ControlResult, DispatchError> {
     let snapshot = catalog.snapshot()?;
     let project = snapshot
@@ -1325,8 +1332,12 @@ fn discover_project_checkouts(
         .iter()
         .find(|project| project.id == project_id)
         .ok_or_else(|| CatalogError::NotFound(format!("project {project_id}")))?;
-    let discovered = discover_git_checkouts(&project.path)
-        .map_err(|error| DispatchError::Validation(error.to_string()))?;
+    let discovered = match monitor.and_then(|monitor| monitor.discovery(project_id)) {
+        Some(Ok(discovery)) => discovery,
+        Some(Err(error)) => return Err(DispatchError::Validation(error)),
+        None => discover_git_checkouts(&project.path)
+            .map_err(|error| DispatchError::Validation(error.to_string()))?,
+    };
     let checkouts = discovered
         .checkouts
         .into_iter()

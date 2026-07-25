@@ -14,9 +14,13 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 mod git;
+mod watch;
 
 pub use git::{
     discover_git_checkouts, DiscoveredGitCheckout, GitCheckoutDiscovery, GitCheckoutError,
+};
+pub use watch::{
+    GitCheckoutInventory, GitCheckoutMonitor, MonitoredGitCheckout, MonitoredGitProject,
 };
 
 const MAX_DEPTH: usize = 6;

@@ -19,6 +19,7 @@ use accessfs_control::{
 use accessfs_core::audit::AuditLog;
 use accessfs_core::authz::{Authorizer, Enforcement, PolicyMode, PolicyModeStatus};
 use accessfs_core::config::{Config, ResolvedConfig, SECRETS_DIR, SURFACES_DIR};
+use accessfs_discover::{GitCheckoutMonitor, MonitoredGitProject};
 use accessfs_platform::{CodeSignedPeerVerifier, SocketPeerVerifier};
 use accessfs_store::{AgeDirStore, NewSecret, SecretId, SecretRecord, SecretStore, SshKeyProvider};
 use accessfs_surface::{
@@ -408,6 +409,10 @@ fn cmd_mount(config: &Path) -> Result<()> {
     let catalog = Catalog::open(&catalog_path)
         .with_context(|| format!("opening catalog at {}", catalog_path.display()))?;
     let snapshot = catalog.snapshot().context("loading initial surface registry")?;
+    let checkout_monitor = Arc::new(
+        GitCheckoutMonitor::start(monitored_git_projects(&snapshot))
+            .context("starting Git checkout monitor")?,
+    );
     let surface_registry = Arc::new(SurfaceRegistry::from_snapshot(&snapshot));
     let linked_file_surfaces =
         file_surface_instances(&snapshot).context("materializing project checkout links")?;
@@ -441,6 +446,7 @@ fn cmd_mount(config: &Path) -> Result<()> {
         agent: Arc::clone(&agent),
         ssh_runtime: Arc::clone(&ssh_runtime),
         linked_file_surfaces: Mutex::new(linked_file_surfaces),
+        checkout_monitor: Arc::clone(&checkout_monitor),
     });
     let policy: Arc<dyn RuntimePolicyController> = Arc::new(AgentPolicyController {
         agent: Arc::clone(&agent),
@@ -458,6 +464,7 @@ fn cmd_mount(config: &Path) -> Result<()> {
         cfg.mount_path.clone(),
         ControlRuntimeServices {
             observer,
+            checkout_monitor,
             policy,
             ssh_discovery,
             ssh_config,
@@ -563,10 +570,13 @@ struct RuntimeCatalogObserver {
     agent: Arc<accessfs_agent::SocketAgent>,
     ssh_runtime: Arc<accessfs_agent::SshAgentRuntime>,
     linked_file_surfaces: Mutex<Vec<Surface>>,
+    checkout_monitor: Arc<GitCheckoutMonitor>,
 }
 
 impl CatalogObserver for RuntimeCatalogObserver {
     fn catalog_changed(&self, snapshot: &CatalogSnapshot) {
+        self.checkout_monitor
+            .replace_projects(monitored_git_projects(snapshot));
         let next_links = match file_surface_instances(snapshot) {
             Ok(links) => links,
             Err(error) => {
@@ -592,6 +602,17 @@ impl CatalogObserver for RuntimeCatalogObserver {
             Err(error) => tracing::warn!(%error, "refreshing managed security levels failed"),
         }
     }
+}
+
+fn monitored_git_projects(snapshot: &CatalogSnapshot) -> Vec<MonitoredGitProject> {
+    snapshot
+        .projects
+        .iter()
+        .map(|project| MonitoredGitProject {
+            id: project.id.clone(),
+            root: project.path.clone(),
+        })
+        .collect()
 }
 
 fn managed_enforcement(
