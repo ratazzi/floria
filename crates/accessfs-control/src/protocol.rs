@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use accessfs_catalog::{
     Binding, CatalogError, CatalogSnapshot, Environment, Project, ResolvedEnvironment, Resource,
-    ResourceCodec, ResourceUsage, Surface,
+    ItemMetadata, ResourceCodec, ResourceUsage, Surface,
 };
 use accessfs_store::StoreError;
 use serde::de::DeserializeOwned;
@@ -58,6 +58,7 @@ pub enum ControlCommand {
     FileProtect { path: PathBuf },
     ProtectedFileHistory { id: String },
     ProtectedFileRollback { id: String, version: u32 },
+    ProtectedFileMetadataUpdate { id: String, metadata: ItemMetadata },
     FileRestore { id: String },
     ResolveEnvironment { project_id: String, environment_id: String },
     ResourceUsage { resource_id: String },
@@ -66,12 +67,14 @@ pub enum ControlCommand {
         name: String,
         default_env_key: Option<String>,
         value: SecretValue,
+        metadata: ItemMetadata,
     },
     SharedSecretUpdate {
         resource_id: String,
         name: String,
         default_env_key: Option<String>,
         value: Option<SecretValue>,
+        metadata: ItemMetadata,
     },
     SharedSecretRemove { resource_id: String },
     SharedSecretRotate { resource_id: String, value: SecretValue },
@@ -80,7 +83,9 @@ pub enum ControlCommand {
         name: String,
         codec: ResourceCodec,
         value: SecretValue,
+        metadata: ItemMetadata,
     },
+    ResourceMetadataUpdate { resource_id: String, name: String, metadata: ItemMetadata },
     ProjectCreate { project: Project, environment: Environment, surface: Surface },
     ProjectUpsert { project: Project },
     ProjectRemove { id: String },
@@ -134,6 +139,7 @@ pub struct ProtectedFile {
     pub size: u64,
     pub current_version: u32,
     pub linked: bool,
+    pub metadata: ItemMetadata,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,6 +253,7 @@ mod tests {
                 name: "Fixture INI".to_string(),
                 codec: ResourceCodec::Ini,
                 value: SecretValue::new("[fixture]\nREGION=fixture-region\n"),
+                metadata: ItemMetadata::default(),
             },
         };
         let value = serde_json::to_value(request).unwrap();

@@ -1750,6 +1750,13 @@ mod tests {
         fn get_by_path(&self, _source_path: &Path) -> StoreResult<Option<SecretRecord>> {
             unimplemented!()
         }
+        fn update_metadata(
+            &self,
+            _id: &SecretId,
+            _metadata: accessfs_core::metadata::ItemMetadata,
+        ) -> StoreResult<()> {
+            unimplemented!()
+        }
         fn delete(&self, _id: &SecretId) -> StoreResult<()> {
             unimplemented!()
         }

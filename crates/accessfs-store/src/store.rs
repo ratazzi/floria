@@ -14,6 +14,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+use accessfs_core::metadata::ItemMetadata;
+
 use crate::error::{StoreError, StoreResult};
 use crate::keys::KeyProvider;
 
@@ -85,6 +87,8 @@ pub struct SecretRecord {
     pub created: String,
     /// Head version number.
     pub current_version: u32,
+    /// Plaintext, non-secret context for display and navigation.
+    pub metadata: ItemMetadata,
 }
 
 impl SecretRecord {
@@ -133,6 +137,8 @@ pub trait SecretStore: Send + Sync {
     fn record(&self, id: &SecretId) -> StoreResult<Option<SecretRecord>>;
     fn list(&self) -> StoreResult<Vec<SecretRecord>>;
     fn get_by_path(&self, source_path: &Path) -> StoreResult<Option<SecretRecord>>;
+    /// Replace plaintext display metadata without creating a secret content version.
+    fn update_metadata(&self, id: &SecretId, metadata: ItemMetadata) -> StoreResult<()>;
     /// Delete a secret and all its versions.
     fn delete(&self, id: &SecretId) -> StoreResult<()>;
 }
@@ -151,6 +157,8 @@ struct MetaFile {
     mode: u32,
     created: String,
     current_version: u32,
+    #[serde(default, skip_serializing_if = "ItemMetadata::is_empty")]
+    metadata: ItemMetadata,
 }
 
 /// On-disk `<id>/v/NNNN.toml`: immutable per-version metadata.
@@ -389,6 +397,7 @@ impl SecretStore for AgeDirStore {
                 mode,
                 created: now_rfc3339(),
                 current_version: 1,
+                metadata: ItemMetadata::default(),
             },
         )?;
         Ok(id)
@@ -478,6 +487,7 @@ impl SecretStore for AgeDirStore {
             size: vm.size,
             created: meta.created,
             current_version: meta.current_version,
+            metadata: meta.metadata,
         }))
     }
 
@@ -517,6 +527,14 @@ impl SecretStore for AgeDirStore {
                     .source_path()
                     .is_some_and(|path| path.to_string_lossy() == target)
             }))
+    }
+
+    fn update_metadata(&self, id: &SecretId, metadata: ItemMetadata) -> StoreResult<()> {
+        metadata.validate().map_err(StoreError::Invalid)?;
+        let _lock = self.lock_exclusive()?;
+        let mut meta = self.read_meta(id)?;
+        meta.metadata = metadata;
+        self.write_meta(id, &meta)
     }
 
     fn delete(&self, id: &SecretId) -> StoreResult<()> {
@@ -687,6 +705,34 @@ mod tests {
         let meta = std::fs::read_to_string(s.entry_dir(&id).join("meta.toml")).unwrap();
         assert!(meta.contains("managed_label = \"Fixture Shared Secret\""));
         assert!(!meta.contains("fixture-managed-value"));
+    }
+
+    #[test]
+    fn metadata_roundtrips_without_creating_a_content_version() {
+        use accessfs_core::metadata::ItemLink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path().to_path_buf());
+        let id = s
+            .put(NewSecret::file(PathBuf::from("/fixture/.pgpass"), 0o600), b"fixture")
+            .unwrap();
+        let metadata = ItemMetadata {
+            note: Some("Local reporting database".to_string()),
+            links: vec![ItemLink {
+                label: "Database console".to_string(),
+                url: "https://example.invalid/databases/reporting".to_string(),
+            }],
+        };
+
+        s.update_metadata(&id, metadata.clone()).unwrap();
+
+        let record = s.record(&id).unwrap().unwrap();
+        assert_eq!(record.metadata, metadata);
+        assert_eq!(record.current_version, 1);
+        assert_eq!(s.history(&id).unwrap().len(), 1);
+        let sidecar = std::fs::read_to_string(s.entry_dir(&id).join("meta.toml")).unwrap();
+        assert!(sidecar.contains("Local reporting database"));
+        assert!(!sidecar.contains("fixture\n"));
     }
 
     #[test]

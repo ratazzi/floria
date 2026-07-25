@@ -73,7 +73,7 @@ final class WorkspaceModelTests: XCTestCase {
                     address: "keys/FALLBACK_URL", label: "FALLBACK_URL", key: "FALLBACK_URL",
                     sensitive: true),
             ],
-            detail: "2 entries", usageCount: 0)
+            usageCount: 0)
         let selection = WorkspaceEntrySelection.entries([
             "keys/FALLBACK_URL", "keys/PRIMARY_URL",
         ])
@@ -94,7 +94,7 @@ final class WorkspaceModelTests: XCTestCase {
                 WorkspaceEntry(
                     address: "keys/LOG_LEVEL", label: "LOG_LEVEL", key: "LOG_LEVEL",
                     previewValue: "debug", sensitive: false),
-            ], detail: "2 entries", usageCount: 0)
+            ], usageCount: 0)
         let environment = WorkspaceEnvironment(
             id: "development", name: "Development",
             bindings: [
@@ -131,7 +131,7 @@ final class WorkspaceModelTests: XCTestCase {
                     address: "sections/staging/keys/credential-process",
                     label: "[staging] credential-process", key: "credential-process",
                     sensitive: true),
-            ], detail: "3 entries", usageCount: 0)
+            ], usageCount: 0)
         let store = WorkspaceStore(projects: [], resources: [resource])
         let selected = WorkspaceBinding(
             id: "fixture-binding", resourceID: resource.id,
@@ -202,11 +202,11 @@ final class WorkspaceModelTests: XCTestCase {
             WorkspaceResource(
                 id: "first", name: "First", kind: .sharedSecret, shape: .scalar,
                 exports: [WorkspaceExport(key: "FIRST", previewValue: "one", sensitive: true)],
-                detail: "First", usageCount: 1),
+                usageCount: 1),
             WorkspaceResource(
                 id: "second", name: "Second", kind: .sharedSecret, shape: .scalar,
                 exports: [WorkspaceExport(key: "SECOND", previewValue: "two", sensitive: true)],
-                detail: "Second", usageCount: 1),
+                usageCount: 1),
         ]
         let environment = WorkspaceEnvironment(
             id: "development", name: "Development",
@@ -237,5 +237,29 @@ final class WorkspaceModelTests: XCTestCase {
         XCTAssertEqual(store.resolvedExports.map(\.key), ["FIRST"])
         store.selectedSurfaceID = "second-surface"
         XCTAssertEqual(store.resolvedExports.map(\.key), ["SECOND"])
+    }
+
+    func testItemMetadataIsNormalizedAndRejectsCredentialURLs() throws {
+        let metadata = try WorkspaceStore.validatedMetadata(
+            ItemMetadata(
+                note: "  Used by staging  ",
+                links: [
+                    ItemLink(
+                        label: "  Dashboard  ",
+                        url: "  https://example.invalid/tokens  ")
+                ]))
+        XCTAssertEqual(metadata.note, "Used by staging")
+        XCTAssertEqual(metadata.links[0].label, "Dashboard")
+        XCTAssertEqual(metadata.links[0].url, "https://example.invalid/tokens")
+
+        XCTAssertThrowsError(
+            try WorkspaceStore.validatedMetadata(
+                ItemMetadata(
+                    note: nil,
+                    links: [
+                        ItemLink(
+                            label: "Dashboard",
+                            url: "https://fixture-user:fixture-password@example.invalid")
+                    ])))
     }
 }

@@ -140,14 +140,15 @@ struct WorkspaceResource: Identifiable, Hashable, Sendable {
     let codec: WorkspaceResourceCodec
     let defaultEnvKey: String?
     let entries: [WorkspaceEntry]
-    let detail: String
+    let metadata: ItemMetadata
     let usageCount: Int
 
     init(
         id: String, name: String, kind: WorkspaceResourceKind, shape: WorkspaceValueShape,
         codec: WorkspaceResourceCodec? = nil,
         defaultEnvKey: String? = nil,
-        exports: [WorkspaceExport], entries: [WorkspaceEntry] = [], detail: String,
+        exports: [WorkspaceExport], entries: [WorkspaceEntry] = [],
+        metadata: ItemMetadata = .empty,
         usageCount: Int
     ) {
         self.id = id
@@ -164,7 +165,7 @@ struct WorkspaceResource: Identifiable, Hashable, Sendable {
                     sensitive: $0.sensitive)
             }
             : entries
-        self.detail = detail
+        self.metadata = metadata
         self.usageCount = usageCount
     }
 
@@ -409,6 +410,7 @@ struct WorkspaceProtectedFile: Identifiable, Hashable, Sendable {
     let size: UInt64
     let currentVersion: UInt32
     let linked: Bool
+    let metadata: ItemMetadata
 
     var kind: WorkspaceProtectedFileKind {
         WorkspaceProtectedFileKind.infer(from: path)
@@ -660,6 +662,19 @@ final class WorkspaceStore {
         lastError = nil
     }
 
+    func updateProtectedFileMetadata(_ id: String, metadata: ItemMetadata) async throws {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        guard protectedFiles.contains(where: { $0.id == id }) else {
+            throw WorkspaceStoreError.invalid("Choose a protected file first")
+        }
+        let metadata = try Self.validatedMetadata(metadata)
+        try await controlClient.updateProtectedFileMetadata(id, metadata: metadata)
+        if let files = try? await controlClient.protectedFiles() {
+            protectedFiles = files.map(WorkspaceProtectedFile.init)
+        }
+        lastError = nil
+    }
+
     func restoreFile(_ id: String) async throws -> Bool {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
         let storageDeleted = try await controlClient.restoreFile(id)
@@ -718,7 +733,9 @@ final class WorkspaceStore {
     }
 
     @discardableResult
-    func createSharedSecret(name: String, defaultEnvKey: String, value: String) async throws
+    func createSharedSecret(
+        name: String, defaultEnvKey: String, value: String, metadata: ItemMetadata
+    ) async throws
         -> WorkspaceResource.ID
     {
         guard let controlClient else {
@@ -733,10 +750,12 @@ final class WorkspaceStore {
                 "The default key must start with A-Z or _, followed by A-Z, 0-9, or _")
         }
         guard !value.isEmpty else { throw WorkspaceStoreError.invalid("Secret value is required") }
+        let metadata = try Self.validatedMetadata(metadata)
 
         let resourceID = Self.newID("shared-secret")
         try await controlClient.createSharedSecret(
-            resourceID: resourceID, name: name, defaultEnvKey: key, value: value)
+            resourceID: resourceID, name: name, defaultEnvKey: key, value: value,
+            metadata: metadata)
         apply(try await controlClient.snapshot())
         lastError = nil
         return resourceID
@@ -744,7 +763,7 @@ final class WorkspaceStore {
 
     func updateSharedSecret(
         _ id: WorkspaceResource.ID, name: String, defaultEnvKey: String,
-        newValue: String = ""
+        newValue: String = "", metadata: ItemMetadata
     ) async throws {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
         guard resources.contains(where: { $0.id == id && $0.kind == .sharedSecret }) else {
@@ -758,10 +777,11 @@ final class WorkspaceStore {
             throw WorkspaceStoreError.invalid(
                 "The default key must start with A-Z or _, followed by A-Z, 0-9, or _")
         }
+        let metadata = try Self.validatedMetadata(metadata)
 
         try await controlClient.updateSharedSecret(
             resourceID: id, name: name, defaultEnvKey: key,
-            value: newValue.isEmpty ? nil : newValue)
+            value: newValue.isEmpty ? nil : newValue, metadata: metadata)
         apply(try await controlClient.snapshot())
         lastError = nil
     }
@@ -785,7 +805,7 @@ final class WorkspaceStore {
 
     @discardableResult
     func createEnvFile(
-        name: String, codec: WorkspaceResourceCodec, value: String
+        name: String, codec: WorkspaceResourceCodec, value: String, metadata: ItemMetadata
     ) async throws -> WorkspaceResource.ID {
         guard let controlClient else {
             throw WorkspaceStoreError.controlUnavailable
@@ -798,13 +818,31 @@ final class WorkspaceStore {
         guard codec == .dotenv || codec == .ini else {
             throw WorkspaceStoreError.invalid("Choose dotenv or INI format")
         }
+        let metadata = try Self.validatedMetadata(metadata)
 
         let resourceID = Self.newID("env-file")
         try await controlClient.createEnvFile(
-            resourceID: resourceID, name: name, codec: codec, value: value)
+            resourceID: resourceID, name: name, codec: codec, value: value,
+            metadata: metadata)
         apply(try await controlClient.snapshot())
         lastError = nil
         return resourceID
+    }
+
+    func updateResourceMetadata(
+        _ id: WorkspaceResource.ID, name: String, metadata: ItemMetadata
+    ) async throws {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        guard resources.contains(where: { $0.id == id }) else {
+            throw WorkspaceStoreError.invalid("Choose a resource first")
+        }
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { throw WorkspaceStoreError.invalid("Resource name is required") }
+        let metadata = try Self.validatedMetadata(metadata)
+        try await controlClient.updateResourceMetadata(
+            resourceID: id, name: name, metadata: metadata)
+        apply(try await controlClient.snapshot())
+        lastError = nil
     }
 
     @discardableResult
@@ -1308,7 +1346,7 @@ final class WorkspaceStore {
                 defaultEnvKey: resource.defaultEnvKey,
                 exports: [],
                 entries: entries,
-                detail: resource.detail ?? resource.defaultEnvKey ?? kind.title,
+                metadata: resource.metadata,
                 usageCount: projectUsage[resource.id] ?? 0)
         }
 
@@ -1359,6 +1397,37 @@ final class WorkspaceStore {
     static func isValidEnvKey(_ key: String) -> Bool {
         key.range(of: "^[A-Z_][A-Z0-9_]*$", options: .regularExpression) != nil
     }
+
+    static func validatedMetadata(_ metadata: ItemMetadata) throws -> ItemMetadata {
+        let trimmedNote = metadata.note?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let note = trimmedNote.flatMap { $0.isEmpty ? nil : $0 }
+        guard note?.utf8.count ?? 0 <= 4096 else {
+            throw WorkspaceStoreError.invalid("Note cannot exceed 4096 bytes")
+        }
+        guard metadata.links.count <= 16 else {
+            throw WorkspaceStoreError.invalid("Add no more than 16 links")
+        }
+        let links = try metadata.links.map { link in
+            let label = link.label.trimmingCharacters(in: .whitespacesAndNewlines)
+            let url = link.url.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !label.isEmpty, !url.isEmpty else {
+                throw WorkspaceStoreError.invalid("Every link needs a label and URL")
+            }
+            guard label.utf8.count <= 100, url.utf8.count <= 2048 else {
+                throw WorkspaceStoreError.invalid("A link label or URL is too long")
+            }
+            guard let components = URLComponents(string: url),
+                components.scheme == "https" || components.scheme == "http",
+                components.host?.isEmpty == false,
+                components.user == nil, components.password == nil
+            else {
+                throw WorkspaceStoreError.invalid(
+                    "Links must use a valid http:// or https:// URL without credentials")
+            }
+            return ItemLink(label: label, url: url)
+        }
+        return ItemMetadata(note: note, links: links)
+    }
 }
 
 private extension WorkspaceBinding {
@@ -1400,7 +1469,7 @@ private extension WorkspaceProtectedFile {
     init(_ file: CatalogProtectedFile) {
         self.init(
             id: file.id, path: file.sourcePath, mode: file.mode, size: file.size,
-            currentVersion: file.currentVersion, linked: file.linked)
+            currentVersion: file.currentVersion, linked: file.linked, metadata: file.metadata)
     }
 }
 
@@ -1512,7 +1581,10 @@ extension WorkspaceStore {
                     WorkspaceExport(
                         key: "CLOUDFLARE_API_TOKEN", previewValue: "••••••••••••", sensitive: true)
                 ],
-                detail: "Rotated 12 days ago", usageCount: 12),
+                metadata: ItemMetadata(
+                    note: "Account-wide token for DNS automation",
+                    links: [ItemLink(label: "Cloudflare dashboard", url: "https://dash.cloudflare.com")]),
+                usageCount: 12),
             WorkspaceResource(
                 id: "team-defaults", name: "Team defaults", kind: .envFile,
                 shape: .keyValueSet,
@@ -1525,7 +1597,7 @@ extension WorkspaceStore {
                     WorkspaceExport(key: "REGION", previewValue: "local", sensitive: false),
                     WorkspaceExport(key: "TRACE_SAMPLE_RATE", previewValue: "1.0", sensitive: false),
                 ],
-                detail: "6 variables", usageCount: 8),
+                usageCount: 8),
             WorkspaceResource(
                 id: "local-database", name: "Local database", kind: .envFile,
                 shape: .keyValueSet,
@@ -1534,33 +1606,34 @@ extension WorkspaceStore {
                     WorkspaceExport(key: "REDIS_URL", previewValue: "••••••••••••", sensitive: true),
                     WorkspaceExport(key: "DATABASE_POOL", previewValue: "5", sensitive: false),
                 ],
-                detail: "3 variables", usageCount: 1),
+                metadata: ItemMetadata(note: "Local PostgreSQL and Redis services", links: []),
+                usageCount: 1),
             WorkspaceResource(
                 id: "app-env", name: "APP_ENV", kind: .literal, shape: .scalar,
                 exports: [
                     WorkspaceExport(key: "APP_ENV", previewValue: "development", sensitive: false)
                 ],
-                detail: "development", usageCount: 1),
+                usageCount: 1),
             WorkspaceResource(
                 id: "developer-ssh-agent", name: "Developer SSH Agent", kind: .sshAgent,
                 shape: .socket,
                 exports: [
                     WorkspaceExport(key: "SSH_AUTH_SOCK", previewValue: socketPath, sensitive: false)
                 ],
-                detail: "2 keys available", usageCount: 3),
+                metadata: ItemMetadata(note: "SSH signing proxy", links: []), usageCount: 3),
             WorkspaceResource(
                 id: "sentry-dsn", name: "Sentry DSN", kind: .sharedSecret, shape: .scalar,
                 exports: [
                     WorkspaceExport(key: "SENTRY_DSN", previewValue: "••••••••••••", sensitive: true)
                 ],
-                detail: "Rotated 2 months ago", usageCount: 5),
+                usageCount: 5),
             WorkspaceResource(
                 id: "github-token", name: "GitHub Automation Token", kind: .sharedSecret,
                 shape: .scalar,
                 exports: [
                     WorkspaceExport(key: "GITHUB_TOKEN", previewValue: "••••••••••••", sensitive: true)
                 ],
-                detail: "Expires in 24 days", usageCount: 4),
+                usageCount: 4),
         ]
 
         func binding(_ id: String, _ resourceID: String) -> WorkspaceBinding {

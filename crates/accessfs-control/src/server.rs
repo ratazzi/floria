@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use accessfs_catalog::{
-    Catalog, CatalogError, CatalogSnapshot, EntrySpec, Resource, ResourceCodec, ResourceKind,
-    ResourceSource, ValueShape,
+    Catalog, CatalogError, CatalogSnapshot, EntrySpec, ItemMetadata, Resource, ResourceCodec,
+    ResourceKind, ResourceSource, ValueShape,
 };
 use accessfs_store::{NewSecret, SecretId, SecretOrigin, SecretRecord, SecretStore, StoreError};
 use accessfs_surface::{decode_source, validate_secret_bytes};
@@ -168,6 +168,7 @@ fn mutates_catalog(command: &ControlCommand) -> bool {
             | ControlCommand::SharedSecretUpdate { .. }
             | ControlCommand::SharedSecretRemove { .. }
             | ControlCommand::EnvFileCreate { .. }
+            | ControlCommand::ResourceMetadataUpdate { .. }
     )
 }
 
@@ -255,6 +256,13 @@ fn dispatch(
                 version,
             )
         }
+        ControlCommand::ProtectedFileMetadataUpdate { id, metadata } => {
+            update_protected_file_metadata(
+                store.ok_or(DispatchError::StoreUnavailable)?,
+                &id,
+                metadata,
+            )
+        }
         ControlCommand::FileRestore { id } => restore_file(
             catalog,
             store.ok_or(DispatchError::StoreUnavailable)?,
@@ -274,6 +282,7 @@ fn dispatch(
             name,
             default_env_key,
             value,
+            metadata,
         } => create_shared_secret(
             catalog,
             store.ok_or(DispatchError::StoreUnavailable)?,
@@ -281,8 +290,15 @@ fn dispatch(
             name,
             default_env_key,
             value,
+            metadata,
         ),
-        ControlCommand::SharedSecretUpdate { resource_id, name, default_env_key, value } => {
+        ControlCommand::SharedSecretUpdate {
+            resource_id,
+            name,
+            default_env_key,
+            value,
+            metadata,
+        } => {
             update_shared_secret(
                 catalog,
                 store.ok_or(DispatchError::StoreUnavailable)?,
@@ -290,6 +306,7 @@ fn dispatch(
                 name,
                 default_env_key,
                 value,
+                metadata,
             )
         }
         ControlCommand::SharedSecretRemove { resource_id } => remove_shared_secret(
@@ -303,14 +320,18 @@ fn dispatch(
             resource_id,
             value,
         ),
-        ControlCommand::EnvFileCreate { resource_id, name, codec, value } => create_env_file(
+        ControlCommand::EnvFileCreate { resource_id, name, codec, value, metadata } => create_env_file(
             catalog,
             store.ok_or(DispatchError::StoreUnavailable)?,
             resource_id,
             name,
             codec,
             value,
+            metadata,
         ),
+        ControlCommand::ResourceMetadataUpdate { resource_id, name, metadata } => {
+            update_resource_metadata(catalog, &resource_id, name, metadata)
+        }
         ControlCommand::ProjectCreate { project, environment, surface } => {
             create_project_workspace(catalog, project, environment, surface)
         }
@@ -452,6 +473,7 @@ fn protected_file(record: SecretRecord, mount_path: &Path) -> Option<ProtectedFi
         size: record.size,
         current_version: record.current_version,
         linked,
+        metadata: record.metadata,
     })
 }
 
@@ -575,6 +597,16 @@ fn protected_file_history(
         })
         .collect();
     Ok(ControlResult::ProtectedFileHistory { id: id.to_string(), versions })
+}
+
+fn update_protected_file_metadata(
+    store: &dyn SecretStore,
+    id: &str,
+    metadata: ItemMetadata,
+) -> Result<ControlResult, DispatchError> {
+    let (id, _) = file_record(store, id)?;
+    store.update_metadata(&id, metadata)?;
+    Ok(ControlResult::Empty)
 }
 
 fn rollback_protected_file(
@@ -772,6 +804,7 @@ fn create_shared_secret(
     name: String,
     default_env_key: Option<String>,
     value: crate::protocol::SecretValue,
+    metadata: ItemMetadata,
 ) -> Result<ControlResult, DispatchError> {
     if value.as_bytes().is_empty() {
         return Err(DispatchError::Validation(
@@ -793,7 +826,7 @@ fn create_shared_secret(
             sensitive: true,
         }],
         source: ResourceSource::SecretRef { secret_id: "pending-secret-id".to_string() },
-        detail: None,
+        metadata,
     };
     catalog.validate_resource(&resource)?;
     match catalog.resource(&resource.id) {
@@ -842,6 +875,7 @@ fn update_shared_secret(
     name: String,
     default_env_key: Option<String>,
     value: Option<crate::protocol::SecretValue>,
+    metadata: ItemMetadata,
 ) -> Result<ControlResult, DispatchError> {
     if value.as_ref().is_some_and(|value| value.as_bytes().is_empty()) {
         return Err(DispatchError::Validation(
@@ -865,6 +899,7 @@ fn update_shared_secret(
     resource.default_env_key = default_env_key.clone();
     resource.entries[0].label = resource.name.clone();
     resource.entries[0].key = default_env_key;
+    resource.metadata = metadata;
     catalog.validate_resource(&resource)?;
     validate_resource_value(catalog, Some(store), &resource)?;
     let ResourceSource::SecretRef { secret_id } = &resource.source else {
@@ -991,6 +1026,7 @@ fn create_env_file(
     name: String,
     codec: ResourceCodec,
     value: crate::protocol::SecretValue,
+    metadata: ItemMetadata,
 ) -> Result<ControlResult, DispatchError> {
     if !matches!(codec, ResourceCodec::Dotenv | ResourceCodec::Ini) {
         return Err(DispatchError::Validation(format!(
@@ -1025,7 +1061,7 @@ fn create_env_file(
             })
             .collect(),
         source: ResourceSource::SecretRef { secret_id: "pending-secret-id".to_string() },
-        detail: None,
+        metadata,
     };
     catalog.validate_resource(&resource)?;
     match catalog.resource(&resource.id) {
@@ -1050,6 +1086,22 @@ fn create_env_file(
     Ok(ControlResult::EnvFileCreated { resource, version: 1 })
 }
 
+fn update_resource_metadata(
+    catalog: &Catalog,
+    resource_id: &str,
+    name: String,
+    metadata: ItemMetadata,
+) -> Result<ControlResult, DispatchError> {
+    let mut resource = catalog.resource(resource_id)?;
+    resource.name = name;
+    resource.metadata = metadata;
+    if resource.kind == ResourceKind::SharedSecret && resource.entries.len() == 1 {
+        resource.entries[0].label = resource.name.clone();
+    }
+    catalog.upsert_resource(&resource)?;
+    Ok(ControlResult::Empty)
+}
+
 fn same_uid(stream: &UnixStream) -> bool {
     let mut uid: libc::uid_t = 0;
     let mut gid: libc::gid_t = 0;
@@ -1065,7 +1117,7 @@ mod tests {
     use accessfs_catalog::SurfaceInput;
     use crate::client::ControlClient;
     use accessfs_catalog::{
-        Binding, BindingScope, EntrySelection, Environment, Project, Surface, SurfaceKind,
+        Binding, BindingScope, EntrySelection, Environment, ItemLink, Project, Surface, SurfaceKind,
     };
     use accessfs_store::{
         SecretOrigin, SecretRecord, StoreResult, VersionRecord,
@@ -1081,7 +1133,7 @@ mod tests {
 
     struct FixtureStore {
         entries: Mutex<HashMap<String, Vec<Vec<u8>>>>,
-        metadata: Mutex<HashMap<String, (SecretOrigin, u32)>>,
+        metadata: Mutex<HashMap<String, (SecretOrigin, u32, ItemMetadata)>>,
         heads: Mutex<HashMap<String, u32>>,
     }
 
@@ -1111,7 +1163,7 @@ mod tests {
             self.metadata
                 .lock()
                 .unwrap()
-                .insert(id.to_string(), (meta.origin, meta.mode));
+                .insert(id.to_string(), (meta.origin, meta.mode, ItemMetadata::default()));
             self.heads.lock().unwrap().insert(id.to_string(), 1);
             Ok(id)
         }
@@ -1171,6 +1223,7 @@ mod tests {
                 size: versions[(heads[id.as_str()] - 1) as usize].len() as u64,
                 created: "fixture-time".to_string(),
                 current_version: heads[id.as_str()],
+                metadata: metadata[id.as_str()].2.clone(),
             }))
         }
 
@@ -1187,6 +1240,7 @@ mod tests {
                     size: versions[(heads[id] - 1) as usize].len() as u64,
                     created: "fixture-time".to_string(),
                     current_version: heads[id],
+                    metadata: metadata[id].2.clone(),
                 })
                 .collect())
         }
@@ -1197,7 +1251,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .find_map(|(id, (origin, _))| match origin {
+                .find_map(|(id, (origin, _, _))| match origin {
                     SecretOrigin::File { source_path: candidate }
                         if candidate == source_path => Some(id.clone()),
                     _ => None,
@@ -1206,6 +1260,11 @@ mod tests {
                 Some(id) => self.record(&id.parse().unwrap()),
                 None => Ok(None),
             }
+        }
+
+        fn update_metadata(&self, id: &SecretId, item_metadata: ItemMetadata) -> StoreResult<()> {
+            self.metadata.lock().unwrap().get_mut(id.as_str()).unwrap().2 = item_metadata;
+            Ok(())
         }
 
         fn delete(&self, id: &SecretId) -> StoreResult<()> {
@@ -1242,7 +1301,7 @@ mod tests {
         let mut client = ControlClient::connect(&socket).unwrap();
         assert_eq!(
             client.request(ControlCommand::Ping).unwrap(),
-            ControlResult::Pong { schema_version: 4 }
+            ControlResult::Pong { schema_version: 5 }
         );
         client
             .request(ControlCommand::ProjectUpsert {
@@ -1452,6 +1511,13 @@ mod tests {
                 name: "Fixture Shared Secret".to_string(),
                 default_env_key: Some("FIXTURE_TOKEN".to_string()),
                 value: crate::protocol::SecretValue::new("fixture-value-one"),
+                metadata: ItemMetadata {
+                    note: Some("Documentation deployment token".to_string()),
+                    links: vec![ItemLink {
+                        label: "Token dashboard".to_string(),
+                        url: "https://example.invalid/tokens".to_string(),
+                    }],
+                },
             })
             .unwrap();
         assert!(matches!(
@@ -1463,6 +1529,8 @@ mod tests {
             resource.source,
             ResourceSource::SecretRef { secret_id: FIXTURE_SECRET_ID.to_string() }
         );
+        assert_eq!(resource.metadata.note.as_deref(), Some("Documentation deployment token"));
+        assert_eq!(resource.metadata.links[0].label, "Token dashboard");
         assert!(!serde_json::to_string(&catalog.snapshot().unwrap())
             .unwrap()
             .contains("fixture-value-one"));
@@ -1491,6 +1559,10 @@ mod tests {
                     name: "Renamed Shared Secret".to_string(),
                     default_env_key: Some("RENAMED_TOKEN".to_string()),
                     value: Some(crate::protocol::SecretValue::new("fixture-value-three")),
+                    metadata: ItemMetadata {
+                        note: Some("Renamed deployment token".to_string()),
+                        links: Vec::new(),
+                    },
                 })
                 .unwrap(),
             ControlResult::Empty
@@ -1500,6 +1572,7 @@ mod tests {
         assert_eq!(resource.default_env_key.as_deref(), Some("RENAMED_TOKEN"));
         assert_eq!(resource.entries[0].label, "Renamed Shared Secret");
         assert_eq!(resource.entries[0].key.as_deref(), Some("RENAMED_TOKEN"));
+        assert_eq!(resource.metadata.note.as_deref(), Some("Renamed deployment token"));
         assert_eq!(store.get(&secret_id).unwrap().as_slice(), b"fixture-value-three");
         assert_eq!(store.record(&secret_id).unwrap().unwrap().current_version, 3);
 
@@ -1509,9 +1582,17 @@ mod tests {
                 name: "Metadata Only Rename".to_string(),
                 default_env_key: Some("RENAMED_TOKEN".to_string()),
                 value: None,
+                metadata: ItemMetadata {
+                    note: Some("Metadata-only edit".to_string()),
+                    links: Vec::new(),
+                },
             })
             .unwrap();
         assert_eq!(store.record(&secret_id).unwrap().unwrap().current_version, 3);
+        assert_eq!(
+            catalog.resource("fixture-shared-secret").unwrap().metadata.note.as_deref(),
+            Some("Metadata-only edit")
+        );
 
         assert_eq!(
             client
@@ -1554,6 +1635,7 @@ mod tests {
                 name: "Fixture Shared Secret".to_string(),
                 default_env_key: Some("FIXTURE_TOKEN".to_string()),
                 value: crate::protocol::SecretValue::new("fixture-bound-value"),
+                metadata: ItemMetadata::default(),
             })
             .unwrap();
         client
@@ -1645,11 +1727,37 @@ mod tests {
         };
         assert_eq!(files, vec![file.clone()]);
 
+        let file_metadata = ItemMetadata {
+            note: Some("Loaded automatically by direnv".to_string()),
+            links: vec![ItemLink {
+                label: "Project documentation".to_string(),
+                url: "https://example.invalid/docs/local-env".to_string(),
+            }],
+        };
+        assert_eq!(
+            client
+                .request(ControlCommand::ProtectedFileMetadataUpdate {
+                    id: FIXTURE_SECRET_ID.to_string(),
+                    metadata: file_metadata.clone(),
+                })
+                .unwrap(),
+            ControlResult::Empty
+        );
+        let ControlResult::ProtectedFiles(files) =
+            client.request(ControlCommand::ProtectedFiles).unwrap()
+        else {
+            panic!("expected protected files result");
+        };
+        assert_eq!(files[0].metadata, file_metadata);
+        assert_eq!(files[0].current_version, 1);
+
+        let mut expected_file = file.clone();
+        expected_file.metadata = file_metadata;
         assert_eq!(
             client
                 .request(ControlCommand::FileProtect { path: source.clone() })
                 .unwrap(),
-            ControlResult::FileProtected { file: file.clone(), created: false }
+            ControlResult::FileProtected { file: expected_file, created: false }
         );
 
         store
@@ -1691,7 +1799,7 @@ mod tests {
                     source: ResourceSource::SecretRef {
                         secret_id: FIXTURE_SECRET_ID.to_string(),
                     },
-                    detail: None,
+                    metadata: Default::default(),
                 },
             })
             .unwrap();
@@ -1756,6 +1864,10 @@ mod tests {
                 value: crate::protocol::SecretValue::new(
                     "API_HOST=http://127.0.0.1:8787\nLOG_LEVEL=debug\n",
                 ),
+                metadata: ItemMetadata {
+                    note: Some("Local application defaults".to_string()),
+                    links: Vec::new(),
+                },
             })
             .unwrap();
         let ControlResult::EnvFileCreated { resource, version } = created else {
@@ -1764,6 +1876,7 @@ mod tests {
         assert_eq!(version, 1);
         assert_eq!(resource.kind, ResourceKind::EnvFile);
         assert_eq!(resource.codec, ResourceCodec::Dotenv);
+        assert_eq!(resource.metadata.note.as_deref(), Some("Local application defaults"));
         assert_eq!(
             resource.entries.iter().filter_map(|entry| entry.key.as_deref()).collect::<Vec<_>>(),
             vec!["API_HOST", "LOG_LEVEL"]
@@ -1779,6 +1892,23 @@ mod tests {
         let encoded = serde_json::to_string(&catalog.snapshot().unwrap()).unwrap();
         assert!(!encoded.contains("127.0.0.1"));
         assert!(!encoded.contains("LOG_LEVEL=debug"));
+
+        client
+            .request(ControlCommand::ResourceMetadataUpdate {
+                resource_id: "fixture-env-file".to_string(),
+                name: "Renamed Env File".to_string(),
+                metadata: ItemMetadata {
+                    note: Some("Values imported from the local stack".to_string()),
+                    links: Vec::new(),
+                },
+            })
+            .unwrap();
+        let updated = catalog.resource("fixture-env-file").unwrap();
+        assert_eq!(updated.name, "Renamed Env File");
+        assert_eq!(
+            updated.metadata.note.as_deref(),
+            Some("Values imported from the local stack")
+        );
     }
 
     #[test]
@@ -1809,6 +1939,7 @@ mod tests {
                 value: crate::protocol::SecretValue::new(
                     "[fixture-one]\nregion=fixture-region\noutput=fixture-output\n[fixture-two]\nregion=fixture-region-two\n",
                 ),
+                metadata: ItemMetadata::default(),
             })
             .unwrap();
         let ControlResult::EnvFileCreated { resource, version } = created else {

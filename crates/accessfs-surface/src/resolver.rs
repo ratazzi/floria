@@ -802,6 +802,7 @@ mod tests {
                 size: versions[(*head - 1) as usize].len() as u64,
                 created: "fixture-time".to_string(),
                 current_version: *head,
+                metadata: Default::default(),
             }))
         }
 
@@ -830,6 +831,13 @@ mod tests {
             unimplemented!()
         }
         fn get_by_path(&self, _source_path: &Path) -> StoreResult<Option<SecretRecord>> {
+            unimplemented!()
+        }
+        fn update_metadata(
+            &self,
+            _id: &SecretId,
+            _metadata: accessfs_core::metadata::ItemMetadata,
+        ) -> StoreResult<()> {
             unimplemented!()
         }
         fn delete(&self, _id: &SecretId) -> StoreResult<()> {
@@ -893,7 +901,7 @@ mod tests {
                     sensitive: true,
                 }],
                 source: ResourceSource::SecretRef { secret_id: TOKEN_ID.to_string() },
-                detail: None,
+                metadata: Default::default(),
             },
         );
         add_resource(
@@ -920,7 +928,7 @@ mod tests {
                     },
                 ],
                 source: ResourceSource::SecretRef { secret_id: ENV_FILE_ID.to_string() },
-                detail: None,
+                metadata: Default::default(),
             },
         );
         add_resource(
@@ -939,7 +947,7 @@ mod tests {
                     sensitive: false,
                 }],
                 source: ResourceSource::Literal { value: "development".to_string() },
-                detail: None,
+                metadata: Default::default(),
             },
         );
         bind(&catalog, "fixture-token-binding", "fixture-token", 0);
@@ -1110,7 +1118,7 @@ mod tests {
                     },
                 ],
                 source: ResourceSource::SecretRef { secret_id: INI_FILE_ID.to_string() },
-                detail: None,
+                metadata: Default::default(),
             },
         );
         catalog
@@ -1204,7 +1212,7 @@ mod tests {
                         sensitive: true,
                     }],
                     source: ResourceSource::SecretRef { secret_id: secret_id.to_string() },
-                    detail: None,
+                    metadata: Default::default(),
                 },
             );
         }

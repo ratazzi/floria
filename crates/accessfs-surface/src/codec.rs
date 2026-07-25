@@ -277,7 +277,7 @@ mod tests {
                 sensitive: true,
             }],
             source: ResourceSource::SecretRef { secret_id: "fixture-secret".to_string() },
-            detail: None,
+            metadata: Default::default(),
         };
 
         assert!(matches!(
@@ -302,7 +302,7 @@ mod tests {
                 sensitive: true,
             }],
             source: ResourceSource::SecretRef { secret_id: "fixture-secret".to_string() },
-            detail: None,
+            metadata: Default::default(),
         };
         let snapshot = CatalogSnapshot {
             resources: vec![resource],

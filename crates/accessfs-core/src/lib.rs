@@ -10,6 +10,7 @@ pub mod config;
 pub mod error;
 pub mod handler;
 pub mod identity;
+pub mod metadata;
 pub mod rules;
 pub mod snapshot;
 pub mod writebuf;

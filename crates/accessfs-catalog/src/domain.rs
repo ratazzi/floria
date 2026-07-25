@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+pub use accessfs_core::metadata::{ItemLink, ItemMetadata};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Project {
@@ -153,7 +154,7 @@ pub struct Resource {
     pub entries: Vec<EntrySpec>,
     pub source: ResourceSource,
     #[serde(default)]
-    pub detail: Option<String>,
+    pub metadata: ItemMetadata,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

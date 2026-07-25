@@ -6,6 +6,94 @@ private func copyToPasteboard(_ value: String) {
     NSPasteboard.general.setString(value, forType: .string)
 }
 
+private func openMetadataLink(_ link: ItemLink) {
+    guard let url = URL(string: link.url) else { return }
+    NSWorkspace.shared.open(url)
+}
+
+private struct EditableItemLink: Identifiable {
+    let id = UUID()
+    var label: String
+    var url: String
+
+    init(label: String = "", url: String = "") {
+        self.label = label
+        self.url = url
+    }
+}
+
+private func editableLinks(_ metadata: ItemMetadata) -> [EditableItemLink] {
+    metadata.links.map { EditableItemLink(label: $0.label, url: $0.url) }
+}
+
+private func itemMetadata(note: String, links: [EditableItemLink]) -> ItemMetadata {
+    ItemMetadata(
+        note: note,
+        links: links.map { ItemLink(label: $0.label, url: $0.url) })
+}
+
+private struct ItemMetadataEditor: View {
+    @Binding var note: String
+    @Binding var links: [EditableItemLink]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Note (optional)").font(.callout.weight(.medium))
+                TextEditor(text: $note)
+                    .scrollContentBackground(.hidden)
+                    .padding(7)
+                    .frame(height: 66)
+                    .background(Color(nsColor: .textBackgroundColor))
+                    .clipShape(RoundedRectangle(cornerRadius: 7))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 7)
+                            .stroke(Color.secondary.opacity(0.25), lineWidth: 1)
+                    }
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                HStack {
+                    Text("Links").font(.callout.weight(.medium))
+                    Spacer()
+                    Button("Add Link", systemImage: "plus") {
+                        links.append(EditableItemLink())
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(links.count >= 16)
+                }
+                ForEach($links) { $link in
+                    HStack(spacing: 7) {
+                        TextField("Label", text: $link.label)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 135)
+                        TextField("https://…", text: $link.url)
+                            .textFieldStyle(.roundedBorder)
+                        Button(role: .destructive) {
+                            links.removeAll { $0.id == link.id }
+                        } label: {
+                            Image(systemName: "minus.circle.fill")
+                        }
+                        .buttonStyle(.borderless)
+                        .accessibilityLabel("Remove link")
+                    }
+                }
+                if links.isEmpty {
+                    Text("Add dashboards, documentation, or service pages for quick access.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Label(
+                "Notes and links are stored as plaintext metadata. Do not put credentials here.",
+                systemImage: "info.circle")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
 private func defaultEnvironmentFileName(_ name: String) -> String {
     let slug = name
         .lowercased()
@@ -1107,7 +1195,9 @@ private struct SocketSurfacePreview: View {
                             .textSelection(.enabled)
                     }
                     InspectorSection(title: "Capability") {
-                        Label(resource?.detail ?? "SSH signing proxy", systemImage: "key.horizontal")
+                        Label(
+                            resource?.metadata.note ?? "SSH signing proxy",
+                            systemImage: "key.horizontal")
                         Label("Exports SSH_AUTH_SOCK", systemImage: "arrow.turn.down.right")
                         Label("0 active connections", systemImage: "network")
                     }
@@ -1504,6 +1594,7 @@ private struct ProtectedFilesView: View {
     let protectFile: () -> Void
     @State private var historyFile: WorkspaceProtectedFile?
     @State private var restoreFile: WorkspaceProtectedFile?
+    @State private var editingFile: WorkspaceProtectedFile?
     @State private var errorMessage: String?
 
     private var filtered: [WorkspaceProtectedFile] {
@@ -1511,6 +1602,11 @@ private struct ProtectedFilesView: View {
         return store.protectedFiles.filter {
             $0.path.localizedCaseInsensitiveContains(search)
                 || $0.kind.title.localizedCaseInsensitiveContains(search)
+                || ($0.metadata.note?.localizedCaseInsensitiveContains(search) == true)
+                || $0.metadata.links.contains {
+                    $0.label.localizedCaseInsensitiveContains(search)
+                        || $0.url.localizedCaseInsensitiveContains(search)
+                }
         }
     }
 
@@ -1540,6 +1636,12 @@ private struct ProtectedFilesView: View {
                     VStack(alignment: .leading, spacing: 3) {
                         Text(URL(fileURLWithPath: file.path).lastPathComponent)
                             .font(.body.weight(.medium))
+                        if let note = file.metadata.note {
+                            Text(note)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
                         Text(file.path)
                             .font(.caption)
                             .foregroundStyle(.secondary)
@@ -1560,6 +1662,18 @@ private struct ProtectedFilesView: View {
                         Button("Version History", systemImage: "clock.arrow.circlepath") {
                             historyFile = file
                         }
+                        Button("Edit Info…", systemImage: "pencil") {
+                            editingFile = file
+                        }
+                        if !file.metadata.links.isEmpty {
+                            Divider()
+                            ForEach(file.metadata.links, id: \.self) { link in
+                                Button(link.label, systemImage: "link") {
+                                    openMetadataLink(link)
+                                }
+                            }
+                        }
+                        Divider()
                         Button("Open in Finder", systemImage: "folder") {
                             NSWorkspace.shared.activateFileViewerSelecting(
                                 [URL(fileURLWithPath: file.path)])
@@ -1603,6 +1717,9 @@ private struct ProtectedFilesView: View {
         .sheet(item: $historyFile) { file in
             ProtectedFileHistorySheet(store: store, file: file)
         }
+        .sheet(item: $editingFile) { file in
+            EditProtectedFileMetadataSheet(store: store, file: file)
+        }
         .alert(
             "Restore plaintext and stop protecting?",
             isPresented: Binding(
@@ -1637,6 +1754,76 @@ private struct ProtectedFilesView: View {
                 if !deleted {
                     errorMessage = "The plaintext file was restored, but Floria could not delete its encrypted history. The stored copy remains listed for recovery."
                 }
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+}
+
+private struct EditProtectedFileMetadataSheet: View {
+    @Bindable var store: WorkspaceStore
+    let file: WorkspaceProtectedFile
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var note: String
+    @State private var links: [EditableItemLink]
+    @State private var isSaving = false
+    @State private var errorMessage: String?
+
+    init(store: WorkspaceStore, file: WorkspaceProtectedFile) {
+        self.store = store
+        self.file = file
+        _note = State(initialValue: file.metadata.note ?? "")
+        _links = State(initialValue: editableLinks(file.metadata))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Edit Protected File Info").font(.title2.bold())
+                Text(file.path)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+            }
+
+            ItemMetadataEditor(note: $note, links: $links)
+
+            Divider()
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Save Changes", action: save)
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isSaving)
+            }
+        }
+        .padding(24)
+        .frame(width: 560)
+        .alert(
+            "Could not update protected file",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } })
+        ) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
+    }
+
+    private func save() {
+        Task {
+            isSaving = true
+            defer { isSaving = false }
+            do {
+                try await store.updateProtectedFileMetadata(
+                    file.id, metadata: itemMetadata(note: note, links: links))
+                dismiss()
             } catch {
                 errorMessage = error.localizedDescription
             }
@@ -1758,6 +1945,7 @@ private struct ResourceCatalogView: View {
     let addResourceTitle: String
     let addResource: (() -> Void)?
     @State private var editingSharedSecret: WorkspaceResource?
+    @State private var editingResourceInfo: WorkspaceResource?
     @State private var deletingSharedSecret: WorkspaceResource?
 
     private var filtered: [WorkspaceResource] {
@@ -1765,7 +1953,12 @@ private struct ResourceCatalogView: View {
             kinds.contains(resource.kind)
                 && (search.isEmpty
                     || resource.name.localizedCaseInsensitiveContains(search)
-                    || resource.exportSummary.localizedCaseInsensitiveContains(search))
+                    || resource.exportSummary.localizedCaseInsensitiveContains(search)
+                    || (resource.metadata.note?.localizedCaseInsensitiveContains(search) == true)
+                    || resource.metadata.links.contains {
+                        $0.label.localizedCaseInsensitiveContains(search)
+                            || $0.url.localizedCaseInsensitiveContains(search)
+                    })
         }
     }
 
@@ -1789,6 +1982,12 @@ private struct ResourceCatalogView: View {
                     ResourceIcon(kind: resource.kind)
                     VStack(alignment: .leading, spacing: 3) {
                         Text(resource.name).font(.body.weight(.medium))
+                        if let note = resource.metadata.note {
+                            Text(note)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
                         Text(resource.exportSummary)
                             .font(.caption.monospaced())
                             .foregroundStyle(.secondary)
@@ -1800,14 +1999,30 @@ private struct ResourceCatalogView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
-                    if resource.kind == .sharedSecret {
+                    if resource.kind == .sharedSecret || resource.kind == .envFile {
                         Menu {
-                            Button("Edit Secret…", systemImage: "pencil") {
-                                editingSharedSecret = resource
+                            if resource.kind == .sharedSecret {
+                                Button("Edit Secret…", systemImage: "pencil") {
+                                    editingSharedSecret = resource
+                                }
+                            } else {
+                                Button("Edit Info…", systemImage: "pencil") {
+                                    editingResourceInfo = resource
+                                }
                             }
-                            Divider()
-                            Button("Delete Secret…", systemImage: "trash", role: .destructive) {
-                                deletingSharedSecret = resource
+                            if !resource.metadata.links.isEmpty {
+                                Divider()
+                                ForEach(resource.metadata.links, id: \.self) { link in
+                                    Button(link.label, systemImage: "link") {
+                                        openMetadataLink(link)
+                                    }
+                                }
+                            }
+                            if resource.kind == .sharedSecret {
+                                Divider()
+                                Button("Delete Secret…", systemImage: "trash", role: .destructive) {
+                                    deletingSharedSecret = resource
+                                }
                             }
                         } label: {
                             Image(systemName: "ellipsis")
@@ -1836,6 +2051,9 @@ private struct ResourceCatalogView: View {
         .navigationTitle(title)
         .sheet(item: $editingSharedSecret) { resource in
             EditSharedSecretSheet(store: store, resource: resource)
+        }
+        .sheet(item: $editingResourceInfo) { resource in
+            EditResourceMetadataSheet(store: store, resource: resource)
         }
         .alert(
             deletingSharedSecret?.usageCount == 0
@@ -1877,6 +2095,84 @@ private struct ResourceCatalogView: View {
     }
 }
 
+private struct EditResourceMetadataSheet: View {
+    @Bindable var store: WorkspaceStore
+    let resource: WorkspaceResource
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var name: String
+    @State private var note: String
+    @State private var links: [EditableItemLink]
+    @State private var isSaving = false
+    @State private var errorMessage: String?
+
+    init(store: WorkspaceStore, resource: WorkspaceResource) {
+        self.store = store
+        self.resource = resource
+        _name = State(initialValue: resource.name)
+        _note = State(initialValue: resource.metadata.note ?? "")
+        _links = State(initialValue: editableLinks(resource.metadata))
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Edit Env File Info").font(.title2.bold())
+                Text("Change how this encrypted document is identified in Floria.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Name").font(.callout.weight(.medium))
+                TextField("Team defaults", text: $name)
+                    .textFieldStyle(.roundedBorder)
+            }
+            ItemMetadataEditor(note: $note, links: $links)
+
+            Divider()
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Save Changes", action: save)
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(
+                        isSaving
+                            || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(width: 560)
+        .alert(
+            "Could not update Env File",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } })
+        ) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
+    }
+
+    private func save() {
+        Task {
+            isSaving = true
+            defer { isSaving = false }
+            do {
+                try await store.updateResourceMetadata(
+                    resource.id, name: name,
+                    metadata: itemMetadata(note: note, links: links))
+                dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+}
+
 private struct EditSharedSecretSheet: View {
     @Bindable var store: WorkspaceStore
     let resource: WorkspaceResource
@@ -1885,6 +2181,8 @@ private struct EditSharedSecretSheet: View {
     @State private var name: String
     @State private var defaultKey: String
     @State private var newValue = ""
+    @State private var note: String
+    @State private var links: [EditableItemLink]
     @State private var isSaving = false
     @State private var errorMessage: String?
 
@@ -1893,6 +2191,8 @@ private struct EditSharedSecretSheet: View {
         self.resource = resource
         _name = State(initialValue: resource.name)
         _defaultKey = State(initialValue: resource.defaultEnvKey ?? "")
+        _note = State(initialValue: resource.metadata.note ?? "")
+        _links = State(initialValue: editableLinks(resource.metadata))
     }
 
     var body: some View {
@@ -1909,6 +2209,8 @@ private struct EditSharedSecretSheet: View {
                 TextField("Cloudflare API Token", text: $name)
                     .textFieldStyle(.roundedBorder)
             }
+
+            ItemMetadataEditor(note: $note, links: $links)
             VStack(alignment: .leading, spacing: 7) {
                 Text("Default environment key (optional)")
                     .font(.callout.weight(.medium))
@@ -1970,7 +2272,8 @@ private struct EditSharedSecretSheet: View {
             do {
                 try await store.updateSharedSecret(
                     resource.id, name: name, defaultEnvKey: defaultKey.uppercased(),
-                    newValue: submittedValue)
+                    newValue: submittedValue,
+                    metadata: itemMetadata(note: note, links: links))
                 dismiss()
             } catch {
                 errorMessage = error.localizedDescription
@@ -2542,6 +2845,8 @@ private struct NewSharedSecretSheet: View {
     @State private var name = ""
     @State private var defaultKey = ""
     @State private var value = ""
+    @State private var note = ""
+    @State private var links: [EditableItemLink] = []
     @State private var isSaving = false
     @State private var errorMessage: String?
 
@@ -2570,6 +2875,8 @@ private struct NewSharedSecretSheet: View {
                 SecureField("Value", text: $value)
                     .textFieldStyle(.roundedBorder)
             }
+
+            ItemMetadataEditor(note: $note, links: $links)
 
             HStack {
                 Image(systemName: "lock.fill")
@@ -2618,7 +2925,8 @@ private struct NewSharedSecretSheet: View {
             value = ""
             do {
                 try await store.createSharedSecret(
-                    name: name, defaultEnvKey: defaultKey.uppercased(), value: submittedValue)
+                    name: name, defaultEnvKey: defaultKey.uppercased(), value: submittedValue,
+                    metadata: itemMetadata(note: note, links: links))
                 dismiss()
             } catch {
                 errorMessage = error.localizedDescription
@@ -2635,6 +2943,8 @@ private struct NewEnvFileSheet: View {
     @State private var codec = WorkspaceResourceCodec.dotenv
     @State private var iniPreset = WorkspaceIniPreset.generic
     @State private var value = ""
+    @State private var note = ""
+    @State private var links: [EditableItemLink] = []
     @State private var isSaving = false
     @State private var errorMessage: String?
 
@@ -2715,6 +3025,8 @@ private struct NewEnvFileSheet: View {
                     .frame(minHeight: 230)
             }
 
+            ItemMetadataEditor(note: $note, links: $links)
+
             HStack {
                 Image(systemName: "lock.fill")
                 Text("Values are encrypted in the store; only section and key metadata appears in the catalog.")
@@ -2734,7 +3046,7 @@ private struct NewEnvFileSheet: View {
             }
         }
         .padding(24)
-        .frame(width: 620, height: 640)
+        .frame(width: 620, height: 820)
         .alert(
             "Could not create Env File",
             isPresented: Binding(
@@ -2772,7 +3084,9 @@ private struct NewEnvFileSheet: View {
             let submittedValue = value
             value = ""
             do {
-                try await store.createEnvFile(name: name, codec: codec, value: submittedValue)
+                try await store.createEnvFile(
+                    name: name, codec: codec, value: submittedValue,
+                    metadata: itemMetadata(note: note, links: links))
                 dismiss()
             } catch {
                 errorMessage = error.localizedDescription

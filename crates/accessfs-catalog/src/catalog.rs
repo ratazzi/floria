@@ -12,7 +12,7 @@ use crate::domain::{
 };
 use crate::error::{CatalogError, CatalogResult};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 #[derive(Debug, Clone)]
 pub struct Catalog {
@@ -138,13 +138,13 @@ impl Catalog {
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO resources
-                (id, name, kind, shape, codec, default_env_key, entries_json, source_json, detail)
+                (id, name, kind, shape, codec, default_env_key, entries_json, source_json, metadata_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(id) DO UPDATE SET name = excluded.name, kind = excluded.kind,
                  shape = excluded.shape, codec = excluded.codec,
                  default_env_key = excluded.default_env_key,
                  entries_json = excluded.entries_json,
-                 source_json = excluded.source_json, detail = excluded.detail,
+                 source_json = excluded.source_json, metadata_json = excluded.metadata_json,
                  updated_at = CURRENT_TIMESTAMP",
             params![
                 resource.id,
@@ -155,7 +155,7 @@ impl Catalog {
                 resource.default_env_key,
                 serde_json::to_string(&resource.entries)?,
                 serde_json::to_string(&resource.source)?,
-                resource.detail,
+                serde_json::to_string(&resource.metadata)?,
             ],
         )?;
         validate_snapshot_conflicts(&snapshot_from(&tx)?)?;
@@ -183,7 +183,7 @@ impl Catalog {
         }
         tx.execute(
             "INSERT INTO resources
-                (id, name, kind, shape, codec, default_env_key, entries_json, source_json, detail)
+                (id, name, kind, shape, codec, default_env_key, entries_json, source_json, metadata_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 resource.id,
@@ -194,7 +194,7 @@ impl Catalog {
                 resource.default_env_key,
                 serde_json::to_string(&resource.entries)?,
                 serde_json::to_string(&resource.source)?,
-                resource.detail,
+                serde_json::to_string(&resource.metadata)?,
             ],
         )?;
         validate_snapshot_conflicts(&snapshot_from(&tx)?)?;
@@ -496,7 +496,7 @@ fn migrate(conn: &mut Connection) -> CatalogResult<()> {
             default_env_key TEXT,
             entries_json TEXT NOT NULL,
             source_json TEXT NOT NULL,
-            detail TEXT,
+            metadata_json TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
@@ -529,7 +529,7 @@ fn migrate(conn: &mut Connection) -> CatalogResult<()> {
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         CREATE INDEX surfaces_environment_idx ON surfaces(environment_id, position);
-        PRAGMA user_version = 4;",
+        PRAGMA user_version = 5;",
     )?;
     tx.commit()?;
     Ok(())
@@ -568,7 +568,7 @@ fn snapshot_from(conn: &Connection) -> CatalogResult<CatalogSnapshot> {
 
     let resources = {
         let mut stmt = conn.prepare(
-            "SELECT id, name, kind, shape, codec, default_env_key, entries_json, source_json, detail
+            "SELECT id, name, kind, shape, codec, default_env_key, entries_json, source_json, metadata_json
              FROM resources ORDER BY name, id",
         )?;
         let values = stmt.query_map([], |row| {
@@ -584,7 +584,7 @@ fn snapshot_from(conn: &Connection) -> CatalogResult<CatalogSnapshot> {
                 default_env_key: row.get(5)?,
                 entries: decode_json(6, &row.get::<_, String>(6)?)?,
                 source: decode_json(7, &row.get::<_, String>(7)?)?,
-                detail: row.get(8)?,
+                metadata: decode_json(8, &row.get::<_, String>(8)?)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -1081,6 +1081,7 @@ fn validate_environment(environment: &Environment) -> CatalogResult<()> {
 fn validate_resource(resource: &Resource) -> CatalogResult<()> {
     require_id(&resource.id, "resource id")?;
     require_name(&resource.name, "resource name")?;
+    resource.metadata.validate().map_err(CatalogError::Validation)?;
     if let Some(key) = &resource.default_env_key {
         require_env_key(key)?;
     }
@@ -1440,7 +1441,7 @@ mod tests {
                 sensitive: true,
             }],
             source: ResourceSource::SecretRef { secret_id: format!("secret-{id}") },
-            detail: None,
+            metadata: Default::default(),
         }
     }
 
@@ -1467,7 +1468,7 @@ mod tests {
                 },
             ],
             source: ResourceSource::SecretRef { secret_id: format!("secret-{id}") },
-            detail: None,
+            metadata: Default::default(),
         }
     }
 
@@ -1501,7 +1502,7 @@ mod tests {
         let error = migrate(&mut conn).unwrap_err();
         assert!(matches!(
             error,
-            CatalogError::UnsupportedSchema { found: 1, expected: 4 }
+            CatalogError::UnsupportedSchema { found: 1, expected: 5 }
         ));
     }
 
@@ -1563,7 +1564,7 @@ mod tests {
                 sensitive: true,
             }],
             source: ResourceSource::SecretRef { secret_id: "fixture-ini-secret".to_string() },
-            detail: None,
+            metadata: Default::default(),
         };
         catalog.upsert_resource(&resource).unwrap();
         catalog
@@ -1632,7 +1633,12 @@ mod tests {
     #[test]
     fn snapshot_round_trips_typed_metadata_without_secret_values() {
         let (_dir, catalog) = catalog();
-        let resource = scalar_resource("cloudflare", "CLOUDFLARE_API_TOKEN");
+        let mut resource = scalar_resource("cloudflare", "CLOUDFLARE_API_TOKEN");
+        resource.metadata.note = Some("Deployment token for the documentation zone".to_string());
+        resource.metadata.links.push(crate::domain::ItemLink {
+            label: "Cloudflare dashboard".to_string(),
+            url: "https://dash.cloudflare.com/example/tokens".to_string(),
+        });
         catalog.upsert_resource(&resource).unwrap();
         catalog
             .upsert_binding(&binding("common-cloudflare", "cloudflare", BindingScope::Common))
@@ -1990,7 +1996,7 @@ mod tests {
                     sensitive: false,
                 }],
                 source: ResourceSource::SecretRef { secret_id: "secret-defaults".to_string() },
-                detail: None,
+                metadata: Default::default(),
             })
             .unwrap();
         let mut binding = binding(

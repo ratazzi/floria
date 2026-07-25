@@ -31,7 +31,7 @@ final class ControlProtocolTests: XCTestCase {
 
     func testDecodesProtectedFileMetadataWithoutPlaintext() throws {
         let data = Data(
-            #"{"id":"00000000-0000-0000-0000-000000000001","source_path":"/fixture/project/.env","mode":384,"size":42,"current_version":3,"linked":true}"#.utf8)
+            #"{"id":"00000000-0000-0000-0000-000000000001","source_path":"/fixture/project/.env","mode":384,"size":42,"current_version":3,"linked":true,"metadata":{"note":"Local app environment","links":[]}}"#.utf8)
 
         let file = try JSONDecoder().decode(CatalogProtectedFile.self, from: data)
 
@@ -104,7 +104,8 @@ final class ControlProtocolTests: XCTestCase {
         encoder.keyEncodingStrategy = .convertToSnakeCase
         let data = try ControlCommand.sharedSecretCreate(
             resourceID: "fixture-line", name: "Fixture Line", defaultEnvKey: nil,
-            value: "fixture-host|5432|fixture-db|fixture-user|fixture-value"
+            value: "fixture-host|5432|fixture-db|fixture-user|fixture-value",
+            metadata: ItemMetadata(note: "Reporting database", links: [])
         ).requestData(requestID: 9, encoder: encoder)
         let value = try XCTUnwrap(
             JSONSerialization.jsonObject(with: data) as? [String: Any])
@@ -115,6 +116,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(
             params["value"] as? String,
             "fixture-host|5432|fixture-db|fixture-user|fixture-value")
+        XCTAssertEqual((params["metadata"] as? [String: Any])?["note"] as? String, "Reporting database")
     }
 
     func testSharedSecretMaintenanceRequestsMatchRustWireShape() throws {
@@ -123,7 +125,8 @@ final class ControlProtocolTests: XCTestCase {
 
         let update = try ControlCommand.sharedSecretUpdate(
             resourceID: "fixture-secret", name: "Renamed Secret",
-            defaultEnvKey: "RENAMED_TOKEN", value: "fixture-value-three"
+            defaultEnvKey: "RENAMED_TOKEN", value: "fixture-value-three",
+            metadata: .empty
         ).requestData(requestID: 91, encoder: encoder)
         let updateValue = try XCTUnwrap(
             JSONSerialization.jsonObject(with: update) as? [String: Any])
@@ -149,7 +152,8 @@ final class ControlProtocolTests: XCTestCase {
         let data = try ControlCommand.envFileCreate(
             resourceID: "fixture-env-file", name: "Fixture Env File",
             codec: "dotenv",
-            value: "API_HOST=http://127.0.0.1:8787\nLOG_LEVEL=debug\n"
+            value: "API_HOST=http://127.0.0.1:8787\nLOG_LEVEL=debug\n",
+            metadata: .empty
         ).requestData(requestID: 12, encoder: encoder)
         let value = try XCTUnwrap(
             JSONSerialization.jsonObject(with: data) as? [String: Any])
@@ -166,13 +170,14 @@ final class ControlProtocolTests: XCTestCase {
 
     func testDecodesResourceEntriesWithoutLegacyExportMetadata() throws {
         let data = Data(
-            #"{"projects":[],"environments":[],"resources":[{"id":"fixture-line","name":"Fixture Line","kind":"shared_secret","shape":"scalar","codec":"opaque","default_env_key":null,"entries":[{"address":"value","label":"Fixture Line","key":null,"sensitive":true}],"source":{"type":"secret_ref","secret_id":"fixture-secret"},"detail":null}],"bindings":[],"surfaces":[]}"#.utf8)
+            #"{"projects":[],"environments":[],"resources":[{"id":"fixture-line","name":"Fixture Line","kind":"shared_secret","shape":"scalar","codec":"opaque","default_env_key":null,"entries":[{"address":"value","label":"Fixture Line","key":null,"sensitive":true}],"source":{"type":"secret_ref","secret_id":"fixture-secret"},"metadata":{}}],"bindings":[],"surfaces":[]}"#.utf8)
 
         let snapshot = try JSONDecoder().decode(CatalogSnapshot.self, from: data)
 
         XCTAssertEqual(snapshot.resources.first?.entries.first?.address, "value")
         XCTAssertNil(snapshot.resources.first?.entries.first?.key)
         XCTAssertEqual(snapshot.resources.first?.codec, "opaque")
+        XCTAssertEqual(snapshot.resources.first?.metadata, .empty)
     }
 
     func testProjectCreateRequestCarriesCompleteWorkspace() throws {
