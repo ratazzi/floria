@@ -652,8 +652,12 @@ private struct BindingRow: View {
                 }
             } label: {
                 Image(systemName: "ellipsis")
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
             }
-                .buttonStyle(.plain)
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .accessibilityLabel("More")
                 .foregroundStyle(.secondary)
         }
         .padding(.horizontal, 12)
@@ -1408,6 +1412,9 @@ private struct ProtectedFilesView: View {
     @Bindable var store: WorkspaceStore
     let search: String
     let protectFile: () -> Void
+    @State private var historyFile: WorkspaceProtectedFile?
+    @State private var restoreFile: WorkspaceProtectedFile?
+    @State private var errorMessage: String?
 
     private var filtered: [WorkspaceProtectedFile] {
         guard !search.isEmpty else { return store.protectedFiles }
@@ -1454,12 +1461,15 @@ private struct ProtectedFilesView: View {
                         Text(file.kind.title)
                             .font(.caption.weight(.medium))
                         Text(
-                            "v\(file.currentVersion) · \(ByteCountFormatter.string(fromByteCount: Int64(file.size), countStyle: .file)) · \(String(format: "%04o", file.mode))"
+                            "\(file.linked ? "Linked" : "Stored only") · v\(file.currentVersion) · \(ByteCountFormatter.string(fromByteCount: Int64(file.size), countStyle: .file)) · \(String(format: "%04o", file.mode))"
                         )
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                     }
                     Menu {
+                        Button("Version History", systemImage: "clock.arrow.circlepath") {
+                            historyFile = file
+                        }
                         Button("Open in Finder", systemImage: "folder") {
                             NSWorkspace.shared.activateFileViewerSelecting(
                                 [URL(fileURLWithPath: file.path)])
@@ -1470,10 +1480,19 @@ private struct ProtectedFilesView: View {
                         Button("Copy Recovery ID", systemImage: "number") {
                             copyToPasteboard(file.id)
                         }
+                        Divider()
+                        Button("Stop Protecting…", systemImage: "lock.open", role: .destructive) {
+                            restoreFile = file
+                        }
+                        .disabled(!file.linked)
                     } label: {
                         Image(systemName: "ellipsis")
+                            .frame(width: 28, height: 28)
+                            .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .accessibilityLabel("More")
                 }
                 .padding(.vertical, 5)
             }
@@ -1491,6 +1510,152 @@ private struct ProtectedFilesView: View {
             }
         }
         .navigationTitle("Protected Files")
+        .sheet(item: $historyFile) { file in
+            ProtectedFileHistorySheet(store: store, file: file)
+        }
+        .alert(
+            "Restore plaintext and stop protecting?",
+            isPresented: Binding(
+                get: { restoreFile != nil },
+                set: { if !$0 { restoreFile = nil } })
+        ) {
+            Button("Cancel", role: .cancel) { restoreFile = nil }
+            Button("Restore and Delete History", role: .destructive, action: restoreSelectedFile)
+        } message: {
+            if let restoreFile {
+                Text("Floria will restore version \(restoreFile.currentVersion) at \(restoreFile.path) and permanently delete every encrypted version after the plaintext file is safely written.")
+            }
+        }
+        .alert(
+            "Could not restore file",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } })
+        ) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
+    }
+
+    private func restoreSelectedFile() {
+        guard let file = restoreFile else { return }
+        restoreFile = nil
+        Task {
+            do {
+                let deleted = try await store.restoreFile(file.id)
+                if !deleted {
+                    errorMessage = "The plaintext file was restored, but Floria could not delete its encrypted history. The stored copy remains listed for recovery."
+                }
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+}
+
+private struct ProtectedFileHistorySheet: View {
+    @Bindable var store: WorkspaceStore
+    let file: WorkspaceProtectedFile
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var versions: [WorkspaceProtectedFileVersion] = []
+    @State private var isLoading = true
+    @State private var rollingBack: UInt32?
+    @State private var errorMessage: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Version History").font(.title2.bold())
+                Text(file.path)
+                    .font(.callout.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+            }
+
+            List(versions) { version in
+                HStack(spacing: 12) {
+                    Image(systemName: version.current ? "checkmark.circle.fill" : "clock")
+                        .foregroundStyle(version.current ? Color.green : Color.secondary)
+                    VStack(alignment: .leading, spacing: 3) {
+                        HStack(spacing: 7) {
+                            Text("Version \(version.version)").font(.body.weight(.medium))
+                            if version.current {
+                                Text("Current")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.green)
+                            }
+                        }
+                        Text(version.created)
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Text(ByteCountFormatter.string(fromByteCount: Int64(version.size), countStyle: .file))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if !version.current {
+                        Button("Roll Back") { rollback(to: version.version) }
+                            .disabled(rollingBack != nil)
+                    }
+                }
+                .padding(.vertical, 4)
+            }
+            .overlay {
+                if isLoading {
+                    ProgressView().controlSize(.small)
+                } else if versions.isEmpty {
+                    ContentUnavailableView("No versions", systemImage: "clock")
+                }
+            }
+
+            HStack {
+                Text("Rollback only moves the head; no version is deleted.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Close") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(24)
+        .frame(width: 620, height: 470)
+        .task { await loadHistory() }
+        .alert(
+            "Could not update history",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } })
+        ) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
+    }
+
+    private func loadHistory() async {
+        isLoading = true
+        defer { isLoading = false }
+        do {
+            versions = Array(try await store.protectedFileHistory(file.id).reversed())
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func rollback(to version: UInt32) {
+        Task {
+            rollingBack = version
+            defer { rollingBack = nil }
+            do {
+                try await store.rollbackProtectedFile(file.id, to: version)
+                await loadHistory()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
     }
 }
 

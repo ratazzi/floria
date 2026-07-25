@@ -151,18 +151,30 @@ struct CatalogProtectedFile: Codable, Sendable {
     let mode: UInt32
     let size: UInt64
     let currentVersion: UInt32
+    let linked: Bool
 
     enum CodingKeys: String, CodingKey {
-        case id, mode, size
+        case id, mode, size, linked
         case sourcePath = "source_path"
         case currentVersion = "current_version"
     }
+}
+
+struct CatalogProtectedFileVersion: Codable, Sendable {
+    let version: UInt32
+    let size: UInt64
+    let created: String
+    let note: String?
+    let current: Bool
 }
 
 enum ControlCommand: Sendable {
     case snapshot
     case protectedFiles
     case fileProtect(String)
+    case protectedFileHistory(String)
+    case protectedFileRollback(id: String, version: UInt32)
+    case fileRestore(String)
     case sharedSecretCreate(resourceID: String, name: String, defaultEnvKey: String?, value: String)
     case envFileCreate(resourceID: String, name: String, codec: String, value: String)
     case projectCreate(CatalogProject, CatalogEnvironment, CatalogSurface)
@@ -180,6 +192,9 @@ enum ControlCommand: Sendable {
         case .snapshot: "snapshot"
         case .protectedFiles: "protected_files"
         case .fileProtect: "file_protect"
+        case .protectedFileHistory: "protected_file_history"
+        case .protectedFileRollback: "protected_file_rollback"
+        case .fileRestore: "file_restore"
         case .sharedSecretCreate: "shared_secret_create"
         case .envFileCreate: "env_file_create"
         case .projectCreate: "project_create"
@@ -203,6 +218,16 @@ enum ControlCommand: Sendable {
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: FileProtectParams(path: path)))
+        case .protectedFileHistory(let id), .fileRestore(let id):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: ProtectedFileIDParams(id: id)))
+        case .protectedFileRollback(let id, let version):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: ProtectedFileRollbackParams(id: id, version: version)))
         case .sharedSecretCreate(let resourceID, let name, let defaultEnvKey, let value):
             return try encoder.encode(
                 ControlRequest(
@@ -270,6 +295,11 @@ private struct SharedSecretCreateParams: Encodable {
 }
 
 private struct FileProtectParams: Encodable { let path: String }
+private struct ProtectedFileIDParams: Encodable { let id: String }
+private struct ProtectedFileRollbackParams: Encodable {
+    let id: String
+    let version: UInt32
+}
 
 private struct EnvFileCreateParams: Encodable {
     let resourceID: String

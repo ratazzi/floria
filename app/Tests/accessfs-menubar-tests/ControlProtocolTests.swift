@@ -31,7 +31,7 @@ final class ControlProtocolTests: XCTestCase {
 
     func testDecodesProtectedFileMetadataWithoutPlaintext() throws {
         let data = Data(
-            #"{"id":"00000000-0000-0000-0000-000000000001","source_path":"/fixture/project/.env","mode":384,"size":42,"current_version":3}"#.utf8)
+            #"{"id":"00000000-0000-0000-0000-000000000001","source_path":"/fixture/project/.env","mode":384,"size":42,"current_version":3,"linked":true}"#.utf8)
 
         let file = try JSONDecoder().decode(CatalogProtectedFile.self, from: data)
 
@@ -39,6 +39,40 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(file.mode, 0o600)
         XCTAssertEqual(file.size, 42)
         XCTAssertEqual(file.currentVersion, 3)
+        XCTAssertTrue(file.linked)
+    }
+
+    func testProtectedFileMaintenanceRequestsMatchRustWireShape() throws {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+
+        let history = try ControlCommand.protectedFileHistory("fixture-secret")
+            .requestData(requestID: 72, encoder: encoder)
+        let historyValue = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: history) as? [String: Any])
+        XCTAssertEqual(historyValue["method"] as? String, "protected_file_history")
+        XCTAssertEqual(
+            (historyValue["params"] as? [String: Any])?["id"] as? String,
+            "fixture-secret")
+
+        let rollback = try ControlCommand.protectedFileRollback(
+            id: "fixture-secret", version: 2
+        ).requestData(requestID: 73, encoder: encoder)
+        let rollbackValue = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: rollback) as? [String: Any])
+        let rollbackParams = try XCTUnwrap(rollbackValue["params"] as? [String: Any])
+        XCTAssertEqual(rollbackValue["method"] as? String, "protected_file_rollback")
+        XCTAssertEqual(rollbackParams["id"] as? String, "fixture-secret")
+        XCTAssertEqual(rollbackParams["version"] as? UInt32, 2)
+
+        let restore = try ControlCommand.fileRestore("fixture-secret")
+            .requestData(requestID: 74, encoder: encoder)
+        let restoreValue = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: restore) as? [String: Any])
+        XCTAssertEqual(restoreValue["method"] as? String, "file_restore")
+        XCTAssertEqual(
+            (restoreValue["params"] as? [String: Any])?["id"] as? String,
+            "fixture-secret")
     }
 
     func testBindingRequestEncodesEnvironmentScope() throws {

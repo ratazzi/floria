@@ -385,10 +385,20 @@ struct WorkspaceProtectedFile: Identifiable, Hashable, Sendable {
     let mode: UInt32
     let size: UInt64
     let currentVersion: UInt32
+    let linked: Bool
 
     var kind: WorkspaceProtectedFileKind {
         WorkspaceProtectedFileKind.infer(from: path)
     }
+}
+
+struct WorkspaceProtectedFileVersion: Identifiable, Hashable, Sendable {
+    var id: UInt32 { version }
+    let version: UInt32
+    let size: UInt64
+    let created: String
+    let note: String?
+    let current: Bool
 }
 
 @Observable @MainActor
@@ -606,6 +616,37 @@ final class WorkspaceStore {
             protectedFiles.sort { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
         }
         lastError = nil
+    }
+
+    func protectedFileHistory(_ id: String) async throws -> [WorkspaceProtectedFileVersion] {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        return try await controlClient.protectedFileHistory(id).map {
+            WorkspaceProtectedFileVersion(
+                version: $0.version, size: $0.size, created: $0.created,
+                note: $0.note, current: $0.current)
+        }
+    }
+
+    func rollbackProtectedFile(_ id: String, to version: UInt32) async throws {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        let file = WorkspaceProtectedFile(
+            try await controlClient.rollbackProtectedFile(id, to: version))
+        if let index = protectedFiles.firstIndex(where: { $0.id == id }) {
+            protectedFiles[index] = file
+        }
+        lastError = nil
+    }
+
+    func restoreFile(_ id: String) async throws -> Bool {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        let storageDeleted = try await controlClient.restoreFile(id)
+        if storageDeleted {
+            protectedFiles.removeAll { $0.id == id }
+        } else if let files = try? await controlClient.protectedFiles() {
+            protectedFiles = files.map(WorkspaceProtectedFile.init)
+        }
+        lastError = nil
+        return storageDeleted
     }
 
     @discardableResult
@@ -1239,7 +1280,7 @@ private extension WorkspaceProtectedFile {
     init(_ file: CatalogProtectedFile) {
         self.init(
             id: file.id, path: file.sourcePath, mode: file.mode, size: file.size,
-            currentVersion: file.currentVersion)
+            currentVersion: file.currentVersion, linked: file.linked)
     }
 }
 

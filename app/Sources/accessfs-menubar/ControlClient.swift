@@ -37,6 +37,37 @@ final class ControlClient: @unchecked Sendable {
         return result.file
     }
 
+    func protectedFileHistory(_ id: String) async throws -> [CatalogProtectedFileVersion] {
+        guard let result: ProtectedFileHistory = try await request(
+            .protectedFileHistory(id), expecting: "protected_file_history",
+            as: ProtectedFileHistory.self)
+        else {
+            throw ControlClientError.missingResult("protected_file_history")
+        }
+        return result.versions
+    }
+
+    func rollbackProtectedFile(_ id: String, to version: UInt32) async throws
+        -> CatalogProtectedFile
+    {
+        guard let result: ProtectedFileResult = try await request(
+            .protectedFileRollback(id: id, version: version),
+            expecting: "protected_file_rolled_back", as: ProtectedFileResult.self)
+        else {
+            throw ControlClientError.missingResult("protected_file_rolled_back")
+        }
+        return result.file
+    }
+
+    func restoreFile(_ id: String) async throws -> Bool {
+        guard let result: FileRestored = try await request(
+            .fileRestore(id), expecting: "file_restored", as: FileRestored.self)
+        else {
+            throw ControlClientError.missingResult("file_restored")
+        }
+        return result.storageDeleted
+    }
+
     func createSharedSecret(
         resourceID: String, name: String, defaultEnvKey: String?, value: String
     ) async throws {
@@ -224,6 +255,25 @@ final class ControlClient: @unchecked Sendable {
     private struct FileProtected: Decodable {
         let file: CatalogProtectedFile
         let created: Bool
+    }
+
+    private struct ProtectedFileResult: Decodable {
+        let file: CatalogProtectedFile
+    }
+
+    private struct ProtectedFileHistory: Decodable {
+        let id: String
+        let versions: [CatalogProtectedFileVersion]
+    }
+
+    private struct FileRestored: Decodable {
+        let path: String
+        let storageDeleted: Bool
+
+        enum CodingKeys: String, CodingKey {
+            case path
+            case storageDeleted = "storage_deleted"
+        }
     }
 
 }
