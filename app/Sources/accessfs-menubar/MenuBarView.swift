@@ -569,7 +569,7 @@ private struct MenuBarFooter: View {
             }
             .keyboardShortcut("k")
             .disabled(state.recents.isEmpty)
-            MenuItemButton(title: "Quit floria", icon: "power", shortcut: "Q") {
+            MenuItemButton(title: "Quit Floria", icon: "xmark.square", shortcut: "Q") {
                 NSApp.terminate(nil)
             }
             .keyboardShortcut("q")
