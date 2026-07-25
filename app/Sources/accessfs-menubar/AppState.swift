@@ -3,7 +3,7 @@ import Observation
 
 /// One line of the recent-access list, decoded from an AccessEvent.
 struct RecentAccess: Identifiable {
-    let id = UUID()
+    let id: String
     let date: Date?
     let path: String
     /// Tilde-abbreviated original source path, when the daemon knows one (secrets).
@@ -39,6 +39,10 @@ struct RecentAccess: Identifiable {
     }()
 
     init(_ ev: AccessEventMsg) {
+        id = [
+            ev.ts, ev.path, ev.operation, ev.decision, String(ev.identity.pid),
+            ev.rule_id ?? "", ev.ssh?.key_fingerprint ?? "",
+        ].joined(separator: "\u{1f}")
         date = Self.iso.date(from: ev.ts)
         path = ev.path
         display = ev.display.map { ($0 as NSString).abbreviatingWithTildeInPath }
@@ -67,12 +71,14 @@ final class AppState {
     var workspace: WorkspaceStore
     var policyMode = RuntimePolicyStatus.normal
     var policyModeError: String?
+    var accessHistoryLoading = false
 
     @ObservationIgnored private var client: AgentClient!
     @ObservationIgnored private let controlClient: ControlClient
     @ObservationIgnored private var policyRefreshTask: Task<Void, Never>?
     @ObservationIgnored private let prompter = PromptPresenter()
     @ObservationIgnored private let daemonManager = DaemonManager()
+    @ObservationIgnored private var accessHistoryLoaded = false
 
     // Sized for the dashboard table; the dropdown only ever renders a screenful.
     private static let maxRecents = 500
@@ -95,6 +101,7 @@ final class AppState {
                     Task {
                         await self.workspace.reload()
                         await self.reloadPolicyMode()
+                        await self.loadAccessHistoryIfNeeded()
                     }
                 }
             }
@@ -112,6 +119,7 @@ final class AppState {
         Task {
             await workspace.reload()
             await reloadPolicyMode()
+            await loadAccessHistoryIfNeeded()
         }
         policyRefreshTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -140,6 +148,19 @@ final class AppState {
         recents.removeAll()
     }
 
+    func loadAccessHistoryIfNeeded() async {
+        guard !accessHistoryLoaded, !accessHistoryLoading else { return }
+        accessHistoryLoading = true
+        defer { accessHistoryLoading = false }
+        do {
+            merge(try await controlClient.accessHistory(limit: Self.maxRecents))
+            accessHistoryLoaded = true
+        } catch {
+            // A daemon from an older bundle may still be restarting. The next connection event
+            // retries; live access events remain available in the meantime.
+        }
+    }
+
     func reloadPolicyMode() async {
         do {
             policyMode = try await controlClient.policyMode()
@@ -159,7 +180,23 @@ final class AppState {
     }
 
     private func add(_ ev: AccessEventMsg) {
-        recents.insert(RecentAccess(ev), at: 0)
+        let recent = RecentAccess(ev)
+        guard !recents.contains(where: { $0.id == recent.id }) else { return }
+        recents.insert(recent, at: 0)
+        if recents.count > Self.maxRecents {
+            recents.removeLast(recents.count - Self.maxRecents)
+        }
+    }
+
+    private func merge(_ events: [AccessEventMsg]) {
+        var seen = Set(recents.map(\.id))
+        for event in events {
+            let recent = RecentAccess(event)
+            if seen.insert(recent.id).inserted {
+                recents.append(recent)
+            }
+        }
+        recents.sort { ($0.date ?? .distantPast) > ($1.date ?? .distantPast) }
         if recents.count > Self.maxRecents {
             recents.removeLast(recents.count - Self.maxRecents)
         }

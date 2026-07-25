@@ -65,12 +65,19 @@ struct MenuBarView: View {
 
     private var emptyState: some View {
         VStack(spacing: 6) {
-            Image(systemName: state.connected ? "checkmark.shield" : "shield.slash")
-                .font(.title2)
-                .foregroundStyle(.tertiary)
+            if state.accessHistoryLoading && searchText.isEmpty {
+                ProgressView()
+                    .controlSize(.small)
+            } else {
+                Image(systemName: state.connected ? "checkmark.shield" : "shield.slash")
+                    .font(.title2)
+                    .foregroundStyle(.tertiary)
+            }
             Text(
                 searchText.isEmpty
-                    ? (state.connected ? "No recent access" : "Agent not connected")
+                    ? (state.accessHistoryLoading
+                        ? "Loading access history…"
+                        : (state.connected ? "No recent access" : "Agent not connected"))
                     : "No matches"
             )
             .font(.callout)

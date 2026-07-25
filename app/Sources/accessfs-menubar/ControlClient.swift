@@ -31,6 +31,16 @@ final class ControlClient: @unchecked Sendable {
         return status
     }
 
+    func accessHistory(limit: Int) async throws -> [AccessEventMsg] {
+        guard let events: [AccessEventMsg] = try await request(
+            .accessHistory(limit: limit), expecting: "access_history",
+            as: [AccessEventMsg].self)
+        else {
+            throw ControlClientError.missingResult("access_history")
+        }
+        return events
+    }
+
     func snapshot() async throws -> CatalogSnapshot {
         guard let snapshot: CatalogSnapshot = try await request(
             .snapshot, expecting: "snapshot", as: CatalogSnapshot.self)

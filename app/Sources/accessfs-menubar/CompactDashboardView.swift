@@ -439,12 +439,16 @@ struct DashboardView: View {
             }
         } content: {
             if visibleAccess.isEmpty {
-                CompactEmptyRow(
-                    icon: state.connected ? "checkmark.shield" : "shield.slash",
-                    title: state.connected ? "No recent access" : "Daemon is offline",
-                    detail: state.connected
-                        ? "Reads and SSH signatures will appear here."
-                        : "Reconnect the daemon to receive access events.")
+                if state.accessHistoryLoading {
+                    CompactLoadingRow(title: "Loading access history…")
+                } else {
+                    CompactEmptyRow(
+                        icon: state.connected ? "checkmark.shield" : "shield.slash",
+                        title: state.connected ? "No recent access" : "Daemon is offline",
+                        detail: state.connected
+                            ? "Reads and SSH signatures will appear here."
+                            : "Reconnect the daemon to receive access events.")
+                }
             } else {
                 VStack(spacing: 0) {
                     ForEach(Array(visibleAccess.enumerated()), id: \.element.id) { index, event in
@@ -912,6 +916,24 @@ private struct CompactEmptyRow: View {
     }
 }
 
+private struct CompactLoadingRow: View {
+    let title: String
+
+    var body: some View {
+        HStack(spacing: 12) {
+            ProgressView()
+                .controlSize(.small)
+                .frame(width: 34)
+            Text(title)
+                .font(.callout.weight(.medium))
+                .foregroundStyle(.secondary)
+            Spacer()
+        }
+        .padding(.horizontal, 14)
+        .frame(minHeight: 56)
+    }
+}
+
 private struct CompactProjectDetailView: View {
     @Bindable var state: AppState
     let project: WorkspaceProject
@@ -1089,10 +1111,14 @@ private struct CompactProjectDetailView: View {
             EmptyView()
         } content: {
             if recentAccess.isEmpty {
-                CompactEmptyRow(
-                    icon: "clock",
-                    title: "No recent access for this project",
-                    detail: "Reads and SSH signatures will appear here.")
+                if state.accessHistoryLoading {
+                    CompactLoadingRow(title: "Loading project access…")
+                } else {
+                    CompactEmptyRow(
+                        icon: "clock",
+                        title: "No recent access for this project",
+                        detail: "Reads and SSH signatures will appear here.")
+                }
             } else {
                 VStack(spacing: 0) {
                     ForEach(Array(recentAccess.enumerated()), id: \.element.id) { index, event in

@@ -3,13 +3,13 @@ import Foundation
 // Wire types mirroring `accessfs-agent::protocol`. Framing is a 4-byte big-endian
 // length prefix followed by that many bytes of JSON.
 
-struct ProcessView: Codable, Hashable {
+struct ProcessView: Codable, Hashable, Sendable {
     let pid: Int32
     let name: String
     let exe: String?
 }
 
-struct IdentityView: Codable {
+struct IdentityView: Codable, Sendable {
     let pid: Int32
     let uid: UInt32
     let exe: String?
@@ -39,13 +39,13 @@ struct IdentityView: Codable {
     }
 }
 
-struct PolicyEvaluationView: Codable {
+struct PolicyEvaluationView: Codable, Sendable {
     let configured_enforcement: String
     let effective_enforcement: String
     let mode: String
 }
 
-struct SshSignView: Codable {
+struct SshSignView: Codable, Sendable {
     let surface_id: String
     let surface_name: String
     let resource_id: String
@@ -74,7 +74,7 @@ struct PromptMsg: Decodable {
     let identity: IdentityView
 }
 
-struct AccessEventMsg: Decodable {
+struct AccessEventMsg: Decodable, Sendable {
     let ts: String
     let path: String
     /// Human-facing name (a secret's original source path); `path` stays the rule key.

@@ -410,6 +410,7 @@ struct CatalogProtectedFileVersion: Codable, Sendable {
 enum ControlCommand: Sendable {
     case policyModeGet
     case policyModeSet(mode: RuntimePolicyMode, durationSecs: UInt64?)
+    case accessHistory(limit: Int)
     case snapshot
     case discover(path: String)
     case discoverApply(path: String)
@@ -457,6 +458,7 @@ enum ControlCommand: Sendable {
         switch self {
         case .policyModeGet: "policy_mode_get"
         case .policyModeSet: "policy_mode_set"
+        case .accessHistory: "access_history"
         case .snapshot: "snapshot"
         case .discover: "discover"
         case .discoverApply: "discover_apply"
@@ -501,6 +503,11 @@ enum ControlCommand: Sendable {
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: PolicyModeSetParams(mode: mode, durationSecs: durationSecs)))
+        case .accessHistory(let limit):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: AccessHistoryParams(limit: limit)))
         case .discover(let path):
             return try encoder.encode(
                 ControlRequest(
@@ -631,6 +638,7 @@ private struct PolicyModeSetParams: Encodable {
     let durationSecs: UInt64?
 }
 
+private struct AccessHistoryParams: Encodable { let limit: Int }
 private struct DiscoverParams: Encodable { let path: String }
 private struct SshAgentDiscoverParams: Encodable { let endpoint: String }
 

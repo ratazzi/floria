@@ -147,10 +147,14 @@ struct AccessLogView: View {
         }
         .overlay {
             if events.isEmpty {
-                ContentUnavailableView(
-                    state.connected ? "No recent access" : "Agent not connected",
-                    systemImage: state.connected ? "checkmark.shield" : "shield.slash"
-                )
+                if state.accessHistoryLoading {
+                    ProgressView("Loading access history…")
+                } else {
+                    ContentUnavailableView(
+                        state.connected ? "No recent access" : "Agent not connected",
+                        systemImage: state.connected ? "checkmark.shield" : "shield.slash"
+                    )
+                }
             }
         }
         .safeAreaInset(edge: .bottom, spacing: 0) {

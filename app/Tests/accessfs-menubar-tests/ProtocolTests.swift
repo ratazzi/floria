@@ -133,6 +133,27 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(row.shownPath, "~/.env")
     }
 
+    func testRecentAccessIdentityIsStableForPersistedAndLiveCopies() {
+        let event = AccessEventMsg(
+            ts: "2026-07-24T08:30:15.123Z", path: "surfaces/project-env",
+            display: "/Users/me/project/.env", operation: "read",
+            decision: "allowed", rule_id: "surface:project-env",
+            policy: nil, ssh: nil,
+            identity: IdentityView(
+                pid: 42, uid: 501, exe: "/usr/bin/cat", cwd: "/Users/me/project",
+                chain: "zsh -> cat"))
+        let differentProcess = AccessEventMsg(
+            ts: event.ts, path: event.path, display: event.display,
+            operation: event.operation, decision: event.decision, rule_id: event.rule_id,
+            policy: event.policy, ssh: event.ssh,
+            identity: IdentityView(
+                pid: 43, uid: 501, exe: "/usr/bin/cat", cwd: "/Users/me/project",
+                chain: "zsh -> cat"))
+
+        XCTAssertEqual(RecentAccess(event).id, RecentAccess(event).id)
+        XCTAssertNotEqual(RecentAccess(event).id, RecentAccess(differentProcess).id)
+    }
+
     func testSshSignPresentationUsesIdentityMetadata() {
         let ssh = SshSignView(
             surface_id: "surface-1", surface_name: "GitHub identities",

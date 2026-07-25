@@ -85,6 +85,30 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(normal, .normal)
     }
 
+    func testAccessHistoryRequestAndResultMatchRustWireShape() throws {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let data = try ControlCommand.accessHistory(limit: 500)
+            .requestData(requestID: 72, encoder: encoder)
+        let request = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let params = try XCTUnwrap(request["params"] as? [String: Any])
+
+        XCTAssertEqual(request["method"] as? String, "access_history")
+        XCTAssertEqual(params["limit"] as? Int, 500)
+
+        let response = Data(
+            #"{"request_id":72,"status":"ok","result":{"type":"access_history","value":[{"ts":"2026-07-24T10:20:30.123Z","path":"surfaces/project-env","display":"/Users/me/project/.env","operation":"read","decision":"allowed","rule_id":"surface:project-env","policy":{"configured_enforcement":"prompt","effective_enforcement":"allow","mode":"audit_only"},"ssh":null,"identity":{"pid":42,"uid":501,"exe":"/usr/bin/cat","cwd":"/Users/me/project","cmdline":["cat",".env"],"bundle_id":null,"team_id":null,"repo":"/Users/me/project","parent_chain":[{"pid":42,"name":"cat","exe":"/usr/bin/cat"}],"chain":"zsh -> cat"}}]}}"#.utf8)
+        let decoded = try JSONDecoder().decode(
+            ControlResponseEnvelope<[AccessEventMsg]>.self, from: response)
+        let event = try XCTUnwrap(decoded.result?.value?.first)
+
+        XCTAssertEqual(decoded.result?.type, "access_history")
+        XCTAssertEqual(event.display, "/Users/me/project/.env")
+        XCTAssertEqual(event.policy?.mode, "audit_only")
+        XCTAssertEqual(event.identity.parent_chain?.first?.name, "cat")
+    }
+
     func testSshAgentDiscoveryAndResourceRequestsMatchRustWireShape() throws {
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
