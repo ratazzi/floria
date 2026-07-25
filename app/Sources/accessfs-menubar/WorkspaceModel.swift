@@ -69,6 +69,7 @@ enum WorkspaceResourceKind: String, CaseIterable, Sendable {
     case envFile
     case literal
     case command
+    case sshIdentity
     case sshAgent
 
     var title: String {
@@ -78,7 +79,8 @@ enum WorkspaceResourceKind: String, CaseIterable, Sendable {
         case .envFile: "Env File"
         case .literal: "Literal"
         case .command: "Command"
-        case .sshAgent: "SSH Agent"
+        case .sshIdentity: "SSH Identity"
+        case .sshAgent: "External Agent"
         }
     }
 
@@ -88,6 +90,7 @@ enum WorkspaceResourceKind: String, CaseIterable, Sendable {
         case .envFile: "doc.badge.gearshape"
         case .literal: "chevron.left.forwardslash.chevron.right"
         case .command: "terminal.fill"
+        case .sshIdentity: "key.horizontal.fill"
         case .sshAgent: "network"
         }
     }
@@ -97,6 +100,7 @@ enum WorkspaceValueShape: String, Sendable {
     case scalar
     case keyValueSet
     case bytes
+    case sshIdentity
     case socket
 }
 
@@ -243,7 +247,9 @@ struct WorkspaceResource: Identifiable, Hashable, Sendable {
     }
 
     var exportSummary: String {
-        if kind == .sshAgent { return "\(entries.count) identit\(entries.count == 1 ? "y" : "ies")" }
+        if kind == .sshIdentity || kind == .sshAgent {
+            return "\(entries.count) identit\(entries.count == 1 ? "y" : "ies")"
+        }
         if exports.isEmpty, entries.count == 1 { return "Keyless value" }
         if exports.count == 1, let key = exports.first?.key { return key }
         return "\(entries.count) entries"
@@ -657,8 +663,11 @@ final class WorkspaceStore {
         resources.filter { $0.kind == .envFile && $0.codec == .dotenv }
     }
 
-    var sshAgentResources: [WorkspaceResource] {
-        resources.filter { $0.kind == .sshAgent && $0.shape == .socket }
+    var sshIdentityProviders: [WorkspaceResource] {
+        resources.filter {
+            ($0.kind == .sshIdentity && $0.shape == .sshIdentity)
+                || ($0.kind == .sshAgent && $0.shape == .socket)
+        }
     }
 
     func compatibleBindings(for kind: WorkspaceSurfaceKind) -> [WorkspaceBinding] {
@@ -699,7 +708,10 @@ final class WorkspaceStore {
                     || resource.kind == .literal)
                 && binding.keyOverride == nil && entries.count == 1 && entries[0].key == nil
         case .unixSocket:
-            return resource.kind == .sshAgent && resource.shape == .socket
+            let isIdentityProvider =
+                (resource.kind == .sshIdentity && resource.shape == .sshIdentity)
+                || (resource.kind == .sshAgent && resource.shape == .socket)
+            return isIdentityProvider
                 && resource.codec == .opaque && binding.keyOverride == nil
                 && !entries.isEmpty && entries.allSatisfy { $0.key == nil && !$0.sensitive }
         case .envFileDirect, .regularFile:
@@ -974,6 +986,29 @@ final class WorkspaceStore {
         return try await controlClient.discoverSshIdentities(endpoint: endpoint)
     }
 
+    @discardableResult
+    func importSshIdentity(
+        name: String, path: String, passphrase: String?,
+        securityLevel: WorkspaceSecurityLevel, metadata: ItemMetadata = .empty
+    ) async throws -> WorkspaceResource.ID {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let path = (path as NSString).expandingTildeInPath
+        guard !name.isEmpty else { throw WorkspaceStoreError.invalid("Identity name is required") }
+        guard (path as NSString).isAbsolutePath else {
+            throw WorkspaceStoreError.invalid("SSH private key path must be absolute")
+        }
+        let metadata = try Self.validatedMetadata(metadata)
+        let resourceID = Self.newID("ssh-identity")
+        _ = try await controlClient.importSshIdentity(
+            resourceID: resourceID, name: name, path: path,
+            passphrase: passphrase?.isEmpty == false ? passphrase : nil,
+            enforcement: securityLevel.rawValue, metadata: metadata)
+        apply(try await controlClient.snapshot())
+        lastError = nil
+        return resourceID
+    }
+
     func sshConfigStatus() async throws -> SshConfigIntegrationStatus {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
         return try await controlClient.sshConfigStatus()
@@ -1026,10 +1061,16 @@ final class WorkspaceStore {
 
     func removeSshAgentResource(_ id: WorkspaceResource.ID) async throws {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
-        guard resources.contains(where: { $0.id == id && $0.kind == .sshAgent }) else {
-            throw WorkspaceStoreError.invalid("Choose an SSH agent first")
+        guard let resource = resources.first(where: { $0.id == id }),
+            resource.kind == .sshIdentity || resource.kind == .sshAgent
+        else {
+            throw WorkspaceStoreError.invalid("Choose an SSH identity provider first")
         }
-        try await controlClient.removeResource(id)
+        if resource.kind == .sshIdentity {
+            try await controlClient.removeSshIdentity(resourceID: id)
+        } else {
+            try await controlClient.removeResource(id)
+        }
         apply(try await controlClient.snapshot())
         lastError = nil
     }
@@ -1207,8 +1248,8 @@ final class WorkspaceStore {
         guard let project = selectedProject, let environment = selectedEnvironment else {
             throw WorkspaceStoreError.invalid("Select a project environment first")
         }
-        guard let resource = sshAgentResources.first(where: { $0.id == resourceID }) else {
-            throw WorkspaceStoreError.invalid("Choose an SSH agent")
+        guard let resource = sshIdentityProviders.first(where: { $0.id == resourceID }) else {
+            throw WorkspaceStoreError.invalid("Choose an SSH identity provider")
         }
         let addresses = resource.entries.map(\.address).filter(selectedEntries.contains)
         guard !addresses.isEmpty else {
@@ -1814,6 +1855,7 @@ private extension WorkspaceResourceKind {
         case "env_file": self = .envFile
         case "literal": self = .literal
         case "command": self = .command
+        case "ssh_identity": self = .sshIdentity
         case "ssh_agent": self = .sshAgent
         default: return nil
         }
@@ -1826,6 +1868,7 @@ private extension WorkspaceValueShape {
         case "scalar": self = .scalar
         case "key_value_set": self = .keyValueSet
         case "bytes": self = .bytes
+        case "ssh_identity": self = .sshIdentity
         case "socket": self = .socket
         default: return nil
         }

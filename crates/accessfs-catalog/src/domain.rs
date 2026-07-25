@@ -28,6 +28,7 @@ pub enum ResourceKind {
     EnvFile,
     Literal,
     Command,
+    SshIdentity,
     SshAgent,
 }
 
@@ -39,6 +40,7 @@ impl ResourceKind {
             ResourceKind::EnvFile => "env_file",
             ResourceKind::Literal => "literal",
             ResourceKind::Command => "command",
+            ResourceKind::SshIdentity => "ssh_identity",
             ResourceKind::SshAgent => "ssh_agent",
         }
     }
@@ -50,6 +52,7 @@ impl ResourceKind {
             "env_file" => Some(ResourceKind::EnvFile),
             "literal" => Some(ResourceKind::Literal),
             "command" => Some(ResourceKind::Command),
+            "ssh_identity" => Some(ResourceKind::SshIdentity),
             "ssh_agent" => Some(ResourceKind::SshAgent),
             _ => None,
         }
@@ -62,6 +65,7 @@ pub enum ValueShape {
     Scalar,
     KeyValueSet,
     Bytes,
+    SshIdentity,
     Socket,
 }
 
@@ -71,6 +75,7 @@ impl ValueShape {
             ValueShape::Scalar => "scalar",
             ValueShape::KeyValueSet => "key_value_set",
             ValueShape::Bytes => "bytes",
+            ValueShape::SshIdentity => "ssh_identity",
             ValueShape::Socket => "socket",
         }
     }
@@ -80,6 +85,7 @@ impl ValueShape {
             "scalar" => Some(ValueShape::Scalar),
             "key_value_set" => Some(ValueShape::KeyValueSet),
             "bytes" => Some(ValueShape::Bytes),
+            "ssh_identity" => Some(ValueShape::SshIdentity),
             "socket" => Some(ValueShape::Socket),
             _ => None,
         }

@@ -1033,12 +1033,21 @@ fn validate_composed_surface_member(
             }
         }
         SurfaceKind::UnixSocket => {
-            let compatible = resource.kind == ResourceKind::SshAgent
-                && resource.shape == ValueShape::Socket
+            let compatible = matches!(
+                (&resource.kind, &resource.shape, &resource.source),
+                (
+                    ResourceKind::SshIdentity,
+                    ValueShape::SshIdentity,
+                    ResourceSource::SecretRef { .. }
+                ) | (
+                    ResourceKind::SshAgent,
+                    ValueShape::Socket,
+                    ResourceSource::Socket { .. }
+                )
+            )
                 && resource.codec == ResourceCodec::Opaque
                 && binding.key_override.is_none()
-                && entries.into_iter().all(|entry| entry.key.is_none())
-                && matches!(resource.source, ResourceSource::Socket { .. });
+                && entries.into_iter().all(|entry| entry.key.is_none());
             if !compatible {
                 return Err(CatalogError::Validation(format!(
                     "binding {:?} cannot feed SSH agent surface {:?}",
@@ -1208,7 +1217,10 @@ fn validate_resource(resource: &Resource) -> CatalogResult<()> {
 
     match (resource.shape, resource.codec) {
         (
-            ValueShape::Scalar | ValueShape::Bytes | ValueShape::Socket,
+            ValueShape::Scalar
+                | ValueShape::Bytes
+                | ValueShape::SshIdentity
+                | ValueShape::Socket,
             ResourceCodec::Opaque,
         )
         | (
@@ -1242,6 +1254,24 @@ fn validate_resource(resource: &Resource) -> CatalogResult<()> {
         (ResourceKind::SharedSecret, ValueShape::Scalar, ResourceSource::SecretRef { .. }) => {}
         (ResourceKind::Secret, ValueShape::Scalar | ValueShape::Bytes, ResourceSource::SecretRef { .. }) => {}
         (ResourceKind::EnvFile, ValueShape::KeyValueSet, ResourceSource::SecretRef { .. }) => {}
+        (
+            ResourceKind::SshIdentity,
+            ValueShape::SshIdentity,
+            ResourceSource::SecretRef { .. },
+        ) => {
+            if resource.default_env_key.is_some()
+                || resource.entries.len() != 1
+                || resource
+                    .entries
+                    .iter()
+                    .any(|entry| !is_ssh_identity_address(&entry.address) || entry.sensitive || entry.key.is_some())
+            {
+                return Err(CatalogError::Validation(format!(
+                    "SSH identity resource {:?} requires exactly one non-sensitive ssh/sha256 identity entry without an environment key",
+                    resource.id
+                )));
+            }
+        }
         (ResourceKind::Literal, ValueShape::Scalar, ResourceSource::Literal { .. }) => {}
         (
             ResourceKind::Command,
@@ -2193,7 +2223,7 @@ mod tests {
     }
 
     #[test]
-    fn ssh_agent_surface_composes_selected_identity_bindings() {
+    fn ssh_agent_surface_composes_managed_and_external_identity_bindings() {
         let (_dir, catalog) = catalog();
         let address =
             "ssh/sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string();
@@ -2227,6 +2257,35 @@ mod tests {
             addresses: vec![address.clone()],
         };
         catalog.upsert_binding(&selected).unwrap();
+        let managed_address =
+            "ssh/sha256/BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_string();
+        catalog
+            .upsert_resource(&Resource {
+                id: "fixture-managed-identity".to_string(),
+                name: "Fixture Managed Identity".to_string(),
+                kind: ResourceKind::SshIdentity,
+                shape: ValueShape::SshIdentity,
+                codec: ResourceCodec::Opaque,
+                default_env_key: None,
+                entries: vec![EntrySpec {
+                    address: managed_address,
+                    label: "Managed fleet key".to_string(),
+                    key: None,
+                    sensitive: false,
+                }],
+                source: ResourceSource::SecretRef {
+                    secret_id: "fixture-managed-private-key".to_string(),
+                },
+                enforcement: Enforcement::Prompt,
+                metadata: Default::default(),
+            })
+            .unwrap();
+        let managed = binding(
+            "fixture-managed-binding",
+            "fixture-managed-identity",
+            BindingScope::Environment { environment_id: "development".to_string() },
+        );
+        catalog.upsert_binding(&managed).unwrap();
 
         let surface = Surface {
             id: "fixture-agent-surface".to_string(),
@@ -2235,7 +2294,7 @@ mod tests {
             kind: SurfaceKind::UnixSocket,
             path: PathBuf::from("/workspace/floria/.floria/agent.sock"),
             input: SurfaceInput::SshAgent {
-                binding_ids: vec![selected.id.clone()],
+                binding_ids: vec![selected.id.clone(), managed.id],
                 route: Some(SshRouteSpec {
                     host_patterns: vec!["ec2-*.example.internal".to_string()],
                     hostname: None,

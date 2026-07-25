@@ -304,6 +304,10 @@ enum ControlCommand: Sendable {
     case policyModeSet(mode: RuntimePolicyMode, durationSecs: UInt64?)
     case snapshot
     case sshAgentDiscover(endpoint: String)
+    case sshIdentityImport(
+        resourceID: String, name: String, path: String, passphrase: String?,
+        enforcement: String, metadata: ItemMetadata)
+    case sshIdentityRemove(resourceID: String)
     case sshConfigStatus
     case sshConfigInstall
     case sshConfigRemove
@@ -345,6 +349,8 @@ enum ControlCommand: Sendable {
         case .policyModeSet: "policy_mode_set"
         case .snapshot: "snapshot"
         case .sshAgentDiscover: "ssh_agent_discover"
+        case .sshIdentityImport: "ssh_identity_import"
+        case .sshIdentityRemove: "ssh_identity_remove"
         case .sshConfigStatus: "ssh_config_status"
         case .sshConfigInstall: "ssh_config_install"
         case .sshConfigRemove: "ssh_config_remove"
@@ -388,6 +394,19 @@ enum ControlCommand: Sendable {
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: SshAgentDiscoverParams(endpoint: endpoint)))
+        case .sshIdentityImport(
+            let resourceID, let name, let path, let passphrase, let enforcement, let metadata):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: SshIdentityImportParams(
+                        resourceID: resourceID, name: name, path: path,
+                        passphrase: passphrase, enforcement: enforcement, metadata: metadata)))
+        case .sshIdentityRemove(let resourceID):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: SshIdentityRemoveParams(resourceID: resourceID)))
         case .fileProtect(let path):
             return try encoder.encode(
                 ControlRequest(
@@ -491,6 +510,17 @@ private struct PolicyModeSetParams: Encodable {
 }
 
 private struct SshAgentDiscoverParams: Encodable { let endpoint: String }
+
+private struct SshIdentityImportParams: Encodable {
+    let resourceID: String
+    let name: String
+    let path: String
+    let passphrase: String?
+    let enforcement: String
+    let metadata: ItemMetadata
+}
+
+private struct SshIdentityRemoveParams: Encodable { let resourceID: String }
 
 private struct ControlRequestWithoutParams: Encodable {
     let requestID: UInt64

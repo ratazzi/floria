@@ -241,7 +241,8 @@ struct DashboardView: View {
     @State private var showingProtectFile = false
     @State private var showingNewSharedSecret = false
     @State private var showingNewEnvFile = false
-    @State private var showingNewSshAgent = false
+    @State private var showingImportSshIdentity = false
+    @State private var showingConnectExternalAgent = false
     @State private var pendingAuditWindow: AuditOnlyWindow?
     @State private var showingAuditConfirmation = false
 
@@ -276,7 +277,10 @@ struct DashboardView: View {
         .sheet(isPresented: $showingNewEnvFile) {
             NewEnvFileSheet(store: state.workspace)
         }
-        .sheet(isPresented: $showingNewSshAgent) {
+        .sheet(isPresented: $showingImportSshIdentity) {
+            ImportSshIdentitySheet(store: state.workspace)
+        }
+        .sheet(isPresented: $showingConnectExternalAgent) {
             NewSshAgentSheet(store: state.workspace)
         }
         .alert(
@@ -336,8 +340,11 @@ struct DashboardView: View {
                 Button("New Env File", systemImage: "doc.badge.plus") {
                     showingNewEnvFile = true
                 }
-                Button("Connect SSH Agent", systemImage: "network") {
-                    showingNewSshAgent = true
+                Button("Import SSH Private Key", systemImage: "key.horizontal.fill") {
+                    showingImportSshIdentity = true
+                }
+                Button("Connect External SSH Agent", systemImage: "network") {
+                    showingConnectExternalAgent = true
                 }
             } label: {
                 Image(systemName: "plus")
@@ -418,7 +425,9 @@ struct DashboardView: View {
                             tag: .protectedFiles)
                         sidebarRow("Shared Secrets", systemImage: "key", tag: .sharedSecrets)
                         sidebarRow("Env Files", systemImage: "doc.badge.gearshape", tag: .envFiles)
-                        sidebarRow("SSH Agents", systemImage: "network", tag: .sshAgents)
+                        sidebarRow(
+                            "SSH Identities", systemImage: "key.horizontal",
+                            tag: .sshAgents)
                         sidebarRow(
                             "Access Log",
                             systemImage: "clock.arrow.trianglehead.counterclockwise.rotate.90",
@@ -551,7 +560,8 @@ struct DashboardView: View {
         case .sshAgents:
             SshAgentsCatalogView(
                 store: state.workspace, search: search,
-                connectAgent: { showingNewSshAgent = true })
+                importIdentity: { showingImportSshIdentity = true },
+                connectExternalAgent: { showingConnectExternalAgent = true })
         case .accessLog:
             AccessLogView(state: state)
         case nil:
@@ -2199,6 +2209,117 @@ private struct ProtectedFileHistorySheet: View {
     }
 }
 
+private struct ImportSshIdentitySheet: View {
+    @Bindable var store: WorkspaceStore
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = "SSH Identity"
+    @State private var path = ""
+    @State private var passphrase = ""
+    @State private var securityLevel = WorkspaceSecurityLevel.confirmation
+    @State private var note = ""
+    @State private var links: [EditableItemLink] = []
+    @State private var isSaving = false
+    @State private var errorMessage: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Import SSH Identity").font(.title2.bold())
+                Text("Use a private key directly from Floria's encrypted store.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Name").font(.callout.weight(.medium))
+                TextField("Production fleet", text: $name)
+                    .textFieldStyle(.roundedBorder)
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text("OpenSSH private key").font(.callout.weight(.medium))
+                HStack {
+                    TextField("~/.ssh/id_ed25519", text: $path)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.body.monospaced())
+                    Button("Choose…", action: chooseKey)
+                }
+                SecureField("Passphrase, if the source key is encrypted", text: $passphrase)
+                    .textFieldStyle(.roundedBorder)
+                Label(
+                    "Floria copies the key into encrypted storage. The original file is not changed or removed.",
+                    systemImage: "lock.shield")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Supports OpenSSH Ed25519/RSA and unencrypted EC2-style RSA PEM keys.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            SecurityLevelPicker(selection: $securityLevel)
+            ItemMetadataEditor(note: $note, links: $links)
+
+            Divider()
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Import Identity", action: importIdentity)
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(
+                        isSaving || path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(width: 620)
+        .alert(
+            "Could not import SSH identity",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } })
+        ) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
+    }
+
+    private func chooseKey() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.showsHiddenFiles = true
+        panel.resolvesAliases = false
+        if panel.runModal() == .OK, let url = panel.url {
+            path = url.path
+            if name == "SSH Identity" {
+                name = url.lastPathComponent
+            }
+        }
+    }
+
+    private func importIdentity() {
+        Task {
+            isSaving = true
+            defer { isSaving = false }
+            do {
+                try await store.importSshIdentity(
+                    name: name, path: path, passphrase: passphrase,
+                    securityLevel: securityLevel,
+                    metadata: itemMetadata(note: note, links: links))
+                passphrase = ""
+                dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+}
+
 private struct NewSshAgentSheet: View {
     @Bindable var store: WorkspaceStore
 
@@ -2221,8 +2342,8 @@ private struct NewSshAgentSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Connect SSH Agent").font(.title2.bold())
-                Text("Import only public identity metadata from an existing agent socket.")
+                Text("Connect External SSH Agent").font(.title2.bold())
+                Text("Advanced provider: forward signing to an existing agent socket.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -2242,7 +2363,7 @@ private struct NewSshAgentSheet: View {
                     Button("Discover", action: discover)
                         .disabled(isDiscovering || endpoint.isEmpty)
                 }
-                Text("Floria never imports private keys; signatures continue to be produced by this agent.")
+                    Text("Floria stores only public metadata; signatures continue to be produced by this external agent.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -2360,7 +2481,7 @@ private struct AddSshAgentSurfaceSheet: View {
     @State private var errorMessage: String?
 
     private var resource: WorkspaceResource? {
-        store.sshAgentResources.first { $0.id == resourceID }
+        store.sshIdentityProviders.first { $0.id == resourceID }
     }
 
     var body: some View {
@@ -2372,16 +2493,16 @@ private struct AddSshAgentSurfaceSheet: View {
                     .foregroundStyle(.secondary)
             }
 
-            if store.sshAgentResources.isEmpty {
+            if store.sshIdentityProviders.isEmpty {
                 ContentUnavailableView(
-                    "No SSH Agents", systemImage: "network",
-                    description: Text("Connect an upstream SSH agent from the SSH Agents section first."))
+                    "No SSH Identities", systemImage: "key.horizontal",
+                    description: Text("Import a private key from the SSH Identities section first."))
                     .frame(maxWidth: .infinity, minHeight: 180)
             } else {
                 VStack(alignment: .leading, spacing: 7) {
-                    Text("Upstream agent").font(.callout.weight(.medium))
-                    Picker("Upstream agent", selection: $resourceID) {
-                        ForEach(store.sshAgentResources) { resource in
+                    Text("Signing identity provider").font(.callout.weight(.medium))
+                    Picker("Signing identity provider", selection: $resourceID) {
+                        ForEach(store.sshIdentityProviders) { resource in
                             Text("\(resource.name) · \(resource.entries.count) identities")
                                 .tag(resource.id)
                         }
@@ -2454,7 +2575,7 @@ private struct AddSshAgentSurfaceSheet: View {
         .padding(24)
         .frame(width: 580)
         .onAppear {
-            if resourceID.isEmpty { selectResource(store.sshAgentResources.first?.id ?? "") }
+            if resourceID.isEmpty { selectResource(store.sshIdentityProviders.first?.id ?? "") }
         }
         .onChange(of: resourceID) { _, value in selectResource(value) }
         .alert(
@@ -2472,7 +2593,7 @@ private struct AddSshAgentSurfaceSheet: View {
     private func selectResource(_ id: String) {
         resourceID = id
         selectedEntries = Set(
-            store.sshAgentResources.first(where: { $0.id == id })?.entries.map(\.address) ?? [])
+            store.sshIdentityProviders.first(where: { $0.id == id })?.entries.map(\.address) ?? [])
     }
 
     private func entrySelection(_ address: String) -> Binding<Bool> {
@@ -2521,7 +2642,8 @@ private struct AddSshAgentSurfaceSheet: View {
 private struct SshAgentsCatalogView: View {
     @Bindable var store: WorkspaceStore
     let search: String
-    let connectAgent: () -> Void
+    let importIdentity: () -> Void
+    let connectExternalAgent: () -> Void
 
     @State private var integration: SshConfigIntegrationStatus?
     @State private var integrationCheckFailed = false
@@ -2598,10 +2720,12 @@ private struct SshAgentsCatalogView: View {
     var body: some View {
         VStack(spacing: 0) {
             ResourceCatalogView(
-                store: store, title: "SSH Agents",
-                subtitle: "Public identities discovered from existing agent sockets",
-                kinds: [.sshAgent], search: search,
-                addResourceTitle: "Connect Agent", addResource: connectAgent)
+                store: store, title: "SSH Identities",
+                subtitle: "Private keys managed by Floria, with optional external signing providers",
+                kinds: [.sshIdentity, .sshAgent], search: search,
+                addResourceTitle: "Import Private Key", addResource: importIdentity,
+                secondaryResourceTitle: "External Agent",
+                secondaryResource: connectExternalAgent)
                 .frame(maxHeight: .infinity)
             Divider()
             HStack(spacing: 12) {
@@ -2711,6 +2835,8 @@ private struct ResourceCatalogView: View {
     let search: String
     let addResourceTitle: String
     let addResource: (() -> Void)?
+    var secondaryResourceTitle: String? = nil
+    var secondaryResource: (() -> Void)? = nil
     @State private var editingSharedSecret: WorkspaceResource?
     @State private var editingResourceInfo: WorkspaceResource?
     @State private var deletingSharedSecret: WorkspaceResource?
@@ -2738,6 +2864,10 @@ private struct ResourceCatalogView: View {
                     Text(subtitle).font(.callout).foregroundStyle(.secondary)
                 }
                 Spacer()
+                if let secondaryResourceTitle, let secondaryResource {
+                    Button(secondaryResourceTitle, systemImage: "network", action: secondaryResource)
+                        .buttonStyle(.bordered)
+                }
                 if let addResource {
                     Button(addResourceTitle, systemImage: "plus", action: addResource)
                         .buttonStyle(.borderedProminent)
@@ -2764,16 +2894,10 @@ private struct ResourceCatalogView: View {
                     VStack(alignment: .trailing, spacing: 3) {
                         HStack(spacing: 7) {
                             ResourceKindBadge(kind: resource.kind)
-                            if resource.kind == .sshAgent {
-                                Text("Public keys")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            } else {
-                                SecurityLevelMenu(level: resource.securityLevel) { securityLevel in
-                                    try await store.updateResourceMetadata(
-                                        resource.id, name: resource.name,
-                                        securityLevel: securityLevel, metadata: resource.metadata)
-                                }
+                            SecurityLevelMenu(level: resource.securityLevel) { securityLevel in
+                                try await store.updateResourceMetadata(
+                                    resource.id, name: resource.name,
+                                    securityLevel: securityLevel, metadata: resource.metadata)
                             }
                         }
                         Text("Used by \(resource.usageCount) projects")
@@ -2781,7 +2905,7 @@ private struct ResourceCatalogView: View {
                             .foregroundStyle(.secondary)
                     }
                     if resource.kind == .sharedSecret || resource.kind == .envFile
-                        || resource.kind == .sshAgent
+                        || resource.kind == .sshIdentity || resource.kind == .sshAgent
                     {
                         Menu {
                             if resource.kind == .sharedSecret {
@@ -2806,9 +2930,13 @@ private struct ResourceCatalogView: View {
                                 Button("Delete Secret…", systemImage: "trash", role: .destructive) {
                                     deletingSharedSecret = resource
                                 }
-                            } else if resource.kind == .sshAgent {
+                            } else if resource.kind == .sshIdentity || resource.kind == .sshAgent {
                                 Divider()
-                                Button("Disconnect Agent…", systemImage: "trash", role: .destructive) {
+                                Button(
+                                    resource.kind == .sshIdentity
+                                        ? "Delete Identity…" : "Disconnect Agent…",
+                                    systemImage: "trash", role: .destructive
+                                ) {
                                     deletingSshAgent = resource
                                 }
                             }
@@ -2872,14 +3000,19 @@ private struct ResourceCatalogView: View {
         }
         .alert(
             deletingSshAgent?.usageCount == 0
-                ? "Disconnect SSH Agent?" : "SSH Agent Is In Use",
+                ? (deletingSshAgent?.kind == .sshIdentity
+                    ? "Delete SSH Identity?" : "Disconnect SSH Agent?")
+                : "SSH Identity Is In Use",
             isPresented: Binding(
                 get: { deletingSshAgent != nil },
                 set: { if !$0 { deletingSshAgent = nil } })
         ) {
             if let resource = deletingSshAgent, resource.usageCount == 0 {
                 Button("Cancel", role: .cancel) { deletingSshAgent = nil }
-                Button("Disconnect", role: .destructive) {
+                Button(
+                    resource.kind == .sshIdentity ? "Delete Identity" : "Disconnect",
+                    role: .destructive
+                ) {
                     deleteSshAgent(resource)
                 }
             } else {
@@ -2887,9 +3020,13 @@ private struct ResourceCatalogView: View {
             }
         } message: {
             if let resource = deletingSshAgent {
-                Text(resource.usageCount == 0
-                    ? "Floria removes only the saved public identity metadata. The upstream agent is not changed."
-                    : "Remove this agent from its project bindings first.")
+                if resource.usageCount > 0 {
+                    Text("Remove this identity provider from its project bindings first.")
+                } else if resource.kind == .sshIdentity {
+                    Text("This permanently removes the encrypted private-key copy from Floria. The original imported file is not changed.")
+                } else {
+                    Text("Floria removes only the saved public identity metadata. The external agent is not changed.")
+                }
             }
         }
     }
@@ -2941,11 +3078,9 @@ private struct EditResourceMetadataSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 4) {
-                Text(resource.kind == .sshAgent ? "Edit SSH Agent Info" : "Edit Env File Info")
+                Text(editTitle)
                     .font(.title2.bold())
-                Text(resource.kind == .sshAgent
-                    ? "Change how this upstream agent is identified in Floria."
-                    : "Change how this encrypted document is identified in Floria.")
+                Text(editDetail)
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -2955,9 +3090,7 @@ private struct EditResourceMetadataSheet: View {
                 TextField("Team defaults", text: $name)
                     .textFieldStyle(.roundedBorder)
             }
-            if resource.kind != .sshAgent {
-                SecurityLevelPicker(selection: $securityLevel)
-            }
+            SecurityLevelPicker(selection: $securityLevel)
             ItemMetadataEditor(note: $note, links: $links)
 
             Divider()
@@ -2976,7 +3109,7 @@ private struct EditResourceMetadataSheet: View {
         .padding(24)
         .frame(width: 560)
         .alert(
-            resource.kind == .sshAgent ? "Could not update SSH Agent" : "Could not update Env File",
+            "Could not update \(resource.kind.title)",
             isPresented: Binding(
                 get: { errorMessage != nil },
                 set: { if !$0 { errorMessage = nil } })
@@ -2984,6 +3117,22 @@ private struct EditResourceMetadataSheet: View {
             Button("OK") { errorMessage = nil }
         } message: {
             Text(errorMessage ?? "Unknown error")
+        }
+    }
+
+    private var editTitle: String {
+        switch resource.kind {
+        case .sshIdentity: "Edit SSH Identity"
+        case .sshAgent: "Edit External Agent"
+        default: "Edit Env File Info"
+        }
+    }
+
+    private var editDetail: String {
+        switch resource.kind {
+        case .sshIdentity: "Change the security level and descriptive information for this managed key."
+        case .sshAgent: "Change how this external signing provider is identified in Floria."
+        default: "Change how this encrypted document is identified in Floria."
         }
     }
 
@@ -4684,6 +4833,7 @@ private extension WorkspaceResourceKind {
         case .envFile: .purple
         case .literal: .secondary
         case .command: .teal
+        case .sshIdentity: .indigo
         case .sshAgent: .blue
         }
     }

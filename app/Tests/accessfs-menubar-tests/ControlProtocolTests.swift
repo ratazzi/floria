@@ -79,6 +79,33 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(response.result?.value?.first?.comment, "Fixture key")
     }
 
+    func testManagedSshIdentityRequestsMatchRustWireShape() throws {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let imported = try ControlCommand.sshIdentityImport(
+            resourceID: "fixture-identity", name: "Fixture identity",
+            path: "/private/tmp/fixture-id_ed25519", passphrase: "fixture passphrase",
+            enforcement: "touchid", metadata: .empty
+        ).requestData(requestID: 75, encoder: encoder)
+        let value = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: imported) as? [String: Any])
+        let params = try XCTUnwrap(value["params"] as? [String: Any])
+        XCTAssertEqual(value["method"] as? String, "ssh_identity_import")
+        XCTAssertEqual(params["resource_id"] as? String, "fixture-identity")
+        XCTAssertEqual(params["path"] as? String, "/private/tmp/fixture-id_ed25519")
+        XCTAssertEqual(params["passphrase"] as? String, "fixture passphrase")
+        XCTAssertNil(params["private_key"])
+
+        let removed = try ControlCommand.sshIdentityRemove(resourceID: "fixture-identity")
+            .requestData(requestID: 76, encoder: encoder)
+        let removedValue = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: removed) as? [String: Any])
+        XCTAssertEqual(removedValue["method"] as? String, "ssh_identity_remove")
+        XCTAssertEqual(
+            (removedValue["params"] as? [String: Any])?["resource_id"] as? String,
+            "fixture-identity")
+    }
+
     func testSshConfigIntegrationRequestsAndStatusMatchRustWireShape() throws {
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase

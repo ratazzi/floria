@@ -6,7 +6,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use accessfs_catalog::{
-    Catalog, CatalogSnapshot, ResourceSource, Surface, SurfaceKind,
+    Catalog, CatalogSnapshot, ResourceKind, ResourceSource, Surface, SurfaceKind,
 };
 use accessfs_control::{
     CatalogObserver, ControlClient, ControlCommand, ControlResult, ControlRuntimeServices,
@@ -387,6 +387,8 @@ fn cmd_mount(config: &Path) -> Result<()> {
     agent.replace_managed_enforcement(managed_enforcement(&snapshot, &store.list()?));
     let audit = Arc::new(AuditLog::open(&cfg.audit_log).context("opening shared audit log")?);
     let ssh_authorizer: Arc<dyn Authorizer> = agent.clone();
+    let managed_keys: Arc<dyn accessfs_agent::ManagedKeyReader> =
+        Arc::new(StoreManagedKeyReader { store: Arc::clone(&store) });
     let generated_ssh_config = support_dir.join("ssh/config");
     let ssh_runtime = Arc::new(
         accessfs_agent::SshAgentRuntime::new(
@@ -394,6 +396,7 @@ fn cmd_mount(config: &Path) -> Result<()> {
             &generated_ssh_config,
             ssh_authorizer,
             Arc::clone(&audit),
+            managed_keys,
         )
         .context("creating SSH agent runtime")?,
     );
@@ -441,6 +444,21 @@ struct AgentPolicyController {
 }
 
 struct AgentSshIdentityDiscovery;
+
+struct StoreManagedKeyReader {
+    store: Arc<dyn SecretStore>,
+}
+
+impl accessfs_agent::ManagedKeyReader for StoreManagedKeyReader {
+    fn read_private_key(&self, secret_id: &str) -> std::io::Result<zeroize::Zeroizing<Vec<u8>>> {
+        let id = secret_id
+            .parse::<SecretId>()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        self.store
+            .get(&id)
+            .map_err(std::io::Error::other)
+    }
+}
 
 impl SshIdentityDiscovery for AgentSshIdentityDiscovery {
     fn discover(&self, endpoint: &Path) -> std::io::Result<Vec<SshIdentity>> {
@@ -518,6 +536,9 @@ fn managed_enforcement(
     }
 
     for resource in &snapshot.resources {
+        if matches!(resource.kind, ResourceKind::SshIdentity | ResourceKind::SshAgent) {
+            paths.insert(format!("resources/{}", resource.id), resource.enforcement);
+        }
         let ResourceSource::SecretRef { secret_id } = &resource.source else { continue };
         let path = format!("{SECRETS_DIR}/{secret_id}");
         paths
@@ -655,6 +676,9 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
         }
         ControlResult::SshAgentIdentities(identities) => {
             println!("{}", serde_json::to_string_pretty(&identities)?);
+        }
+        ControlResult::SshIdentityCreated { resource } => {
+            println!("created managed SSH identity {}", resource.id);
         }
         ControlResult::SshConfig(status) => {
             println!("{}", serde_json::to_string_pretty(&status)?);
@@ -833,10 +857,22 @@ mod tests {
         let audit_id = "00000000-0000-0000-0000-000000000201";
         let biometric_id = "00000000-0000-0000-0000-000000000202";
         let protected_id = "00000000-0000-0000-0000-000000000203";
+        let ssh_id = "00000000-0000-0000-0000-000000000204";
+        let mut ssh_identity = resource("managed-ssh", ssh_id, Enforcement::Prompt);
+        ssh_identity.kind = ResourceKind::SshIdentity;
+        ssh_identity.shape = ValueShape::SshIdentity;
+        ssh_identity.default_env_key = None;
+        ssh_identity.entries = vec![EntrySpec {
+            address: "ssh/sha256/fixture-managed-identity".to_string(),
+            label: "Managed SSH identity".to_string(),
+            key: None,
+            sensitive: false,
+        }];
         let snapshot = CatalogSnapshot {
             resources: vec![
                 resource("audit", audit_id, Enforcement::Allow),
                 resource("biometric", biometric_id, Enforcement::TouchId),
+                ssh_identity,
             ],
             bindings: vec![
                 binding("audit-binding", "audit"),
@@ -881,5 +917,6 @@ mod tests {
             levels[&format!("{SURFACES_DIR}/combined")],
             Enforcement::Allow
         );
+        assert_eq!(levels["resources/managed-ssh"], Enforcement::Prompt);
     }
 }

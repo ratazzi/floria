@@ -216,6 +216,22 @@ final class WorkspaceModelTests: XCTestCase {
             input: .sshAgent([binding.id], route))
         XCTAssertEqual(routed.bindingIDs, [binding.id])
         XCTAssertEqual(routed.sshRoute?.hostPatterns, ["ec2-*", "bastion"])
+
+        let managed = WorkspaceResource(
+            id: "fixture-managed", name: "Fixture managed identity", kind: .sshIdentity,
+            shape: .sshIdentity, exports: [],
+            entries: [
+                WorkspaceEntry(
+                    address: "ssh/sha256/fixture-managed-address", label: "Managed fleet key",
+                    key: nil, sensitive: false)
+            ], usageCount: 0)
+        let managedBinding = WorkspaceBinding(
+            id: "fixture-managed-binding", resourceID: managed.id, keyOverride: nil,
+            isEnabled: true)
+        let managedStore = WorkspaceStore(projects: [], resources: [managed])
+        XCTAssertTrue(managedStore.bindingIsCompatible(managedBinding, with: .unixSocket))
+        XCTAssertEqual(managedStore.sshIdentityProviders.map(\.id), [managed.id])
+        XCTAssertEqual(managed.exportSummary, "1 identity")
     }
 
     func testSshAgentRuntimeSocketPathMatchesDaemonAndFitsMacOSAddress() {

@@ -10,6 +10,7 @@ use accessfs_catalog::{
     ResourceKind, ResourceSource, ValueShape,
 };
 use accessfs_core::authz::{Enforcement, PolicyMode, PolicyModeStatus};
+use accessfs_ssh::ManagedKeyError;
 use accessfs_store::{NewSecret, SecretId, SecretOrigin, SecretRecord, SecretStore, StoreError};
 use accessfs_surface::{decode_source, validate_secret_bytes};
 
@@ -265,6 +266,8 @@ fn changes_runtime(command: &ControlCommand) -> bool {
             | ControlCommand::SharedSecretCreate { .. }
             | ControlCommand::SharedSecretUpdate { .. }
             | ControlCommand::SharedSecretRemove { .. }
+            | ControlCommand::SshIdentityImport { .. }
+            | ControlCommand::SshIdentityRemove { .. }
             | ControlCommand::EnvFileCreate { .. }
             | ControlCommand::ResourceMetadataUpdate { .. }
             | ControlCommand::FileProtect { .. }
@@ -285,6 +288,7 @@ fn notify_observer(catalog: &Catalog, observer: Option<&dyn CatalogObserver>) {
 enum DispatchError {
     Catalog(CatalogError),
     Store(StoreError),
+    SshKey(ManagedKeyError),
     Io { path: PathBuf, source: io::Error },
     Policy(io::Error),
     SshConfig(io::Error),
@@ -302,6 +306,10 @@ impl DispatchError {
         match self {
             DispatchError::Catalog(error) => ControlErrorBody::from(error),
             DispatchError::Store(error) => ControlErrorBody::from(error),
+            DispatchError::SshKey(error) => ControlErrorBody {
+                code: "ssh_key".to_string(),
+                message: error.to_string(),
+            },
             DispatchError::Io { path, source } => ControlErrorBody {
                 code: "io".to_string(),
                 message: format!("I/O error on {}: {source}", path.display()),
@@ -343,6 +351,12 @@ impl From<CatalogError> for DispatchError {
 impl From<StoreError> for DispatchError {
     fn from(error: StoreError) -> Self {
         DispatchError::Store(error)
+    }
+}
+
+impl From<ManagedKeyError> for DispatchError {
+    fn from(error: ManagedKeyError) -> Self {
+        DispatchError::SshKey(error)
     }
 }
 
@@ -394,6 +408,27 @@ fn dispatch(
                 .map(ControlResult::SshAgentIdentities)
                 .map_err(|source| DispatchError::Io { path: endpoint, source })
         }
+        ControlCommand::SshIdentityImport {
+            resource_id,
+            name,
+            path,
+            passphrase,
+            enforcement,
+            metadata,
+        } => import_ssh_identity(
+            catalog,
+            store.ok_or(DispatchError::StoreUnavailable)?,
+            resource_id,
+            name,
+            &path,
+            passphrase.as_ref(),
+            ManagedItemSettings { enforcement, metadata },
+        ),
+        ControlCommand::SshIdentityRemove { resource_id } => remove_ssh_identity(
+            catalog,
+            store.ok_or(DispatchError::StoreUnavailable)?,
+            resource_id,
+        ),
         ControlCommand::SshConfigStatus => ssh_config
             .ok_or_else(|| {
                 DispatchError::Validation(
@@ -990,6 +1025,114 @@ fn rollback_project_create(catalog: &Catalog, project_id: &str) {
     }
 }
 
+fn import_ssh_identity(
+    catalog: &Catalog,
+    store: &dyn SecretStore,
+    resource_id: String,
+    name: String,
+    path: &Path,
+    passphrase: Option<&crate::protocol::SecretValue>,
+    settings: ManagedItemSettings,
+) -> Result<ControlResult, DispatchError> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(DispatchError::Validation(
+            "SSH identity name cannot be empty".to_string(),
+        ));
+    }
+    if !path.is_absolute() {
+        return Err(DispatchError::Validation(format!(
+            "SSH private key path {} must be absolute",
+            path.display()
+        )));
+    }
+    accessfs_core::config::check_secure_perms(path)
+        .map_err(|error| DispatchError::Validation(error.to_string()))?;
+    let encoded = zeroize::Zeroizing::new(
+        std::fs::read(path).map_err(|source| DispatchError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?,
+    );
+    let imported = accessfs_ssh::import_private_key(
+        &encoded,
+        passphrase.map(crate::protocol::SecretValue::as_bytes),
+    )?;
+    let ManagedItemSettings { enforcement, metadata } = settings;
+    let mut resource = Resource {
+        id: resource_id,
+        name: name.clone(),
+        kind: ResourceKind::SshIdentity,
+        shape: ValueShape::SshIdentity,
+        codec: ResourceCodec::Opaque,
+        default_env_key: None,
+        entries: vec![EntrySpec {
+            address: imported.identity.address.clone(),
+            label: name.clone(),
+            key: None,
+            sensitive: false,
+        }],
+        source: ResourceSource::SecretRef {
+            secret_id: "pending-managed-private-key".to_string(),
+        },
+        enforcement,
+        metadata,
+    };
+    catalog.validate_resource(&resource)?;
+    match catalog.resource(&resource.id) {
+        Ok(_) => {
+            return Err(DispatchError::Catalog(CatalogError::AlreadyExists {
+                kind: "resource",
+                id: resource.id.clone(),
+            }))
+        }
+        Err(CatalogError::NotFound(_)) => {}
+        Err(error) => return Err(DispatchError::Catalog(error)),
+    }
+
+    let secret_id = store.put(NewSecret::managed(name), imported.as_bytes())?;
+    resource.source = ResourceSource::SecretRef { secret_id: secret_id.to_string() };
+    if let Err(error) = catalog.create_resource(&resource) {
+        if let Err(cleanup_error) = store.delete(&secret_id) {
+            tracing::warn!(%secret_id, %cleanup_error, "cleaning up unreferenced SSH private key failed");
+        }
+        return Err(DispatchError::Catalog(error));
+    }
+    Ok(ControlResult::SshIdentityCreated { resource })
+}
+
+fn remove_ssh_identity(
+    catalog: &Catalog,
+    store: &dyn SecretStore,
+    resource_id: String,
+) -> Result<ControlResult, DispatchError> {
+    let resource = catalog.resource(&resource_id)?;
+    if resource.kind != ResourceKind::SshIdentity {
+        return Err(DispatchError::Validation(format!(
+            "resource {resource_id:?} is not a managed SSH identity"
+        )));
+    }
+    let ResourceSource::SecretRef { secret_id } = &resource.source else {
+        return Err(DispatchError::Validation(format!(
+            "resource {resource_id:?} does not reference a stored private key"
+        )));
+    };
+    let secret_id: SecretId = secret_id.parse()?;
+    catalog.remove_resource(&resource_id)?;
+    if let Err(error) = store.delete(&secret_id) {
+        if let Err(restore_error) = catalog.create_resource(&resource) {
+            tracing::error!(
+                %resource_id,
+                %error,
+                %restore_error,
+                "SSH identity storage deletion failed and catalog rollback also failed"
+            );
+        }
+        return Err(DispatchError::Store(error));
+    }
+    Ok(ControlResult::Empty)
+}
+
 fn create_shared_secret(
     catalog: &Catalog,
     store: &dyn SecretStore,
@@ -1174,6 +1317,9 @@ fn validate_snapshot_values(
     let Some(store) = store else { return Ok(()) };
     let mut validated = std::collections::HashSet::new();
     for resource in &snapshot.resources {
+        if resource.kind == ResourceKind::SshIdentity {
+            continue;
+        }
         let ResourceSource::SecretRef { secret_id } = &resource.source else { continue };
         if !validated.insert(secret_id) {
             continue;
@@ -1353,7 +1499,10 @@ mod tests {
             if let SecretOrigin::Managed { label } = &meta.origin {
                 assert!(matches!(
                     label.as_str(),
-                    "Fixture Shared Secret" | "Fixture Env File" | "Fixture INI File"
+                    "Fixture Shared Secret"
+                        | "Fixture Env File"
+                        | "Fixture INI File"
+                        | "Fixture SSH Identity"
                 ));
             }
             let id: SecretId = FIXTURE_SECRET_ID.parse().unwrap();
@@ -1592,6 +1741,79 @@ mod tests {
                 comment: endpoint.display().to_string(),
             }])
         );
+    }
+
+    #[test]
+    fn managed_ssh_identity_lifecycle_keeps_private_key_out_of_catalog() {
+        use ssh_key::rand_core::OsRng;
+        use ssh_key::{Algorithm, LineEnding, PrivateKey};
+
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("fixture-id_ed25519");
+        let private_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        std::fs::write(
+            &source_path,
+            private_key.to_openssh(LineEnding::LF).unwrap().as_bytes(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&source_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let socket = dir.path().join("control.sock");
+        let store = Arc::new(FixtureStore::new());
+        let observer = Arc::new(SnapshotObserver {
+            notifications: AtomicUsize::new(0),
+            latest: Mutex::new(None),
+        });
+        let _server = ControlServer::start_runtime(
+            &socket,
+            catalog.clone(),
+            Arc::clone(&store) as Arc<dyn SecretStore>,
+            dir.path().join("mount"),
+            Arc::clone(&observer) as Arc<dyn CatalogObserver>,
+        )
+        .unwrap();
+        let mut client = ControlClient::connect(&socket).unwrap();
+
+        let created = client
+            .request(ControlCommand::SshIdentityImport {
+                resource_id: "fixture-ssh-identity".to_string(),
+                name: "Fixture SSH Identity".to_string(),
+                path: source_path,
+                passphrase: None,
+                enforcement: Enforcement::Prompt,
+                metadata: ItemMetadata::default(),
+            })
+            .unwrap();
+        let ControlResult::SshIdentityCreated { resource } = created else {
+            panic!("expected managed SSH identity result");
+        };
+        assert_eq!(resource.kind, ResourceKind::SshIdentity);
+        assert_eq!(resource.shape, ValueShape::SshIdentity);
+        assert_eq!(resource.entries.len(), 1);
+        assert!(resource.entries[0].address.starts_with("ssh/sha256/"));
+        assert_eq!(
+            resource.source,
+            ResourceSource::SecretRef { secret_id: FIXTURE_SECRET_ID.to_string() }
+        );
+        let catalog_json = serde_json::to_string(&catalog.snapshot().unwrap()).unwrap();
+        assert!(!catalog_json.contains("OPENSSH PRIVATE KEY"));
+        let stored = store.get(&FIXTURE_SECRET_ID.parse().unwrap()).unwrap();
+        let stored_identity = accessfs_ssh::identity_from_private_key(&stored).unwrap();
+        assert_eq!(stored_identity.address, resource.entries[0].address);
+        assert_eq!(observer.notifications.load(Ordering::Relaxed), 1);
+
+        assert_eq!(
+            client
+                .request(ControlCommand::SshIdentityRemove {
+                    resource_id: resource.id,
+                })
+                .unwrap(),
+            ControlResult::Empty
+        );
+        assert!(catalog.snapshot().unwrap().resources.is_empty());
+        assert!(store.record(&FIXTURE_SECRET_ID.parse().unwrap()).unwrap().is_none());
+        assert_eq!(observer.notifications.load(Ordering::Relaxed), 2);
     }
 
     #[test]

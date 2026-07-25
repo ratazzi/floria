@@ -8,6 +8,7 @@ license.workspace = true
 accessfs-core = { workspace = true }
 accessfs-platform = { workspace = true }
 accessfs-catalog = { workspace = true }
+accessfs-ssh = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 dashmap = { workspace = true }
@@ -17,6 +18,10 @@ chrono = { workspace = true }
 sha2 = { workspace = true }
 base64 = { workspace = true }
 threadpool = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+signature = { workspace = true }
+ssh-key = { workspace = true }
+rsa = { workspace = true }

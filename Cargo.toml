@@ -34,6 +34,9 @@ age = { version = "0.10", features = ["ssh"] }
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 rusqlite = { version = "0.40", features = ["bundled"] }
+signature = "2"
+rsa = "0.9.10"
+ssh-key = { version = "0.6.7", features = ["ed25519", "encryption", "getrandom", "rsa"] }
 
 accessfs-core = { path = "crates/accessfs-core" }
 accessfs-platform = { path = "crates/accessfs-platform" }
@@ -43,3 +46,4 @@ accessfs-store = { path = "crates/accessfs-store" }
 accessfs-catalog = { path = "crates/accessfs-catalog" }
 accessfs-control = { path = "crates/accessfs-control" }
 accessfs-surface = { path = "crates/accessfs-surface" }
+accessfs-ssh = { path = "crates/accessfs-ssh" }

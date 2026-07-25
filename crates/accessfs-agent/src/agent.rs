@@ -107,6 +107,16 @@ impl SocketAgent {
         }
     }
 
+    fn request_enforcement(&self, request: &AuthRequest<'_>) -> Option<Enforcement> {
+        if let Some(accessfs_core::authz::AccessContext::SshSign(context)) = request.context {
+            let resource_path = format!("resources/{}", context.resource_id);
+            if let Some(enforcement) = self.managed_enforcement(&resource_path) {
+                return Some(enforcement);
+            }
+        }
+        self.managed_enforcement(request.path)
+    }
+
     fn handle_prompt(
         &self,
         req: &AuthRequest,
@@ -183,7 +193,7 @@ impl Authorizer for SocketAgent {
             self.rules
                 .decide(req.identity, req.path, repo.as_deref(), req.operation);
         if matches!(rule_id.as_deref(), Some("secrets-default" | "surfaces-default")) {
-            if let Some(level) = self.managed_enforcement(req.path) {
+            if let Some(level) = self.request_enforcement(req) {
                 enforcement = level;
                 rule_id = Some(format!("security-level:{}", level.as_str()));
             }
@@ -444,6 +454,46 @@ mod tests {
 
         let id = ProcessIdentity::bare(1234, 501, 20);
         let decision = agent.authorize(&req(&id, Operation::Read));
+        assert!(decision.is_allowed());
+        assert_eq!(decision.rule_id.as_deref(), Some("security-level:allow"));
+    }
+
+    #[test]
+    fn ssh_identity_security_level_is_resolved_per_signing_resource() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = agent_with_rules(
+            tmp.path(),
+            vec![Rule {
+                id: "surfaces-default".into(),
+                priority: 0,
+                subject: SubjectMatch::default(),
+                path_glob: any_path_glob(),
+                ops: RuleOps::SIGN,
+                enforcement: Enforcement::Prompt,
+                enabled: true,
+            }],
+        );
+        agent.replace_managed_enforcement(HashMap::from([
+            ("surfaces/fixture-agent".to_string(), Enforcement::TouchId),
+            ("resources/fixture-managed-key".to_string(), Enforcement::Allow),
+        ]));
+        let identity = ProcessIdentity::bare(1234, 501, 20);
+        let context = SshSignContext {
+            surface_id: "fixture-agent",
+            surface_name: "Fixture Agent",
+            resource_id: "fixture-managed-key",
+            key_fingerprint: "SHA256:fixture-managed",
+            key_label: "Managed key",
+            requested_destination: None,
+        };
+        let decision = agent.authorize(&AuthRequest {
+            path: "surfaces/fixture-agent",
+            display: Some("Fixture Agent"),
+            operation: Operation::Sign,
+            context: Some(AccessContext::SshSign(context)),
+            identity: &identity,
+        });
+
         assert!(decision.is_allowed());
         assert_eq!(decision.rule_id.as_deref(), Some("security-level:allow"));
     }

@@ -28,7 +28,7 @@ use accessfs_core::config::{ResolvedConfig, SECRETS_DIR, SURFACES_DIR};
 use accessfs_core::handler::{ContentHandler, HandlerCtx};
 use accessfs_core::snapshot::content_version_of;
 use accessfs_core::writebuf::{WriteBufTable, WriteErr};
-use accessfs_store::{SecretId, SecretStore};
+use accessfs_store::{SecretId, SecretRecord, SecretStore};
 use accessfs_surface::{
     validate_secret_bytes, RegisteredSurface, SurfaceBacking, SurfaceError, SurfaceRegistry,
     SurfaceResolver, DIRENV_MAX_SIZE, DOTENV_MAX_SIZE, INI_MAX_SIZE, LINES_MAX_SIZE,
@@ -264,6 +264,9 @@ impl Shared {
         let ns = self.secrets.as_ref()?;
         let sid: SecretId = id.parse().ok()?;
         let rec = ns.store.record(&sid).ok().flatten()?;
+        if !exposed_as_raw_secret(&rec) {
+            return None;
+        }
         Some(file_attr(
             ino,
             rec.size,
@@ -323,10 +326,13 @@ impl Shared {
             if let Some(id) = ns.id_for_ino(ino) {
                 let sid: SecretId = id.parse().map_err(|_| Errno::ENOENT)?;
                 // Confirm it still exists (may have been deleted since lookup).
-                ns.store
+                let record = ns.store
                     .record(&sid)
                     .map_err(|_| errno(libc::EIO))?
                     .ok_or(Errno::ENOENT)?;
+                if !exposed_as_raw_secret(&record) {
+                    return Err(Errno::ENOENT);
+                }
                 return Ok(OpenTarget {
                     virtual_path: format!("{SECRETS_DIR}/{id}"),
                     display: self.secret_display(&id),
@@ -953,6 +959,12 @@ fn errno(code: i32) -> Errno {
     Errno::from_i32(code)
 }
 
+/// Only user-protected files are addressable through `secrets/<id>`. Managed values (shared
+/// secrets, env documents, SSH private keys) stay behind their typed surface or capability.
+fn exposed_as_raw_secret(record: &SecretRecord) -> bool {
+    record.source_path().is_some()
+}
+
 /// What to do with a `setattr` request.
 #[derive(Debug, PartialEq, Eq)]
 enum SetattrPlan {
@@ -1020,7 +1032,7 @@ impl fuser::Filesystem for AccessFs {
                     .ok()
                     .and_then(|sid| ns.store.record(&sid).ok().flatten())
                 {
-                    Some(rec) => {
+                    Some(rec) if exposed_as_raw_secret(&rec) => {
                         let ino = ns.ino_for(name);
                         let attr = file_attr(
                             ino,
@@ -1032,7 +1044,7 @@ impl fuser::Filesystem for AccessFs {
                         );
                         reply.entry(&TTL, &attr, fuser::Generation(0));
                     }
-                    None => reply.error(Errno::ENOENT),
+                    Some(_) | None => reply.error(Errno::ENOENT),
                 }
                 return;
             }
@@ -1151,7 +1163,13 @@ impl fuser::Filesystem for AccessFs {
                     (ino.0, FileType::Directory, ".".to_string()),
                     (node.parent, FileType::Directory, "..".to_string()),
                 ];
-                for r in ns.store.list().unwrap_or_default() {
+                for r in ns
+                    .store
+                    .list()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(exposed_as_raw_secret)
+                {
                     let id = r.id.to_string();
                     let cino = ns.ino_for(&id);
                     entries.push((cino, FileType::RegularFile, id));
@@ -1614,12 +1632,33 @@ mod tests {
     use accessfs_catalog::{CatalogSnapshot, Surface, SurfaceInput, SurfaceKind};
     use accessfs_core::authz::AllowAll;
     use accessfs_core::identity::ProcessIdentity;
-    use accessfs_store::{NewSecret, SecretRecord, StoreResult, VersionRecord};
-    use std::path::Path;
+    use accessfs_store::{NewSecret, SecretOrigin, SecretRecord, StoreResult, VersionRecord};
+    use std::path::{Path, PathBuf};
     use std::sync::mpsc;
     use std::sync::Mutex;
     use std::time::Duration;
     use zeroize::Zeroizing;
+
+    #[test]
+    fn raw_secret_namespace_exposes_only_file_origin_records() {
+        let record = |origin| SecretRecord {
+            id: "00000000-0000-0000-0000-000000000301".parse().unwrap(),
+            origin,
+            mode: 0o600,
+            size: 32,
+            created: "fixture-time".to_string(),
+            current_version: 1,
+            enforcement: accessfs_core::authz::Enforcement::Prompt,
+            metadata: Default::default(),
+        };
+
+        assert!(exposed_as_raw_secret(&record(SecretOrigin::File {
+            source_path: PathBuf::from("/fixture/protected.env"),
+        })));
+        assert!(!exposed_as_raw_secret(&record(SecretOrigin::Managed {
+            label: "Fixture managed value".to_string(),
+        })));
+    }
 
     #[test]
     fn plan_setattr_refuses_every_mutation_without_a_write_fd() {

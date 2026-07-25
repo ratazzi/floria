@@ -11,4 +11,6 @@ mod ssh_agent;
 pub mod socket;
 
 pub use agent::SocketAgent;
-pub use ssh_agent::{discover_identities, DiscoveredSshIdentity, SshAgentRuntime};
+pub use ssh_agent::{
+    discover_identities, DiscoveredSshIdentity, ManagedKeyReader, SshAgentRuntime,
+};

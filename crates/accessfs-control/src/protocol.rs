@@ -58,6 +58,15 @@ pub enum ControlCommand {
     PolicyModeSet { mode: PolicyMode, duration_secs: Option<u64> },
     Snapshot,
     SshAgentDiscover { endpoint: PathBuf },
+    SshIdentityImport {
+        resource_id: String,
+        name: String,
+        path: PathBuf,
+        passphrase: Option<SecretValue>,
+        enforcement: Enforcement,
+        metadata: ItemMetadata,
+    },
+    SshIdentityRemove { resource_id: String },
     SshConfigStatus,
     SshConfigInstall,
     SshConfigRemove,
@@ -139,6 +148,7 @@ pub enum ControlResult {
     PolicyMode(PolicyModeStatus),
     Snapshot(CatalogSnapshot),
     SshAgentIdentities(Vec<SshIdentity>),
+    SshIdentityCreated { resource: Resource },
     SshConfig(SshConfigStatus),
     ProtectedFiles(Vec<ProtectedFile>),
     FileProtected { file: ProtectedFile, created: bool },
@@ -340,6 +350,28 @@ mod tests {
 
         assert_eq!(value["method"], "ssh_agent_discover");
         assert_eq!(value["params"]["endpoint"], "/private/tmp/fixture-agent.sock");
+    }
+
+    #[test]
+    fn ssh_identity_import_carries_a_path_and_redacted_passphrase_type() {
+        let request = ControlRequest {
+            request_id: 11,
+            command: ControlCommand::SshIdentityImport {
+                resource_id: "fixture-identity".to_string(),
+                name: "Fixture identity".to_string(),
+                path: PathBuf::from("/private/tmp/fixture-id_ed25519"),
+                passphrase: Some(SecretValue::new("fixture passphrase")),
+                enforcement: Enforcement::Prompt,
+                metadata: ItemMetadata::default(),
+            },
+        };
+        assert!(format!("{request:?}").contains("SecretValue([REDACTED])"));
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["method"], "ssh_identity_import");
+        assert_eq!(value["params"]["path"], "/private/tmp/fixture-id_ed25519");
+        assert_eq!(value["params"]["passphrase"], "fixture passphrase");
+        assert!(value["params"].get("private_key").is_none());
     }
 
     #[test]

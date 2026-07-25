@@ -28,6 +28,7 @@ use accessfs_core::identity::ProcessIdentity;
 use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 const MAX_AGENT_FRAME: usize = 1 << 20;
 const DOWNSTREAM_POLL: Duration = Duration::from_secs(1);
@@ -50,6 +51,12 @@ pub struct DiscoveredSshIdentity {
     pub address: String,
     pub fingerprint: String,
     pub comment: String,
+}
+
+/// The only storage capability needed by managed SSH identities. The runtime deliberately has no
+/// access to catalog mutation, secret enumeration, or version history.
+pub trait ManagedKeyReader: Send + Sync + 'static {
+    fn read_private_key(&self, secret_id: &str) -> io::Result<Zeroizing<Vec<u8>>>;
 }
 
 /// Query one upstream agent without changing it. This is the discovery seam used by the control
@@ -81,6 +88,7 @@ pub struct SshAgentRuntime {
     config_path: PathBuf,
     authorizer: Arc<dyn Authorizer>,
     audit: Arc<AuditLog>,
+    managed_keys: Arc<dyn ManagedKeyReader>,
     connections: Arc<threadpool::ThreadPool>,
     running: Mutex<HashMap<String, RunningSurface>>,
 }
@@ -91,6 +99,7 @@ impl SshAgentRuntime {
         config_path: impl Into<PathBuf>,
         authorizer: Arc<dyn Authorizer>,
         audit: Arc<AuditLog>,
+        managed_keys: Arc<dyn ManagedKeyReader>,
     ) -> io::Result<Self> {
         let runtime_dir = runtime_dir.into();
         let config_path = config_path.into();
@@ -101,6 +110,7 @@ impl SshAgentRuntime {
             config_path,
             authorizer,
             audit,
+            managed_keys,
             connections: Arc::new(threadpool::ThreadPool::new(CONNECTION_THREADS)),
             running: Mutex::new(HashMap::new()),
         })
@@ -146,6 +156,7 @@ impl SshAgentRuntime {
                 Arc::clone(&self.authorizer),
                 Arc::clone(&self.audit),
                 Arc::clone(&self.connections),
+                Arc::clone(&self.managed_keys),
             ) {
                 Ok(server) => {
                     tracing::info!(surface = %server.spec.id, socket = %server.spec.socket_path.display(), "SSH agent surface listening");
@@ -195,9 +206,24 @@ struct SurfaceSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ProviderSpec {
-    resource_id: String,
-    endpoint: PathBuf,
+enum ProviderSpec {
+    ManagedPrivateKey {
+        resource_id: String,
+        secret_id: String,
+    },
+    ExternalAgent {
+        resource_id: String,
+        endpoint: PathBuf,
+    },
+}
+
+impl ProviderSpec {
+    fn resource_id(&self) -> &str {
+        match self {
+            ProviderSpec::ManagedPrivateKey { resource_id, .. }
+            | ProviderSpec::ExternalAgent { resource_id, .. } => resource_id,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,21 +280,20 @@ fn compile_surface_specs(
             let resource = resources
                 .get(binding.resource_id.as_str())
                 .ok_or_else(|| invalid(format!("missing resource {:?}", binding.resource_id)))?;
-            let endpoint = ssh_agent_endpoint(resource)?;
-            if endpoint == socket_path || endpoint == surface.path {
-                return Err(invalid(format!(
-                    "SSH agent resource {:?} points back to surface {:?}",
-                    resource.id, surface.id
-                )));
+            let provider = ssh_provider(resource)?;
+            if let ProviderSpec::ExternalAgent { endpoint, .. } = &provider {
+                if endpoint == &socket_path || endpoint == &surface.path {
+                    return Err(invalid(format!(
+                        "SSH agent resource {:?} points back to surface {:?}",
+                        resource.id, surface.id
+                    )));
+                }
             }
             let provider_index = match provider_indexes.get(resource.id.as_str()).copied() {
                 Some(index) => index,
                 None => {
                     let index = providers.len();
-                    providers.push(ProviderSpec {
-                        resource_id: resource.id.clone(),
-                        endpoint: endpoint.to_path_buf(),
-                    });
+                    providers.push(provider);
                     provider_indexes.insert(resource.id.as_str(), index);
                     index
                 }
@@ -363,20 +388,29 @@ fn ssh_config_quote(value: &Path) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\""))
 }
 
-fn ssh_agent_endpoint(resource: &Resource) -> io::Result<&Path> {
-    let ResourceSource::Socket { endpoint } = &resource.source else {
-        return Err(invalid(format!(
-            "SSH agent resource {:?} has no socket endpoint",
+fn ssh_provider(resource: &Resource) -> io::Result<ProviderSpec> {
+    match (&resource.kind, &resource.shape, &resource.source) {
+        (
+            ResourceKind::SshIdentity,
+            ValueShape::SshIdentity,
+            ResourceSource::SecretRef { secret_id },
+        ) => Ok(ProviderSpec::ManagedPrivateKey {
+            resource_id: resource.id.clone(),
+            secret_id: secret_id.clone(),
+        }),
+        (
+            ResourceKind::SshAgent,
+            ValueShape::Socket,
+            ResourceSource::Socket { endpoint },
+        ) => Ok(ProviderSpec::ExternalAgent {
+            resource_id: resource.id.clone(),
+            endpoint: endpoint.clone(),
+        }),
+        _ => Err(invalid(format!(
+            "resource {:?} is not an SSH identity provider",
             resource.id
-        )));
-    };
-    if resource.kind != ResourceKind::SshAgent || resource.shape != ValueShape::Socket {
-        return Err(invalid(format!(
-            "resource {:?} is not an SSH agent",
-            resource.id
-        )));
+        ))),
     }
-    Ok(endpoint)
 }
 
 fn selected_entries<'a>(
@@ -406,6 +440,7 @@ impl RunningSurface {
         authorizer: Arc<dyn Authorizer>,
         audit: Arc<AuditLog>,
         connections: Arc<threadpool::ThreadPool>,
+        managed_keys: Arc<dyn ManagedKeyReader>,
     ) -> io::Result<Self> {
         remove_stale_socket(&spec.socket_path)?;
         let listener = UnixListener::bind(&spec.socket_path)?;
@@ -422,7 +457,15 @@ impl RunningSurface {
         let thread = std::thread::Builder::new()
             .name(format!("accessfs-ssh-agent-{}", spec.id))
             .spawn(move || {
-                accept_loop(listener, loop_spec, authorizer, audit, connections, loop_stop)
+                accept_loop(
+                    listener,
+                    loop_spec,
+                    authorizer,
+                    audit,
+                    connections,
+                    managed_keys,
+                    loop_stop,
+                )
             })?;
 
         Ok(RunningSurface {
@@ -452,6 +495,7 @@ fn accept_loop(
     authorizer: Arc<dyn Authorizer>,
     audit: Arc<AuditLog>,
     connections: Arc<threadpool::ThreadPool>,
+    managed_keys: Arc<dyn ManagedKeyReader>,
     stop: Arc<AtomicBool>,
 ) {
     while !stop.load(Ordering::Acquire) {
@@ -468,6 +512,7 @@ fn accept_loop(
                 let connection_authorizer = Arc::clone(&authorizer);
                 let connection_audit = Arc::clone(&audit);
                 let connection_stop = Arc::clone(&stop);
+                let connection_managed_keys = Arc::clone(&managed_keys);
                 connections.execute(move || {
                     if let Err(error) = serve_connection(
                         stream,
@@ -475,6 +520,7 @@ fn accept_loop(
                         identity,
                         connection_authorizer,
                         connection_audit,
+                        connection_managed_keys,
                         connection_stop,
                     ) {
                         tracing::debug!(%error, "SSH agent connection closed");
@@ -532,12 +578,16 @@ fn peer_pid(_stream: &UnixStream) -> Option<i32> {
 struct ProviderSession {
     spec: ProviderSpec,
     stream: Option<UnixStream>,
+    managed_keys: Arc<dyn ManagedKeyReader>,
 }
 
 impl ProviderSession {
-    fn round_trip(&mut self, request: &[u8]) -> io::Result<Vec<u8>> {
+    fn external_round_trip(&mut self, request: &[u8]) -> io::Result<Vec<u8>> {
+        let ProviderSpec::ExternalAgent { endpoint, .. } = &self.spec else {
+            return Err(invalid("managed SSH key has no upstream agent"));
+        };
         if self.stream.is_none() {
-            let stream = UnixStream::connect(&self.spec.endpoint)?;
+            let stream = UnixStream::connect(endpoint)?;
             stream.set_read_timeout(Some(UPSTREAM_TIMEOUT))?;
             stream.set_write_timeout(Some(UPSTREAM_TIMEOUT))?;
             self.stream = Some(stream);
@@ -555,6 +605,43 @@ impl ProviderSession {
             }
         }
     }
+
+    fn identities(&mut self) -> io::Result<HashMap<String, ParsedIdentity>> {
+        match &self.spec {
+            ProviderSpec::ManagedPrivateKey { secret_id, .. } => {
+                let encoded = self.managed_keys.read_private_key(secret_id)?;
+                let identity = accessfs_ssh::identity_from_private_key(&encoded)
+                    .map_err(|error| invalid(error.to_string()))?;
+                Ok([(
+                    identity.address,
+                    ParsedIdentity {
+                        key_blob: identity.key_blob,
+                        fingerprint: identity.fingerprint,
+                    },
+                )]
+                .into_iter()
+                .collect())
+            }
+            ProviderSpec::ExternalAgent { .. } => {
+                let response = self.external_round_trip(&[SSH_AGENTC_REQUEST_IDENTITIES])?;
+                parse_identities_answer(&response)
+            }
+        }
+    }
+
+    fn sign(&mut self, request: &[u8], parsed: &ParsedSignRequest<'_>) -> io::Result<Vec<u8>> {
+        match &self.spec {
+            ProviderSpec::ManagedPrivateKey { secret_id, .. } => {
+                let encoded = self.managed_keys.read_private_key(secret_id)?;
+                let signature = accessfs_ssh::sign(&encoded, parsed.data, parsed.flags)
+                    .map_err(|error| invalid(error.to_string()))?;
+                let mut response = vec![SSH_AGENT_SIGN_RESPONSE];
+                put_string(&mut response, &signature);
+                Ok(response)
+            }
+            ProviderSpec::ExternalAgent { .. } => self.external_round_trip(request),
+        }
+    }
 }
 
 struct AvailableIdentity {
@@ -570,6 +657,7 @@ fn serve_connection(
     identity: ProcessIdentity,
     authorizer: Arc<dyn Authorizer>,
     audit: Arc<AuditLog>,
+    managed_keys: Arc<dyn ManagedKeyReader>,
     stop: Arc<AtomicBool>,
 ) -> io::Result<()> {
     downstream.set_read_timeout(Some(DOWNSTREAM_POLL))?;
@@ -578,7 +666,11 @@ fn serve_connection(
         .providers
         .iter()
         .cloned()
-        .map(|spec| ProviderSession { spec, stream: None })
+        .map(|spec| ProviderSession {
+            spec,
+            stream: None,
+            managed_keys: Arc::clone(&managed_keys),
+        })
         .collect::<Vec<_>>();
     let mut available = HashMap::<Vec<u8>, AvailableIdentity>::new();
 
@@ -625,8 +717,7 @@ fn refresh_identities(
 ) -> io::Result<Vec<u8>> {
     let mut upstream = Vec::<HashMap<String, ParsedIdentity>>::with_capacity(providers.len());
     for provider in providers.iter_mut() {
-        let response = provider.round_trip(&[SSH_AGENTC_REQUEST_IDENTITIES])?;
-        upstream.push(parse_identities_answer(&response)?);
+        upstream.push(provider.identities()?);
     }
 
     let mut answer = Vec::new();
@@ -647,7 +738,10 @@ fn refresh_identities(
                 selected.address
             )));
         }
-        let resource_id = providers[selected.provider_index].spec.resource_id.clone();
+        let resource_id = providers[selected.provider_index]
+            .spec
+            .resource_id()
+            .to_string();
         answer.push((parsed.key_blob.clone(), selected.label.as_bytes().to_vec()));
         available.insert(
             parsed.key_blob,
@@ -671,15 +765,15 @@ fn handle_sign(
     providers: &mut [ProviderSession],
     available: &mut HashMap<Vec<u8>, AvailableIdentity>,
 ) -> Vec<u8> {
-    let key_blob = match parse_sign_key(request) {
-        Ok(key_blob) => key_blob,
+    let parsed = match parse_sign_request(request) {
+        Ok(parsed) => parsed,
         Err(_) => return vec![SSH_AGENT_FAILURE],
     };
     if available.is_empty() && refresh_identities(spec, providers, available).is_err() {
         return vec![SSH_AGENT_FAILURE];
     }
-    let Some(selected) = available.get(key_blob) else {
-        let (_, fingerprint) = identity_names(key_blob);
+    let Some(selected) = available.get(parsed.key) else {
+        let (_, fingerprint) = identity_names(parsed.key);
         audit.log_ssh_sign(
             &format!("surfaces/{}", spec.id),
             identity,
@@ -731,7 +825,7 @@ fn handle_sign(
         return vec![SSH_AGENT_FAILURE];
     }
 
-    let (response, result) = match providers[selected.provider_index].round_trip(request) {
+    let (response, result) = match providers[selected.provider_index].sign(request, &parsed) {
         Ok(response) if response.first() == Some(&SSH_AGENT_SIGN_RESPONSE) => (response, "signed"),
         Ok(response) if response.first() == Some(&SSH_AGENT_FAILURE) => {
             (response, "upstream_refused")
@@ -851,16 +945,22 @@ fn decode_identities_answer(response: &[u8]) -> io::Result<Vec<DecodedIdentity>>
     Ok(identities)
 }
 
-fn parse_sign_key(request: &[u8]) -> io::Result<&[u8]> {
+struct ParsedSignRequest<'a> {
+    key: &'a [u8],
+    data: &'a [u8],
+    flags: u32,
+}
+
+fn parse_sign_request(request: &[u8]) -> io::Result<ParsedSignRequest<'_>> {
     let mut reader = WireReader::new(request);
     if reader.byte()? != SSH_AGENTC_SIGN_REQUEST {
         return Err(invalid("not an SSH sign request"));
     }
     let key = reader.string()?;
-    let _data = reader.string()?;
-    let _flags = reader.u32()?;
+    let data = reader.string()?;
+    let flags = reader.u32()?;
     reader.finish()?;
-    Ok(key)
+    Ok(ParsedSignRequest { key, data, flags })
 }
 
 fn identity_names(key_blob: &[u8]) -> (String, String) {
@@ -1071,6 +1171,31 @@ mod tests {
 
     const KEY_A: &[u8] = b"fixture-public-identity-a-v1";
     const KEY_B: &[u8] = b"fixture-public-identity-b-v1";
+
+    struct NoManagedKeys;
+
+    impl ManagedKeyReader for NoManagedKeys {
+        fn read_private_key(&self, _secret_id: &str) -> io::Result<Zeroizing<Vec<u8>>> {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "fixture has no managed keys",
+            ))
+        }
+    }
+
+    struct FixtureManagedKeys {
+        entries: HashMap<String, Vec<u8>>,
+    }
+
+    impl ManagedKeyReader for FixtureManagedKeys {
+        fn read_private_key(&self, secret_id: &str) -> io::Result<Zeroizing<Vec<u8>>> {
+            self.entries
+                .get(secret_id)
+                .cloned()
+                .map(Zeroizing::new)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "fixture key not found"))
+        }
+    }
 
     #[test]
     fn runtime_socket_path_fits_unix_socket_address_for_catalog_surface_ids() {
@@ -1299,6 +1424,37 @@ mod tests {
         }
     }
 
+    fn managed_snapshot(
+        project: &Path,
+        identity: &accessfs_ssh::PublicIdentity,
+    ) -> CatalogSnapshot {
+        let mut snapshot = snapshot(project, Path::new("/fixture/unused-external-agent.sock"));
+        snapshot.resources = vec![Resource {
+            id: "fixture-managed-identity".to_string(),
+            name: "Fixture managed identity".to_string(),
+            kind: ResourceKind::SshIdentity,
+            shape: ValueShape::SshIdentity,
+            codec: ResourceCodec::Opaque,
+            default_env_key: None,
+            entries: vec![EntrySpec {
+                address: identity.address.clone(),
+                label: "Managed fleet key".to_string(),
+                key: None,
+                sensitive: false,
+            }],
+            source: ResourceSource::SecretRef {
+                secret_id: "fixture-managed-key".to_string(),
+            },
+            enforcement: Enforcement::Prompt,
+            metadata: Default::default(),
+        }];
+        snapshot.bindings[0].resource_id = "fixture-managed-identity".to_string();
+        snapshot.bindings[0].selection = EntrySelection::Entries {
+            addresses: vec![identity.address.clone()],
+        };
+        snapshot
+    }
+
     fn sign_request(key: &[u8]) -> Vec<u8> {
         let mut request = vec![SSH_AGENTC_SIGN_REQUEST];
         put_string(&mut request, key);
@@ -1326,6 +1482,7 @@ mod tests {
             dir.path().join("ssh/config"),
             Arc::clone(&policy) as Arc<dyn Authorizer>,
             audit,
+            Arc::new(NoManagedKeys),
         )
         .unwrap();
         runtime.replace(&snapshot(&project, &upstream.path)).unwrap();
@@ -1398,5 +1555,154 @@ mod tests {
         drop(client);
         drop(runtime);
         assert!(!project.join("agent.sock").exists());
+    }
+
+    #[test]
+    fn managed_private_key_advertises_and_signs_without_an_upstream_agent() {
+        use ssh_key::rand_core::OsRng;
+        use ssh_key::{Algorithm, LineEnding, PrivateKey, Signature};
+
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let private_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let source = private_key.to_openssh(LineEnding::LF).unwrap();
+        let imported = accessfs_ssh::import_private_key(source.as_bytes(), None).unwrap();
+        let key_blob = imported.identity.key_blob.clone();
+        let managed_keys: Arc<dyn ManagedKeyReader> = Arc::new(FixtureManagedKeys {
+            entries: [(
+                "fixture-managed-key".to_string(),
+                imported.as_bytes().to_vec(),
+            )]
+            .into_iter()
+            .collect(),
+        });
+        let policy = Arc::new(RecordingAuthorizer::allowing());
+        let audit_path = dir.path().join("audit.jsonl");
+        let runtime = SshAgentRuntime::new(
+            dir.path().join("runtime"),
+            dir.path().join("ssh/config"),
+            Arc::clone(&policy) as Arc<dyn Authorizer>,
+            Arc::new(AuditLog::open(&audit_path).unwrap()),
+            managed_keys,
+        )
+        .unwrap();
+        runtime
+            .replace(&managed_snapshot(&project, &imported.identity))
+            .unwrap();
+
+        #[cfg(target_os = "macos")]
+        {
+            let public_key_path = dir.path().join("fixture-managed-key.pub");
+            fs::write(
+                &public_key_path,
+                private_key.public_key().to_openssh().unwrap(),
+            )
+            .unwrap();
+            let output = std::process::Command::new("/usr/bin/ssh-add")
+                .arg("-T")
+                .arg(&public_key_path)
+                .env("SSH_AUTH_SOCK", project.join("agent.sock"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "OpenSSH rejected the managed signer: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let mut client = UnixStream::connect(project.join("agent.sock")).unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        write_frame(&mut client, &[SSH_AGENTC_REQUEST_IDENTITIES]).unwrap();
+        let answer = read_frame(&mut client).unwrap();
+        let mut identities = WireReader::new(&answer);
+        assert_eq!(identities.byte().unwrap(), SSH_AGENT_IDENTITIES_ANSWER);
+        assert_eq!(identities.u32().unwrap(), 1);
+        assert_eq!(identities.string().unwrap(), key_blob);
+        assert_eq!(identities.string().unwrap(), b"Managed fleet key");
+        identities.finish().unwrap();
+
+        let message = b"fixture managed SSH user-auth payload";
+        let mut request = vec![SSH_AGENTC_SIGN_REQUEST];
+        put_string(&mut request, &key_blob);
+        put_string(&mut request, message);
+        request.extend_from_slice(&0u32.to_be_bytes());
+        write_frame(&mut client, &request).unwrap();
+        let response = read_frame(&mut client).unwrap();
+        let mut response_reader = WireReader::new(&response);
+        assert_eq!(response_reader.byte().unwrap(), SSH_AGENT_SIGN_RESPONSE);
+        let signature_blob = response_reader.string().unwrap();
+        response_reader.finish().unwrap();
+        let mut signature_reader = WireReader::new(signature_blob);
+        assert_eq!(signature_reader.string().unwrap(), b"ssh-ed25519");
+        let signature = Signature::new(
+            Algorithm::Ed25519,
+            signature_reader.string().unwrap().to_vec(),
+        )
+        .unwrap();
+        signature_reader.finish().unwrap();
+        signature::Verifier::verify(private_key.public_key(), message, &signature).unwrap();
+
+        let expected_signatures = if cfg!(target_os = "macos") { 2 } else { 1 };
+        assert_eq!(policy.requests.lock().unwrap().len(), expected_signatures);
+        let audit = fs::read_to_string(audit_path).unwrap();
+        assert!(audit.contains("\"result\":\"signed\""));
+        assert!(!audit.contains("fixture managed SSH user-auth payload"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn managed_ec2_style_rsa_key_signs_for_the_openssh_client() {
+        use rsa::pkcs1::{EncodeRsaPrivateKey, LineEnding as PemLineEnding};
+        use ssh_key::rand_core::OsRng;
+        use ssh_key::PrivateKey;
+
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let rsa_key = rsa::RsaPrivateKey::new(&mut OsRng, 2048).unwrap();
+        let source = rsa_key.to_pkcs1_pem(PemLineEnding::LF).unwrap();
+        let imported = accessfs_ssh::import_private_key(source.as_bytes(), None).unwrap();
+        let managed_keys: Arc<dyn ManagedKeyReader> = Arc::new(FixtureManagedKeys {
+            entries: [(
+                "fixture-managed-key".to_string(),
+                imported.as_bytes().to_vec(),
+            )]
+            .into_iter()
+            .collect(),
+        });
+        let policy = Arc::new(RecordingAuthorizer::allowing());
+        let runtime = SshAgentRuntime::new(
+            dir.path().join("runtime"),
+            dir.path().join("ssh/config"),
+            Arc::clone(&policy) as Arc<dyn Authorizer>,
+            Arc::new(AuditLog::open(&dir.path().join("audit.jsonl")).unwrap()),
+            managed_keys,
+        )
+        .unwrap();
+        runtime
+            .replace(&managed_snapshot(&project, &imported.identity))
+            .unwrap();
+        let public_key_path = dir.path().join("fixture-rsa-key.pub");
+        let canonical = PrivateKey::from_openssh(imported.as_bytes()).unwrap();
+        fs::write(
+            &public_key_path,
+            canonical.public_key().to_openssh().unwrap(),
+        )
+        .unwrap();
+
+        let output = std::process::Command::new("/usr/bin/ssh-add")
+            .arg("-T")
+            .arg(&public_key_path)
+            .env("SSH_AUTH_SOCK", project.join("agent.sock"))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "OpenSSH rejected the managed RSA signer: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(policy.requests.lock().unwrap().len(), 1);
     }
 }
