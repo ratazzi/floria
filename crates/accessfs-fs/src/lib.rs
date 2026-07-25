@@ -5,14 +5,15 @@
 //! Key semantics (see the product brief):
 //! - `stat/readdir/getattr` never generate content, and attributes stay constant
 //!   for the mount's lifetime → dev tools don't trigger accidentally.
-//! - `open()` identifies the reading process, generates a single per-open snapshot,
-//!   and writes an audit record.
-//! - Repeated `read`s on the same fd return the same bytes; different fds get
-//!   independent snapshots.
+//! - Each process lifetime observed at `open()` or `read()` is identified, authorized, audited,
+//!   and receives an isolated snapshot. The `read()` boundary is required because macFUSE can
+//!   reuse one vnode-scoped FUSE handle for POSIX opens from several processes.
+//! - Repeated reads in the same process access session return the same bytes.
 //! - A write-open on a secret buffers in memory and commits at flush/release as a
 //!   new immutable version — concurrent writers append, nobody destroys anything.
 
 mod reply;
+mod read_session;
 mod tree;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,11 +21,12 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use accessfs_catalog::Catalog;
-use accessfs_core::audit::AuditLog;
-use accessfs_core::authz::{AuthRequest, Authorizer, Operation};
+use accessfs_core::audit::{AuditDependency, AuditLog};
+use accessfs_core::authz::{AuthRequest, Authorizer, Decision, Operation};
+use accessfs_core::identity::ProcessIdentity;
 use accessfs_core::config::{ResolvedConfig, SECRETS_DIR, SURFACES_DIR};
 use accessfs_core::handler::{ContentHandler, HandlerCtx};
-use accessfs_core::snapshot::{content_version_of, SnapshotTable};
+use accessfs_core::snapshot::content_version_of;
 use accessfs_core::writebuf::{WriteBufTable, WriteErr};
 use accessfs_store::{SecretId, SecretStore};
 use accessfs_surface::{
@@ -39,12 +41,13 @@ use fuser::{
 };
 
 use reply::{dir_attr, file_attr, mount_config, TTL};
+use read_session::{ExistingRead, ReadSessionError, ReadSessionTable};
 use tree::{NodeKind, Tree};
 
-/// Worker threads for open() work. Each pending authorization prompt ties up one thread
+/// Worker threads for authorization work. Each pending prompt ties up one thread
 /// (bounded by the 30s prompt timeout); everything else keeps flowing because the fuser
 /// event loop and the fast callbacks never wait on them.
-const OPEN_POOL_THREADS: usize = 32;
+const AUTH_POOL_THREADS: usize = 32;
 
 /// The dynamic `secrets/<id>` namespace: a live view over the store, resolved on every
 /// lookup/readdir/open so a freshly `protect`ed file appears without remounting. inodes are
@@ -146,12 +149,12 @@ impl SurfaceNs {
     }
 }
 
-/// Shared, thread-movable filesystem state. Behind an `Arc` so open() work can run on a
-/// worker thread — fuser's event loop is single-threaded on macOS, so a blocking open()
-/// on the event-loop thread would freeze the whole mount.
+/// Shared, thread-movable filesystem state. Behind an `Arc` so authorization at `open()` or
+/// `read()` can run on a worker thread — fuser's event loop is single-threaded on macOS, so a
+/// blocking prompt on the event-loop thread would freeze the whole mount.
 struct Shared {
     tree: Tree,
-    snapshots: SnapshotTable,
+    reads: ReadSessionTable,
     /// Per-open write buffers for store-backed secrets (fh >= WRITE_FH_BASE); committed as a
     /// new store version on flush/release.
     writes: WriteBufTable,
@@ -170,9 +173,8 @@ struct Shared {
     mount_gid: u32,
 }
 
-/// FUSE filesystem instance. Fast callbacks run inline on the event loop; open() (which may
-/// block on an authorization prompt or a slow handler) is dispatched to `pool` and replies
-/// from there, so a slow open never freezes the single-threaded event loop.
+/// FUSE filesystem instance. Fast callbacks run inline on the event loop; callbacks that may
+/// authorize or generate content are dispatched to `pool` and reply from there.
 pub struct AccessFs {
     inner: Arc<Shared>,
     pool: threadpool::ThreadPool,
@@ -226,7 +228,7 @@ impl AccessFs {
 
         let inner = Arc::new(Shared {
             tree,
-            snapshots: SnapshotTable::new(),
+            reads: ReadSessionTable::new(),
             writes: WriteBufTable::new(),
             audit,
             authorizer,
@@ -237,8 +239,8 @@ impl AccessFs {
             mount_gid,
         });
         let pool = threadpool::Builder::new()
-            .num_threads(OPEN_POOL_THREADS)
-            .thread_name("accessfs-open".into())
+            .num_threads(AUTH_POOL_THREADS)
+            .thread_name("accessfs-auth".into())
             .build();
         Ok(AccessFs { inner, pool })
     }
@@ -447,6 +449,183 @@ impl Shared {
         }
     }
 
+    fn authorize_access(
+        &self,
+        target: &OpenTarget,
+        operation: Operation,
+        identity: &ProcessIdentity,
+    ) -> Result<Decision, Errno> {
+        let decision = self.authorizer.authorize(&AuthRequest {
+            path: &target.virtual_path,
+            display: target.display.as_deref(),
+            operation,
+            identity,
+        });
+        if decision.is_allowed() {
+            return Ok(decision);
+        }
+
+        tracing::info!(
+            path = %target.virtual_path,
+            op = operation.as_str(),
+            chain = %identity.chain_display(),
+            reason = %decision.reason,
+            "deny"
+        );
+        self.audit.log_denied(
+            &target.virtual_path,
+            operation.as_str(),
+            identity,
+            decision.rule_id.as_deref(),
+            &decision.reason,
+        );
+        Err(errno(libc::EACCES))
+    }
+
+    /// Generate bytes only after the caller has authorized `identity` for this target.
+    fn generate_read(
+        &self,
+        target: &OpenTarget,
+        identity: &ProcessIdentity,
+    ) -> Result<GeneratedRead, Errno> {
+        let generated = match &target.kind {
+            OpenKind::Secret(id) => match self.decrypt_secret(id) {
+                Ok(bytes) => GeneratedRead { bytes, dependencies: None },
+                Err(error) => {
+                    tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), "secret decrypt failed: {error}");
+                    return Err(errno(libc::EIO));
+                }
+            },
+            OpenKind::Handler(handler) => {
+                let ctx = HandlerCtx {
+                    virtual_path: target.virtual_path.clone(),
+                    request_uid: identity.uid,
+                    request_pid: identity.pid,
+                };
+                match handler.generate(&ctx) {
+                    Ok(bytes) => GeneratedRead { bytes, dependencies: None },
+                    Err(error) => {
+                        tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), "handler failed: {error}");
+                        return Err(errno(libc::EIO));
+                    }
+                }
+            }
+            OpenKind::DotenvSurface(surface_id) => {
+                let Some(surfaces) = &self.surfaces else {
+                    tracing::warn!(path = %target.virtual_path, "surface resolver is unavailable");
+                    return Err(errno(libc::EIO));
+                };
+                match surfaces.resolver.render_dotenv_surface(surface_id) {
+                    Ok(snapshot) => {
+                        tracing::debug!(
+                            path = %target.virtual_path,
+                            resources = snapshot.versions.len(),
+                            exports = snapshot.exports.len(),
+                            "dotenv surface resolved"
+                        );
+                        GeneratedRead {
+                            dependencies: Some(snapshot.audit_dependencies()),
+                            bytes: snapshot.bytes,
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), %error, "dotenv surface failed");
+                        return Err(errno(libc::EIO));
+                    }
+                }
+            }
+            OpenKind::DirenvSurface(surface_id) => {
+                let Some(surfaces) = &self.surfaces else {
+                    tracing::warn!(path = %target.virtual_path, "surface resolver is unavailable");
+                    return Err(errno(libc::EIO));
+                };
+                match surfaces.resolver.render_direnv_surface(surface_id) {
+                    Ok(snapshot) => {
+                        tracing::debug!(
+                            path = %target.virtual_path,
+                            resources = snapshot.versions.len(),
+                            exports = snapshot.exports.len(),
+                            "direnv surface resolved"
+                        );
+                        GeneratedRead {
+                            dependencies: Some(snapshot.audit_dependencies()),
+                            bytes: snapshot.bytes,
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), %error, "direnv surface failed");
+                        return Err(errno(libc::EIO));
+                    }
+                }
+            }
+            OpenKind::IniSurface(surface_id) => {
+                let Some(surfaces) = &self.surfaces else {
+                    tracing::warn!(path = %target.virtual_path, "surface resolver is unavailable");
+                    return Err(errno(libc::EIO));
+                };
+                match surfaces.resolver.render_ini_surface(surface_id) {
+                    Ok(snapshot) => {
+                        tracing::debug!(
+                            path = %target.virtual_path,
+                            resources = snapshot.versions.len(),
+                            entries = snapshot.entries.len(),
+                            "INI surface resolved"
+                        );
+                        GeneratedRead {
+                            dependencies: Some(snapshot.audit_dependencies()),
+                            bytes: snapshot.bytes,
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), %error, "INI surface failed");
+                        return Err(errno(libc::EIO));
+                    }
+                }
+            }
+            OpenKind::LinesSurface(surface_id) => {
+                let Some(surfaces) = &self.surfaces else {
+                    tracing::warn!(path = %target.virtual_path, "surface resolver is unavailable");
+                    return Err(errno(libc::EIO));
+                };
+                match surfaces.resolver.render_lines_surface(surface_id) {
+                    Ok(snapshot) => {
+                        tracing::debug!(
+                            path = %target.virtual_path,
+                            resources = snapshot.versions.len(),
+                            entries = snapshot.entries.len(),
+                            "lines surface resolved"
+                        );
+                        GeneratedRead {
+                            dependencies: Some(snapshot.audit_dependencies()),
+                            bytes: snapshot.bytes,
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), %error, "lines surface failed");
+                        return Err(errno(libc::EIO));
+                    }
+                }
+            }
+            OpenKind::DirectEnvFileSurface(surface_id) => {
+                let Some(surfaces) = &self.surfaces else {
+                    tracing::warn!(path = %target.virtual_path, "surface resolver is unavailable");
+                    return Err(errno(libc::EIO));
+                };
+                match surfaces.resolver.read_direct_env_file(surface_id) {
+                    Ok(snapshot) => GeneratedRead {
+                        dependencies: Some(snapshot.audit_dependencies(surface_id)),
+                        bytes: snapshot.bytes,
+                    },
+                    Err(error) => {
+                        tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), %error, "direct env file surface failed");
+                        return Err(errno(libc::EIO));
+                    }
+                }
+            }
+        };
+        Ok(generated)
+    }
+
     /// Runs on a pool thread: validation + identity + authorization + content generation,
     /// then replies. May block on an authorization prompt without stalling the event loop.
     fn handle_open(&self, ino: u64, flags: i32, uid: u32, gid: u32, pid: i32, reply: ReplyOpen) {
@@ -476,30 +655,13 @@ impl Shared {
         let identity = Arc::new(accessfs_platform::enrich(pid, uid, gid));
 
         // Authorization boundary: decide after resolving the identity, before generating content.
-        let decision = self.authorizer.authorize(&AuthRequest {
-            path: &target.virtual_path,
-            display: target.display.as_deref(),
-            operation,
-            identity: &identity,
-        });
-        if !decision.is_allowed() {
-            tracing::info!(
-                path = %target.virtual_path,
-                op = operation.as_str(),
-                chain = %identity.chain_display(),
-                reason = %decision.reason,
-                "deny"
-            );
-            self.audit.log_denied(
-                &target.virtual_path,
-                operation.as_str(),
-                &identity,
-                decision.rule_id.as_deref(),
-                &decision.reason,
-            );
-            reply.error(errno(libc::EACCES));
-            return;
-        }
+        let decision = match self.authorize_access(&target, operation, &identity) {
+            Ok(decision) => decision,
+            Err(error) => {
+                reply.error(error);
+                return;
+            }
+        };
 
         if let Some(write_target) = write_target {
             // Write session: seed the buffer with the decrypted head so partial writes and
@@ -565,149 +727,17 @@ impl Shared {
             return;
         }
 
-        // open boundary: produce the snapshot bytes once. Secrets decrypt through the store;
-        // other handlers generate their content inline.
-        let (bytes, dependencies) = match &target.kind {
-            OpenKind::Secret(id) => match self.decrypt_secret(id) {
-                Ok(bytes) => (bytes, None),
-                Err(e) => {
-                    tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), "secret decrypt failed: {e}");
-                    reply.error(errno(libc::EIO));
-                    return;
-                }
-            },
-            OpenKind::Handler(handler) => {
-                let ctx = HandlerCtx {
-                    virtual_path: target.virtual_path.clone(),
-                    request_uid: uid,
-                    request_pid: pid,
-                };
-                match handler.generate(&ctx) {
-                    Ok(bytes) => (bytes, None),
-                    Err(e) => {
-                        tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), "handler failed: {e}");
-                        reply.error(errno(libc::EIO));
-                        return;
-                    }
-                }
-            }
-            OpenKind::DotenvSurface(surface_id) => {
-                let Some(surfaces) = &self.surfaces else {
-                    tracing::warn!(path = %target.virtual_path, "surface resolver is unavailable");
-                    reply.error(errno(libc::EIO));
-                    return;
-                };
-                match surfaces.resolver.render_dotenv_surface(surface_id) {
-                    Ok(snapshot) => {
-                        tracing::debug!(
-                            path = %target.virtual_path,
-                            resources = snapshot.versions.len(),
-                            exports = snapshot.exports.len(),
-                            "dotenv surface resolved"
-                        );
-                        let dependencies = snapshot.audit_dependencies();
-                        (snapshot.bytes, Some(dependencies))
-                    }
-                    Err(error) => {
-                        tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), %error, "dotenv surface failed");
-                        reply.error(errno(libc::EIO));
-                        return;
-                    }
-                }
-            }
-            OpenKind::DirenvSurface(surface_id) => {
-                let Some(surfaces) = &self.surfaces else {
-                    tracing::warn!(path = %target.virtual_path, "surface resolver is unavailable");
-                    reply.error(errno(libc::EIO));
-                    return;
-                };
-                match surfaces.resolver.render_direnv_surface(surface_id) {
-                    Ok(snapshot) => {
-                        tracing::debug!(
-                            path = %target.virtual_path,
-                            resources = snapshot.versions.len(),
-                            exports = snapshot.exports.len(),
-                            "direnv surface resolved"
-                        );
-                        let dependencies = snapshot.audit_dependencies();
-                        (snapshot.bytes, Some(dependencies))
-                    }
-                    Err(error) => {
-                        tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), %error, "direnv surface failed");
-                        reply.error(errno(libc::EIO));
-                        return;
-                    }
-                }
-            }
-            OpenKind::IniSurface(surface_id) => {
-                let Some(surfaces) = &self.surfaces else {
-                    tracing::warn!(path = %target.virtual_path, "surface resolver is unavailable");
-                    reply.error(errno(libc::EIO));
-                    return;
-                };
-                match surfaces.resolver.render_ini_surface(surface_id) {
-                    Ok(snapshot) => {
-                        tracing::debug!(
-                            path = %target.virtual_path,
-                            resources = snapshot.versions.len(),
-                            entries = snapshot.entries.len(),
-                            "INI surface resolved"
-                        );
-                        let dependencies = snapshot.audit_dependencies();
-                        (snapshot.bytes, Some(dependencies))
-                    }
-                    Err(error) => {
-                        tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), %error, "INI surface failed");
-                        reply.error(errno(libc::EIO));
-                        return;
-                    }
-                }
-            }
-            OpenKind::LinesSurface(surface_id) => {
-                let Some(surfaces) = &self.surfaces else {
-                    tracing::warn!(path = %target.virtual_path, "surface resolver is unavailable");
-                    reply.error(errno(libc::EIO));
-                    return;
-                };
-                match surfaces.resolver.render_lines_surface(surface_id) {
-                    Ok(snapshot) => {
-                        tracing::debug!(
-                            path = %target.virtual_path,
-                            resources = snapshot.versions.len(),
-                            entries = snapshot.entries.len(),
-                            "lines surface resolved"
-                        );
-                        let dependencies = snapshot.audit_dependencies();
-                        (snapshot.bytes, Some(dependencies))
-                    }
-                    Err(error) => {
-                        tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), %error, "lines surface failed");
-                        reply.error(errno(libc::EIO));
-                        return;
-                    }
-                }
-            }
-            OpenKind::DirectEnvFileSurface(surface_id) => {
-                let Some(surfaces) = &self.surfaces else {
-                    tracing::warn!(path = %target.virtual_path, "surface resolver is unavailable");
-                    reply.error(errno(libc::EIO));
-                    return;
-                };
-                match surfaces.resolver.read_direct_env_file(surface_id) {
-                    Ok(snapshot) => {
-                        let dependencies = snapshot.audit_dependencies(surface_id);
-                        (snapshot.bytes, Some(dependencies))
-                    }
-                    Err(error) => {
-                        tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), %error, "direct env file surface failed");
-                        reply.error(errno(libc::EIO));
-                        return;
-                    }
-                }
+        let generated = match self.generate_read(&target, &identity) {
+            Ok(generated) => generated,
+            Err(error) => {
+                reply.error(error);
+                return;
             }
         };
 
-        let opened = self.snapshots.insert(ino, Arc::clone(&identity), bytes);
+        let opened = self
+            .reads
+            .insert(ino, Arc::clone(&identity), generated.bytes);
         tracing::info!(
             path = %target.virtual_path,
             uid, pid,
@@ -728,7 +758,7 @@ impl Shared {
             &opened.content_version,
             opened.fh,
             opened.size,
-            dependencies.as_deref(),
+            generated.dependencies.as_deref(),
         );
 
         // Dynamic (script/secret) files use direct-io: the kernel won't truncate to attr size
@@ -741,6 +771,109 @@ impl Shared {
         };
         reply.opened(FileHandle(opened.fh), fopen);
     }
+
+    /// Authorize and freeze a snapshot for a process whose POSIX open was hidden by macFUSE's
+    /// vnode-level handle reuse. Called once by [`ReadSessionTable`] for each process lifetime.
+    fn create_read_session(
+        &self,
+        ino: u64,
+        fh: u64,
+        identity: &ProcessIdentity,
+    ) -> Result<Vec<u8>, Errno> {
+        let target = self.resolve_open_target(ino)?;
+        let decision = self.authorize_access(&target, Operation::Read, identity)?;
+        let generated = self.generate_read(&target, identity)?;
+        let content_version = content_version_of(&generated.bytes);
+        let size = generated.bytes.len() as u64;
+
+        tracing::info!(
+            path = %target.virtual_path,
+            uid = identity.uid,
+            pid = identity.pid,
+            exe = ?identity.exe_path,
+            chain = %identity.chain_display(),
+            decision = decision.decision_str(),
+            rule = decision.rule_id.as_deref().unwrap_or("-"),
+            fh,
+            size,
+            "read session"
+        );
+        self.audit.log_open(
+            &target.virtual_path,
+            Operation::Read.as_str(),
+            identity,
+            decision.decision_str(),
+            decision.rule_id.as_deref(),
+            &content_version,
+            fh,
+            size,
+            generated.dependencies.as_deref(),
+        );
+        Ok(generated.bytes)
+    }
+
+    fn is_write_owner(&self, fh: u64, pid: i32) -> bool {
+        self.writes
+            .is_owner(fh, accessfs_platform::process_instance(pid))
+    }
+
+    fn log_cross_process_write_denied(&self, ino: u64, uid: u32, gid: u32, pid: i32) {
+        let identity = accessfs_platform::enrich(pid, uid, gid);
+        let path = self
+            .dynamic_path(ino)
+            .or_else(|| {
+                self.tree
+                    .get(ino)
+                    .map(|node| node.virtual_path())
+                    .filter(|path| !path.is_empty())
+            })
+            .unwrap_or_default();
+        let reason = "macFUSE reused a write session owned by another process";
+        tracing::warn!(path = %path, pid, chain = %identity.chain_display(), reason, "deny cross-process write");
+        self.audit
+            .log_denied(&path, Operation::Write.as_str(), &identity, None, reason);
+    }
+
+    /// Runs on the authorization pool after the event-loop fast path found no snapshot for this
+    /// process. It may prompt and generate when macFUSE hid the corresponding `open()` callback.
+    fn handle_uncached_read(
+        &self,
+        request: PendingRead,
+        reply: ReplyData,
+    ) {
+        let identity = accessfs_platform::enrich(request.pid, request.uid, request.gid);
+        let result = if self.writes.owns(request.fh) {
+            let Some(writer) = self.writes.get_identity(request.fh) else {
+                reply.error(Errno::EBADF);
+                return;
+            };
+            if writer.instance() == identity.instance() {
+                self.writes
+                    .read_slice(request.fh, request.offset, request.size)
+                    .ok_or(ReadSessionError::BadHandle)
+            } else {
+                // Never expose another process's uncommitted writer buffer. A reader attached
+                // to the same vnode gets its own authorized snapshot of committed backing data.
+                self.reads
+                    .read_secondary(request.fh, &identity, request.offset, request.size, || {
+                        self.create_read_session(request.ino, request.fh, &identity)
+                            .map_err(Errno::code)
+                    })
+            }
+        } else {
+            self.reads
+                .read_or_create(request.fh, &identity, request.offset, request.size, || {
+                    self.create_read_session(request.ino, request.fh, &identity)
+                        .map_err(Errno::code)
+                })
+        };
+
+        match result {
+            Ok(slice) => reply.data(&slice),
+            Err(ReadSessionError::BadHandle) => reply.error(Errno::EBADF),
+            Err(ReadSessionError::Generate(error)) => reply.error(Errno::from_i32(error)),
+        }
+    }
 }
 
 /// What `open()` should serve for a resolved inode.
@@ -749,6 +882,21 @@ struct OpenTarget {
     display: Option<String>,
     direct_io: bool,
     kind: OpenKind,
+}
+
+struct GeneratedRead {
+    bytes: Vec<u8>,
+    dependencies: Option<Vec<AuditDependency>>,
+}
+
+struct PendingRead {
+    ino: u64,
+    fh: u64,
+    offset: u64,
+    size: u32,
+    uid: u32,
+    gid: u32,
+    pid: i32,
 }
 
 enum OpenKind {
@@ -1061,8 +1209,8 @@ impl fuser::Filesystem for AccessFs {
 
     fn read(
         &self,
-        _req: &Request,
-        _ino: INodeNo,
+        req: &Request,
+        ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         size: u32,
@@ -1070,22 +1218,59 @@ impl fuser::Filesystem for AccessFs {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyData,
     ) {
-        // An O_RDWR writer reads back its own uncommitted buffer; read snapshots are immutable.
-        let slice = if self.inner.writes.owns(fh.0) {
-            self.inner.writes.read_slice(fh.0, offset, size)
+        let (uid, gid, pid) = (req.uid(), req.gid(), req.pid() as i32);
+        let process = accessfs_platform::process_instance(pid);
+
+        let existing = if self.inner.writes.owns(fh.0) {
+            if self.inner.writes.is_owner(fh.0, process) {
+                match self.inner.writes.read_slice(fh.0, offset, size) {
+                    Some(slice) => {
+                        reply.data(&slice);
+                        return;
+                    }
+                    None => ExistingRead::BadHandle,
+                }
+            } else {
+                self.inner
+                    .reads
+                    .read_existing_secondary(fh.0, process, offset, size)
+            }
         } else {
-            self.inner.snapshots.read_slice(fh.0, offset, size)
+            self.inner.reads.read_existing(fh.0, process, offset, size)
         };
-        match slice {
-            Some(slice) => reply.data(&slice),
-            None => reply.error(Errno::EBADF),
+        match existing {
+            ExistingRead::Hit(slice) => {
+                reply.data(&slice);
+                return;
+            }
+            ExistingRead::BadHandle => {
+                reply.error(Errno::EBADF);
+                return;
+            }
+            ExistingRead::Missing => {}
         }
+
+        let shared = Arc::clone(&self.inner);
+        self.pool.execute(move || {
+            shared.handle_uncached_read(
+                PendingRead {
+                    ino: ino.0,
+                    fh: fh.0,
+                    offset,
+                    size,
+                    uid,
+                    gid,
+                    pid,
+                },
+                reply,
+            )
+        });
     }
 
     fn write(
         &self,
-        _req: &Request,
-        _ino: INodeNo,
+        req: &Request,
+        ino: INodeNo,
         fh: FileHandle,
         offset: u64,
         data: &[u8],
@@ -1094,6 +1279,15 @@ impl fuser::Filesystem for AccessFs {
         _lock_owner: Option<fuser::LockOwner>,
         reply: ReplyWrite,
     ) {
+        let (uid, gid, pid) = (req.uid(), req.gid(), req.pid() as i32);
+        if self.inner.writes.owns(fh.0) && !self.inner.is_write_owner(fh.0, pid) {
+            let shared = Arc::clone(&self.inner);
+            self.pool.execute(move || {
+                shared.log_cross_process_write_denied(ino.0, uid, gid, pid);
+                reply.error(errno(libc::EACCES));
+            });
+            return;
+        }
         // Pure memory mutation — runs inline on the event loop; the store isn't touched
         // until flush/release commits.
         match self.inner.writes.write_at(fh.0, offset, data) {
@@ -1106,7 +1300,7 @@ impl fuser::Filesystem for AccessFs {
     #[allow(clippy::too_many_arguments)]
     fn setattr(
         &self,
-        _req: &Request,
+        req: &Request,
         ino: INodeNo,
         mode: Option<u32>,
         uid: Option<u32>,
@@ -1123,6 +1317,17 @@ impl fuser::Filesystem for AccessFs {
         reply: ReplyAttr,
     ) {
         let write_fh = fh.map(|f| f.0).filter(|&f| self.inner.writes.owns(f));
+        if let Some(write_fh) = write_fh {
+            let (uid, gid, pid) = (req.uid(), req.gid(), req.pid() as i32);
+            if !self.inner.is_write_owner(write_fh, pid) {
+                let shared = Arc::clone(&self.inner);
+                self.pool.execute(move || {
+                    shared.log_cross_process_write_denied(ino.0, uid, gid, pid);
+                    reply.error(errno(libc::EACCES));
+                });
+                return;
+            }
+        }
         let wants_times = atime.is_some()
             || mtime.is_some()
             || ctime.is_some()
@@ -1191,7 +1396,7 @@ impl fuser::Filesystem for AccessFs {
 
     fn fsync(
         &self,
-        _req: &Request,
+        req: &Request,
         _ino: INodeNo,
         fh: FileHandle,
         _datasync: bool,
@@ -1201,12 +1406,21 @@ impl fuser::Filesystem for AccessFs {
         // right after writing and before close — commit here so their durability assumption
         // holds and an encrypt/store failure surfaces as their fsync error, not at close.
         if self.inner.writes.owns(fh.0) {
+            let pid = req.pid() as i32;
             let shared = Arc::clone(&self.inner);
-            self.pool.execute(move || match shared.commit_write(fh.0) {
-                Ok(_) => reply.ok(),
-                Err(e) => {
-                    tracing::warn!(fh = fh.0, "write commit failed: {e}");
-                    reply.error(e.errno);
+            self.pool.execute(move || {
+                if !shared.is_write_owner(fh.0, pid) {
+                    // A logical reader can share the writer's physical fh. It has no mutation
+                    // to commit, so acknowledge fsync without touching the owner buffer.
+                    reply.ok();
+                    return;
+                }
+                match shared.commit_write(fh.0) {
+                    Ok(_) => reply.ok(),
+                    Err(e) => {
+                        tracing::warn!(fh = fh.0, "write commit failed: {e}");
+                        reply.error(e.errno);
+                    }
                 }
             });
             return;
@@ -1217,7 +1431,7 @@ impl fuser::Filesystem for AccessFs {
 
     fn flush(
         &self,
-        _req: &Request,
+        req: &Request,
         _ino: INodeNo,
         fh: FileHandle,
         _lock_owner: fuser::LockOwner,
@@ -1227,12 +1441,21 @@ impl fuser::Filesystem for AccessFs {
         // encrypt/store write surfaces as EIO to the writer. Commit does crypto + store I/O
         // (may wait on the store lock), so it runs on the pool like open().
         if self.inner.writes.owns(fh.0) {
+            let pid = req.pid() as i32;
             let shared = Arc::clone(&self.inner);
-            self.pool.execute(move || match shared.commit_write(fh.0) {
-                Ok(_) => reply.ok(),
-                Err(e) => {
-                    tracing::warn!(fh = fh.0, "write commit failed: {e}");
-                    reply.error(e.errno);
+            self.pool.execute(move || {
+                if !shared.is_write_owner(fh.0, pid) {
+                    // macFUSE sends flush for every logical close sharing this physical fh.
+                    // A non-owner has no mutation to commit and must not flush the owner buffer.
+                    reply.ok();
+                    return;
+                }
+                match shared.commit_write(fh.0) {
+                    Ok(_) => reply.ok(),
+                    Err(e) => {
+                        tracing::warn!(fh = fh.0, "write commit failed: {e}");
+                        reply.error(e.errno);
+                    }
                 }
             });
             return;
@@ -1271,11 +1494,14 @@ impl fuser::Filesystem for AccessFs {
                         commit_err.as_ref().map(|error| error.message.as_str()),
                     );
                 }
+                // Purge committed snapshots created for readers that macFUSE attached to this
+                // write handle while it was alive.
+                let _ = shared.reads.remove(fh.0);
                 reply.ok();
             });
             return;
         }
-        if let Some(info) = self.inner.snapshots.remove(fh.0) {
+        if let Some(info) = self.inner.reads.remove(fh.0) {
             let path = self
                 .inner
                 .tree
@@ -1535,7 +1761,7 @@ mod tests {
         let secrets = SecretsNs::new(store, None, tree.secrets_dir_ino(), next_ino);
         Arc::new(Shared {
             tree,
-            snapshots: SnapshotTable::new(),
+            reads: ReadSessionTable::new(),
             writes: WriteBufTable::new(),
             audit: Arc::new(AuditLog::open(&tmp.join("audit.jsonl")).unwrap()),
             authorizer: Arc::new(AllowAll),

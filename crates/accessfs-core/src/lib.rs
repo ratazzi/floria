@@ -1,7 +1,7 @@
 //! accessfs-core: backend-agnostic core logic.
 //!
 //! Pure data and logic only: config parsing and security checks, content handlers,
-//! the per-open snapshot table, process identity structs, and audit events. No dependency
+//! the base FUSE-handle snapshot table, process identity structs, and audit events. No dependency
 //! on fuser / macFUSE, so it can be unit-tested without an actual mount.
 
 pub mod audit;

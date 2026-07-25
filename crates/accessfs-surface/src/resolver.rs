@@ -179,7 +179,7 @@ impl SurfaceResolver {
         SurfaceResolver { catalog, store }
     }
 
-    /// Resolve one catalog DotenvFile into a per-open byte snapshot. All referenced secret
+    /// Resolve one catalog DotenvFile into a process access-session byte snapshot. All referenced secret
     /// heads are captured before any decryption, and `get_version` reads those immutable heads.
     pub fn render_dotenv_surface(&self, surface_id: &str) -> SurfaceResult<DotenvSnapshot> {
         let snapshot = self.catalog.snapshot()?;

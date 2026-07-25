@@ -15,7 +15,7 @@ use std::time::Instant;
 use dashmap::DashMap;
 use zeroize::Zeroizing;
 
-use crate::identity::ProcessIdentity;
+use crate::identity::{ProcessIdentity, ProcessInstance};
 
 /// First fh handed out for write-opens. Read snapshots allocate from 1 upward and will never
 /// reach this, so `fh >= WRITE_FH_BASE` unambiguously identifies a write fd.
@@ -160,6 +160,14 @@ impl WriteBufTable {
         self.open.get(&fh).map(|s| Arc::clone(&s.identity))
     }
 
+    /// Whether this request comes from the process lifetime that opened the write session.
+    /// macFUSE may attach another process to the same vnode-level fh without another `open()`.
+    pub fn is_owner(&self, fh: u64, process: ProcessInstance) -> bool {
+        self.open
+            .get(&fh)
+            .is_some_and(|state| state.identity.instance() == process)
+    }
+
     pub fn ino_of(&self, fh: u64) -> Option<u64> {
         self.open.get(&fh).map(|s| s.ino)
     }
@@ -251,5 +259,26 @@ mod tests {
         assert_eq!(t.write_at(fh, MAX_WRITE_BYTES, b"x"), Err(WriteErr::TooBig));
         assert_eq!(t.truncate(fh, MAX_WRITE_BYTES + 1), Err(WriteErr::TooBig));
         assert_eq!(t.write_at(999, 0, b"x"), Err(WriteErr::BadHandle));
+    }
+
+    #[test]
+    fn writer_ownership_includes_process_start_to_reject_pid_reuse() {
+        let t = WriteBufTable::new();
+        let mut owner = ProcessIdentity::bare(123, 501, 20);
+        owner.started_at_micros = Some(100);
+        let fh = t.insert(2, Arc::new(owner), Vec::new());
+
+        assert!(t.is_owner(
+            fh,
+            ProcessInstance { pid: 123, started_at_micros: Some(100) }
+        ));
+        assert!(!t.is_owner(
+            fh,
+            ProcessInstance { pid: 123, started_at_micros: Some(101) }
+        ));
+        assert!(!t.is_owner(
+            fh,
+            ProcessInstance { pid: 124, started_at_micros: Some(100) }
+        ));
     }
 }

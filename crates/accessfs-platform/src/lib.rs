@@ -5,7 +5,7 @@
 //! [`ProcessIdentity`]. Any individual failure just leaves that field `None`;
 //! it never panics and never blocks the caller's `open()`.
 
-use accessfs_core::identity::ProcessIdentity;
+use accessfs_core::identity::{ProcessIdentity, ProcessInstance};
 
 #[cfg(target_os = "macos")]
 mod codesign;
@@ -18,8 +18,22 @@ pub fn enrich(pid: i32, uid: u32, gid: u32) -> ProcessIdentity {
     macos::enrich(pid, uid, gid)
 }
 
+/// Return the lightweight process-lifetime key used by FUSE callback ownership checks.
+#[cfg(target_os = "macos")]
+pub fn process_instance(pid: i32) -> ProcessInstance {
+    macos::process_instance(pid)
+}
+
 /// Fallback for non-macOS platforms: return only the pid/uid/gid known to FUSE.
 #[cfg(not(target_os = "macos"))]
 pub fn enrich(pid: i32, uid: u32, gid: u32) -> ProcessIdentity {
     ProcessIdentity::bare(pid, uid, gid)
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn process_instance(pid: i32) -> ProcessInstance {
+    ProcessInstance {
+        pid,
+        started_at_micros: None,
+    }
 }

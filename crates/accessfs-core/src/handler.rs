@@ -29,7 +29,7 @@ pub struct HandlerCtx {
 }
 
 impl ContentHandler {
-    /// Generate content once. Used to freeze a per-open snapshot at `open()` time.
+    /// Generate content once to freeze a process access-session snapshot.
     pub fn generate(&self, ctx: &HandlerCtx) -> Result<Vec<u8>> {
         match self {
             ContentHandler::Constant(bytes) => Ok(bytes.as_ref().clone()),

@@ -2,13 +2,26 @@ use std::path::PathBuf;
 
 use serde::Serialize;
 
-/// Identity profile of the reading process. Populated by `accessfs-platform::enrich` during `open()`.
+/// Stable-enough identity of one process lifetime. A PID alone can be reused while a macFUSE
+/// vnode is still alive, so access-session caches also include the process start timestamp when
+/// libproc can provide it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+pub struct ProcessInstance {
+    pub pid: i32,
+    pub started_at_micros: Option<u64>,
+}
+
+/// Identity profile of the accessing process. Populated by `accessfs-platform::enrich` at the
+/// first observable FUSE boundary for that process.
 ///
 /// `uid/gid/pid` come from the FUSE request; the rest come from libproc, best-effort, `None` on
 /// failure. `open()` must never fail just because forensics collection failed.
 #[derive(Debug, Clone, Serialize)]
 pub struct ProcessIdentity {
     pub pid: i32,
+    /// Unix timestamp of process start, with microsecond precision. Used with `pid` to prevent
+    /// PID reuse from inheriting another process's authorized read session.
+    pub started_at_micros: Option<u64>,
     pub uid: u32,
     pub gid: u32,
     pub exe_path: Option<PathBuf>,
@@ -28,6 +41,7 @@ impl ProcessIdentity {
     pub fn bare(pid: i32, uid: u32, gid: u32) -> Self {
         ProcessIdentity {
             pid,
+            started_at_micros: None,
             uid,
             gid,
             exe_path: None,
@@ -36,6 +50,13 @@ impl ProcessIdentity {
             parent_chain: Vec::new(),
             bundle_id: None,
             team_id: None,
+        }
+    }
+
+    pub fn instance(&self) -> ProcessInstance {
+        ProcessInstance {
+            pid: self.pid,
+            started_at_micros: self.started_at_micros,
         }
     }
 

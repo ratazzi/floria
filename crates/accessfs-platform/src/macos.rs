@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use accessfs_core::identity::{ProcSummary, ProcessIdentity};
+use accessfs_core::identity::{ProcSummary, ProcessIdentity, ProcessInstance};
 use libproc::bsd_info::BSDInfo;
 use libproc::proc_pid::{self, pidinfo};
 
@@ -8,6 +8,7 @@ use libproc::proc_pid::{self, pidinfo};
 const MAX_CHAIN_DEPTH: usize = 32;
 
 pub fn enrich(pid: i32, uid: u32, gid: u32) -> ProcessIdentity {
+    let started_at_micros = process_start_micros(pid);
     let exe_path = proc_pid::pidpath(pid).ok().map(PathBuf::from);
     if exe_path.is_none() {
         // Common in the macfuse#378 pid-vs-tid case: pidpath returns ESRCH for a tid.
@@ -18,6 +19,7 @@ pub fn enrich(pid: i32, uid: u32, gid: u32) -> ProcessIdentity {
     let sig = crate::codesign::code_signature(pid);
     ProcessIdentity {
         pid,
+        started_at_micros,
         uid,
         gid,
         exe_path,
@@ -27,6 +29,22 @@ pub fn enrich(pid: i32, uid: u32, gid: u32) -> ProcessIdentity {
         bundle_id: sig.bundle_id,
         team_id: sig.team_id,
     }
+}
+
+pub fn process_instance(pid: i32) -> ProcessInstance {
+    ProcessInstance {
+        pid,
+        started_at_micros: process_start_micros(pid),
+    }
+}
+
+fn process_start_micros(pid: i32) -> Option<u64> {
+    let info = bsd_info(pid)?;
+    Some(
+        info.pbi_start_tvsec
+            .saturating_mul(1_000_000)
+            .saturating_add(info.pbi_start_tvusec),
+    )
 }
 
 /// Walk ppid from `pid` all the way to launchd, returning a leaf-first process chain.
@@ -186,6 +204,8 @@ mod tests {
         let pid = std::process::id() as i32;
         let id = enrich(pid, 0, 0);
         assert_eq!(id.pid, pid);
+        assert!(id.started_at_micros.is_some(), "process start should resolve for self");
+        assert_eq!(id.instance(), process_instance(pid));
         // The current process must always resolve exe and cwd.
         assert!(id.exe_path.is_some(), "exe_path should resolve for self");
         assert!(id.cwd.is_some(), "cwd should resolve for self");

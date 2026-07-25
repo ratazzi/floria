@@ -1,14 +1,14 @@
 //! Authorization boundary: the sole decision interface between the FS backend and the agent.
 //!
-//! On `open()`, the FS backend calls [`Authorizer::authorize`] and allows/denies per the [`Decision`],
-//! holding no policy of its own. The real policy engine (rules, grant cache, prompts, TouchID) is
-//! implemented against this trait by the future `accessfs-agent`. The interface is **synchronous and
-//! blocking** -- matching FUSE `open()`'s blocking semantics: an implementation may do IPC or wait on a
-//! user prompt inside `authorize()`, as long as it returns within the mount's `daemon_timeout`.
+//! At the first observable FUSE access boundary for each process lifetime, the FS backend calls
+//! [`Authorizer::authorize`] and allows/denies per the [`Decision`], holding no policy of its own.
+//! This is usually `open()`, but can be `read()` when macFUSE reuses a vnode-level handle and hides
+//! a later process's POSIX open. The interface is **synchronous and blocking**: an implementation
+//! may do IPC or wait on a user prompt, as long as it returns within `daemon_timeout`.
 
 use crate::identity::ProcessIdentity;
 
-/// A single authorization request, occurring at the `open()` boundary.
+/// A single authorization request at a process's first observable access boundary.
 pub struct AuthRequest<'a> {
     /// Virtual file path, e.g. `env/demo/dev.env`.
     pub path: &'a str,

@@ -75,6 +75,10 @@ pub fn mount_config(volname: &str) -> fuser::Config {
         // Suppress AppleDouble (._*)/.DS_Store and com.apple.* xattr probing.
         MountOption::CUSTOM("noappledouble".to_string()),
         MountOption::CUSTOM("noapplexattr".to_string()),
+        // macFUSE can keep one vnode open while any process holds an fd, hiding later processes'
+        // POSIX opens from FUSE_OPEN. Disabling readahead, UBC, and vnode caching ensures each
+        // reader still reaches FUSE_READ, where process-scoped authorization is enforced.
+        MountOption::CUSTOM("nolocalcaches".to_string()),
         // Give slow handlers enough time so the kernel doesn't declare the mount dead.
         MountOption::CUSTOM("daemon_timeout=60".to_string()),
     ];
@@ -82,4 +86,18 @@ pub fn mount_config(volname: &str) -> fuser::Config {
     // slow/blocking open() would freeze the whole mount. We keep the event loop free by
     // running open() work on our own thread pool and replying from there (see lib.rs).
     config
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mount_disables_macos_local_caches_for_process_scoped_authorization() {
+        let config = mount_config("fixture");
+
+        assert!(config
+            .mount_options
+            .contains(&MountOption::CUSTOM("nolocalcaches".to_string())));
+    }
 }

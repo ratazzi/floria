@@ -17,10 +17,10 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 ctrlc = { workspace = true }
 threadpool = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
-zeroize = { workspace = true }
 
 [features]
 # Typecheck-only on machines without macFUSE: makes fuser skip its pkg-config probe.
