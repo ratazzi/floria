@@ -268,10 +268,10 @@ private struct AccessRow: View {
                 .frame(width: 7, height: 7)
             Text(ev.operation)
                 .font(.caption2.weight(.semibold))
-                .foregroundStyle(ev.operation == "write" ? Color.orange : Color.secondary)
+                .foregroundStyle(operationColor)
                 .padding(.horizontal, 5)
                 .padding(.vertical, 1)
-                .background((ev.operation == "write" ? Color.orange : Color.secondary).opacity(0.15))
+                .background(operationColor.opacity(0.15))
                 .clipShape(Capsule())
             if ev.wasGloballyOverridden {
                 Image(systemName: "eye.fill")
@@ -305,6 +305,10 @@ private struct AccessRow: View {
     /// Full detail for the hover tooltip: friendly path, mount path (when distinct), rule, chain.
     private var tooltip: String {
         var lines = [ev.shownPath]
+        if let ssh = ev.ssh {
+            lines.append(ssh.key_fingerprint)
+            lines.append("agent: \(ssh.surface_name)")
+        }
         if ev.display != nil { lines.append(ev.path) }
         lines.append("rule: \(ev.ruleId ?? "-")")
         if let policy = ev.policy {
@@ -313,6 +317,14 @@ private struct AccessRow: View {
         }
         lines.append("chain: \(ev.chain)")
         return lines.joined(separator: "\n")
+    }
+
+    private var operationColor: Color {
+        switch ev.operation {
+        case "write": .orange
+        case "sign": .blue
+        default: .secondary
+        }
     }
 }
 

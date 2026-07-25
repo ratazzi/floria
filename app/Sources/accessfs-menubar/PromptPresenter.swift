@@ -44,7 +44,9 @@ final class PromptPresenter {
         let panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 520, height: panelHeight),
             styleMask: [.titled, .closable], backing: .buffered, defer: false)
-        panel.title = "Floria Access Request"
+        panel.title = p.operation == "sign"
+            ? "Floria SSH Signature Request"
+            : "Floria Access Request"
         panel.isReleasedWhenClosed = false
         panel.hidesOnDeactivate = false
         panel.collectionBehavior = [.moveToActiveSpace]
@@ -86,7 +88,10 @@ final class PromptPresenter {
             done()
             return
         }
-        authenticateBiometric(reason: "allow access to \(p.path)") { ok in
+        let reason = p.operation == "sign"
+            ? "allow use of \(p.ssh?.key_label ?? "SSH identity")"
+            : "allow access to \(p.path)"
+        authenticateBiometric(reason: reason) { ok in
             if ok { allow() } else { deny() }
             done()
         }

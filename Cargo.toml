@@ -28,6 +28,7 @@ wait-timeout = "0.2"
 ctrlc = "3"
 threadpool = "1"
 sha2 = "0.10"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["clock"], default-features = false }
 age = { version = "0.10", features = ["ssh"] }
 uuid = { version = "1", features = ["v4"] }

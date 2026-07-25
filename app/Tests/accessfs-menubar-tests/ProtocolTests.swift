@@ -68,7 +68,7 @@ final class ProtocolTests: XCTestCase {
             ])
         let prompt = PromptMsg(
             req_id: 9, path: "secrets/fixture", display: "/Users/me/.pgpass",
-            operation: "read", enforcement: "touchid", identity: identity)
+            operation: "read", enforcement: "touchid", ssh: nil, identity: identity)
 
         let presentation = PromptPresentation(prompt)
 
@@ -94,7 +94,7 @@ final class ProtocolTests: XCTestCase {
             ])
         let prompt = PromptMsg(
             req_id: 10, path: "secrets/fixture", display: "/Users/me/.pgpass",
-            operation: "read", enforcement: "prompt", identity: identity)
+            operation: "read", enforcement: "prompt", ssh: nil, identity: identity)
 
         let presentation = PromptPresentation(prompt)
 
@@ -121,6 +121,7 @@ final class ProtocolTests: XCTestCase {
             policy: PolicyEvaluationView(
                 configured_enforcement: "touchid", effective_enforcement: "allow",
                 mode: "audit_only"),
+            ssh: nil,
             identity: IdentityView(pid: 1, uid: 501, exe: "/bin/cat", cwd: nil, chain: "cat"))
         let row = RecentAccess(ev)
         XCTAssertNotNil(row.date)
@@ -130,5 +131,26 @@ final class ProtocolTests: XCTestCase {
         XCTAssertTrue(row.wasGloballyOverridden)
         // The list shows the tilde-abbreviated source path over the uuid mount path.
         XCTAssertEqual(row.shownPath, "~/.env")
+    }
+
+    func testSshSignPresentationUsesIdentityMetadata() {
+        let ssh = SshSignView(
+            surface_id: "surface-1", surface_name: "GitHub identities",
+            resource_id: "resource-1", key_fingerprint: "SHA256:abc123",
+            key_label: "Personal GitHub")
+        let prompt = PromptMsg(
+            req_id: 11, path: "ssh-agent/surface-1", display: nil,
+            operation: "sign", enforcement: "touchid", ssh: ssh,
+            identity: IdentityView(
+                pid: 55, uid: 501, exe: "/usr/bin/ssh", cwd: "/Users/me/project",
+                chain: "zsh -> ssh"))
+
+        let presentation = PromptPresentation(prompt)
+
+        XCTAssertEqual(presentation.actionTitle, "use")
+        XCTAssertEqual(presentation.targetName, "Personal GitHub")
+        XCTAssertEqual(presentation.targetPath, "SHA256:abc123")
+        XCTAssertNil(presentation.mountPath)
+        XCTAssertEqual(presentation.ssh?.surface_name, "GitHub identities")
     }
 }

@@ -5,8 +5,8 @@
 
 use std::io::{self, Read, Write};
 
+use accessfs_core::authz::{AccessContext, PolicyEvaluation};
 use accessfs_core::identity::ProcessIdentity;
-use accessfs_core::authz::PolicyEvaluation;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -44,6 +44,8 @@ pub enum DaemonMsg<'a> {
         display: Option<&'a str>,
         operation: &'a str,
         enforcement: &'a str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ssh: Option<SshSignView<'a>>,
         identity: IdentityView,
     },
     /// A fire-and-forget record of an access, for the app's "recent access" UI.
@@ -57,8 +59,34 @@ pub enum DaemonMsg<'a> {
         decision: &'a str,
         rule_id: Option<&'a str>,
         policy: Option<PolicyEvaluation>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ssh: Option<SshSignView<'a>>,
         identity: IdentityView,
     },
+}
+
+/// Public SSH identity metadata shown in sign prompts and recent access. No key blob, signature,
+/// or bytes-to-sign cross the app protocol.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct SshSignView<'a> {
+    pub surface_id: &'a str,
+    pub surface_name: &'a str,
+    pub resource_id: &'a str,
+    pub key_fingerprint: &'a str,
+    pub key_label: &'a str,
+}
+
+impl<'a> SshSignView<'a> {
+    pub fn from_context(context: Option<AccessContext<'a>>) -> Option<Self> {
+        let AccessContext::SshSign(sign) = context?;
+        Some(SshSignView {
+            surface_id: sign.surface_id,
+            surface_name: sign.surface_name,
+            resource_id: sign.resource_id,
+            key_fingerprint: sign.key_fingerprint,
+            key_label: sign.key_label,
+        })
+    }
 }
 
 /// The reader identity as shown to the app (display-only projection of [`ProcessIdentity`]).
@@ -157,6 +185,7 @@ mod tests {
             decision: "allowed",
             rule_id: Some("grant"),
             policy: None,
+            ssh: None,
             identity: IdentityView::from_identity(&id),
         };
         let v: serde_json::Value = serde_json::from_slice(&serde_json::to_vec(&msg).unwrap()).unwrap();
@@ -202,6 +231,7 @@ mod tests {
             display: None,
             operation: "read",
             enforcement: "prompt",
+            ssh: None,
             identity: IdentityView::from_identity(&id),
         };
         let v: serde_json::Value = serde_json::from_slice(&serde_json::to_vec(&msg).unwrap()).unwrap();

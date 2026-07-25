@@ -814,6 +814,7 @@ fn validate_snapshot_conflicts(snapshot: &CatalogSnapshot) -> CatalogResult<()> 
                 resolve_catalog_surface(snapshot, &surface.id)?;
             }
             SurfaceKind::IniFile => validate_ini_surface_conflicts(snapshot, surface)?,
+            SurfaceKind::UnixSocket => validate_ssh_agent_surface_conflicts(snapshot, surface)?,
             _ => {}
         }
     }
@@ -877,7 +878,8 @@ fn validate_surface_inputs(snapshot: &CatalogSnapshot) -> CatalogResult<()> {
                 SurfaceKind::DotenvFile
                     | SurfaceKind::DirenvFile
                     | SurfaceKind::IniFile
-                    | SurfaceKind::LinesFile,
+                    | SurfaceKind::LinesFile
+                    | SurfaceKind::UnixSocket,
                 SurfaceInput::Bindings { binding_ids },
             ) => {
                 let mut unique = HashSet::new();
@@ -921,17 +923,6 @@ fn validate_surface_inputs(snapshot: &CatalogSnapshot) -> CatalogResult<()> {
                 {
                     return Err(CatalogError::Validation(format!(
                         "env_file_direct surface {:?} requires an env_file resource",
-                        surface.id
-                    )));
-                }
-            }
-            (SurfaceKind::UnixSocket, SurfaceInput::Resource { resource_id }) => {
-                let resource = resources.get(resource_id.as_str()).ok_or_else(|| {
-                    CatalogError::NotFound(format!("resource {resource_id}"))
-                })?;
-                if resource.shape != ValueShape::Socket {
-                    return Err(CatalogError::Validation(format!(
-                        "unix_socket surface {:?} requires a socket resource",
                         surface.id
                     )));
                 }
@@ -1029,7 +1020,65 @@ fn validate_composed_surface_member(
                 )));
             }
         }
+        SurfaceKind::UnixSocket => {
+            let compatible = resource.kind == ResourceKind::SshAgent
+                && resource.shape == ValueShape::Socket
+                && resource.codec == ResourceCodec::Opaque
+                && binding.key_override.is_none()
+                && entries.into_iter().all(|entry| entry.key.is_none())
+                && matches!(resource.source, ResourceSource::Socket { .. });
+            if !compatible {
+                return Err(CatalogError::Validation(format!(
+                    "binding {:?} cannot feed SSH agent surface {:?}",
+                    binding.id, surface.id
+                )));
+            }
+        }
         _ => unreachable!("only composed surfaces call member validation"),
+    }
+    Ok(())
+}
+
+fn validate_ssh_agent_surface_conflicts(
+    snapshot: &CatalogSnapshot,
+    surface: &Surface,
+) -> CatalogResult<()> {
+    let SurfaceInput::Bindings { binding_ids } = &surface.input else {
+        return Err(CatalogError::Validation(format!(
+            "SSH agent surface {:?} requires binding input",
+            surface.id
+        )));
+    };
+    let bindings: HashMap<&str, &Binding> = snapshot
+        .bindings
+        .iter()
+        .map(|binding| (binding.id.as_str(), binding))
+        .collect();
+    let resources: HashMap<&str, &Resource> = snapshot
+        .resources
+        .iter()
+        .map(|resource| (resource.id.as_str(), resource))
+        .collect();
+    let mut addresses: HashMap<&str, &str> = HashMap::new();
+
+    for binding_id in binding_ids {
+        let binding = bindings
+            .get(binding_id.as_str())
+            .ok_or_else(|| CatalogError::NotFound(format!("binding {binding_id}")))?;
+        let resource = resources.get(binding.resource_id.as_str()).ok_or_else(|| {
+            CatalogError::NotFound(format!("resource {}", binding.resource_id))
+        })?;
+        for entry in resource.entries.iter().filter(|entry| match &binding.selection {
+            EntrySelection::All => true,
+            EntrySelection::Entries { addresses } => addresses.contains(&entry.address),
+        }) {
+            if let Some(existing) = addresses.insert(&entry.address, binding.id.as_str()) {
+                return Err(CatalogError::Conflict {
+                    key: entry.address.clone(),
+                    binding_ids: vec![existing.to_string(), binding.id.clone()],
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -1137,11 +1186,9 @@ fn validate_resource(resource: &Resource) -> CatalogResult<()> {
                 "bytes resources cannot declare entries".to_string(),
             ))
         }
-        ValueShape::Socket
-            if resource.entries.len() != 1 || resource.entries[0].key.is_none() =>
-        {
+        ValueShape::Socket if resource.entries.iter().any(|entry| entry.key.is_some()) => {
             return Err(CatalogError::Validation(
-                "socket resources must declare exactly one keyed endpoint entry".to_string(),
+                "socket capability entries cannot declare environment keys".to_string(),
             ))
         }
         _ => {}
@@ -1191,6 +1238,17 @@ fn validate_resource(resource: &Resource) -> CatalogResult<()> {
         ) if !argv.is_empty() => {}
         (ResourceKind::SshAgent, ValueShape::Socket, ResourceSource::Socket { endpoint }) => {
             require_absolute_path(endpoint, "ssh agent endpoint")?;
+            if resource.default_env_key.is_some()
+                || resource
+                    .entries
+                    .iter()
+                    .any(|entry| !is_ssh_identity_address(&entry.address) || entry.sensitive)
+            {
+                return Err(CatalogError::Validation(format!(
+                    "SSH agent resource {:?} requires non-sensitive ssh/sha256 identity entries without an environment key",
+                    resource.id
+                )));
+            }
         }
         _ => {
             return Err(CatalogError::Validation(format!(
@@ -1273,6 +1331,17 @@ fn require_entry_address(value: &str) -> CatalogResult<()> {
     } else {
         Ok(())
     }
+}
+
+fn is_ssh_identity_address(value: &str) -> bool {
+    value
+        .strip_prefix("ssh/sha256/")
+        .is_some_and(|digest| {
+            digest.len() == 43
+                && digest
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+        })
 }
 
 fn validate_surface(surface: &Surface) -> CatalogResult<()> {
@@ -2039,6 +2108,83 @@ mod tests {
         binding.key_override = Some("OTHER".to_string());
         let error = catalog.upsert_binding(&binding).unwrap_err();
         assert!(matches!(error, CatalogError::Validation(message) if message.contains("scalar")));
+    }
+
+    #[test]
+    fn ssh_agent_surface_composes_selected_identity_bindings() {
+        let (_dir, catalog) = catalog();
+        let address =
+            "ssh/sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string();
+        catalog
+            .upsert_resource(&Resource {
+                id: "fixture-agent-provider".to_string(),
+                name: "Fixture Agent".to_string(),
+                kind: ResourceKind::SshAgent,
+                shape: ValueShape::Socket,
+                codec: ResourceCodec::Opaque,
+                default_env_key: None,
+                entries: vec![EntrySpec {
+                    address: address.clone(),
+                    label: "Fleet key".to_string(),
+                    key: None,
+                    sensitive: false,
+                }],
+                source: ResourceSource::Socket {
+                    endpoint: PathBuf::from("/fixture/upstream-agent.sock"),
+                },
+                enforcement: Enforcement::Prompt,
+                metadata: Default::default(),
+            })
+            .unwrap();
+        let mut selected = binding(
+            "fixture-agent-binding",
+            "fixture-agent-provider",
+            BindingScope::Environment { environment_id: "development".to_string() },
+        );
+        selected.selection = EntrySelection::Entries {
+            addresses: vec![address.clone()],
+        };
+        catalog.upsert_binding(&selected).unwrap();
+
+        let surface = Surface {
+            id: "fixture-agent-surface".to_string(),
+            environment_id: "development".to_string(),
+            name: "AWS fleet".to_string(),
+            kind: SurfaceKind::UnixSocket,
+            path: PathBuf::from("/workspace/floria/.floria/agent.sock"),
+            input: SurfaceInput::Bindings {
+                binding_ids: vec![selected.id.clone()],
+            },
+            enforcement: Enforcement::TouchId,
+            position: 0,
+        };
+        catalog.upsert_surface(&surface).unwrap();
+
+        let direct = Surface {
+            input: SurfaceInput::Resource {
+                resource_id: "fixture-agent-provider".to_string(),
+            },
+            ..surface.clone()
+        };
+        let error = catalog.upsert_surface(&direct).unwrap_err();
+        assert!(matches!(error, CatalogError::Validation(message) if message.contains("incompatible")));
+
+        let duplicate = Binding {
+            id: "fixture-agent-binding-duplicate".to_string(),
+            ..selected
+        };
+        catalog.upsert_binding(&duplicate).unwrap();
+        let duplicated_surface = Surface {
+            input: SurfaceInput::Bindings {
+                binding_ids: vec![
+                    "fixture-agent-binding".to_string(),
+                    "fixture-agent-binding-duplicate".to_string(),
+                ],
+            },
+            ..surface
+        };
+        let error = catalog.upsert_surface(&duplicated_surface).unwrap_err();
+        assert!(matches!(error, CatalogError::Conflict { key, .. } if key == address));
     }
 
     #[test]

@@ -7,6 +7,8 @@
 pub mod agent;
 mod policy_mode;
 pub mod protocol;
+mod ssh_agent;
 pub mod socket;
 
 pub use agent::SocketAgent;
+pub use ssh_agent::SshAgentRuntime;

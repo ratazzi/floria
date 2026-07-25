@@ -253,6 +253,7 @@ mod tests {
             display: None,
             operation: "read",
             enforcement: "prompt",
+            ssh: None,
             identity: IdentityView::from_identity(&id),
         }
     }

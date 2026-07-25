@@ -45,6 +45,14 @@ struct PolicyEvaluationView: Codable {
     let mode: String
 }
 
+struct SshSignView: Codable {
+    let surface_id: String
+    let surface_name: String
+    let resource_id: String
+    let key_fingerprint: String
+    let key_label: String
+}
+
 // Incoming (daemon -> app)
 
 struct PromptMsg: Decodable {
@@ -54,6 +62,7 @@ struct PromptMsg: Decodable {
     let display: String?
     let operation: String
     let enforcement: String
+    let ssh: SshSignView?
     let identity: IdentityView
 }
 
@@ -62,11 +71,12 @@ struct AccessEventMsg: Decodable {
     let path: String
     /// Human-facing name (a secret's original source path); `path` stays the rule key.
     let display: String?
-    /// "read" or "write" — with a writable mount, decision alone is ambiguous.
+    /// "read", "write", or "sign" — decision alone is ambiguous.
     let operation: String
     let decision: String
     let rule_id: String?
     let policy: PolicyEvaluationView?
+    let ssh: SshSignView?
     let identity: IdentityView
 }
 

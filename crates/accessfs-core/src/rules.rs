@@ -18,24 +18,28 @@ use crate::identity::ProcessIdentity;
 
 /// Which operations a rule matches. Rules predate the writable mount and mean
 /// "who may *read* what"; keeping unstated rules read-only preserves exactly that — a
-/// read-era `allow` must never silently start covering writes. Write access is opt-in
-/// via an explicit `operation = "write"` / `"readwrite"` in the rule.
+/// read-era `allow` must never silently start covering writes or signatures. Write and sign
+/// access are opt-in via an explicit rule operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RuleOps {
     pub read: bool,
     pub write: bool,
+    pub sign: bool,
 }
 
 impl RuleOps {
-    pub const READ: RuleOps = RuleOps { read: true, write: false };
-    pub const WRITE: RuleOps = RuleOps { read: false, write: true };
-    pub const READ_WRITE: RuleOps = RuleOps { read: true, write: true };
+    pub const READ: RuleOps = RuleOps { read: true, write: false, sign: false };
+    pub const WRITE: RuleOps = RuleOps { read: false, write: true, sign: false };
+    pub const SIGN: RuleOps = RuleOps { read: false, write: false, sign: true };
+    pub const READ_WRITE: RuleOps = RuleOps { read: true, write: true, sign: false };
+    pub const READ_WRITE_SIGN: RuleOps = RuleOps { read: true, write: true, sign: true };
 
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "read" => Some(RuleOps::READ),
             "write" => Some(RuleOps::WRITE),
             "readwrite" => Some(RuleOps::READ_WRITE),
+            "sign" => Some(RuleOps::SIGN),
             _ => None,
         }
     }
@@ -44,6 +48,7 @@ impl RuleOps {
         match op {
             Operation::Read => self.read,
             Operation::Write => self.write,
+            Operation::Sign => self.sign,
         }
     }
 }
@@ -292,5 +297,36 @@ mod tests {
         let set = RuleSet::new(vec![rw]);
         assert_eq!(set.decide(&id, "secrets/x", None, Operation::Write).0, Enforcement::Prompt);
         assert_eq!(set.decide(&id, "secrets/x", None, Operation::Read).0, Enforcement::Prompt);
+    }
+
+    #[test]
+    fn sign_requires_an_explicit_sign_rule() {
+        let id = ident("/usr/bin/ssh", None);
+        let read = RuleSet::new(vec![rule(
+            "legacy-read",
+            10,
+            SubjectMatch::default(),
+            "surfaces/**",
+            Enforcement::Allow,
+        )]);
+        assert_eq!(
+            read.decide(&id, "surfaces/agent", None, Operation::Sign),
+            (Enforcement::Deny, Some("default-deny".to_string()))
+        );
+
+        let mut sign = rule(
+            "sign",
+            10,
+            SubjectMatch::default(),
+            "surfaces/**",
+            Enforcement::Prompt,
+        );
+        sign.ops = RuleOps::SIGN;
+        assert_eq!(
+            RuleSet::new(vec![sign])
+                .decide(&id, "surfaces/agent", None, Operation::Sign)
+                .0,
+            Enforcement::Prompt
+        );
     }
 }

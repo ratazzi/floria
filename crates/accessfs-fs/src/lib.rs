@@ -459,6 +459,7 @@ impl Shared {
             path: &target.virtual_path,
             display: target.display.as_deref(),
             operation,
+            context: None,
             identity,
         });
         if decision.is_allowed() {
@@ -1570,6 +1571,18 @@ pub fn mount(
     surface_registry: Option<Arc<SurfaceRegistry>>,
 ) -> anyhow::Result<()> {
     let audit = Arc::new(AuditLog::open(&cfg.audit_log)?);
+    mount_with_audit(cfg, authorizer, store, catalog, surface_registry, audit)
+}
+
+/// Mount using an audit sink shared with other runtime capabilities such as SSH agent surfaces.
+pub fn mount_with_audit(
+    cfg: ResolvedConfig,
+    authorizer: Arc<dyn Authorizer>,
+    store: Option<Arc<dyn SecretStore>>,
+    catalog: Option<Catalog>,
+    surface_registry: Option<Arc<SurfaceRegistry>>,
+    audit: Arc<AuditLog>,
+) -> anyhow::Result<()> {
     let mount_point = cfg.mount_path.clone();
     let config = mount_config(&cfg.volname);
     let fs = AccessFs::new(&cfg, audit, authorizer, store, catalog, surface_registry)?;

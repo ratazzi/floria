@@ -135,6 +135,44 @@ impl AuditLog {
         });
     }
 
+    /// One SSH agent signature attempt. Only public identity metadata and the authorization/
+    /// provider outcome are recorded; the public key blob, bytes-to-sign, and signature are not.
+    #[allow(clippy::too_many_arguments)]
+    pub fn log_ssh_sign(
+        &self,
+        path: &str,
+        identity: &ProcessIdentity,
+        decision: &str,
+        rule_id: Option<&str>,
+        reason: &str,
+        policy: Option<&PolicyEvaluation>,
+        surface_id: &str,
+        resource_id: &str,
+        key_fingerprint: &str,
+        result: &str,
+    ) {
+        self.write(&SshSignEvent {
+            ts: now_rfc3339(),
+            event: "ssh_sign",
+            path,
+            operation: "sign",
+            decision,
+            rule_id,
+            reason,
+            policy,
+            request: RequestInfo {
+                uid: identity.uid,
+                gid: identity.gid,
+                pid: identity.pid,
+            },
+            identity,
+            surface_id,
+            resource_id,
+            key_fingerprint,
+            result,
+        });
+    }
+
     pub fn log_close(
         &self,
         path: &str,
@@ -215,6 +253,26 @@ struct WriteCommitEvent<'a> {
 }
 
 #[derive(Serialize)]
+struct SshSignEvent<'a> {
+    ts: String,
+    event: &'static str,
+    path: &'a str,
+    operation: &'static str,
+    decision: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rule_id: Option<&'a str>,
+    reason: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy: Option<&'a PolicyEvaluation>,
+    request: RequestInfo,
+    identity: &'a ProcessIdentity,
+    surface_id: &'a str,
+    resource_id: &'a str,
+    key_fingerprint: &'a str,
+    result: &'a str,
+}
+
+#[derive(Serialize)]
 struct CloseEvent<'a> {
     ts: String,
     event: &'static str,
@@ -266,5 +324,31 @@ mod tests {
         assert!(line.contains("\"effective_enforcement\":\"allow\""));
         assert!(line.contains("\"mode\":\"audit_only\""));
         assert!(!line.contains("fixture-secret-value"));
+    }
+
+    #[test]
+    fn ssh_sign_audit_records_public_identity_but_not_signing_material() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let audit = AuditLog::open(&path).unwrap();
+        audit.log_ssh_sign(
+            "surfaces/fixture-agent",
+            &ProcessIdentity::bare(42, 501, 20),
+            "allowed",
+            Some("prompt"),
+            "prompt: allowed",
+            None,
+            "fixture-agent",
+            "fixture-provider",
+            "SHA256:fixtureFingerprint",
+            "signed",
+        );
+
+        let line = std::fs::read_to_string(path).unwrap();
+        assert!(line.contains("\"event\":\"ssh_sign\""));
+        assert!(line.contains("SHA256:fixtureFingerprint"));
+        assert!(line.contains("\"result\":\"signed\""));
+        assert!(!line.contains("fixture-bytes-to-sign"));
+        assert!(!line.contains("fixture-signature"));
     }
 }

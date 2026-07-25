@@ -6,12 +6,17 @@ license.workspace = true
 
 [dependencies]
 accessfs-core = { workspace = true }
+accessfs-platform = { workspace = true }
+accessfs-catalog = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 dashmap = { workspace = true }
 libc = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
+sha2 = { workspace = true }
+base64 = { workspace = true }
+threadpool = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

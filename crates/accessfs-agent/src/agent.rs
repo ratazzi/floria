@@ -17,7 +17,7 @@ use accessfs_core::identity::ProcessIdentity;
 use accessfs_core::rules::{repo_root, RuleSet};
 use dashmap::DashMap;
 
-use crate::protocol::{DaemonMsg, IdentityView};
+use crate::protocol::{DaemonMsg, IdentityView, SshSignView};
 use crate::policy_mode::PolicyModeState;
 use crate::socket::{PromptResult, SocketServer};
 
@@ -125,6 +125,7 @@ impl SocketAgent {
                 display: req.display,
                 operation: req.operation.as_str(),
                 enforcement: enforcement.as_str(),
+                ssh: SshSignView::from_context(req.context),
                 identity: IdentityView::from_identity(req.identity),
             },
             PROMPT_TIMEOUT,
@@ -202,6 +203,7 @@ impl Authorizer for SocketAgent {
             decision: decision.decision_str(),
             rule_id: decision.rule_id.as_deref(),
             policy: decision.policy,
+            ssh: SshSignView::from_context(req.context),
             identity: IdentityView::from_identity(req.identity),
         });
 
@@ -294,6 +296,7 @@ mod tests {
             path: "secrets/test-id",
             display: None,
             operation: op,
+            context: None,
             identity: id,
         }
     }

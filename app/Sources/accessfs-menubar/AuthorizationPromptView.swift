@@ -42,12 +42,20 @@ struct PromptPresentation {
     let processPath: [PromptProcessNode]
     let cwd: String?
     let requiresTouchID: Bool
+    let ssh: SshSignView?
 
     init(_ prompt: PromptMsg) {
-        let originalPath = prompt.display ?? prompt.path
-        targetName = URL(fileURLWithPath: originalPath).lastPathComponent
-        targetPath = (originalPath as NSString).abbreviatingWithTildeInPath
-        mountPath = prompt.display == nil ? nil : prompt.path
+        ssh = prompt.ssh
+        if let ssh = prompt.ssh {
+            targetName = ssh.key_label
+            targetPath = ssh.key_fingerprint
+            mountPath = nil
+        } else {
+            let originalPath = prompt.display ?? prompt.path
+            targetName = URL(fileURLWithPath: originalPath).lastPathComponent
+            targetPath = (originalPath as NSString).abbreviatingWithTildeInPath
+            mountPath = prompt.display == nil ? nil : prompt.path
+        }
         operation = prompt.operation
         cwd = prompt.identity.cwd.map { ($0 as NSString).abbreviatingWithTildeInPath }
         requiresTouchID = prompt.enforcement == "touchid"
@@ -93,7 +101,11 @@ struct PromptPresentation {
     }
 
     var actionTitle: String {
-        operation == "write" ? "modify" : "read"
+        switch operation {
+        case "write": "modify"
+        case "sign": "use"
+        default: "read"
+        }
     }
 
     var intermediateCount: Int { max(0, processPath.count - 2) }
@@ -221,7 +233,9 @@ struct AuthorizationPromptView: View {
             .pickerStyle(.segmented)
             Text(scope == .once
                 ? "Allow only this request."
-                : "Reuse this approval for the same application or project and file for 10 minutes.")
+                : model.operation == "sign"
+                    ? "Reuse this approval for the same application or project and SSH identity for 10 minutes."
+                    : "Reuse this approval for the same application or project and file for 10 minutes.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -272,6 +286,10 @@ struct AuthorizationPromptView: View {
             }
             if let mountPath = model.mountPath {
                 detailRow("Internal mount path", value: mountPath)
+            }
+            if let ssh = model.ssh {
+                detailRow("Agent surface", value: ssh.surface_name)
+                detailRow("Signer source", value: ssh.resource_id)
             }
         }
         .padding(.top, 8)

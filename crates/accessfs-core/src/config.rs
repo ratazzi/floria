@@ -40,7 +40,8 @@ pub struct RuleCfg {
     pub path: Option<String>,
     /// Enforcement to apply on match: `"allow"`, `"deny"`, `"prompt"`, or `"touchid"`.
     pub enforcement: String,
-    /// Which operations the rule matches: `"read"` (default), `"write"`, or `"readwrite"`.
+    /// Which operations the rule matches: `"read"` (default), `"write"`, `"readwrite"`, or
+    /// `"sign"`.
     /// Defaults to read so pre-write-era rules keep meaning "who may read what";
     /// write access is always an explicit opt-in.
     pub operation: Option<String>,
@@ -247,13 +248,13 @@ fn build_ruleset(rule_cfgs: Vec<RuleCfg>, files: &[FileEntry]) -> Result<RuleSet
         subject: SubjectMatch::default(),
         path_glob: compile_glob(&format!("{SURFACES_DIR}/**"))
             .expect("`surfaces/**` is a valid glob"),
-        ops: RuleOps::READ_WRITE,
+        ops: RuleOps::READ_WRITE_SIGN,
         enforcement: Enforcement::Prompt,
         enabled: true,
     });
 
-    // Read-only catch-all: monitor-mode allow for reads. Writes deliberately never match it —
-    // a write that falls past every rule hits the engine's fail-closed default instead.
+    // Read-only catch-all: monitor-mode allow for reads. Writes and signatures deliberately never
+    // match it — either capability falling past every rule hits the fail-closed default instead.
     rules.push(Rule {
         id: "default".to_string(),
         priority: i32::MIN,

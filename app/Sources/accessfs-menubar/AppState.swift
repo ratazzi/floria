@@ -8,7 +8,7 @@ struct RecentAccess: Identifiable {
     let path: String
     /// Tilde-abbreviated original source path, when the daemon knows one (secrets).
     let display: String?
-    let operation: String  // "read" | "write"
+    let operation: String  // "read" | "write" | "sign"
     let decision: String   // "allowed" | "denied"
     let exe: String
     /// Full executable path (icon lookup in the dashboard).
@@ -16,6 +16,7 @@ struct RecentAccess: Identifiable {
     let chain: String
     let ruleId: String?
     let policy: PolicyEvaluationView?
+    let ssh: SshSignView?
 
     var allowed: Bool { decision == "allowed" }
     var wasGloballyOverridden: Bool {
@@ -24,7 +25,7 @@ struct RecentAccess: Identifiable {
     }
 
     /// What the list shows: the friendly name over the opaque `secrets/<uuid>` path.
-    var shownPath: String { display ?? path }
+    var shownPath: String { ssh?.key_label ?? display ?? path }
 
     var time: String {
         guard let date else { return "" }
@@ -48,6 +49,7 @@ struct RecentAccess: Identifiable {
         chain = ev.identity.chain
         ruleId = ev.rule_id
         policy = ev.policy
+        ssh = ev.ssh
     }
 
     private static let iso: ISO8601DateFormatter = {

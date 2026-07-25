@@ -12,7 +12,8 @@ use accessfs_control::{
     CatalogObserver, ControlClient, ControlCommand, ControlResult, ControlServer,
     RuntimePolicyController,
 };
-use accessfs_core::authz::{Enforcement, PolicyMode, PolicyModeStatus};
+use accessfs_core::audit::AuditLog;
+use accessfs_core::authz::{Authorizer, Enforcement, PolicyMode, PolicyModeStatus};
 use accessfs_core::config::{Config, ResolvedConfig, SECRETS_DIR, SURFACES_DIR};
 use accessfs_store::{AgeDirStore, NewSecret, SecretId, SecretRecord, SecretStore, SshKeyProvider};
 use accessfs_surface::{
@@ -381,11 +382,25 @@ fn cmd_mount(config: &Path) -> Result<()> {
     let store: Arc<dyn SecretStore> = Arc::new(open_store(&cfg)?);
     let agent = accessfs_agent::SocketAgent::start(&cfg).context("starting agent socket")?;
     agent.replace_managed_enforcement(managed_enforcement(&snapshot, &store.list()?));
+    let audit = Arc::new(AuditLog::open(&cfg.audit_log).context("opening shared audit log")?);
+    let ssh_authorizer: Arc<dyn Authorizer> = agent.clone();
+    let ssh_runtime = Arc::new(
+        accessfs_agent::SshAgentRuntime::new(
+            support_dir.join("runtime/sockets"),
+            ssh_authorizer,
+            Arc::clone(&audit),
+        )
+        .context("creating SSH agent runtime")?,
+    );
+    ssh_runtime
+        .replace(&snapshot)
+        .context("starting SSH agent surfaces")?;
     let observer: Arc<dyn CatalogObserver> = Arc::new(RuntimeCatalogObserver {
         surface_registry: Arc::clone(&surface_registry),
         mount_path: cfg.mount_path.clone(),
         store: Arc::clone(&store),
         agent: Arc::clone(&agent),
+        ssh_runtime: Arc::clone(&ssh_runtime),
     });
     let policy: Arc<dyn RuntimePolicyController> = Arc::new(AgentPolicyController {
         agent: Arc::clone(&agent),
@@ -400,12 +415,13 @@ fn cmd_mount(config: &Path) -> Result<()> {
     )
         .with_context(|| format!("starting control socket at {}", control_path.display()))?;
     tracing::info!(socket = %control_path.display(), "control socket listening");
-    accessfs_fs::mount(
+    accessfs_fs::mount_with_audit(
         cfg,
         agent,
         Some(store),
         Some(catalog),
         Some(surface_registry),
+        audit,
     )
     .context("mount failed")
 }
@@ -433,6 +449,7 @@ struct RuntimeCatalogObserver {
     mount_path: PathBuf,
     store: Arc<dyn SecretStore>,
     agent: Arc<accessfs_agent::SocketAgent>,
+    ssh_runtime: Arc<accessfs_agent::SshAgentRuntime>,
 }
 
 impl CatalogObserver for RuntimeCatalogObserver {
@@ -446,6 +463,9 @@ impl CatalogObserver for RuntimeCatalogObserver {
         cleanup_removed_file_links(&previous, snapshot, &self.mount_path);
         self.surface_registry.replace(snapshot);
         reconcile_file_links(snapshot, &self.mount_path);
+        if let Err(error) = self.ssh_runtime.replace(snapshot) {
+            tracing::warn!(%error, "refreshing SSH agent surfaces failed");
+        }
         match self.store.list() {
             Ok(records) => self
                 .agent

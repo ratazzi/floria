@@ -129,7 +129,7 @@ struct AccessLogView: View {
             TableColumn("Path") { ev in
                 Text(ev.shownPath)
                     .truncationMode(.middle)
-                    .help(ev.display != nil ? "\(ev.shownPath)\n\(ev.path)" : ev.path)
+                    .help(eventDetail(ev))
             }
         }
         .overlay {
@@ -143,6 +143,13 @@ struct AccessLogView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             bottomBar
         }
+    }
+
+    private func eventDetail(_ event: RecentAccess) -> String {
+        if let ssh = event.ssh {
+            return "\(event.shownPath)\n\(ssh.key_fingerprint)\nAgent: \(ssh.surface_name)"
+        }
+        return event.display != nil ? "\(event.shownPath)\n\(event.path)" : event.path
     }
 
     private var bottomBar: some View {
@@ -190,11 +197,20 @@ struct OperationBadge: View {
     var body: some View {
         Text(operation)
             .font(.caption2.weight(.semibold))
-            .foregroundStyle(operation == "write" ? Color.orange : Color.secondary)
+            .foregroundStyle(color)
             .padding(.horizontal, 5)
             .padding(.vertical, 1)
-            .background((operation == "write" ? Color.orange : Color.secondary).opacity(0.15))
+            .background(color.opacity(0.15))
             .clipShape(Capsule())
+    }
+
+
+    private var color: Color {
+        switch operation {
+        case "write": .orange
+        case "sign": .blue
+        default: .secondary
+        }
     }
 }
 

@@ -18,8 +18,27 @@ pub struct AuthRequest<'a> {
     /// grants, and audit all keep keying on the stable `path`.
     pub display: Option<&'a str>,
     pub operation: Operation,
+    /// Operation-specific public metadata for prompts and audit. Policy continues to key on the
+    /// stable path + operation; callers must never place payloads or bytes-to-sign here.
+    pub context: Option<AccessContext<'a>>,
     /// Enriched identity of the reader.
     pub identity: &'a ProcessIdentity,
+}
+
+/// Metadata for capabilities that cross the same authorization seam as file access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessContext<'a> {
+    SshSign(SshSignContext<'a>),
+}
+
+/// Public, non-secret identity information for one SSH signature request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SshSignContext<'a> {
+    pub surface_id: &'a str,
+    pub surface_name: &'a str,
+    pub resource_id: &'a str,
+    pub key_fingerprint: &'a str,
+    pub key_label: &'a str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -28,6 +47,8 @@ pub enum Operation {
     /// Opening for write (store-backed secrets only). Each committed close appends a new
     /// immutable version to the store, so a write is never destructive.
     Write,
+    /// Use a non-exportable private capability to sign data, currently for SSH agent requests.
+    Sign,
 }
 
 impl Operation {
@@ -35,6 +56,7 @@ impl Operation {
         match self {
             Operation::Read => "read",
             Operation::Write => "write",
+            Operation::Sign => "sign",
         }
     }
 }
@@ -199,6 +221,7 @@ mod tests {
             path: "env/demo/dev.env",
             display: None,
             operation: Operation::Read,
+            context: None,
             identity: &id,
         });
         assert!(d.is_allowed());
