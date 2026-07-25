@@ -39,6 +39,9 @@ pub struct SshSignContext<'a> {
     pub resource_id: &'a str,
     pub key_fingerprint: &'a str,
     pub key_label: &'a str,
+    /// Destination token claimed by the local ssh process. Display-only: the SSH agent protocol
+    /// does not authenticate hostnames, so policy must not treat this as a destination constraint.
+    pub requested_destination: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

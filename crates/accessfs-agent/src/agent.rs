@@ -361,6 +361,7 @@ mod tests {
             resource_id: "fixture-provider",
             key_fingerprint: "SHA256:fixture-first",
             key_label: "First key",
+            requested_destination: None,
         };
         let second = SshSignContext {
             key_fingerprint: "SHA256:fixture-second",

@@ -43,9 +43,11 @@ struct PromptPresentation {
     let cwd: String?
     let requiresTouchID: Bool
     let ssh: SshSignView?
+    let sshDestination: String?
 
     init(_ prompt: PromptMsg) {
         ssh = prompt.ssh
+        sshDestination = prompt.ssh?.requested_destination
         if let ssh = prompt.ssh {
             targetName = ssh.key_label
             targetPath = ssh.key_fingerprint
@@ -163,6 +165,19 @@ struct AuthorizationPromptView: View {
                     .lineLimit(2)
                     .truncationMode(.middle)
                     .textSelection(.enabled)
+                if let destination = model.sshDestination {
+                    HStack(spacing: 6) {
+                        Image(systemName: "server.rack")
+                        Text("Requested server")
+                        Text(destination)
+                            .font(.callout.monospaced())
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .textSelection(.enabled)
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
             }
             Spacer(minLength: 0)
         }

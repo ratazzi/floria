@@ -696,12 +696,17 @@ fn handle_sign(
     };
 
     let path = format!("surfaces/{}", spec.id);
+    let requested_destination = identity
+        .cmdline
+        .as_deref()
+        .and_then(ssh_requested_destination);
     let context = AccessContext::SshSign(SshSignContext {
         surface_id: &spec.id,
         surface_name: &spec.name,
         resource_id: &selected.resource_id,
         key_fingerprint: &selected.fingerprint,
         key_label: &selected.label,
+        requested_destination,
     });
     let decision = authorizer.authorize(&AuthRequest {
         path: &path,
@@ -750,6 +755,44 @@ fn handle_sign(
         result,
     );
     response
+}
+
+/// Extract the destination token from a direct OpenSSH invocation for display. This intentionally
+/// does not resolve aliases or claim the host is verified; the agent protocol carries neither.
+fn ssh_requested_destination(cmdline: &[String]) -> Option<&str> {
+    let program = Path::new(cmdline.first()?).file_name()?.to_str()?;
+    if program != "ssh" {
+        return None;
+    }
+
+    let mut options = true;
+    let mut skip_next = false;
+    for argument in &cmdline[1..] {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if options && argument == "--" {
+            options = false;
+            continue;
+        }
+        if options && argument.starts_with('-') && argument != "-" {
+            skip_next = ssh_option_consumes_next(argument);
+            continue;
+        }
+        return Some(argument);
+    }
+    None
+}
+
+fn ssh_option_consumes_next(argument: &str) -> bool {
+    const WITH_VALUE: &str = "BbcDEeFIiJLlmOoPpQRSWw";
+
+    argument
+        .char_indices()
+        .skip(1)
+        .find(|(_, option)| WITH_VALUE.contains(*option))
+        .is_some_and(|(index, option)| index + option.len_utf8() == argument.len())
 }
 
 struct ParsedIdentity {
@@ -1046,6 +1089,33 @@ mod tests {
             path.as_os_str().as_bytes().len(),
             address.sun_path.len(),
         );
+    }
+
+    #[test]
+    fn extracts_display_destination_from_common_openssh_arguments() {
+        let arguments = [
+            "/usr/bin/ssh",
+            "-vvv",
+            "-o",
+            "BatchMode=yes",
+            "-p2222",
+            "git@fixture.example",
+            "git-upload-pack",
+        ]
+        .map(str::to_string);
+        assert_eq!(
+            ssh_requested_destination(&arguments),
+            Some("git@fixture.example")
+        );
+
+        let separated_port = ["ssh", "-p", "2222", "fixture.example"].map(str::to_string);
+        assert_eq!(
+            ssh_requested_destination(&separated_port),
+            Some("fixture.example")
+        );
+
+        let other_program = ["ssh-add", "-T", "fixture.pub"].map(str::to_string);
+        assert_eq!(ssh_requested_destination(&other_program), None);
     }
 
     struct RecordingAuthorizer {

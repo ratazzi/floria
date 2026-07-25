@@ -51,6 +51,8 @@ struct SshSignView: Codable {
     let resource_id: String
     let key_fingerprint: String
     let key_label: String
+    /// Display-only token from the local ssh command. It is not a verified destination identity.
+    let requested_destination: String?
 }
 
 // Incoming (daemon -> app)

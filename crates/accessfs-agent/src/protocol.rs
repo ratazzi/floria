@@ -74,6 +74,8 @@ pub struct SshSignView<'a> {
     pub resource_id: &'a str,
     pub key_fingerprint: &'a str,
     pub key_label: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_destination: Option<&'a str>,
 }
 
 impl<'a> SshSignView<'a> {
@@ -85,6 +87,7 @@ impl<'a> SshSignView<'a> {
             resource_id: sign.resource_id,
             key_fingerprint: sign.key_fingerprint,
             key_label: sign.key_label,
+            requested_destination: sign.requested_destination,
         })
     }
 }
@@ -243,5 +246,21 @@ mod tests {
         assert_eq!(v["identity"]["cmdline"][0], "cat");
         assert_eq!(v["identity"]["parent_chain"][0]["name"], "launchd");
         assert_eq!(v["identity"]["parent_chain"][2]["name"], "cat");
+    }
+
+    #[test]
+    fn ssh_sign_view_includes_display_only_requested_destination() {
+        let context = AccessContext::SshSign(accessfs_core::authz::SshSignContext {
+            surface_id: "fixture-surface",
+            surface_name: "Fixture identities",
+            resource_id: "fixture-resource",
+            key_fingerprint: "SHA256:fixture-fingerprint",
+            key_label: "Fixture identity",
+            requested_destination: Some("git@github.com"),
+        });
+
+        let value = serde_json::to_value(SshSignView::from_context(Some(context))).unwrap();
+
+        assert_eq!(value["requested_destination"], "git@github.com");
     }
 }

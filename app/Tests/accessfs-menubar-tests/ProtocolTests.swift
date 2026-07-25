@@ -137,7 +137,8 @@ final class ProtocolTests: XCTestCase {
         let ssh = SshSignView(
             surface_id: "surface-1", surface_name: "GitHub identities",
             resource_id: "resource-1", key_fingerprint: "SHA256:abc123",
-            key_label: "Personal GitHub")
+            key_label: "Personal GitHub",
+            requested_destination: "git@github.com")
         let prompt = PromptMsg(
             req_id: 11, path: "ssh-agent/surface-1", display: nil,
             operation: "sign", enforcement: "touchid", ssh: ssh,
@@ -151,6 +152,7 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(presentation.targetName, "Personal GitHub")
         XCTAssertEqual(presentation.targetPath, "SHA256:abc123")
         XCTAssertNil(presentation.mountPath)
+        XCTAssertEqual(presentation.sshDestination, "git@github.com")
         XCTAssertEqual(presentation.ssh?.surface_name, "GitHub identities")
     }
 }
