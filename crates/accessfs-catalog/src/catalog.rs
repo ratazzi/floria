@@ -7,14 +7,14 @@ use accessfs_core::authz::Enforcement;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::domain::{
-    Binding, BindingScope, CatalogSnapshot, EntrySelection, Environment, Project, ProjectCheckout,
-    ProjectCheckoutKind, ResolvedEnvironment, ResolvedExport, Resource, ResourceBindingUsage,
-    ResourceCodec, ResourceKind, ResourceSource, ResourceUsage, Surface, SurfaceInput, SurfaceKind,
-    ValueShape,
+    Binding, BindingScope, CatalogSnapshot, EntrySelection, Environment, OriginSource, Project,
+    ProjectCheckout, ProjectCheckoutKind, ResolvedEnvironment, ResolvedExport, Resource,
+    ResourceBindingUsage, ResourceCodec, ResourceKind, ResourceOrigin, ResourceSource,
+    ResourceUsage, Surface, SurfaceInput, SurfaceKind, ValueShape,
 };
 use crate::error::{CatalogError, CatalogResult};
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 #[derive(Debug, Clone)]
 pub struct Catalog {
@@ -238,14 +238,15 @@ impl Catalog {
         let tx = conn.transaction()?;
         tx.execute(
             "INSERT INTO resources
-                (id, name, kind, shape, codec, default_env_key, entries_json, source_json, enforcement, metadata_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                (id, name, kind, shape, codec, default_env_key, entries_json, source_json, enforcement, metadata_json, origin_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(id) DO UPDATE SET name = excluded.name, kind = excluded.kind,
                  shape = excluded.shape, codec = excluded.codec,
                  default_env_key = excluded.default_env_key,
                  entries_json = excluded.entries_json,
                  source_json = excluded.source_json, enforcement = excluded.enforcement,
                  metadata_json = excluded.metadata_json,
+                 origin_json = excluded.origin_json,
                  updated_at = CURRENT_TIMESTAMP",
             params![
                 resource.id,
@@ -258,9 +259,35 @@ impl Catalog {
                 serde_json::to_string(&resource.source)?,
                 resource.enforcement.as_str(),
                 serde_json::to_string(&resource.metadata)?,
+                serde_json::to_string(&resource.origin)?,
             ],
         )?;
         validate_snapshot_conflicts(&snapshot_from(&tx)?)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Record one more source file on a resource's origin, deduplicated by path.
+    ///
+    /// The origin kind is left untouched: reusing a manual secret from discovery
+    /// keeps it manual while still remembering where it is used from.
+    pub fn append_resource_origin(&self, id: &str, source: &OriginSource) -> CatalogResult<()> {
+        require_id(id, "resource id")?;
+        let mut conn = self.connection()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let origin_json: String = tx
+            .query_row("SELECT origin_json FROM resources WHERE id = ?1", [id], |row| row.get(0))
+            .optional()?
+            .ok_or_else(|| CatalogError::NotFound(format!("resource {id}")))?;
+        let mut origin: ResourceOrigin = serde_json::from_str(&origin_json)?;
+        if origin.sources.iter().any(|existing| existing.path == source.path) {
+            return Ok(());
+        }
+        origin.sources.push(source.clone());
+        tx.execute(
+            "UPDATE resources SET origin_json = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            params![id, serde_json::to_string(&origin)?],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -285,8 +312,8 @@ impl Catalog {
         }
         tx.execute(
             "INSERT INTO resources
-                (id, name, kind, shape, codec, default_env_key, entries_json, source_json, enforcement, metadata_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                (id, name, kind, shape, codec, default_env_key, entries_json, source_json, enforcement, metadata_json, origin_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 resource.id,
                 resource.name,
@@ -298,6 +325,7 @@ impl Catalog {
                 serde_json::to_string(&resource.source)?,
                 resource.enforcement.as_str(),
                 serde_json::to_string(&resource.metadata)?,
+                serde_json::to_string(&resource.origin)?,
             ],
         )?;
         validate_snapshot_conflicts(&snapshot_from(&tx)?)?;
@@ -620,6 +648,7 @@ fn migrate(conn: &mut Connection) -> CatalogResult<()> {
             source_json TEXT NOT NULL,
             enforcement TEXT NOT NULL,
             metadata_json TEXT NOT NULL,
+            origin_json TEXT NOT NULL DEFAULT '{}',
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
@@ -722,7 +751,7 @@ fn snapshot_from(conn: &Connection) -> CatalogResult<CatalogSnapshot> {
 
     let resources = {
         let mut stmt = conn.prepare(
-            "SELECT id, name, kind, shape, codec, default_env_key, entries_json, source_json, enforcement, metadata_json
+            "SELECT id, name, kind, shape, codec, default_env_key, entries_json, source_json, enforcement, metadata_json, origin_json
              FROM resources ORDER BY name, id",
         )?;
         let values = stmt.query_map([], |row| {
@@ -742,6 +771,7 @@ fn snapshot_from(conn: &Connection) -> CatalogResult<CatalogSnapshot> {
                 enforcement: Enforcement::parse(&enforcement)
                     .ok_or_else(|| invalid_value(8, enforcement))?,
                 metadata: decode_json(9, &row.get::<_, String>(9)?)?,
+                origin: decode_json(10, &row.get::<_, String>(10)?)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -1843,6 +1873,7 @@ mod tests {
             source: ResourceSource::SecretRef { secret_id: format!("secret-{id}") },
             enforcement: Enforcement::Prompt,
             metadata: Default::default(),
+            origin: Default::default(),
         }
     }
 
@@ -1871,6 +1902,7 @@ mod tests {
             source: ResourceSource::SecretRef { secret_id: format!("secret-{id}") },
             enforcement: Enforcement::Prompt,
             metadata: Default::default(),
+            origin: Default::default(),
         }
     }
 
@@ -1904,8 +1936,37 @@ mod tests {
         let error = migrate(&mut conn).unwrap_err();
         assert!(matches!(
             error,
-            CatalogError::UnsupportedSchema { found: 1, expected: 8 }
+            CatalogError::UnsupportedSchema { found: 1, expected: 9 }
         ));
+    }
+
+    #[test]
+    fn append_resource_origin_deduplicates_by_path() {
+        let (_dir, catalog) = catalog();
+        catalog.upsert_resource(&scalar_resource("fixture-secret", "API_TOKEN")).unwrap();
+        let source = OriginSource {
+            path: PathBuf::from("/workspace/floria/.env"),
+            project_id: Some("floria".to_string()),
+            environment: Some("development".to_string()),
+            imported_at: "2026-07-24T00:00:00Z".to_string(),
+        };
+
+        catalog.append_resource_origin("fixture-secret", &source).unwrap();
+        catalog.append_resource_origin("fixture-secret", &source).unwrap();
+        let other = OriginSource {
+            path: PathBuf::from("/workspace/floria/.env.production"),
+            ..source.clone()
+        };
+        catalog.append_resource_origin("fixture-secret", &other).unwrap();
+
+        let snapshot = catalog.snapshot().unwrap();
+        let resource =
+            snapshot.resources.iter().find(|resource| resource.id == "fixture-secret").unwrap();
+        assert_eq!(resource.origin.sources.len(), 2);
+        assert_eq!(resource.origin.sources[0].path, Path::new("/workspace/floria/.env"));
+        assert!(catalog
+            .append_resource_origin("missing", &source)
+            .is_err());
     }
 
     #[test]
@@ -1968,6 +2029,7 @@ mod tests {
             source: ResourceSource::SecretRef { secret_id: "fixture-ini-secret".to_string() },
             enforcement: Enforcement::Prompt,
             metadata: Default::default(),
+            origin: Default::default(),
         };
         catalog.upsert_resource(&resource).unwrap();
         catalog
@@ -2487,6 +2549,7 @@ mod tests {
                 source: ResourceSource::SecretRef { secret_id: "secret-defaults".to_string() },
                 enforcement: Enforcement::Prompt,
                 metadata: Default::default(),
+                origin: Default::default(),
             })
             .unwrap();
         let mut binding = binding(
@@ -2523,6 +2586,7 @@ mod tests {
                 },
                 enforcement: Enforcement::Prompt,
                 metadata: Default::default(),
+                origin: Default::default(),
             })
             .unwrap();
         let mut selected = binding(
@@ -2555,6 +2619,7 @@ mod tests {
                 },
                 enforcement: Enforcement::Prompt,
                 metadata: Default::default(),
+                origin: Default::default(),
             })
             .unwrap();
         let managed = binding(

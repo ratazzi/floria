@@ -7,15 +7,16 @@ use std::sync::Arc;
 
 use accessfs_catalog::{
     resolve_catalog_surface, Binding, BindingScope, Catalog, CatalogError, CatalogSnapshot,
-    EntrySelection, EntrySpec, Environment, ItemMetadata, Project, Resource, ResourceCodec,
-    ResourceKind, ResourceSource, Surface, SurfaceInput, SurfaceKind, ValueShape,
+    EntrySelection, EntrySpec, Environment, ItemMetadata, OriginKind, OriginSource, Project,
+    Resource, ResourceCodec, ResourceKind, ResourceOrigin, ResourceSource, Surface, SurfaceInput,
+    SurfaceKind, ValueShape,
 };
 use accessfs_core::audit::{read_recent_access, AuditAccessRecord};
 use accessfs_core::authz::{Enforcement, PolicyMode, PolicyModeStatus};
 use accessfs_discover::{
-    discover, discover_git_checkouts, DiscoveredContent, DiscoveredFileAction, DiscoveredFileKind,
-    ExistingEnvironment, ExistingProject, ExistingSecret, ExistingSurface, GitCheckoutDiscovery,
-    GitCheckoutMonitor, MonitoredGitCheckout,
+    classify_key, discover, discover_git_checkouts, DiscoveredContent, DiscoveredFileAction,
+    DiscoveredFileKind, ExistingEnvironment, ExistingProject, ExistingSecret, ExistingSurface,
+    GitCheckoutDiscovery, GitCheckoutMonitor, KeyClass, MonitoredGitCheckout,
 };
 use accessfs_platform::SocketPeerVerifier;
 use accessfs_ssh::ManagedKeyError;
@@ -507,13 +508,21 @@ fn dispatch(
                 discovery.plan_with_project(&existing, managed_project.as_ref()),
             ))
         }
-        ControlCommand::DiscoverApply { path, files, separate_entries } => apply_discovery(
+        ControlCommand::DiscoverApply {
+            path,
+            files,
+            separate_entries,
+            promote_entries,
+            demote_entries,
+        } => apply_discovery(
             catalog,
             store.ok_or(DispatchError::StoreUnavailable)?,
             mount_path.ok_or(DispatchError::StoreUnavailable)?,
             &path,
             files.as_deref(),
             &separate_entries,
+            &promote_entries,
+            &demote_entries,
         ),
         ControlCommand::DiscoverReferenceResolve { surface_id, key, source } => {
             resolve_discovery_reference(
@@ -569,6 +578,15 @@ fn dispatch(
             &path,
             passphrase.as_ref(),
             ManagedItemSettings { enforcement, metadata },
+            ResourceOrigin {
+                kind: OriginKind::SshImport,
+                sources: vec![OriginSource {
+                    path: path.clone(),
+                    project_id: None,
+                    environment: None,
+                    imported_at: now_rfc3339(),
+                }],
+            },
         ),
         ControlCommand::SshIdentityRemove { resource_id } => remove_ssh_identity(
             catalog,
@@ -662,6 +680,7 @@ fn dispatch(
             default_env_key,
             value,
             ManagedItemSettings { enforcement, metadata },
+            ResourceOrigin { kind: OriginKind::Manual, sources: Vec::new() },
         ),
         ControlCommand::SharedSecretUpdate {
             resource_id,
@@ -700,6 +719,7 @@ fn dispatch(
             codec,
             value,
             ManagedItemSettings { enforcement, metadata },
+            ResourceOrigin { kind: OriginKind::Manual, sources: Vec::new() },
         ),
         ControlCommand::ResourceMetadataUpdate { resource_id, name, enforcement, metadata } => {
             update_resource_metadata(catalog, &resource_id, name, enforcement, metadata)
@@ -874,6 +894,7 @@ fn history_identity(identity: &accessfs_core::identity::ProcessIdentity) -> Acce
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_discovery(
     catalog: &Catalog,
     store: &dyn SecretStore,
@@ -881,6 +902,8 @@ fn apply_discovery(
     path: &Path,
     selected_files: Option<&[PathBuf]>,
     separate_entries: &[crate::protocol::DiscoveryEntryRef],
+    promote_entries: &[crate::protocol::DiscoveryEntryRef],
+    demote_entries: &[crate::protocol::DiscoveryEntryRef],
 ) -> Result<ControlResult, DispatchError> {
     let discovery =
         discover(path).map_err(|error| DispatchError::Validation(error.to_string()))?;
@@ -906,7 +929,7 @@ fn apply_discovery(
             )));
         }
     }
-    let valid_separate_entries = contents
+    let valid_override_entries = contents
         .iter()
         .filter(|file| {
             file.action == DiscoveredFileAction::Compose
@@ -921,18 +944,28 @@ fn apply_discovery(
                 .map(|entry| (file.path.clone(), entry.address.clone()))
         })
         .collect::<HashSet<_>>();
-    let separate_entries = separate_entries
-        .iter()
-        .map(|entry| (entry.path.clone(), entry.address.clone()))
-        .collect::<HashSet<_>>();
-    if let Some((path, address)) = separate_entries
-        .iter()
-        .find(|entry| !valid_separate_entries.contains(*entry))
-    {
-        return Err(DispatchError::Validation(format!(
-            "separate-secret choice was not part of the reviewed discovery: {} ({address})",
-            path.display()
-        )));
+    let as_entry_set = |entries: &[crate::protocol::DiscoveryEntryRef]| {
+        entries
+            .iter()
+            .map(|entry| (entry.path.clone(), entry.address.clone()))
+            .collect::<HashSet<_>>()
+    };
+    let separate_entries = as_entry_set(separate_entries);
+    let promote_entries = as_entry_set(promote_entries);
+    let demote_entries = as_entry_set(demote_entries);
+    for (label, entries) in [
+        ("separate-secret", &separate_entries),
+        ("promote", &promote_entries),
+        ("demote", &demote_entries),
+    ] {
+        if let Some((path, address)) =
+            entries.iter().find(|entry| !valid_override_entries.contains(*entry))
+        {
+            return Err(DispatchError::Validation(format!(
+                "{label} choice was not part of the reviewed discovery: {} ({address})",
+                path.display()
+            )));
+        }
     }
     let needs_project = contents
         .iter()
@@ -1001,7 +1034,16 @@ fn apply_discovery(
                         None,
                         ManagedItemSettings {
                             enforcement: Enforcement::Prompt,
-                            metadata: discovered_metadata(&file),
+                            metadata: ItemMetadata::default(),
+                        },
+                        ResourceOrigin {
+                            kind: OriginKind::Discovered,
+                            sources: vec![OriginSource {
+                                path: file.path.clone(),
+                                project_id: project_id.clone(),
+                                environment: None,
+                                imported_at: now_rfc3339(),
+                            }],
                         },
                     )?;
                     result.imported_ssh_identities += 1;
@@ -1026,6 +1068,8 @@ fn apply_discovery(
                         DiscoveryReuseState {
                             existing: &mut existing,
                             separate_entries: &separate_entries,
+                            promote_entries: &promote_entries,
+                            demote_entries: &demote_entries,
                         },
                         &mut result,
                         file,
@@ -1075,6 +1119,8 @@ fn apply_discovery(
 struct DiscoveryReuseState<'a> {
     existing: &'a mut Vec<ExistingSecret>,
     separate_entries: &'a HashSet<(PathBuf, String)>,
+    promote_entries: &'a HashSet<(PathBuf, String)>,
+    demote_entries: &'a HashSet<(PathBuf, String)>,
 }
 
 fn apply_composed_discovery(
@@ -1106,11 +1152,19 @@ fn apply_composed_discovery(
 
     match file.kind {
         DiscoveredFileKind::Dotenv | DiscoveredFileKind::Direnv => {
+            let source = discovered_source(&file, project_id, environment_name);
+            let mut plain_entries: Vec<(usize, &accessfs_discover::DiscoveredValue)> = Vec::new();
             for (position, entry) in file.entries.iter().enumerate() {
-                let force_separate =
-                    reuse
-                        .separate_entries
-                        .contains(&(file.path.clone(), entry.address.clone()));
+                let entry_ref = (file.path.clone(), entry.address.clone());
+                let import_as_secret = match classify_key(&entry.key) {
+                    KeyClass::Secret => !reuse.demote_entries.contains(&entry_ref),
+                    KeyClass::Plain => reuse.promote_entries.contains(&entry_ref),
+                };
+                if !import_as_secret {
+                    plain_entries.push((position, entry));
+                    continue;
+                }
+                let force_separate = reuse.separate_entries.contains(&entry_ref);
                 let reusable = (!force_separate).then(|| {
                     reuse.existing.iter().find(|candidate| {
                         candidate.key == entry.key
@@ -1119,7 +1173,9 @@ fn apply_composed_discovery(
                 });
                 let resource_id = if let Some(candidate) = reusable.flatten() {
                     result.reused_resources += 1;
-                    candidate.resource_id.clone()
+                    let resource_id = candidate.resource_id.clone();
+                    catalog.append_resource_origin(&resource_id, &source)?;
+                    resource_id
                 } else {
                     let resource_id = generated_id("secret");
                     create_shared_secret(
@@ -1131,7 +1187,11 @@ fn apply_composed_discovery(
                         SecretValue::new(entry.value.as_str().to_string()),
                         ManagedItemSettings {
                             enforcement: Enforcement::Prompt,
-                            metadata: discovered_metadata(&file),
+                            metadata: ItemMetadata::default(),
+                        },
+                        ResourceOrigin {
+                            kind: OriginKind::Discovered,
+                            sources: vec![source.clone()],
                         },
                     )?;
                     mutation.created_resources.push(resource_id.clone());
@@ -1163,6 +1223,55 @@ fn apply_composed_discovery(
                 mutation.created_bindings.push(binding_id.clone());
                 binding_ids.push(binding_id);
             }
+            if !plain_entries.is_empty() {
+                let values = plain_entries
+                    .iter()
+                    .map(|(_, entry)| (entry.key.clone(), entry.value.as_str().to_string()))
+                    .collect::<Vec<_>>();
+                let rendered = accessfs_surface::render_dotenv(&values)
+                    .map_err(|error| DispatchError::Validation(error.to_string()))?;
+                let content = String::from_utf8(rendered).map_err(|_| {
+                    DispatchError::Validation(format!(
+                        "{} produced non-UTF-8 env values",
+                        file.path.display()
+                    ))
+                })?;
+                let resource_id = generated_id("env-file");
+                create_env_file(
+                    catalog,
+                    store,
+                    resource_id.clone(),
+                    file.relative_path.display().to_string(),
+                    ResourceCodec::Dotenv,
+                    SecretValue::new(content),
+                    ManagedItemSettings {
+                        enforcement: Enforcement::Allow,
+                        metadata: ItemMetadata::default(),
+                    },
+                    ResourceOrigin {
+                        kind: OriginKind::Discovered,
+                        sources: vec![source.clone()],
+                    },
+                )?;
+                mutation.created_resources.push(resource_id.clone());
+                result.created_resources += 1;
+                let binding_id = generated_id("binding");
+                catalog.upsert_binding(&Binding {
+                    id: binding_id.clone(),
+                    project_id: project_id.to_string(),
+                    scope: BindingScope::Environment {
+                        environment_id: environment_id.clone(),
+                    },
+                    resource_id,
+                    selection: EntrySelection::All,
+                    key_override: None,
+                    enabled: true,
+                    allow_override: false,
+                    position: plain_entries[0].0 as i64,
+                })?;
+                mutation.created_bindings.push(binding_id.clone());
+                binding_ids.push(binding_id);
+            }
         }
         DiscoveredFileKind::AwsCredentials => {
             let bytes = zeroize::Zeroizing::new(std::fs::read(&file.path).map_err(|source| {
@@ -1188,7 +1297,11 @@ fn apply_composed_discovery(
                 SecretValue::new(text.to_string()),
                 ManagedItemSettings {
                     enforcement: Enforcement::Prompt,
-                    metadata: discovered_metadata(&file),
+                    metadata: ItemMetadata::default(),
+                },
+                ResourceOrigin {
+                    kind: OriginKind::Discovered,
+                    sources: vec![discovered_source(&file, project_id, environment_name)],
                 },
             )?;
             mutation.created_resources.push(resource_id.clone());
@@ -1496,10 +1609,20 @@ fn replace_discovered_file_with_surface(
     Ok(())
 }
 
-fn discovered_metadata(file: &DiscoveredContent) -> ItemMetadata {
-    ItemMetadata {
-        note: Some(format!("Discovered from {}", file.relative_path.display())),
-        links: Vec::new(),
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn discovered_source(
+    file: &DiscoveredContent,
+    project_id: &str,
+    environment: &str,
+) -> OriginSource {
+    OriginSource {
+        path: file.path.clone(),
+        project_id: Some(project_id.to_string()),
+        environment: Some(environment.to_string()),
+        imported_at: now_rfc3339(),
     }
 }
 
@@ -1664,6 +1787,7 @@ fn resolve_discovery_reference(
                 Some(key.to_string()),
                 value,
                 ManagedItemSettings { enforcement, metadata },
+                ResourceOrigin { kind: OriginKind::Manual, sources: Vec::new() },
             )?;
             mutation.created_resources.push(resource_id.clone());
             (resource_id, Some(key.to_string()))
@@ -2153,6 +2277,7 @@ fn rollback_project_create(catalog: &Catalog, project_id: &str) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn import_ssh_identity(
     catalog: &Catalog,
     store: &dyn SecretStore,
@@ -2161,6 +2286,7 @@ fn import_ssh_identity(
     path: &Path,
     passphrase: Option<&crate::protocol::SecretValue>,
     settings: ManagedItemSettings,
+    origin: ResourceOrigin,
 ) -> Result<ControlResult, DispatchError> {
     let name = name.trim().to_string();
     if name.is_empty() {
@@ -2205,6 +2331,7 @@ fn import_ssh_identity(
         },
         enforcement,
         metadata,
+        origin,
     };
     catalog.validate_resource(&resource)?;
     match catalog.resource(&resource.id) {
@@ -2261,6 +2388,7 @@ fn remove_ssh_identity(
     Ok(ControlResult::Empty)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_shared_secret(
     catalog: &Catalog,
     store: &dyn SecretStore,
@@ -2269,6 +2397,7 @@ fn create_shared_secret(
     default_env_key: Option<String>,
     value: crate::protocol::SecretValue,
     settings: ManagedItemSettings,
+    origin: ResourceOrigin,
 ) -> Result<ControlResult, DispatchError> {
     let ManagedItemSettings { enforcement, metadata } = settings;
     if value.as_bytes().is_empty() {
@@ -2293,6 +2422,7 @@ fn create_shared_secret(
         source: ResourceSource::SecretRef { secret_id: "pending-secret-id".to_string() },
         enforcement,
         metadata,
+        origin,
     };
     catalog.validate_resource(&resource)?;
     match catalog.resource(&resource.id) {
@@ -2490,6 +2620,7 @@ fn rotate_shared_secret(
     Ok(ControlResult::SharedSecretRotated { resource_id, version })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_env_file(
     catalog: &Catalog,
     store: &dyn SecretStore,
@@ -2498,6 +2629,7 @@ fn create_env_file(
     codec: ResourceCodec,
     value: crate::protocol::SecretValue,
     settings: ManagedItemSettings,
+    origin: ResourceOrigin,
 ) -> Result<ControlResult, DispatchError> {
     let ManagedItemSettings { enforcement, metadata } = settings;
     if !matches!(codec, ResourceCodec::Dotenv | ResourceCodec::Ini) {
@@ -2535,6 +2667,7 @@ fn create_env_file(
         source: ResourceSource::SecretRef { secret_id: "pending-secret-id".to_string() },
         enforcement,
         metadata,
+        origin,
     };
     catalog.validate_resource(&resource)?;
     match catalog.resource(&resource.id) {
@@ -2646,6 +2779,8 @@ mod tests {
                         | "DISCOVERED_TOKEN"
                         | "OPTIONAL_NEW_TOKEN"
                         | "credentials"
+                        | "DEBUG"
+                        | ".env"
                 ));
             }
             let id: SecretId = FIXTURE_SECRET_ID.parse().unwrap();
@@ -3185,6 +3320,8 @@ mod tests {
                 path: project_path.clone(),
                 files: Some(vec![source_path.clone()]),
                 separate_entries: Vec::new(),
+                promote_entries: Vec::new(),
+                demote_entries: Vec::new(),
             },
         )
         .unwrap();
@@ -3220,6 +3357,188 @@ mod tests {
     }
 
     #[test]
+    fn discovery_apply_splits_plain_values_into_an_env_file_with_origins() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("fixture-project");
+        let source_path = project_path.join(".env");
+        let mount_path = dir.path().join("mount");
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
+        std::fs::create_dir_all(mount_path.join(accessfs_core::config::SURFACES_DIR)).unwrap();
+        std::fs::write(
+            &source_path,
+            "DEBUG=true\nDISCOVERED_TOKEN=fixture-discovered-value\nRETRIES=3\n",
+        )
+        .unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let store = FixtureStore::new();
+
+        let applied = dispatch(
+            &catalog,
+            DispatchServices {
+                store: Some(&store),
+                mount_path: Some(&mount_path),
+                ..DispatchServices::default()
+            },
+            ControlCommand::DiscoverApply {
+                path: project_path,
+                files: Some(vec![source_path.clone()]),
+                separate_entries: Vec::new(),
+                promote_entries: Vec::new(),
+                demote_entries: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let ControlResult::DiscoveryApplied(result) = applied else {
+            panic!("expected discovery apply result");
+        };
+        assert_eq!(result.created_resources, 2);
+        let snapshot = catalog.snapshot().unwrap();
+        let secret = snapshot
+            .resources
+            .iter()
+            .find(|resource| resource.kind == ResourceKind::SharedSecret)
+            .unwrap();
+        assert_eq!(secret.name, "DISCOVERED_TOKEN");
+        assert_eq!(secret.enforcement, Enforcement::Prompt);
+        assert_eq!(secret.origin.kind, accessfs_catalog::OriginKind::Discovered);
+        assert_eq!(secret.origin.sources.len(), 1);
+        assert_eq!(secret.origin.sources[0].path, source_path);
+        let env_file = snapshot
+            .resources
+            .iter()
+            .find(|resource| resource.kind == ResourceKind::EnvFile)
+            .unwrap();
+        assert_eq!(env_file.name, ".env");
+        assert_eq!(env_file.enforcement, Enforcement::Allow);
+        assert_eq!(env_file.origin.kind, accessfs_catalog::OriginKind::Discovered);
+        let env_keys = env_file
+            .entries
+            .iter()
+            .filter_map(|entry| entry.key.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(env_keys, ["DEBUG", "RETRIES"]);
+        assert_eq!(snapshot.bindings.len(), 2);
+        let secret_binding =
+            snapshot.bindings.iter().find(|binding| binding.resource_id == secret.id).unwrap();
+        let env_binding =
+            snapshot.bindings.iter().find(|binding| binding.resource_id == env_file.id).unwrap();
+        assert_eq!(env_binding.position, 0);
+        assert_eq!(secret_binding.position, 1);
+    }
+
+    #[test]
+    fn discovery_apply_honors_promote_and_demote_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("fixture-project");
+        let source_path = project_path.join(".env");
+        let mount_path = dir.path().join("mount");
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
+        std::fs::create_dir_all(mount_path.join(accessfs_core::config::SURFACES_DIR)).unwrap();
+        std::fs::write(
+            &source_path,
+            "DEBUG=fixture-promoted-value\nDISCOVERED_TOKEN=fixture-demoted-value\n",
+        )
+        .unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let store = FixtureStore::new();
+
+        let applied = dispatch(
+            &catalog,
+            DispatchServices {
+                store: Some(&store),
+                mount_path: Some(&mount_path),
+                ..DispatchServices::default()
+            },
+            ControlCommand::DiscoverApply {
+                path: project_path,
+                files: Some(vec![source_path.clone()]),
+                separate_entries: Vec::new(),
+                promote_entries: vec![crate::protocol::DiscoveryEntryRef {
+                    path: source_path.clone(),
+                    address: "keys/DEBUG".to_string(),
+                }],
+                demote_entries: vec![crate::protocol::DiscoveryEntryRef {
+                    path: source_path.clone(),
+                    address: "keys/DISCOVERED_TOKEN".to_string(),
+                }],
+            },
+        )
+        .unwrap();
+
+        let ControlResult::DiscoveryApplied(result) = applied else {
+            panic!("expected discovery apply result");
+        };
+        assert_eq!(result.created_resources, 2);
+        let snapshot = catalog.snapshot().unwrap();
+        let secret = snapshot
+            .resources
+            .iter()
+            .find(|resource| resource.kind == ResourceKind::SharedSecret)
+            .unwrap();
+        assert_eq!(secret.name, "DEBUG");
+        let env_file = snapshot
+            .resources
+            .iter()
+            .find(|resource| resource.kind == ResourceKind::EnvFile)
+            .unwrap();
+        let env_keys = env_file
+            .entries
+            .iter()
+            .filter_map(|entry| entry.key.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(env_keys, ["DISCOVERED_TOKEN"]);
+    }
+
+    #[test]
+    fn discovery_reuse_appends_a_source_to_the_existing_secret_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("fixture-project");
+        let source_path = project_path.join(".env");
+        let mount_path = dir.path().join("mount");
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
+        std::fs::create_dir_all(mount_path.join(accessfs_core::config::SURFACES_DIR)).unwrap();
+        std::fs::write(&source_path, "API_TOKEN=fixture-shared-value\n").unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let store = FixtureStore::new();
+        dispatch(
+            &catalog,
+            DispatchServices { store: Some(&store), ..DispatchServices::default() },
+            ControlCommand::SharedSecretCreate {
+                resource_id: "fixture-shared-api-token".to_string(),
+                name: "Fixture Shared Secret".to_string(),
+                default_env_key: Some("API_TOKEN".to_string()),
+                value: crate::protocol::SecretValue::new("fixture-shared-value"),
+                enforcement: Enforcement::Prompt,
+                metadata: ItemMetadata::default(),
+            },
+        )
+        .unwrap();
+
+        dispatch(
+            &catalog,
+            DispatchServices {
+                store: Some(&store),
+                mount_path: Some(&mount_path),
+                ..DispatchServices::default()
+            },
+            ControlCommand::DiscoverApply {
+                path: project_path,
+                files: Some(vec![source_path.clone()]),
+                separate_entries: Vec::new(),
+                promote_entries: Vec::new(),
+                demote_entries: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let resource = catalog.resource("fixture-shared-api-token").unwrap();
+        assert_eq!(resource.origin.kind, accessfs_catalog::OriginKind::Manual);
+        assert_eq!(resource.origin.sources.len(), 1);
+        assert_eq!(resource.origin.sources[0].path, source_path);
+    }
+
+    #[test]
     fn discovery_apply_mutates_only_reviewed_files() {
         let dir = tempfile::tempdir().unwrap();
         let project_path = dir.path().join("fixture-project");
@@ -3244,6 +3563,8 @@ mod tests {
                 path: project_path,
                 files: Some(vec![production_path.clone()]),
                 separate_entries: Vec::new(),
+                promote_entries: Vec::new(),
+                demote_entries: Vec::new(),
             },
         )
         .unwrap();
@@ -3291,6 +3612,8 @@ mod tests {
                 path: project_path.clone(),
                 files: None,
                 separate_entries: Vec::new(),
+                promote_entries: Vec::new(),
+                demote_entries: Vec::new(),
             },
         )
         .unwrap();
@@ -3454,6 +3777,8 @@ mod tests {
                 path: project_path,
                 files: Some(vec![development_path, production_path]),
                 separate_entries: Vec::new(),
+                promote_entries: Vec::new(),
+                demote_entries: Vec::new(),
             },
         )
         .unwrap();
@@ -3505,6 +3830,8 @@ mod tests {
                     path: production_path,
                     address: "keys/DISCOVERED_TOKEN".to_string(),
                 }],
+                promote_entries: Vec::new(),
+                demote_entries: Vec::new(),
             },
         )
         .unwrap();
@@ -3543,6 +3870,8 @@ mod tests {
                 path: project_path.clone(),
                 files: Some(vec![project_path.join(".env.not-reviewed")]),
                 separate_entries: Vec::new(),
+                promote_entries: Vec::new(),
+                demote_entries: Vec::new(),
             },
         )
         .unwrap_err();
@@ -3588,6 +3917,8 @@ mod tests {
                 path: project_path,
                 files: Some(vec![dotenv_path.clone(), ssh_path.clone()]),
                 separate_entries: Vec::new(),
+                promote_entries: Vec::new(),
+                demote_entries: Vec::new(),
             },
         )
         .unwrap();
@@ -3642,6 +3973,8 @@ mod tests {
                 path: project_path,
                 files: Some(vec![source_path.clone()]),
                 separate_entries: Vec::new(),
+                promote_entries: Vec::new(),
+                demote_entries: Vec::new(),
             },
         )
         .unwrap();
@@ -3843,7 +4176,7 @@ mod tests {
         let mut client = ControlClient::connect(&socket).unwrap();
         assert_eq!(
             client.request(ControlCommand::Ping).unwrap(),
-            ControlResult::Pong { schema_version: 8 }
+            ControlResult::Pong { schema_version: 9 }
         );
         client
             .request(ControlCommand::ProjectUpsert {
@@ -4369,6 +4702,7 @@ mod tests {
                     },
                     enforcement: Enforcement::Prompt,
                     metadata: Default::default(),
+                    origin: Default::default(),
                 },
             })
             .unwrap();

@@ -67,6 +67,12 @@ pub enum ControlCommand {
         path: PathBuf,
         files: Option<Vec<PathBuf>>,
         separate_entries: Vec<DiscoveryEntryRef>,
+        /// Review overrides: import these plain-classified entries as secrets.
+        #[serde(default)]
+        promote_entries: Vec<DiscoveryEntryRef>,
+        /// Review overrides: keep these secret-classified entries as plain env values.
+        #[serde(default)]
+        demote_entries: Vec<DiscoveryEntryRef>,
     },
     DiscoverReferenceResolve {
         surface_id: String,
@@ -633,6 +639,8 @@ mod tests {
                     path: PathBuf::from("/fixture/project/.env"),
                     address: "keys/API_TOKEN".to_string(),
                 }],
+                promote_entries: Vec::new(),
+                demote_entries: Vec::new(),
             },
         };
         let value = serde_json::to_value(request).unwrap();

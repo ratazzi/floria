@@ -905,6 +905,7 @@ mod tests {
                 source: ResourceSource::SecretRef { secret_id: TOKEN_ID.to_string() },
                 enforcement: Default::default(),
                 metadata: Default::default(),
+                origin: Default::default(),
             },
         );
         add_resource(
@@ -933,6 +934,7 @@ mod tests {
                 source: ResourceSource::SecretRef { secret_id: ENV_FILE_ID.to_string() },
                 enforcement: Default::default(),
                 metadata: Default::default(),
+                origin: Default::default(),
             },
         );
         add_resource(
@@ -953,6 +955,7 @@ mod tests {
                 source: ResourceSource::Literal { value: "development".to_string() },
                 enforcement: Default::default(),
                 metadata: Default::default(),
+                origin: Default::default(),
             },
         );
         bind(&catalog, "fixture-token-binding", "fixture-token", 0);
@@ -1128,6 +1131,7 @@ mod tests {
                 source: ResourceSource::SecretRef { secret_id: INI_FILE_ID.to_string() },
                 enforcement: Default::default(),
                 metadata: Default::default(),
+                origin: Default::default(),
             },
         );
         catalog
@@ -1225,6 +1229,7 @@ mod tests {
                     source: ResourceSource::SecretRef { secret_id: secret_id.to_string() },
                     enforcement: Default::default(),
                     metadata: Default::default(),
+                    origin: Default::default(),
                 },
             );
         }

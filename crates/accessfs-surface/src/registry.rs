@@ -140,6 +140,7 @@ mod tests {
             source: ResourceSource::SecretRef { secret_id: "fixture-secret".to_string() },
             enforcement: Default::default(),
             metadata: Default::default(),
+            origin: Default::default(),
         };
         let registry = SurfaceRegistry::from_snapshot(&CatalogSnapshot {
             surfaces: vec![

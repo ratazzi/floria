@@ -748,6 +748,8 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
                     path,
                     files: None,
                     separate_entries: Vec::new(),
+                    promote_entries: Vec::new(),
+                    demote_entries: Vec::new(),
                 }
             } else {
                 ControlCommand::Discover { path }
@@ -1181,6 +1183,7 @@ mod tests {
             source: ResourceSource::SecretRef { secret_id: secret_id.to_string() },
             enforcement,
             metadata: Default::default(),
+            origin: Default::default(),
         }
     }
 

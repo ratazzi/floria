@@ -1578,6 +1578,7 @@ mod tests {
                 source: ResourceSource::Socket { endpoint: upstream.to_path_buf() },
                 enforcement: Enforcement::Prompt,
                 metadata: Default::default(),
+                origin: Default::default(),
             }],
             bindings: vec![Binding {
                 id: "fixture-binding".to_string(),
@@ -1640,6 +1641,7 @@ mod tests {
             },
             enforcement: Enforcement::Prompt,
             metadata: Default::default(),
+            origin: Default::default(),
         }];
         snapshot.bindings[0].resource_id = "fixture-managed-identity".to_string();
         snapshot.bindings[0].selection = EntrySelection::Entries {
