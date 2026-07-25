@@ -1,6 +1,13 @@
 import AppKit
 import SwiftUI
 
+private enum AuthorizationPromptLayout {
+    static let visualColumnWidth: CGFloat = 58
+    static let columnSpacing: CGFloat = 16
+    static let cardPadding: CGFloat = 14
+    static let processVisualWidth = visualColumnWidth - cardPadding
+}
+
 enum PromptGrantScope: Equatable {
     case once
     case timed(seconds: UInt64)
@@ -222,11 +229,22 @@ struct AuthorizationPromptView: View {
                     requestHeader
                     processSummary
                     securityNotice
-                    AuthorizationScopePicker(
-                        preset: $grantPreset,
-                        customDuration: $customDuration,
-                        customUnit: $customUnit,
-                        operation: model.operation)
+                    HStack(
+                        alignment: .top,
+                        spacing: AuthorizationPromptLayout.columnSpacing
+                    ) {
+                        Color.clear
+                            .frame(
+                                width: AuthorizationPromptLayout.visualColumnWidth,
+                                height: 1)
+                            .accessibilityHidden(true)
+                        AuthorizationScopePicker(
+                            preset: $grantPreset,
+                            customDuration: $customDuration,
+                            customUnit: $customUnit,
+                            operation: model.operation)
+                        Spacer(minLength: 0)
+                    }
                 }
                 .padding(.horizontal, 26)
                 .padding(.vertical, 22)
@@ -248,8 +266,10 @@ struct AuthorizationPromptView: View {
     }
 
     private var requestHeader: some View {
-        HStack(spacing: 16) {
-            endpointIcon(process: model.requester, size: 58)
+        HStack(spacing: AuthorizationPromptLayout.columnSpacing) {
+            endpointIcon(
+                process: model.requester,
+                size: AuthorizationPromptLayout.visualColumnWidth)
             VStack(alignment: .leading, spacing: 5) {
                 Text("Allow \(model.requester.displayName) to \(model.actionTitle) \(model.targetName)?")
                     .font(.title2.weight(.semibold))
@@ -308,8 +328,43 @@ struct AuthorizationPromptView: View {
     }
 
     private var processSummary: some View {
-        DisclosureGroup(isExpanded: $showsFullPath) {
-            VStack(spacing: 0) {
+        VStack(spacing: 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.16)) {
+                    showsFullPath.toggle()
+                }
+            } label: {
+                HStack(spacing: AuthorizationPromptLayout.columnSpacing) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "chevron.right")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.tertiary)
+                            .rotationEffect(.degrees(showsFullPath ? 90 : 0))
+                            .frame(width: 8)
+                        Image(systemName: "point.3.connected.trianglepath.dotted")
+                            .font(.title3)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 28, height: 28)
+                    }
+                    .frame(
+                        width: AuthorizationPromptLayout.processVisualWidth,
+                        alignment: .leading)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(processSummaryTitle)
+                            .font(.callout.weight(.semibold))
+                        Text(processSummarySubtitle)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityLabel("\(processSummaryTitle), \(processSummarySubtitle)")
+            .accessibilityValue(showsFullPath ? "Expanded" : "Collapsed")
+
+            if showsFullPath {
                 Divider().padding(.vertical, 8)
                 VStack(spacing: 0) {
                     ForEach(Array(model.processPath.enumerated()), id: \.element.id) { index, process in
@@ -318,33 +373,21 @@ struct AuthorizationPromptView: View {
                     details
                 }
             }
-        } label: {
-            HStack(spacing: 12) {
-                Image(systemName: "point.3.connected.trianglepath.dotted")
-                    .font(.title3)
-                    .foregroundStyle(.secondary)
-                    .frame(width: 28, height: 28)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(processSummaryTitle)
-                        .font(.callout.weight(.semibold))
-                    Text(processSummarySubtitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
         }
-        .tint(.secondary)
-        .padding(14)
+        .padding(AuthorizationPromptLayout.cardPadding)
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
     }
 
     @ViewBuilder
     private var securityNotice: some View {
         if model.requiresTouchID {
-            HStack(spacing: 12) {
+            HStack(spacing: AuthorizationPromptLayout.columnSpacing) {
                 Image(systemName: "touchid")
                     .font(.title2)
                     .foregroundStyle(.orange)
+                    .frame(
+                        width: AuthorizationPromptLayout.processVisualWidth,
+                        alignment: .leading)
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Touch ID required")
                         .font(.callout.weight(.semibold))
@@ -354,7 +397,7 @@ struct AuthorizationPromptView: View {
                 }
                 Spacer()
             }
-            .padding(14)
+            .padding(AuthorizationPromptLayout.cardPadding)
             .background(.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
         }
     }
