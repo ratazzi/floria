@@ -73,6 +73,19 @@ final class ControlClient: @unchecked Sendable {
         return result
     }
 
+    func resolveDiscoveryReference(
+        surfaceID: String, key: String, source: DiscoveryReferenceSource
+    ) async throws -> DiscoveryReferenceResolution {
+        guard let result: DiscoveryReferenceResolution = try await request(
+            .discoverReferenceResolve(surfaceID: surfaceID, key: key, source: source),
+            expecting: "discovery_reference_resolved",
+            as: DiscoveryReferenceResolution.self)
+        else {
+            throw ControlClientError.missingResult("discovery_reference_resolved")
+        }
+        return result
+    }
+
     func discoverSshIdentities(endpoint: String) async throws -> [DiscoveredSshIdentity] {
         guard let identities: [DiscoveredSshIdentity] = try await request(
             .sshAgentDiscover(endpoint: endpoint), expecting: "ssh_agent_identities",

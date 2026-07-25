@@ -70,6 +70,8 @@ pub struct DiscoveredFile {
     pub kind: DiscoveredFileKind,
     pub codec: ResourceCodec,
     pub environment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_surface_id: Option<String>,
     pub tags: Vec<String>,
     pub entries: Vec<DiscoveredEntry>,
     pub warnings: Vec<DiscoveryWarning>,
@@ -147,6 +149,12 @@ pub struct ExistingProject {
 
 pub struct ExistingEnvironment {
     pub name: String,
+    pub surfaces: Vec<ExistingSurface>,
+}
+
+pub struct ExistingSurface {
+    pub id: String,
+    pub path: PathBuf,
     pub keys: Vec<String>,
 }
 
@@ -279,16 +287,23 @@ impl Discovery {
                 .or_default();
             keys.extend(file.entries.iter().map(|entry| entry.key.clone()));
         }
-        if let Some(project) = managed_project {
-            for environment in &project.environments {
-                discovered_dotenv_keys
-                    .entry(normalize_environment(Some(&environment.name)))
-                    .or_default()
-                    .extend(environment.keys.iter().cloned());
-            }
-        }
         let mut files = Vec::with_capacity(self.files.len());
         for file in &self.files {
+            let managed_surface = managed_project
+                .and_then(|project| {
+                    project.environments.iter().find(|environment| {
+                        normalize_environment(Some(&environment.name))
+                            == normalize_environment(file.environment.as_deref())
+                    })
+                })
+                .and_then(|environment| {
+                    reference_target_path(&file.path).and_then(|target| {
+                        environment
+                            .surfaces
+                            .iter()
+                            .find(|surface| surface.path == target)
+                    })
+                });
             let mut entries = Vec::with_capacity(file.entries.len());
             for entry in &file.entries {
                 let action = match file.entry_disposition {
@@ -330,7 +345,9 @@ impl Discovery {
                         let environment = normalize_environment(file.environment.as_deref());
                         let matched = discovered_dotenv_keys
                             .get(&environment)
-                            .is_some_and(|keys| keys.contains(entry.key.as_str()));
+                            .is_some_and(|keys| keys.contains(entry.key.as_str()))
+                            || managed_surface
+                                .is_some_and(|surface| surface.keys.contains(&entry.key));
                         if !matched {
                             missing_reference_entries += 1;
                         }
@@ -350,6 +367,7 @@ impl Discovery {
                 kind: file.kind,
                 codec: file.codec,
                 environment: file.environment.clone(),
+                managed_surface_id: managed_surface.map(|surface| surface.id.clone()),
                 tags: file.tags.clone(),
                 entries,
                 warnings: file.warnings.clone(),
@@ -811,6 +829,13 @@ fn dotenv_reference_marker(path: &Path) -> Option<&'static str> {
         .find_map(|part| DOTENV_REFERENCE_MARKERS.iter().copied().find(|marker| *marker == part))
 }
 
+fn reference_target_path(path: &Path) -> Option<PathBuf> {
+    let marker = dotenv_reference_marker(path)?;
+    let file_name = path.file_name()?.to_str()?;
+    let target_name = file_name.replacen(&format!(".{marker}"), "", 1);
+    Some(path.with_file_name(target_name))
+}
+
 fn relative_to(root: &Path, path: &Path) -> PathBuf {
     path.strip_prefix(root).unwrap_or(path).to_path_buf()
 }
@@ -1079,7 +1104,11 @@ mod tests {
             id: "fixture-project".to_string(),
             environments: vec![ExistingEnvironment {
                 name: "QA West".to_string(),
-                keys: vec!["MANAGED_TOKEN".to_string()],
+                surfaces: vec![ExistingSurface {
+                    id: "fixture-surface".to_string(),
+                    path: root.join(".env.qa-west"),
+                    keys: vec!["MANAGED_TOKEN".to_string()],
+                }],
             }],
         };
 
@@ -1087,6 +1116,7 @@ mod tests {
 
         assert_eq!(plan.project.managed_project_id.as_deref(), Some("fixture-project"));
         assert_eq!(plan.summary.missing_reference_entries, 1);
+        assert_eq!(plan.files[0].managed_surface_id.as_deref(), Some("fixture-surface"));
         let entries = &plan.files[0].entries;
         assert!(entries.iter().any(|entry| {
             entry.key == "MANAGED_TOKEN"

@@ -708,6 +708,9 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
         ControlResult::DiscoveryApplied(result) => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
+        ControlResult::DiscoveryReferenceResolved(result) => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
         ControlResult::SshAgentIdentities(identities) => {
             println!("{}", serde_json::to_string_pretty(&identities)?);
         }

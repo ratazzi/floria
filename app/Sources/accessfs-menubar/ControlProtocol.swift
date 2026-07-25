@@ -304,6 +304,7 @@ struct DiscoveredFile: Codable, Hashable, Sendable, Identifiable {
     let kind: DiscoveredFileKind
     let codec: String
     let environment: String?
+    let managedSurfaceID: String?
     let tags: [String]
     let entries: [DiscoveredEntry]
     let warnings: [DiscoveryWarning]
@@ -312,6 +313,7 @@ struct DiscoveredFile: Codable, Hashable, Sendable, Identifiable {
     enum CodingKeys: String, CodingKey {
         case path, kind, codec, environment, tags, entries, warnings, action
         case relativePath = "relative_path"
+        case managedSurfaceID = "managed_surface_id"
     }
 }
 
@@ -367,6 +369,46 @@ struct DiscoveryAppliedFile: Codable, Hashable, Sendable, Identifiable {
     let path: String
     let outcome: String
     let detail: String
+}
+
+enum DiscoveryReferenceSource: Encodable, Sendable {
+    case newSharedSecret(
+        name: String, value: String, enforcement: String, metadata: ItemMetadata)
+    case existingSharedSecret(resourceID: String)
+
+    private enum CodingKeys: String, CodingKey {
+        case type, name, value, enforcement, metadata
+        case resourceID = "resource_id"
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .newSharedSecret(let name, let value, let enforcement, let metadata):
+            try container.encode("new_shared_secret", forKey: .type)
+            try container.encode(name, forKey: .name)
+            try container.encode(value, forKey: .value)
+            try container.encode(enforcement, forKey: .enforcement)
+            try container.encode(metadata, forKey: .metadata)
+        case .existingSharedSecret(let resourceID):
+            try container.encode("existing_shared_secret", forKey: .type)
+            try container.encode(resourceID, forKey: .resourceID)
+        }
+    }
+}
+
+struct DiscoveryReferenceResolution: Codable, Hashable, Sendable {
+    let surfaceID: String
+    let resourceID: String
+    let bindingID: String
+    let key: String
+
+    enum CodingKeys: String, CodingKey {
+        case key
+        case surfaceID = "surface_id"
+        case resourceID = "resource_id"
+        case bindingID = "binding_id"
+    }
 }
 
 struct DiscoverySeparateEntry: Codable, Hashable, Sendable {
@@ -435,6 +477,8 @@ enum ControlCommand: Sendable {
     case discover(path: String)
     case discoverApply(
         path: String, files: [String], separateEntries: [DiscoverySeparateEntry])
+    case discoverReferenceResolve(
+        surfaceID: String, key: String, source: DiscoveryReferenceSource)
     case sshAgentDiscover(endpoint: String)
     case sshIdentityImport(
         resourceID: String, name: String, path: String, passphrase: String?,
@@ -483,6 +527,7 @@ enum ControlCommand: Sendable {
         case .snapshot: "snapshot"
         case .discover: "discover"
         case .discoverApply: "discover_apply"
+        case .discoverReferenceResolve: "discover_reference_resolve"
         case .sshAgentDiscover: "ssh_agent_discover"
         case .sshIdentityImport: "ssh_identity_import"
         case .sshIdentityRemove: "ssh_identity_remove"
@@ -540,6 +585,12 @@ enum ControlCommand: Sendable {
                     requestID: requestID, method: method,
                     params: DiscoverApplyParams(
                         path: path, files: files, separateEntries: separateEntries)))
+        case .discoverReferenceResolve(let surfaceID, let key, let source):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: DiscoverReferenceResolveParams(
+                        surfaceID: surfaceID, key: key, source: source)))
         case .sshAgentDiscover(let endpoint):
             return try encoder.encode(
                 ControlRequest(
@@ -666,6 +717,11 @@ private struct DiscoverApplyParams: Encodable {
     let path: String
     let files: [String]
     let separateEntries: [DiscoverySeparateEntry]
+}
+private struct DiscoverReferenceResolveParams: Encodable {
+    let surfaceID: String
+    let key: String
+    let source: DiscoveryReferenceSource
 }
 private struct SshAgentDiscoverParams: Encodable { let endpoint: String }
 

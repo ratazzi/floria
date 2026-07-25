@@ -105,6 +105,37 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(result.files.first?.outcome, "imported")
     }
 
+    func testDiscoverReferenceResolveRequestAndResultMatchRustWireShape() throws {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let data = try ControlCommand.discoverReferenceResolve(
+            surfaceID: "fixture-surface",
+            key: "API_TOKEN",
+            source: .newSharedSecret(
+                name: "API token", value: "fixture-reference-value",
+                enforcement: "prompt", metadata: .empty)
+        )
+        .requestData(requestID: 10, encoder: encoder)
+        let request = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let params = try XCTUnwrap(request["params"] as? [String: Any])
+        let source = try XCTUnwrap(params["source"] as? [String: Any])
+
+        XCTAssertEqual(request["method"] as? String, "discover_reference_resolve")
+        XCTAssertEqual(params["surface_id"] as? String, "fixture-surface")
+        XCTAssertEqual(params["key"] as? String, "API_TOKEN")
+        XCTAssertEqual(source["type"] as? String, "new_shared_secret")
+        XCTAssertEqual(source["value"] as? String, "fixture-reference-value")
+
+        let response = Data(
+            #"{"request_id":10,"status":"ok","result":{"type":"discovery_reference_resolved","value":{"surface_id":"fixture-surface","resource_id":"fixture-resource","binding_id":"fixture-binding","key":"API_TOKEN"}}}"#.utf8)
+        let decoded = try JSONDecoder().decode(
+            ControlResponseEnvelope<DiscoveryReferenceResolution>.self, from: response)
+        let result = try XCTUnwrap(decoded.result?.value)
+        XCTAssertEqual(result.resourceID, "fixture-resource")
+        XCTAssertEqual(result.bindingID, "fixture-binding")
+    }
+
     func testDiscoveryReviewOnlyActionMatchesRustWireShape() throws {
         let file = try JSONDecoder().decode(
             DiscoveredFile.self,

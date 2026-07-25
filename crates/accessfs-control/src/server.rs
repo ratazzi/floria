@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use accessfs_catalog::{
-    resolve_catalog_snapshot, Binding, BindingScope, Catalog, CatalogError, CatalogSnapshot,
+    resolve_catalog_surface, Binding, BindingScope, Catalog, CatalogError, CatalogSnapshot,
     EntrySelection, EntrySpec, Environment, ItemMetadata, Project, Resource, ResourceCodec,
     ResourceKind, ResourceSource, Surface, SurfaceInput, SurfaceKind, ValueShape,
 };
@@ -15,7 +15,7 @@ use accessfs_core::audit::{read_recent_access, AuditAccessRecord};
 use accessfs_core::authz::{Enforcement, PolicyMode, PolicyModeStatus};
 use accessfs_discover::{
     discover, DiscoveredContent, DiscoveredFileAction, DiscoveredFileKind, ExistingEnvironment,
-    ExistingProject, ExistingSecret,
+    ExistingProject, ExistingSecret, ExistingSurface,
 };
 use accessfs_ssh::ManagedKeyError;
 use accessfs_store::{NewSecret, SecretId, SecretOrigin, SecretRecord, SecretStore, StoreError};
@@ -25,8 +25,8 @@ use crate::protocol::{
     read_msg, write_msg, AccessHistoryEvent, AccessHistoryIdentity, AccessHistoryProcess,
     AccessHistorySsh, ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest,
     ControlResponse, ControlResult, DiscoveryAppliedFile, DiscoveryApplyOutcome,
-    DiscoveryApplyResult, ProtectedFile, ProtectedFileVersion, SecretValue, SshConfigStatus,
-    SshIdentity,
+    DiscoveryApplyResult, DiscoveryReferenceResolution, DiscoveryReferenceSource, ProtectedFile,
+    ProtectedFileVersion, SecretValue, SshConfigStatus, SshIdentity,
 };
 
 pub struct ControlServer {
@@ -286,6 +286,7 @@ fn changes_runtime(command: &ControlCommand) -> bool {
             | ControlCommand::ProtectedFileMetadataUpdate { .. }
             | ControlCommand::FileRestore { .. }
             | ControlCommand::DiscoverApply { .. }
+            | ControlCommand::DiscoverReferenceResolve { .. }
     )
 }
 
@@ -447,6 +448,15 @@ fn dispatch(
             files.as_deref(),
             &separate_entries,
         ),
+        ControlCommand::DiscoverReferenceResolve { surface_id, key, source } => {
+            resolve_discovery_reference(
+                catalog,
+                store.ok_or(DispatchError::StoreUnavailable)?,
+                &surface_id,
+                &key,
+                source,
+            )
+        }
         ControlCommand::SshAgentDiscover { endpoint } => {
             if !endpoint.is_absolute() {
                 return Err(DispatchError::Validation(
@@ -1352,14 +1362,30 @@ fn existing_discovery_project(
         .iter()
         .filter(|environment| environment.project_id == project.id)
         .map(|environment| {
-            let resolved = resolve_catalog_snapshot(&snapshot, &project.id, &environment.id)?;
+            let surfaces = snapshot
+                .surfaces
+                .iter()
+                .filter(|surface| {
+                    surface.environment_id == environment.id
+                        && matches!(
+                            surface.kind,
+                            SurfaceKind::DotenvFile | SurfaceKind::DirenvFile
+                        )
+                })
+                .map(|surface| {
+                    Ok(ExistingSurface {
+                        id: surface.id.clone(),
+                        path: surface.path.clone(),
+                        keys: resolve_catalog_surface(&snapshot, &surface.id)?
+                            .into_iter()
+                            .map(|export| export.key)
+                            .collect(),
+                    })
+                })
+                .collect::<Result<Vec<_>, CatalogError>>()?;
             Ok(ExistingEnvironment {
                 name: environment.name.clone(),
-                keys: resolved
-                    .exports
-                    .into_iter()
-                    .map(|export| export.key)
-                    .collect(),
+                surfaces,
             })
         })
         .collect::<Result<Vec<_>, CatalogError>>()?;
@@ -1411,6 +1437,153 @@ fn existing_discovery_secrets(
         });
     }
     Ok(existing)
+}
+
+fn resolve_discovery_reference(
+    catalog: &Catalog,
+    store: &dyn SecretStore,
+    surface_id: &str,
+    key: &str,
+    source: DiscoveryReferenceSource,
+) -> Result<ControlResult, DispatchError> {
+    let snapshot = catalog.snapshot()?;
+    let surface = snapshot
+        .surfaces
+        .iter()
+        .find(|surface| surface.id == surface_id)
+        .ok_or_else(|| DispatchError::Validation(format!("surface {surface_id:?} was not found")))?
+        .clone();
+    if !matches!(surface.kind, SurfaceKind::DotenvFile | SurfaceKind::DirenvFile) {
+        return Err(DispatchError::Validation(
+            "reference values can only be attached to dotenv or direnv outputs".to_string(),
+        ));
+    }
+    let binding_ids = match &surface.input {
+        SurfaceInput::Bindings { binding_ids } => binding_ids.clone(),
+        _ => {
+            return Err(DispatchError::Validation(
+                "reference target must be a composed environment output".to_string(),
+            ))
+        }
+    };
+    if resolve_catalog_surface(&snapshot, surface_id)?
+        .iter()
+        .any(|export| export.key == key)
+    {
+        return Err(DispatchError::Validation(format!(
+            "{key:?} is already exported by this output"
+        )));
+    }
+    let environment = snapshot
+        .environments
+        .iter()
+        .find(|environment| environment.id == surface.environment_id)
+        .ok_or_else(|| {
+            DispatchError::Validation(format!(
+                "environment {:?} was not found",
+                surface.environment_id
+            ))
+        })?;
+
+    let mut mutation = DiscoveryMutationGuard::new(catalog, store);
+    let (resource_id, default_env_key) = match source {
+        DiscoveryReferenceSource::NewSharedSecret {
+            name,
+            value,
+            enforcement,
+            metadata,
+        } => {
+            let resource_id = generated_id("shared-secret");
+            create_shared_secret(
+                catalog,
+                store,
+                resource_id.clone(),
+                name,
+                Some(key.to_string()),
+                value,
+                ManagedItemSettings { enforcement, metadata },
+            )?;
+            mutation.created_resources.push(resource_id.clone());
+            (resource_id, Some(key.to_string()))
+        }
+        DiscoveryReferenceSource::ExistingSharedSecret { resource_id } => {
+            let resource = catalog.resource(&resource_id)?;
+            if resource.kind != ResourceKind::SharedSecret || resource.shape != ValueShape::Scalar {
+                return Err(DispatchError::Validation(
+                    "choose a scalar Shared Secret for this reference value".to_string(),
+                ));
+            }
+            (resource_id, resource.default_env_key)
+        }
+    };
+
+    let key_override = (default_env_key.as_deref() != Some(key)).then(|| key.to_string());
+    let reusable_binding = snapshot
+        .bindings
+        .iter()
+        .filter(|binding| {
+            binding.project_id == environment.project_id
+                && binding.resource_id == resource_id
+                && binding.selection == EntrySelection::All
+                && binding.key_override == key_override
+                && binding.enabled
+                && match &binding.scope {
+                    BindingScope::Common => true,
+                    BindingScope::Environment { environment_id } => {
+                        environment_id == &environment.id
+                    }
+                }
+        })
+        .min_by_key(|binding| matches!(&binding.scope, BindingScope::Common));
+    let binding_id = if let Some(binding) = reusable_binding {
+        binding.id.clone()
+    } else {
+        let binding_id = generated_id("binding");
+        catalog.upsert_binding(&Binding {
+            id: binding_id.clone(),
+            project_id: environment.project_id.clone(),
+            scope: BindingScope::Environment {
+                environment_id: environment.id.clone(),
+            },
+            resource_id: resource_id.clone(),
+            selection: EntrySelection::All,
+            key_override,
+            enabled: true,
+            allow_override: false,
+            position: snapshot
+                .bindings
+                .iter()
+                .filter(|binding| {
+                    binding.project_id == environment.project_id
+                        && binding.scope
+                            == (BindingScope::Environment {
+                                environment_id: environment.id.clone(),
+                            })
+                })
+                .count() as i64,
+        })?;
+        mutation.created_bindings.push(binding_id.clone());
+        binding_id
+    };
+
+    let mut updated_surface = surface;
+    updated_surface.input = SurfaceInput::Bindings {
+        binding_ids: binding_ids
+            .into_iter()
+            .chain(std::iter::once(binding_id.clone()))
+            .collect(),
+    };
+    catalog.upsert_surface(&updated_surface)?;
+    mutation.committed = true;
+
+    Ok(ControlResult::DiscoveryReferenceResolved(
+        DiscoveryReferenceResolution {
+            surface_id: surface_id.to_string(),
+            resource_id,
+            binding_id,
+            key: key.to_string(),
+        },
+    ))
 }
 
 fn create_project_workspace(
@@ -2299,6 +2472,7 @@ mod tests {
                         | "Fixture INI File"
                         | "Fixture SSH Identity"
                         | "DISCOVERED_TOKEN"
+                        | "OPTIONAL_NEW_TOKEN"
                         | "credentials"
                 ));
             }
@@ -2766,8 +2940,9 @@ mod tests {
         std::fs::create_dir_all(project_path.join(".git")).unwrap();
         std::fs::create_dir_all(mount_path.join(accessfs_core::config::SURFACES_DIR)).unwrap();
         std::fs::write(&source_path, "DISCOVERED_TOKEN=fixture-real-value\n").unwrap();
-        let reference_bytes =
-            b"DISCOVERED_TOKEN=replace-me\nOPTIONAL_DISCOVERED_TOKEN=replace-me\n";
+        let reference_bytes = b"DISCOVERED_TOKEN=replace-me\n\
+            OPTIONAL_REUSED_TOKEN=replace-me\n\
+            OPTIONAL_NEW_TOKEN=replace-me\n";
         std::fs::write(&reference_path, reference_bytes).unwrap();
         let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
         let store = FixtureStore::new();
@@ -2806,7 +2981,7 @@ mod tests {
         let rediscovered = dispatch(
             &catalog,
             DispatchServices { store: Some(&store), ..DispatchServices::default() },
-            ControlCommand::Discover { path: project_path },
+            ControlCommand::Discover { path: project_path.clone() },
         )
         .unwrap();
         let ControlResult::Discovery(plan) = rediscovered else {
@@ -2816,7 +2991,7 @@ mod tests {
             plan.project.managed_project_id.as_deref(),
             Some(snapshot.projects[0].id.as_str())
         );
-        assert_eq!(plan.summary.missing_reference_entries, 1);
+        assert_eq!(plan.summary.missing_reference_entries, 2);
         let reference = plan
             .files
             .iter()
@@ -2828,10 +3003,89 @@ mod tests {
                     == accessfs_discover::DiscoveredEntryAction::ReferenceEntry { matched: true }
         }));
         assert!(reference.entries.iter().any(|entry| {
-            entry.key == "OPTIONAL_DISCOVERED_TOKEN"
+            entry.key == "OPTIONAL_REUSED_TOKEN"
                 && entry.action
                     == accessfs_discover::DiscoveredEntryAction::ReferenceEntry { matched: false }
         }));
+        let surface_id = reference.managed_surface_id.clone().expect("managed surface");
+
+        let reused = dispatch(
+            &catalog,
+            DispatchServices { store: Some(&store), ..DispatchServices::default() },
+            ControlCommand::DiscoverReferenceResolve {
+                surface_id: surface_id.clone(),
+                key: "OPTIONAL_REUSED_TOKEN".to_string(),
+                source: DiscoveryReferenceSource::ExistingSharedSecret {
+                    resource_id: snapshot.resources[0].id.clone(),
+                },
+            },
+        )
+        .unwrap();
+        let ControlResult::DiscoveryReferenceResolved(reused) = reused else {
+            panic!("expected resolved reference");
+        };
+        assert_eq!(reused.surface_id, snapshot.surfaces[0].id);
+        assert_eq!(reused.resource_id, snapshot.resources[0].id);
+        assert_eq!(reused.key, "OPTIONAL_REUSED_TOKEN");
+
+        let mut secondary_surface = snapshot.surfaces[0].clone();
+        secondary_surface.id = "fixture-secondary-surface".to_string();
+        secondary_surface.name = ".env.secondary".to_string();
+        secondary_surface.path = project_path.join(".env.secondary");
+        secondary_surface.input = SurfaceInput::Bindings { binding_ids: Vec::new() };
+        secondary_surface.position = 1;
+        catalog.upsert_surface(&secondary_surface).unwrap();
+        let reused_again = dispatch(
+            &catalog,
+            DispatchServices { store: Some(&store), ..DispatchServices::default() },
+            ControlCommand::DiscoverReferenceResolve {
+                surface_id: secondary_surface.id.clone(),
+                key: "OPTIONAL_REUSED_TOKEN".to_string(),
+                source: DiscoveryReferenceSource::ExistingSharedSecret {
+                    resource_id: snapshot.resources[0].id.clone(),
+                },
+            },
+        )
+        .unwrap();
+        let ControlResult::DiscoveryReferenceResolved(reused_again) = reused_again else {
+            panic!("expected resolved reference");
+        };
+        assert_eq!(reused_again.binding_id, reused.binding_id);
+        assert_eq!(catalog.snapshot().unwrap().bindings.len(), 2);
+
+        dispatch(
+            &catalog,
+            DispatchServices { store: Some(&store), ..DispatchServices::default() },
+            ControlCommand::DiscoverReferenceResolve {
+                surface_id,
+                key: "OPTIONAL_NEW_TOKEN".to_string(),
+                source: DiscoveryReferenceSource::NewSharedSecret {
+                    name: "OPTIONAL_NEW_TOKEN".to_string(),
+                    value: SecretValue::new("fixture-new-reference-value"),
+                    enforcement: Enforcement::Prompt,
+                    metadata: ItemMetadata::default(),
+                },
+            },
+        )
+        .unwrap();
+
+        let resolved_snapshot = catalog.snapshot().unwrap();
+        assert_eq!(resolved_snapshot.resources.len(), 2);
+        assert_eq!(resolved_snapshot.bindings.len(), 3);
+        assert_eq!(
+            resolved_snapshot.surfaces[0].input.binding_ids().unwrap().len(),
+            3
+        );
+        let rediscovered = dispatch(
+            &catalog,
+            DispatchServices { store: Some(&store), ..DispatchServices::default() },
+            ControlCommand::Discover { path: project_path },
+        )
+        .unwrap();
+        let ControlResult::Discovery(resolved_plan) = rediscovered else {
+            panic!("expected discovery result");
+        };
+        assert_eq!(resolved_plan.summary.missing_reference_entries, 0);
     }
 
     #[test]

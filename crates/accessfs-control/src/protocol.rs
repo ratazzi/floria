@@ -65,6 +65,11 @@ pub enum ControlCommand {
         files: Option<Vec<PathBuf>>,
         separate_entries: Vec<DiscoveryEntryRef>,
     },
+    DiscoverReferenceResolve {
+        surface_id: String,
+        key: String,
+        source: DiscoveryReferenceSource,
+    },
     SshAgentDiscover { endpoint: PathBuf },
     SshIdentityImport {
         resource_id: String,
@@ -158,6 +163,7 @@ pub enum ControlResult {
     Snapshot(CatalogSnapshot),
     Discovery(DiscoveryPlan),
     DiscoveryApplied(DiscoveryApplyResult),
+    DiscoveryReferenceResolved(DiscoveryReferenceResolution),
     SshAgentIdentities(Vec<SshIdentity>),
     SshIdentityCreated { resource: Resource },
     SshConfig(SshConfigStatus),
@@ -236,6 +242,28 @@ pub struct DiscoveryApplyResult {
 pub struct DiscoveryEntryRef {
     pub path: PathBuf,
     pub address: String,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DiscoveryReferenceSource {
+    NewSharedSecret {
+        name: String,
+        value: SecretValue,
+        enforcement: Enforcement,
+        metadata: ItemMetadata,
+    },
+    ExistingSharedSecret {
+        resource_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveryReferenceResolution {
+    pub surface_id: String,
+    pub resource_id: String,
+    pub binding_id: String,
+    pub key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -453,6 +481,30 @@ mod tests {
                 "address": "keys/API_TOKEN"
             }])
         );
+    }
+
+    #[test]
+    fn discover_reference_resolve_has_one_atomic_wire_command() {
+        let request = ControlRequest {
+            request_id: 10,
+            command: ControlCommand::DiscoverReferenceResolve {
+                surface_id: "fixture-surface".to_string(),
+                key: "API_TOKEN".to_string(),
+                source: DiscoveryReferenceSource::NewSharedSecret {
+                    name: "API token".to_string(),
+                    value: SecretValue::new("fixture-reference-value"),
+                    enforcement: Enforcement::Prompt,
+                    metadata: ItemMetadata::default(),
+                },
+            },
+        };
+
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["method"], "discover_reference_resolve");
+        assert_eq!(value["params"]["surface_id"], "fixture-surface");
+        assert_eq!(value["params"]["key"], "API_TOKEN");
+        assert_eq!(value["params"]["source"]["type"], "new_shared_secret");
+        assert_eq!(value["params"]["source"]["enforcement"], "prompt");
     }
 
     #[test]

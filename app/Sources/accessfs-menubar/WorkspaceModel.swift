@@ -801,6 +801,17 @@ final class WorkspaceStore {
         return result
     }
 
+    func resolveDiscoveryReference(
+        surfaceID: String, key: String, source: DiscoveryReferenceSource
+    ) async throws -> DiscoveryReferenceResolution {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        let result = try await controlClient.resolveDiscoveryReference(
+            surfaceID: surfaceID, key: key, source: source)
+        apply(try await controlClient.snapshot())
+        lastError = nil
+        return result
+    }
+
     func protectFile(at path: String) async throws {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
         let file = try await controlClient.protectFile(at: path)
