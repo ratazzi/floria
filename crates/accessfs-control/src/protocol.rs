@@ -1,4 +1,5 @@
 use std::io::{self, Read, Write};
+use std::path::PathBuf;
 
 use accessfs_catalog::{
     Binding, CatalogError, CatalogSnapshot, Environment, Project, ResolvedEnvironment, Resource,
@@ -53,6 +54,8 @@ impl Drop for SecretValue {
 pub enum ControlCommand {
     Ping,
     Snapshot,
+    ProtectedFiles,
+    FileProtect { path: PathBuf },
     ResolveEnvironment { project_id: String, environment_id: String },
     ResourceUsage { resource_id: String },
     SharedSecretCreate {
@@ -100,12 +103,23 @@ pub enum ControlOutcome {
 pub enum ControlResult {
     Pong { schema_version: i64 },
     Snapshot(CatalogSnapshot),
+    ProtectedFiles(Vec<ProtectedFile>),
+    FileProtected { file: ProtectedFile, created: bool },
     ResolvedEnvironment(ResolvedEnvironment),
     ResourceUsage(ResourceUsage),
     SharedSecretCreated { resource: Resource, version: u32 },
     SharedSecretRotated { resource_id: String, version: u32 },
     EnvFileCreated { resource: Resource, version: u32 },
     Empty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtectedFile {
+    pub id: String,
+    pub source_path: PathBuf,
+    pub mode: u32,
+    pub size: u64,
+    pub current_version: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -217,6 +231,20 @@ mod tests {
         assert_eq!(value["method"], "env_file_create");
         assert_eq!(value["params"]["codec"], "ini");
         assert_eq!(value["params"]["resource_id"], "fixture-ini");
+    }
+
+    #[test]
+    fn file_protect_carries_only_the_absolute_source_path() {
+        let request = ControlRequest {
+            request_id: 9,
+            command: ControlCommand::FileProtect {
+                path: PathBuf::from("/fixture/project/.env"),
+            },
+        };
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["method"], "file_protect");
+        assert_eq!(value["params"]["path"], "/fixture/project/.env");
     }
 
     #[test]

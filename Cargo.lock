@@ -51,6 +51,7 @@ name = "accessfs-control"
 version = "0.1.0"
 dependencies = [
  "accessfs-catalog",
+ "accessfs-core",
  "accessfs-store",
  "accessfs-surface",
  "libc",

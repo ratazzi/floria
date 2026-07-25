@@ -1,5 +1,6 @@
 use std::io;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -9,12 +10,12 @@ use accessfs_catalog::{
     Catalog, CatalogError, CatalogSnapshot, EntrySpec, Resource, ResourceCodec, ResourceKind,
     ResourceSource, ValueShape,
 };
-use accessfs_store::{NewSecret, SecretId, SecretStore, StoreError};
+use accessfs_store::{NewSecret, SecretId, SecretOrigin, SecretRecord, SecretStore, StoreError};
 use accessfs_surface::{decode_source, validate_secret_bytes};
 
 use crate::protocol::{
     read_msg, write_msg, ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest,
-    ControlResponse, ControlResult,
+    ControlResponse, ControlResult, ProtectedFile,
 };
 
 pub struct ControlServer {
@@ -29,7 +30,7 @@ impl ControlServer {
     /// Start the catalog control socket. Each connection gets a dedicated request loop;
     /// authorization prompts continue to use the separate agent socket.
     pub fn start(path: &Path, catalog: Catalog) -> io::Result<Self> {
-        Self::start_inner(path, catalog, None, None)
+        Self::start_inner(path, catalog, None, None, None)
     }
 
     pub fn start_observed(
@@ -37,22 +38,24 @@ impl ControlServer {
         catalog: Catalog,
         observer: Arc<dyn CatalogObserver>,
     ) -> io::Result<Self> {
-        Self::start_inner(path, catalog, None, Some(observer))
+        Self::start_inner(path, catalog, None, None, Some(observer))
     }
 
     pub fn start_runtime(
         path: &Path,
         catalog: Catalog,
         store: Arc<dyn SecretStore>,
+        mount_path: PathBuf,
         observer: Arc<dyn CatalogObserver>,
     ) -> io::Result<Self> {
-        Self::start_inner(path, catalog, Some(store), Some(observer))
+        Self::start_inner(path, catalog, Some(store), Some(mount_path), Some(observer))
     }
 
     fn start_inner(
         path: &Path,
         catalog: Catalog,
         store: Option<Arc<dyn SecretStore>>,
+        mount_path: Option<PathBuf>,
         observer: Option<Arc<dyn CatalogObserver>>,
     ) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
@@ -65,7 +68,7 @@ impl ControlServer {
         let catalog = Arc::new(catalog);
         std::thread::Builder::new()
             .name("accessfs-control-accept".to_string())
-            .spawn(move || accept_loop(listener, catalog, store, observer))?;
+            .spawn(move || accept_loop(listener, catalog, store, mount_path, observer))?;
 
         Ok(ControlServer { socket_path: path.to_path_buf() })
     }
@@ -79,6 +82,7 @@ fn accept_loop(
     listener: UnixListener,
     catalog: Arc<Catalog>,
     store: Option<Arc<dyn SecretStore>>,
+    mount_path: Option<PathBuf>,
     observer: Option<Arc<dyn CatalogObserver>>,
 ) {
     for stream in listener.incoming() {
@@ -95,10 +99,11 @@ fn accept_loop(
         }
         let catalog = Arc::clone(&catalog);
         let store = store.clone();
+        let mount_path = mount_path.clone();
         let observer = observer.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("accessfs-control-conn".to_string())
-            .spawn(move || handle_connection(stream, catalog, store, observer))
+            .spawn(move || handle_connection(stream, catalog, store, mount_path, observer))
         {
             tracing::warn!(%error, "spawning control connection failed");
         }
@@ -109,6 +114,7 @@ fn handle_connection(
     mut stream: UnixStream,
     catalog: Arc<Catalog>,
     store: Option<Arc<dyn SecretStore>>,
+    mount_path: Option<PathBuf>,
     observer: Option<Arc<dyn CatalogObserver>>,
 ) {
     loop {
@@ -121,7 +127,12 @@ fn handle_connection(
             }
         };
         let mutates_catalog = mutates_catalog(&request.command);
-        let outcome = match dispatch(&catalog, store.as_deref(), request.command) {
+        let outcome = match dispatch(
+            &catalog,
+            store.as_deref(),
+            mount_path.as_deref(),
+            request.command,
+        ) {
             Ok(result) => {
                 if mutates_catalog {
                     notify_observer(&catalog, observer.as_deref());
@@ -171,6 +182,7 @@ fn notify_observer(catalog: &Catalog, observer: Option<&dyn CatalogObserver>) {
 enum DispatchError {
     Catalog(CatalogError),
     Store(StoreError),
+    Io { path: PathBuf, source: io::Error },
     Validation(String),
     StoreUnavailable,
 }
@@ -180,6 +192,10 @@ impl DispatchError {
         match self {
             DispatchError::Catalog(error) => ControlErrorBody::from(error),
             DispatchError::Store(error) => ControlErrorBody::from(error),
+            DispatchError::Io { path, source } => ControlErrorBody {
+                code: "io".to_string(),
+                message: format!("I/O error on {}: {source}", path.display()),
+            },
             DispatchError::Validation(message) => ControlErrorBody {
                 code: "validation".to_string(),
                 message: message.clone(),
@@ -207,6 +223,7 @@ impl From<StoreError> for DispatchError {
 fn dispatch(
     catalog: &Catalog,
     store: Option<&dyn SecretStore>,
+    mount_path: Option<&Path>,
     command: ControlCommand,
 ) -> Result<ControlResult, DispatchError> {
     match command {
@@ -214,6 +231,15 @@ fn dispatch(
             Ok(ControlResult::Pong { schema_version: catalog.schema_version() })
         }
         ControlCommand::Snapshot => Ok(ControlResult::Snapshot(catalog.snapshot()?)),
+        ControlCommand::ProtectedFiles => protected_files(
+            store.ok_or(DispatchError::StoreUnavailable)?,
+        ),
+        ControlCommand::FileProtect { path } => protect_file(
+            catalog,
+            store.ok_or(DispatchError::StoreUnavailable)?,
+            mount_path.ok_or(DispatchError::StoreUnavailable)?,
+            &path,
+        ),
         ControlCommand::ResolveEnvironment { project_id, environment_id } => Ok(
             ControlResult::ResolvedEnvironment(
                 catalog.resolve_environment(&project_id, &environment_id)?,
@@ -358,6 +384,164 @@ fn create_project_workspace(
         return Err(DispatchError::Catalog(error));
     }
     Ok(ControlResult::Empty)
+}
+
+fn protected_files(store: &dyn SecretStore) -> Result<ControlResult, DispatchError> {
+    let mut files = store
+        .list()?
+        .into_iter()
+        .filter_map(protected_file)
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| left.source_path.cmp(&right.source_path));
+    Ok(ControlResult::ProtectedFiles(files))
+}
+
+fn protected_file(record: SecretRecord) -> Option<ProtectedFile> {
+    let SecretOrigin::File { source_path } = record.origin else { return None };
+    Some(ProtectedFile {
+        id: record.id.to_string(),
+        source_path,
+        mode: record.mode,
+        size: record.size,
+        current_version: record.current_version,
+    })
+}
+
+fn protect_file(
+    catalog: &Catalog,
+    store: &dyn SecretStore,
+    mount_path: &Path,
+    path: &Path,
+) -> Result<ControlResult, DispatchError> {
+    if !path.is_absolute() {
+        return Err(DispatchError::Validation(format!(
+            "protected file path {} must be absolute",
+            path.display()
+        )));
+    }
+
+    let path = canonical_source_path(path).map_err(|source| DispatchError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let metadata = std::fs::symlink_metadata(&path).map_err(|source| DispatchError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    if metadata.file_type().is_symlink() {
+        let record = store.get_by_path(&path)?.ok_or_else(|| {
+            DispatchError::Validation(format!(
+                "{} is a symlink not managed by Floria",
+                path.display()
+            ))
+        })?;
+        let expected = mount_path
+            .join(accessfs_core::config::SECRETS_DIR)
+            .join(record.id.to_string());
+        let actual = std::fs::read_link(&path).map_err(|source| DispatchError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        if actual != expected {
+            return Err(DispatchError::Validation(format!(
+                "{} points to {}, not the managed target {}",
+                path.display(),
+                actual.display(),
+                expected.display()
+            )));
+        }
+        return Ok(ControlResult::FileProtected {
+            file: protected_file(record).expect("file lookup returns a file-origin record"),
+            created: false,
+        });
+    }
+    if !metadata.is_file() {
+        return Err(DispatchError::Validation(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+
+    let absolute = std::fs::canonicalize(&path).map_err(|source| DispatchError::Io {
+        path: path.clone(),
+        source,
+    })?;
+    let plaintext = zeroize::Zeroizing::new(
+        std::fs::read(&absolute).map_err(|source| DispatchError::Io {
+            path: absolute.clone(),
+            source,
+        })?,
+    );
+    let mode = (metadata.mode() & 0o7777) as u32;
+    let existing = store.get_by_path(&absolute)?;
+    let (id, created) = match existing {
+        Some(record) => {
+            let current = store.get(&record.id)?;
+            if current.as_slice() != plaintext.as_slice() {
+                let snapshot = catalog.snapshot()?;
+                validate_secret_bytes(&snapshot, record.id.as_str(), &plaintext)
+                    .map_err(|error| DispatchError::Validation(error.to_string()))?;
+                store.append_version(&record.id, &plaintext)?;
+            }
+            (record.id, false)
+        }
+        None => (store.put(NewSecret::file(absolute.clone(), mode), &plaintext)?, true),
+    };
+
+    let target = mount_path
+        .join(accessfs_core::config::SECRETS_DIR)
+        .join(id.to_string());
+    if let Err(source) = replace_file_with_symlink(&absolute, &target) {
+        if created {
+            if let Err(cleanup_error) = store.delete(&id) {
+                tracing::warn!(%id, %cleanup_error, "cleaning up failed file protection failed");
+            }
+        }
+        return Err(DispatchError::Io { path: absolute, source });
+    }
+    let record = store
+        .record(&id)?
+        .ok_or_else(|| DispatchError::Validation(format!("protected file {id} disappeared")))?;
+    Ok(ControlResult::FileProtected {
+        file: protected_file(record).expect("new file protection has file-origin metadata"),
+        created,
+    })
+}
+
+fn canonical_source_path(path: &Path) -> io::Result<PathBuf> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("/"));
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "protected file path has no file name")
+    })?;
+    Ok(std::fs::canonicalize(parent)?.join(name))
+}
+
+fn replace_file_with_symlink(path: &Path, target: &Path) -> io::Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("/"));
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let mut temporary = None;
+    for counter in 0..100 {
+        let candidate = parent.join(format!(
+            ".{name}.floria-{}-{counter}.tmp",
+            std::process::id()
+        ));
+        match std::os::unix::fs::symlink(target, &candidate) {
+            Ok(()) => {
+                temporary = Some(candidate);
+                break;
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    let temporary = temporary.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::AlreadyExists, "could not allocate a temporary symlink name")
+    })?;
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
 }
 
 fn rollback_project_create(catalog: &Catalog, project_id: &str) {
@@ -580,31 +764,35 @@ mod tests {
 
     struct FixtureStore {
         entries: Mutex<HashMap<String, Vec<Vec<u8>>>>,
+        metadata: Mutex<HashMap<String, (SecretOrigin, u32)>>,
     }
 
     impl FixtureStore {
         fn new() -> Self {
-            FixtureStore { entries: Mutex::new(HashMap::new()) }
+            FixtureStore {
+                entries: Mutex::new(HashMap::new()),
+                metadata: Mutex::new(HashMap::new()),
+            }
         }
     }
 
     impl SecretStore for FixtureStore {
         fn put(&self, meta: NewSecret, plaintext: &[u8]) -> StoreResult<SecretId> {
-            assert!(matches!(
-                meta.origin,
-                SecretOrigin::Managed { ref label }
-                    if matches!(
-                        label.as_str(),
-                        "Fixture Shared Secret"
-                            | "Fixture Env File"
-                            | "Fixture INI File"
-                    )
-            ));
+            if let SecretOrigin::Managed { label } = &meta.origin {
+                assert!(matches!(
+                    label.as_str(),
+                    "Fixture Shared Secret" | "Fixture Env File" | "Fixture INI File"
+                ));
+            }
             let id: SecretId = FIXTURE_SECRET_ID.parse().unwrap();
             self.entries
                 .lock()
                 .unwrap()
                 .insert(id.to_string(), vec![plaintext.to_vec()]);
+            self.metadata
+                .lock()
+                .unwrap()
+                .insert(id.to_string(), (meta.origin, meta.mode));
             Ok(id)
         }
 
@@ -635,10 +823,11 @@ mod tests {
 
         fn record(&self, id: &SecretId) -> StoreResult<Option<SecretRecord>> {
             let entries = self.entries.lock().unwrap();
+            let metadata = self.metadata.lock().unwrap();
             Ok(entries.get(id.as_str()).map(|versions| SecretRecord {
                 id: id.clone(),
-                origin: SecretOrigin::Managed { label: "Fixture Shared Secret".to_string() },
-                mode: 0o600,
+                origin: metadata[id.as_str()].0.clone(),
+                mode: metadata[id.as_str()].1,
                 size: versions.last().unwrap().len() as u64,
                 created: "fixture-time".to_string(),
                 current_version: versions.len() as u32,
@@ -646,15 +835,41 @@ mod tests {
         }
 
         fn list(&self) -> StoreResult<Vec<SecretRecord>> {
-            unimplemented!()
+            let entries = self.entries.lock().unwrap();
+            let metadata = self.metadata.lock().unwrap();
+            Ok(entries
+                .iter()
+                .map(|(id, versions)| SecretRecord {
+                    id: id.parse().unwrap(),
+                    origin: metadata[id].0.clone(),
+                    mode: metadata[id].1,
+                    size: versions.last().unwrap().len() as u64,
+                    created: "fixture-time".to_string(),
+                    current_version: versions.len() as u32,
+                })
+                .collect())
         }
 
-        fn get_by_path(&self, _source_path: &Path) -> StoreResult<Option<SecretRecord>> {
-            Ok(None)
+        fn get_by_path(&self, source_path: &Path) -> StoreResult<Option<SecretRecord>> {
+            let id = self
+                .metadata
+                .lock()
+                .unwrap()
+                .iter()
+                .find_map(|(id, (origin, _))| match origin {
+                    SecretOrigin::File { source_path: candidate }
+                        if candidate == source_path => Some(id.clone()),
+                    _ => None,
+                });
+            match id {
+                Some(id) => self.record(&id.parse().unwrap()),
+                None => Ok(None),
+            }
         }
 
         fn delete(&self, id: &SecretId) -> StoreResult<()> {
             self.entries.lock().unwrap().remove(id.as_str());
+            self.metadata.lock().unwrap().remove(id.as_str());
             Ok(())
         }
     }
@@ -883,6 +1098,7 @@ mod tests {
             &socket,
             catalog.clone(),
             Arc::clone(&store) as Arc<dyn SecretStore>,
+            dir.path().join("mount"),
             observer,
         )
         .unwrap();
@@ -928,6 +1144,66 @@ mod tests {
     }
 
     #[test]
+    fn protects_an_existing_file_at_its_original_path_and_lists_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let socket = dir.path().join("control.sock");
+        let mount = dir.path().join("mount");
+        let source = dir.path().join(".envrc");
+        std::fs::write(&source, "export FIXTURE_VALUE='fixture-value'\n").unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let canonical_source = canonical_source_path(&source).unwrap();
+        let store = Arc::new(FixtureStore::new());
+        let observer: Arc<dyn CatalogObserver> = Arc::new(SnapshotObserver {
+            notifications: AtomicUsize::new(0),
+            latest: Mutex::new(None),
+        });
+        let _server = ControlServer::start_runtime(
+            &socket,
+            catalog,
+            Arc::clone(&store) as Arc<dyn SecretStore>,
+            mount.clone(),
+            observer,
+        )
+        .unwrap();
+        let mut client = ControlClient::connect(&socket).unwrap();
+
+        let protected = client
+            .request(ControlCommand::FileProtect { path: source.clone() })
+            .unwrap();
+        let ControlResult::FileProtected { file, created } = protected else {
+            panic!("expected protected file result");
+        };
+        assert!(created);
+        assert_eq!(file.source_path, canonical_source);
+        assert_eq!(file.mode, 0o600);
+        assert_eq!(file.current_version, 1);
+        assert!(std::fs::symlink_metadata(&source).unwrap().file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_link(&source).unwrap(),
+            mount.join(accessfs_core::config::SECRETS_DIR).join(FIXTURE_SECRET_ID)
+        );
+        let secret_id: SecretId = FIXTURE_SECRET_ID.parse().unwrap();
+        assert_eq!(
+            store.get(&secret_id).unwrap().as_slice(),
+            b"export FIXTURE_VALUE='fixture-value'\n"
+        );
+
+        let listed = client.request(ControlCommand::ProtectedFiles).unwrap();
+        let ControlResult::ProtectedFiles(files) = listed else {
+            panic!("expected protected files result");
+        };
+        assert_eq!(files, vec![file.clone()]);
+
+        assert_eq!(
+            client
+                .request(ControlCommand::FileProtect { path: source })
+                .unwrap(),
+            ControlResult::FileProtected { file, created: false }
+        );
+    }
+
+    #[test]
     fn env_file_create_parses_keys_and_only_stores_a_reference_in_catalog() {
         let dir = tempfile::tempdir().unwrap();
         let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
@@ -941,6 +1217,7 @@ mod tests {
             &socket,
             catalog.clone(),
             Arc::clone(&store) as Arc<dyn SecretStore>,
+            dir.path().join("mount"),
             observer,
         )
         .unwrap();
@@ -993,6 +1270,7 @@ mod tests {
             &socket,
             catalog.clone(),
             Arc::clone(&store) as Arc<dyn SecretStore>,
+            dir.path().join("mount"),
             observer,
         )
         .unwrap();

@@ -359,6 +359,7 @@ fn cmd_mount(config: &Path) -> Result<()> {
         &control_path,
         catalog.clone(),
         Arc::clone(&store),
+        cfg.mount_path.clone(),
         observer,
     )
         .with_context(|| format!("starting control socket at {}", control_path.display()))?;
@@ -489,6 +490,13 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
         }
         ControlResult::Snapshot(snapshot) => {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        }
+        ControlResult::ProtectedFiles(files) => {
+            println!("{}", serde_json::to_string_pretty(&files)?);
+        }
+        ControlResult::FileProtected { file, created } => {
+            let action = if created { "protected" } else { "already protected" };
+            println!("{action} {} as {}", file.source_path.display(), file.id);
         }
         ControlResult::ResolvedEnvironment(resolved) => {
             println!("{}", serde_json::to_string_pretty(&resolved)?);
