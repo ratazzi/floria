@@ -1233,6 +1233,11 @@ private struct ProjectCheckoutsSheet: View {
         store.projects.first { $0.id == projectID }
     }
 
+    private var sheetHeight: CGFloat {
+        let rowCount = discovery?.checkouts.count ?? 1
+        return min(560, max(270, CGFloat(rowCount * 66 + 190)))
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -1241,8 +1246,7 @@ private struct ProjectCheckoutsSheet: View {
             Divider()
             footer
         }
-        .frame(width: 680)
-        .frame(minHeight: 430, idealHeight: 500, maxHeight: 620)
+        .frame(width: 680, height: sheetHeight)
         .task {
             await discover()
         }
