@@ -88,13 +88,19 @@ final class PromptPresenter {
             done()
             return
         }
-        let reason = p.operation == "sign"
-            ? "allow use of \(p.ssh?.key_label ?? "SSH identity")"
-            : "allow access to \(p.path)"
+        let reason = Self.biometricReason(for: p)
         authenticateBiometric(reason: reason) { ok in
             if ok { allow() } else { deny() }
             done()
         }
+    }
+
+    static func biometricReason(for prompt: PromptMsg) -> String {
+        let presentation = PromptPresentation(prompt)
+        if prompt.operation == "sign" {
+            return "allow \(presentation.requester.displayName) to use SSH identity “\(presentation.targetName)”"
+        }
+        return "allow \(presentation.requester.displayName) to \(presentation.actionTitle) \(presentation.targetPath)"
     }
 
     /// Prompt for biometric auth (Touch ID), falling back to password if biometrics are unavailable.

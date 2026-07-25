@@ -137,7 +137,7 @@ struct AuthorizationPromptView: View {
                     requestHeader
                     processSummary
                     securityNotice
-                    scopePicker
+                    AuthorizationScopePicker(scope: $scope, operation: model.operation)
                 }
                 .padding(.horizontal, 26)
                 .padding(.vertical, 22)
@@ -270,27 +270,6 @@ struct AuthorizationPromptView: View {
         }
     }
 
-    private var scopePicker: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Authorization scope")
-                .font(.headline)
-            Picker("Authorization scope", selection: $scope) {
-                ForEach(PromptGrantScope.allCases, id: \.self) { option in
-                    Text(option.title).tag(option)
-                }
-            }
-            .labelsHidden()
-            .pickerStyle(.segmented)
-            Text(scope == .once
-                ? "Allow only this request."
-                : model.operation == "sign"
-                    ? "Reuse this approval for the same application or project and SSH identity for 10 minutes."
-                    : "Reuse this approval for the same application or project and file for 10 minutes.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
-    }
-
     private func endpointIcon(process: PromptProcessNode, size: CGFloat) -> some View {
         Image(nsImage: icon(for: process))
             .resizable()
@@ -391,5 +370,32 @@ struct AuthorizationPromptView: View {
             return NSWorkspace.shared.icon(forFile: String(bundlePath))
         }
         return NSWorkspace.shared.icon(forFile: executable)
+    }
+}
+
+struct AuthorizationScopePicker: View {
+    @Binding var scope: PromptGrantScope
+    let operation: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Authorization scope")
+                .font(.headline)
+            Picker("Authorization scope", selection: $scope) {
+                ForEach(PromptGrantScope.allCases, id: \.self) { option in
+                    Text(option.title).tag(option)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            Text(scope == .once
+                ? "Allow only this request."
+                : operation == "sign"
+                    ? "Reuse this approval for the same application or project and SSH identity for 10 minutes."
+                    : "Reuse this approval for the same application or project and file for 10 minutes.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .frame(width: 240, alignment: .leading)
     }
 }
