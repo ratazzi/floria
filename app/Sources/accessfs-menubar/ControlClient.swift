@@ -10,6 +10,27 @@ final class ControlClient: @unchecked Sendable {
         self.socketPath = socketPath
     }
 
+    func policyMode() async throws -> RuntimePolicyStatus {
+        guard let status: RuntimePolicyStatus = try await request(
+            .policyModeGet, expecting: "policy_mode", as: RuntimePolicyStatus.self)
+        else {
+            throw ControlClientError.missingResult("policy_mode")
+        }
+        return status
+    }
+
+    func setPolicyMode(
+        _ mode: RuntimePolicyMode, durationSecs: UInt64?
+    ) async throws -> RuntimePolicyStatus {
+        guard let status: RuntimePolicyStatus = try await request(
+            .policyModeSet(mode: mode, durationSecs: durationSecs),
+            expecting: "policy_mode", as: RuntimePolicyStatus.self)
+        else {
+            throw ControlClientError.missingResult("policy_mode")
+        }
+        return status
+    }
+
     func snapshot() async throws -> CatalogSnapshot {
         guard let snapshot: CatalogSnapshot = try await request(
             .snapshot, expecting: "snapshot", as: CatalogSnapshot.self)

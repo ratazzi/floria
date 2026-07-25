@@ -1,5 +1,31 @@
 import Foundation
 
+enum RuntimePolicyMode: String, Codable, Sendable {
+    case normal
+    case auditOnly = "audit_only"
+}
+
+struct RuntimePolicyStatus: Codable, Equatable, Sendable {
+    let mode: RuntimePolicyMode
+    let expiresAt: Int64?
+
+    static let normal = RuntimePolicyStatus(mode: .normal, expiresAt: nil)
+
+    enum CodingKeys: String, CodingKey {
+        case mode
+        case expiresAt = "expires_at"
+    }
+
+    var expirationDate: Date? {
+        expiresAt.map { Date(timeIntervalSince1970: TimeInterval($0)) }
+    }
+
+    func isAuditOnly(at date: Date = Date()) -> Bool {
+        guard mode == .auditOnly else { return false }
+        return expirationDate.map { $0 > date } ?? true
+    }
+}
+
 struct ItemLink: Codable, Hashable, Sendable {
     let label: String
     let url: String
@@ -219,6 +245,8 @@ struct CatalogProtectedFileVersion: Codable, Sendable {
 }
 
 enum ControlCommand: Sendable {
+    case policyModeGet
+    case policyModeSet(mode: RuntimePolicyMode, durationSecs: UInt64?)
     case snapshot
     case protectedFiles
     case fileProtect(String)
@@ -252,6 +280,8 @@ enum ControlCommand: Sendable {
 
     var method: String {
         switch self {
+        case .policyModeGet: "policy_mode_get"
+        case .policyModeSet: "policy_mode_set"
         case .snapshot: "snapshot"
         case .protectedFiles: "protected_files"
         case .fileProtect: "file_protect"
@@ -278,8 +308,13 @@ enum ControlCommand: Sendable {
 
     func requestData(requestID: UInt64, encoder: JSONEncoder) throws -> Data {
         switch self {
-        case .snapshot, .protectedFiles:
+        case .policyModeGet, .snapshot, .protectedFiles:
             return try encoder.encode(ControlRequestWithoutParams(requestID: requestID, method: method))
+        case .policyModeSet(let mode, let durationSecs):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: PolicyModeSetParams(mode: mode, durationSecs: durationSecs)))
         case .fileProtect(let path):
             return try encoder.encode(
                 ControlRequest(
@@ -370,6 +405,11 @@ enum ControlCommand: Sendable {
                     params: SurfaceUpsertParams(surface: surface)))
         }
     }
+}
+
+private struct PolicyModeSetParams: Encodable {
+    let mode: RuntimePolicyMode
+    let durationSecs: UInt64?
 }
 
 private struct ControlRequestWithoutParams: Encodable {

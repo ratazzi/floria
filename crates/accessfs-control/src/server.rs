@@ -9,7 +9,7 @@ use accessfs_catalog::{
     Catalog, CatalogError, CatalogSnapshot, EntrySpec, ItemMetadata, Resource, ResourceCodec,
     ResourceKind, ResourceSource, ValueShape,
 };
-use accessfs_core::authz::Enforcement;
+use accessfs_core::authz::{Enforcement, PolicyMode, PolicyModeStatus};
 use accessfs_store::{NewSecret, SecretId, SecretOrigin, SecretRecord, SecretStore, StoreError};
 use accessfs_surface::{decode_source, validate_secret_bytes};
 
@@ -26,11 +26,22 @@ pub trait CatalogObserver: Send + Sync + 'static {
     fn catalog_changed(&self, snapshot: &CatalogSnapshot);
 }
 
+/// Runtime policy seam used by the local control plane. Production adapts the live
+/// `SocketAgent`; tests can supply an in-memory adapter without starting FUSE or an agent socket.
+pub trait RuntimePolicyController: Send + Sync + 'static {
+    fn policy_mode(&self) -> PolicyModeStatus;
+    fn set_policy_mode(
+        &self,
+        mode: PolicyMode,
+        duration_secs: Option<u64>,
+    ) -> io::Result<PolicyModeStatus>;
+}
+
 impl ControlServer {
     /// Start the catalog control socket. Each connection gets a dedicated request loop;
     /// authorization prompts continue to use the separate agent socket.
     pub fn start(path: &Path, catalog: Catalog) -> io::Result<Self> {
-        Self::start_inner(path, catalog, None, None, None)
+        Self::start_inner(path, catalog, None, None, None, None)
     }
 
     pub fn start_observed(
@@ -38,7 +49,7 @@ impl ControlServer {
         catalog: Catalog,
         observer: Arc<dyn CatalogObserver>,
     ) -> io::Result<Self> {
-        Self::start_inner(path, catalog, None, None, Some(observer))
+        Self::start_inner(path, catalog, None, None, Some(observer), None)
     }
 
     pub fn start_runtime(
@@ -48,7 +59,25 @@ impl ControlServer {
         mount_path: PathBuf,
         observer: Arc<dyn CatalogObserver>,
     ) -> io::Result<Self> {
-        Self::start_inner(path, catalog, Some(store), Some(mount_path), Some(observer))
+        Self::start_inner(path, catalog, Some(store), Some(mount_path), Some(observer), None)
+    }
+
+    pub fn start_runtime_with_policy(
+        path: &Path,
+        catalog: Catalog,
+        store: Arc<dyn SecretStore>,
+        mount_path: PathBuf,
+        observer: Arc<dyn CatalogObserver>,
+        policy: Arc<dyn RuntimePolicyController>,
+    ) -> io::Result<Self> {
+        Self::start_inner(
+            path,
+            catalog,
+            Some(store),
+            Some(mount_path),
+            Some(observer),
+            Some(policy),
+        )
     }
 
     fn start_inner(
@@ -57,6 +86,7 @@ impl ControlServer {
         store: Option<Arc<dyn SecretStore>>,
         mount_path: Option<PathBuf>,
         observer: Option<Arc<dyn CatalogObserver>>,
+        policy: Option<Arc<dyn RuntimePolicyController>>,
     ) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -68,7 +98,7 @@ impl ControlServer {
         let catalog = Arc::new(catalog);
         std::thread::Builder::new()
             .name("accessfs-control-accept".to_string())
-            .spawn(move || accept_loop(listener, catalog, store, mount_path, observer))?;
+            .spawn(move || accept_loop(listener, catalog, store, mount_path, observer, policy))?;
 
         Ok(ControlServer { socket_path: path.to_path_buf() })
     }
@@ -84,6 +114,7 @@ fn accept_loop(
     store: Option<Arc<dyn SecretStore>>,
     mount_path: Option<PathBuf>,
     observer: Option<Arc<dyn CatalogObserver>>,
+    policy: Option<Arc<dyn RuntimePolicyController>>,
 ) {
     for stream in listener.incoming() {
         let stream = match stream {
@@ -101,9 +132,12 @@ fn accept_loop(
         let store = store.clone();
         let mount_path = mount_path.clone();
         let observer = observer.clone();
+        let policy = policy.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("accessfs-control-conn".to_string())
-            .spawn(move || handle_connection(stream, catalog, store, mount_path, observer))
+            .spawn(move || {
+                handle_connection(stream, catalog, store, mount_path, observer, policy)
+            })
         {
             tracing::warn!(%error, "spawning control connection failed");
         }
@@ -116,6 +150,7 @@ fn handle_connection(
     store: Option<Arc<dyn SecretStore>>,
     mount_path: Option<PathBuf>,
     observer: Option<Arc<dyn CatalogObserver>>,
+    policy: Option<Arc<dyn RuntimePolicyController>>,
 ) {
     loop {
         let request: ControlRequest = match read_msg(&mut stream) {
@@ -131,6 +166,7 @@ fn handle_connection(
             &catalog,
             store.as_deref(),
             mount_path.as_deref(),
+            policy.as_deref(),
             request.command,
         ) {
             Ok(result) => {
@@ -189,6 +225,7 @@ enum DispatchError {
     Catalog(CatalogError),
     Store(StoreError),
     Io { path: PathBuf, source: io::Error },
+    Policy(io::Error),
     Validation(String),
     StoreUnavailable,
 }
@@ -210,6 +247,14 @@ impl DispatchError {
             DispatchError::Validation(message) => ControlErrorBody {
                 code: "validation".to_string(),
                 message: message.clone(),
+            },
+            DispatchError::Policy(error) => ControlErrorBody {
+                code: if error.kind() == io::ErrorKind::InvalidInput {
+                    "validation".to_string()
+                } else {
+                    "policy_io".to_string()
+                },
+                message: error.to_string(),
             },
             DispatchError::StoreUnavailable => ControlErrorBody {
                 code: "secret_store_unavailable".to_string(),
@@ -235,11 +280,30 @@ fn dispatch(
     catalog: &Catalog,
     store: Option<&dyn SecretStore>,
     mount_path: Option<&Path>,
+    policy: Option<&dyn RuntimePolicyController>,
     command: ControlCommand,
 ) -> Result<ControlResult, DispatchError> {
     match command {
         ControlCommand::Ping => {
             Ok(ControlResult::Pong { schema_version: catalog.schema_version() })
+        }
+        ControlCommand::PolicyModeGet => policy
+            .map(|controller| ControlResult::PolicyMode(controller.policy_mode()))
+            .ok_or_else(|| {
+                DispatchError::Validation(
+                    "runtime policy is unavailable on this control server".to_string(),
+                )
+            }),
+        ControlCommand::PolicyModeSet { mode, duration_secs } => {
+            let controller = policy.ok_or_else(|| {
+                DispatchError::Validation(
+                    "runtime policy is unavailable on this control server".to_string(),
+                )
+            })?;
+            controller
+                .set_policy_mode(mode, duration_secs)
+                .map(ControlResult::PolicyMode)
+                .map_err(DispatchError::Policy)
         }
         ControlCommand::Snapshot => Ok(ControlResult::Snapshot(catalog.snapshot()?)),
         ControlCommand::ProtectedFiles => protected_files(
@@ -1314,6 +1378,66 @@ mod tests {
             self.notifications.fetch_add(1, Ordering::Relaxed);
             *self.latest.lock().unwrap() = Some(snapshot.clone());
         }
+    }
+
+    struct FixturePolicy {
+        status: Mutex<PolicyModeStatus>,
+    }
+
+    impl RuntimePolicyController for FixturePolicy {
+        fn policy_mode(&self) -> PolicyModeStatus {
+            *self.status.lock().unwrap()
+        }
+
+        fn set_policy_mode(
+            &self,
+            mode: PolicyMode,
+            duration_secs: Option<u64>,
+        ) -> io::Result<PolicyModeStatus> {
+            let status = PolicyModeStatus {
+                mode,
+                expires_at: duration_secs.map(|seconds| 1_800_000_000 + seconds as i64),
+            };
+            *self.status.lock().unwrap() = status;
+            Ok(status)
+        }
+    }
+
+    #[test]
+    fn policy_mode_roundtrips_through_the_control_seam() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let socket = dir.path().join("control.sock");
+        let policy: Arc<dyn RuntimePolicyController> = Arc::new(FixturePolicy {
+            status: Mutex::new(PolicyModeStatus::default()),
+        });
+        let _server = ControlServer::start_inner(
+            &socket,
+            catalog,
+            None,
+            None,
+            None,
+            Some(policy),
+        )
+        .unwrap();
+        let mut client = ControlClient::connect(&socket).unwrap();
+
+        assert_eq!(
+            client.request(ControlCommand::PolicyModeGet).unwrap(),
+            ControlResult::PolicyMode(PolicyModeStatus::default())
+        );
+        assert_eq!(
+            client
+                .request(ControlCommand::PolicyModeSet {
+                    mode: PolicyMode::AuditOnly,
+                    duration_secs: Some(3600),
+                })
+                .unwrap(),
+            ControlResult::PolicyMode(PolicyModeStatus {
+                mode: PolicyMode::AuditOnly,
+                expires_at: Some(1_800_003_600),
+            })
+        );
     }
 
     #[test]

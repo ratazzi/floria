@@ -5,6 +5,7 @@ use std::sync::Mutex;
 
 use serde::Serialize;
 
+use crate::authz::PolicyEvaluation;
 use crate::error::Result;
 use crate::identity::ProcessIdentity;
 
@@ -58,6 +59,7 @@ impl AuditLog {
         identity: &ProcessIdentity,
         decision: &str,
         rule_id: Option<&str>,
+        policy: Option<&PolicyEvaluation>,
         content_version: &str,
         fh: u64,
         size: u64,
@@ -70,6 +72,7 @@ impl AuditLog {
             operation,
             decision,
             rule_id,
+            policy,
             request: RequestInfo {
                 uid: identity.uid,
                 gid: identity.gid,
@@ -91,6 +94,7 @@ impl AuditLog {
         identity: &ProcessIdentity,
         rule_id: Option<&str>,
         reason: &str,
+        policy: Option<&PolicyEvaluation>,
     ) {
         self.write(&DeniedEvent {
             ts: now_rfc3339(),
@@ -100,6 +104,7 @@ impl AuditLog {
             decision: "denied",
             rule_id,
             reason,
+            policy,
             request: RequestInfo {
                 uid: identity.uid,
                 gid: identity.gid,
@@ -171,6 +176,8 @@ struct OpenEvent<'a> {
     decision: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     rule_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy: Option<&'a PolicyEvaluation>,
     request: RequestInfo,
     identity: &'a ProcessIdentity,
     content_version: &'a str,
@@ -190,6 +197,8 @@ struct DeniedEvent<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     rule_id: Option<&'a str>,
     reason: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy: Option<&'a PolicyEvaluation>,
     request: RequestInfo,
     identity: &'a ProcessIdentity,
 }
@@ -219,18 +228,25 @@ struct CloseEvent<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::authz::{Enforcement, PolicyMode};
 
     #[test]
     fn surface_audit_records_version_provenance_without_plaintext() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audit.jsonl");
         let audit = AuditLog::open(&path).unwrap();
+        let policy = PolicyEvaluation {
+            configured_enforcement: Enforcement::TouchId,
+            effective_enforcement: Enforcement::Allow,
+            mode: PolicyMode::AuditOnly,
+        };
         audit.log_open(
             "surfaces/fixture-dotenv",
             "read",
             &ProcessIdentity::bare(42, 501, 20),
             "allowed",
             Some("surfaces-default"),
+            Some(&policy),
             "sha256:fixture-content-hash",
             7,
             32,
@@ -246,6 +262,9 @@ mod tests {
         let line = std::fs::read_to_string(path).unwrap();
         assert!(line.contains("fixture-resource"));
         assert!(line.contains("\"version\":3"));
+        assert!(line.contains("\"configured_enforcement\":\"touchid\""));
+        assert!(line.contains("\"effective_enforcement\":\"allow\""));
+        assert!(line.contains("\"mode\":\"audit_only\""));
         assert!(!line.contains("fixture-secret-value"));
     }
 }

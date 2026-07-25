@@ -118,12 +118,16 @@ final class ProtocolTests: XCTestCase {
             ts: "2026-07-11T08:30:15.123Z", path: "secrets/abc",
             display: NSHomeDirectory() + "/.env", operation: "read",
             decision: "allowed", rule_id: "grant",
+            policy: PolicyEvaluationView(
+                configured_enforcement: "touchid", effective_enforcement: "allow",
+                mode: "audit_only"),
             identity: IdentityView(pid: 1, uid: 501, exe: "/bin/cat", cwd: nil, chain: "cat"))
         let row = RecentAccess(ev)
         XCTAssertNotNil(row.date)
         XCTAssertFalse(row.time.isEmpty)
         XCTAssertEqual(row.exe, "cat")
         XCTAssertTrue(row.allowed)
+        XCTAssertTrue(row.wasGloballyOverridden)
         // The list shows the tilde-abbreviated source path over the uuid mount path.
         XCTAssertEqual(row.shownPath, "~/.env")
     }

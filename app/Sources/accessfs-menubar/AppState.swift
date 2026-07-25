@@ -15,8 +15,13 @@ struct RecentAccess: Identifiable {
     let exePath: String?
     let chain: String
     let ruleId: String?
+    let policy: PolicyEvaluationView?
 
     var allowed: Bool { decision == "allowed" }
+    var wasGloballyOverridden: Bool {
+        policy?.configured_enforcement != policy?.effective_enforcement
+            && policy?.mode == "audit_only"
+    }
 
     /// What the list shows: the friendly name over the opaque `secrets/<uuid>` path.
     var shownPath: String { display ?? path }
@@ -42,6 +47,7 @@ struct RecentAccess: Identifiable {
         exePath = ev.identity.exe
         chain = ev.identity.chain
         ruleId = ev.rule_id
+        policy = ev.policy
     }
 
     private static let iso: ISO8601DateFormatter = {
@@ -57,8 +63,12 @@ final class AppState {
     var connected = false
     var recents: [RecentAccess] = []
     var workspace: WorkspaceStore
+    var policyMode = RuntimePolicyStatus.normal
+    var policyModeError: String?
 
     @ObservationIgnored private var client: AgentClient!
+    @ObservationIgnored private let controlClient: ControlClient
+    @ObservationIgnored private var policyRefreshTask: Task<Void, Never>?
     @ObservationIgnored private let prompter = PromptPresenter()
     @ObservationIgnored private let daemonManager = DaemonManager()
 
@@ -70,7 +80,9 @@ final class AppState {
             .appendingPathComponent("Library/Application Support/floria")
         let sock = (supportDirectory as NSString).appendingPathComponent("agent.sock")
         let controlSock = (supportDirectory as NSString).appendingPathComponent("control.sock")
-        workspace = WorkspaceStore(controlClient: ControlClient(socketPath: controlSock))
+        let controlClient = ControlClient(socketPath: controlSock)
+        self.controlClient = controlClient
+        workspace = WorkspaceStore(controlClient: controlClient)
 
         client = AgentClient(socketPath: sock)
         client.onStateChange = { [weak self] up in
@@ -78,7 +90,10 @@ final class AppState {
                 guard let self else { return }
                 self.connected = up
                 if up {
-                    Task { await self.workspace.reload() }
+                    Task {
+                        await self.workspace.reload()
+                        await self.reloadPolicyMode()
+                    }
                 }
             }
         }
@@ -92,7 +107,17 @@ final class AppState {
             }
         }
         client.start()
-        Task { await workspace.reload() }
+        Task {
+            await workspace.reload()
+            await reloadPolicyMode()
+        }
+        policyRefreshTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 30_000_000_000)
+                guard let self, !Task.isCancelled else { return }
+                await self.reloadPolicyMode()
+            }
+        }
 
         // A packaged app always reconciles the LaunchAgent definition. DaemonManager makes
         // the same bundle revision a no-op, while a newly installed bundle must replace an
@@ -111,6 +136,24 @@ final class AppState {
 
     func clearRecents() {
         recents.removeAll()
+    }
+
+    func reloadPolicyMode() async {
+        do {
+            policyMode = try await controlClient.policyMode()
+            policyModeError = nil
+        } catch {
+            policyModeError = error.localizedDescription
+        }
+    }
+
+    func setPolicyMode(_ mode: RuntimePolicyMode, durationSecs: UInt64?) async {
+        do {
+            policyMode = try await controlClient.setPolicyMode(mode, durationSecs: durationSecs)
+            policyModeError = nil
+        } catch {
+            policyModeError = error.localizedDescription
+        }
     }
 
     private func add(_ ev: AccessEventMsg) {

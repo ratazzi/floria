@@ -478,6 +478,7 @@ impl Shared {
             identity,
             decision.rule_id.as_deref(),
             &decision.reason,
+            decision.policy.as_ref(),
         );
         Err(errno(libc::EACCES))
     }
@@ -718,6 +719,7 @@ impl Shared {
                 &identity,
                 decision.decision_str(),
                 decision.rule_id.as_deref(),
+                decision.policy.as_ref(),
                 "-",
                 fh,
                 size,
@@ -755,6 +757,7 @@ impl Shared {
             &identity,
             decision.decision_str(),
             decision.rule_id.as_deref(),
+            decision.policy.as_ref(),
             &opened.content_version,
             opened.fh,
             opened.size,
@@ -804,6 +807,7 @@ impl Shared {
             identity,
             decision.decision_str(),
             decision.rule_id.as_deref(),
+            decision.policy.as_ref(),
             &content_version,
             fh,
             size,
@@ -831,7 +835,7 @@ impl Shared {
         let reason = "macFUSE reused a write session owned by another process";
         tracing::warn!(path = %path, pid, chain = %identity.chain_display(), reason, "deny cross-process write");
         self.audit
-            .log_denied(&path, Operation::Write.as_str(), &identity, None, reason);
+            .log_denied(&path, Operation::Write.as_str(), &identity, None, reason, None);
     }
 
     /// Runs on the authorization pool after the event-loop fast path found no snapshot for this

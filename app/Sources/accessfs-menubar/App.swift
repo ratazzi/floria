@@ -20,7 +20,13 @@ struct FloriaMenuBarApp: App {
         MenuBarExtra {
             MenuBarView(state: state)
         } label: {
-            Image(systemName: "lock.shield")
+            // Do not put a TimelineView here: on macOS 26 a periodic status-item label caused
+            // continuous invalidation (~99% CPU). AppState's refresh task drives mode changes.
+            Image(
+                systemName: state.policyMode.isAuditOnly()
+                    ? "eye.circle.fill" : "lock.shield")
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(state.policyMode.isAuditOnly() ? Color.orange : Color.primary)
         }
         // `.window` turns the dropdown into a real anchored window that hosts arbitrary
         // SwiftUI (search field, hover rows, ...) instead of an NSMenu.

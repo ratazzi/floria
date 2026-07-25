@@ -76,6 +76,42 @@ impl Enforcement {
     }
 }
 
+/// Daemon-wide runtime policy. It changes how configured enforcement is applied without
+/// rewriting any per-item security level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PolicyMode {
+    /// Apply every item's configured enforcement unchanged.
+    #[default]
+    Normal,
+    /// Allow configured prompt/Touch ID items without interaction while retaining auditing.
+    /// Explicit deny rules remain deny.
+    AuditOnly,
+}
+
+/// Persisted and control-plane-visible status for the daemon-wide runtime policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyModeStatus {
+    pub mode: PolicyMode,
+    /// Unix timestamp in seconds. `None` means the mode remains until explicitly changed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
+}
+
+impl Default for PolicyModeStatus {
+    fn default() -> Self {
+        PolicyModeStatus { mode: PolicyMode::Normal, expires_at: None }
+    }
+}
+
+/// Structured policy rationale carried through the Authorizer seam into both audit sinks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicyEvaluation {
+    pub configured_enforcement: Enforcement,
+    pub effective_enforcement: Enforcement,
+    pub mode: PolicyMode,
+}
+
 /// Authorization decision. The FS only cares about allow/deny; side effects like `notify` are
 /// handled by the authorizer itself and don't belong in this type. `reason`/`rule_id` are for auditing.
 #[derive(Debug, Clone)]
@@ -85,6 +121,8 @@ pub struct Decision {
     pub reason: String,
     /// The matched rule/grant id, recorded in the audit log; None in monitor mode.
     pub rule_id: Option<String>,
+    /// Present when a policy engine evaluated configured enforcement for this decision.
+    pub policy: Option<PolicyEvaluation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +137,7 @@ impl Decision {
             outcome: Outcome::Allowed,
             reason: reason.into(),
             rule_id: None,
+            policy: None,
         }
     }
 
@@ -107,11 +146,17 @@ impl Decision {
             outcome: Outcome::Denied,
             reason: reason.into(),
             rule_id: None,
+            policy: None,
         }
     }
 
     pub fn with_rule(mut self, rule_id: impl Into<String>) -> Self {
         self.rule_id = Some(rule_id.into());
+        self
+    }
+
+    pub fn with_policy(mut self, policy: PolicyEvaluation) -> Self {
+        self.policy = Some(policy);
         self
     }
 

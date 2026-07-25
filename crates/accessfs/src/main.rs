@@ -10,8 +10,9 @@ use accessfs_catalog::{
 };
 use accessfs_control::{
     CatalogObserver, ControlClient, ControlCommand, ControlResult, ControlServer,
+    RuntimePolicyController,
 };
-use accessfs_core::authz::Enforcement;
+use accessfs_core::authz::{Enforcement, PolicyMode, PolicyModeStatus};
 use accessfs_core::config::{Config, ResolvedConfig, SECRETS_DIR, SURFACES_DIR};
 use accessfs_store::{AgeDirStore, NewSecret, SecretId, SecretRecord, SecretStore, SshKeyProvider};
 use accessfs_surface::{
@@ -115,6 +116,14 @@ enum Cmd {
 enum ControlCmd {
     /// Check that the daemon control socket and catalog schema are available.
     Ping,
+    /// Show or change the daemon-wide runtime policy mode.
+    Policy {
+        /// Omit to show the current mode. Audit-only without a duration stays active until reset.
+        #[arg(value_enum)]
+        mode: Option<ControlPolicyMode>,
+        #[arg(long)]
+        duration_secs: Option<u64>,
+    },
     /// Print the complete metadata catalog as JSON (never secret plaintext).
     Snapshot,
     /// Resolve environment keys and provenance without decrypting values.
@@ -124,6 +133,21 @@ enum ControlCmd {
     },
     /// Show every binding and surface affected by a resource.
     Usage { resource_id: String },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ControlPolicyMode {
+    Normal,
+    AuditOnly,
+}
+
+impl From<ControlPolicyMode> for PolicyMode {
+    fn from(mode: ControlPolicyMode) -> Self {
+        match mode {
+            ControlPolicyMode::Normal => PolicyMode::Normal,
+            ControlPolicyMode::AuditOnly => PolicyMode::AuditOnly,
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -363,12 +387,16 @@ fn cmd_mount(config: &Path) -> Result<()> {
         store: Arc::clone(&store),
         agent: Arc::clone(&agent),
     });
-    let _control = ControlServer::start_runtime(
+    let policy: Arc<dyn RuntimePolicyController> = Arc::new(AgentPolicyController {
+        agent: Arc::clone(&agent),
+    });
+    let _control = ControlServer::start_runtime_with_policy(
         &control_path,
         catalog.clone(),
         Arc::clone(&store),
         cfg.mount_path.clone(),
         observer,
+        policy,
     )
         .with_context(|| format!("starting control socket at {}", control_path.display()))?;
     tracing::info!(socket = %control_path.display(), "control socket listening");
@@ -380,6 +408,24 @@ fn cmd_mount(config: &Path) -> Result<()> {
         Some(surface_registry),
     )
     .context("mount failed")
+}
+
+struct AgentPolicyController {
+    agent: Arc<accessfs_agent::SocketAgent>,
+}
+
+impl RuntimePolicyController for AgentPolicyController {
+    fn policy_mode(&self) -> PolicyModeStatus {
+        self.agent.policy_mode()
+    }
+
+    fn set_policy_mode(
+        &self,
+        mode: PolicyMode,
+        duration_secs: Option<u64>,
+    ) -> std::io::Result<PolicyModeStatus> {
+        self.agent.set_policy_mode(mode, duration_secs)
+    }
 }
 
 struct RuntimeCatalogObserver {
@@ -536,6 +582,13 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
         .with_context(|| format!("connecting to control socket {}", socket.display()))?;
     let command = match command {
         ControlCmd::Ping => ControlCommand::Ping,
+        ControlCmd::Policy { mode: None, duration_secs: None } => ControlCommand::PolicyModeGet,
+        ControlCmd::Policy { mode: None, duration_secs: Some(_) } => {
+            anyhow::bail!("--duration-secs requires a policy mode")
+        }
+        ControlCmd::Policy { mode: Some(mode), duration_secs } => {
+            ControlCommand::PolicyModeSet { mode: mode.into(), duration_secs }
+        }
         ControlCmd::Snapshot => ControlCommand::Snapshot,
         ControlCmd::Resolve { project_id, environment_id } => {
             ControlCommand::ResolveEnvironment { project_id, environment_id }
@@ -545,6 +598,9 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
     match client.request(command)? {
         ControlResult::Pong { schema_version } => {
             println!("daemon ready; catalog schema v{schema_version}");
+        }
+        ControlResult::PolicyMode(status) => {
+            println!("{}", serde_json::to_string_pretty(&status)?);
         }
         ControlResult::Snapshot(snapshot) => {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);

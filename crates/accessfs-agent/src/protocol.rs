@@ -6,6 +6,7 @@
 use std::io::{self, Read, Write};
 
 use accessfs_core::identity::ProcessIdentity;
+use accessfs_core::authz::PolicyEvaluation;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +56,7 @@ pub enum DaemonMsg<'a> {
         operation: &'a str,
         decision: &'a str,
         rule_id: Option<&'a str>,
+        policy: Option<PolicyEvaluation>,
         identity: IdentityView,
     },
 }
@@ -154,6 +156,7 @@ mod tests {
             operation: "write",
             decision: "allowed",
             rule_id: Some("grant"),
+            policy: None,
             identity: IdentityView::from_identity(&id),
         };
         let v: serde_json::Value = serde_json::from_slice(&serde_json::to_vec(&msg).unwrap()).unwrap();
@@ -163,6 +166,7 @@ mod tests {
         assert_eq!(v["decision"], "allowed");
         assert_eq!(v["path"], "secrets/abc");
         assert_eq!(v["rule_id"], "grant");
+        assert_eq!(v["policy"], serde_json::Value::Null);
         assert_eq!(v["identity"]["pid"], 42);
         assert_eq!(v["identity"]["parent_chain"], serde_json::json!([]));
     }

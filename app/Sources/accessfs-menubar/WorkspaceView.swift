@@ -236,6 +236,8 @@ struct DashboardView: View {
     @State private var showingProtectFile = false
     @State private var showingNewSharedSecret = false
     @State private var showingNewEnvFile = false
+    @State private var pendingAuditWindow: AuditOnlyWindow?
+    @State private var showingAuditConfirmation = false
 
     var body: some View {
         HStack(spacing: 0) {
@@ -277,6 +279,21 @@ struct DashboardView: View {
             Button("OK") { state.workspace.lastError = nil }
         } message: {
             Text(state.workspace.lastError ?? "Unknown error")
+        }
+        .confirmationDialog(
+            "Enable Audit Only?", isPresented: $showingAuditConfirmation,
+            presenting: pendingAuditWindow
+        ) { window in
+            Button("Enable for \(window.title)", role: .destructive) {
+                Task {
+                    await state.setPolicyMode(.auditOnly, durationSecs: window.durationSecs)
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { _ in
+            Text(
+                "Ask and Touch ID items will be allowed without interaction. Every access will still be audited, and explicit deny rules remain blocked."
+            )
         }
     }
 
@@ -321,8 +338,30 @@ struct DashboardView: View {
             Menu {
                 Button(state.connected ? "Daemon connected" : "Daemon disconnected") { }
                     .disabled(true)
+                if state.policyMode.isAuditOnly() {
+                    Button("Audit Only is active", systemImage: "eye.fill") { }
+                        .disabled(true)
+                    Button("Return to Normal", systemImage: "checkmark.shield") {
+                        Task { await state.setPolicyMode(.normal, durationSecs: nil) }
+                    }
+                } else {
+                    Menu("Enable Audit Only", systemImage: "eye") {
+                        ForEach(
+                            [AuditOnlyWindow.oneHour, .eightHours, .untilChanged]
+                        ) { window in
+                            Button(window.title) {
+                                pendingAuditWindow = window
+                                showingAuditConfirmation = true
+                            }
+                        }
+                    }
+                }
+                Divider()
                 Button("Refresh Workspace", systemImage: "arrow.clockwise") {
-                    Task { await state.workspace.reload(reportErrors: true) }
+                    Task {
+                        await state.workspace.reload(reportErrors: true)
+                        await state.reloadPolicyMode()
+                    }
                 }
                 Divider()
                 Button("Open Access Log", systemImage: "clock") {
@@ -330,8 +369,13 @@ struct DashboardView: View {
                 }
             } label: {
                 HStack(spacing: 8) {
-                    Image(systemName: "checkmark.shield.fill")
-                        .foregroundStyle(state.connected ? Color.green : Color.secondary)
+                    Image(
+                        systemName: state.policyMode.isAuditOnly()
+                            ? "eye.circle.fill" : "checkmark.shield.fill")
+                        .foregroundStyle(
+                            state.policyMode.isAuditOnly()
+                                ? Color.orange
+                                : (state.connected ? Color.green : Color.secondary))
                     Image(systemName: "chevron.down")
                         .font(.caption)
                 }
@@ -388,16 +432,27 @@ struct DashboardView: View {
             Divider()
             HStack(spacing: 7) {
                 Circle()
-                    .fill(state.connected ? Color.green : Color.secondary.opacity(0.45))
+                    .fill(
+                        state.policyMode.isAuditOnly()
+                            ? Color.orange
+                            : (state.connected ? Color.green : Color.secondary.opacity(0.45)))
                     .frame(width: 8, height: 8)
-                Text(state.connected ? "Daemon running" : "Daemon starting")
+                Text(
+                    state.policyMode.isAuditOnly()
+                        ? "Audit Only · daemon running"
+                        : (state.connected ? "Daemon running" : "Daemon starting"))
                     .font(.caption)
-                    .foregroundStyle(state.connected ? Color.green : Color.secondary)
+                    .foregroundStyle(
+                        state.policyMode.isAuditOnly()
+                            ? Color.orange
+                            : (state.connected ? Color.green : Color.secondary))
             }
             .padding(.horizontal, 11)
             .padding(.vertical, 8)
             .background(
-                state.connected ? Color.green.opacity(0.09) : Color.secondary.opacity(0.08),
+                state.policyMode.isAuditOnly()
+                    ? Color.orange.opacity(0.10)
+                    : (state.connected ? Color.green.opacity(0.09) : Color.secondary.opacity(0.08)),
                 in: RoundedRectangle(cornerRadius: 7))
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(12)

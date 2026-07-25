@@ -5,7 +5,7 @@ use accessfs_catalog::{
     Binding, CatalogError, CatalogSnapshot, Environment, Project, ResolvedEnvironment, Resource,
     ItemMetadata, ResourceCodec, ResourceUsage, Surface,
 };
-use accessfs_core::authz::Enforcement;
+use accessfs_core::authz::{Enforcement, PolicyMode, PolicyModeStatus};
 use accessfs_store::StoreError;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -54,6 +54,8 @@ impl Drop for SecretValue {
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum ControlCommand {
     Ping,
+    PolicyModeGet,
+    PolicyModeSet { mode: PolicyMode, duration_secs: Option<u64> },
     Snapshot,
     ProtectedFiles,
     FileProtect { path: PathBuf },
@@ -130,6 +132,7 @@ pub enum ControlOutcome {
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum ControlResult {
     Pong { schema_version: i64 },
+    PolicyMode(PolicyModeStatus),
     Snapshot(CatalogSnapshot),
     ProtectedFiles(Vec<ProtectedFile>),
     FileProtected { file: ProtectedFile, created: bool },
@@ -241,6 +244,22 @@ mod tests {
         assert_eq!(value["method"], "resolve_environment");
         assert_eq!(value["params"]["project_id"], "floria");
         assert_eq!(value["params"]["environment_id"], "development");
+    }
+
+    #[test]
+    fn policy_mode_set_wire_shape_is_stable_for_swift_client() {
+        let request = ControlRequest {
+            request_id: 8,
+            command: ControlCommand::PolicyModeSet {
+                mode: PolicyMode::AuditOnly,
+                duration_secs: Some(3600),
+            },
+        };
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["method"], "policy_mode_set");
+        assert_eq!(value["params"]["mode"], "audit_only");
+        assert_eq!(value["params"]["duration_secs"], 3600);
     }
 
     #[test]

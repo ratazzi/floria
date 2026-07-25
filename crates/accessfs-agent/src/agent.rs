@@ -9,13 +9,16 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use accessfs_core::authz::{AuthRequest, Authorizer, Decision, Enforcement, Operation};
+use accessfs_core::authz::{
+    AuthRequest, Authorizer, Decision, Enforcement, Operation, PolicyMode, PolicyModeStatus,
+};
 use accessfs_core::config::ResolvedConfig;
 use accessfs_core::identity::ProcessIdentity;
 use accessfs_core::rules::{repo_root, RuleSet};
 use dashmap::DashMap;
 
 use crate::protocol::{DaemonMsg, IdentityView};
+use crate::policy_mode::PolicyModeState;
 use crate::socket::{PromptResult, SocketServer};
 
 /// Executable basenames treated as interpreters: their code identity is the distributor's, not the
@@ -42,6 +45,8 @@ pub struct SocketAgent {
     /// Per-managed-path defaults supplied by the live catalog/store snapshot. Explicit process
     /// rules still win; these values replace only the built-in secrets/surfaces defaults.
     managed_enforcement: RwLock<HashMap<String, Enforcement>>,
+    /// Daemon-wide runtime override, persisted independently from per-item catalog settings.
+    policy_mode: PolicyModeState,
     /// (grant_key, path, operation) -> grant expiry. Operation is part of the key so a read
     /// grant never authorizes a write (and vice versa) — approving "read .env" must not let
     /// the same subject silently rewrite it within the TTL.
@@ -61,8 +66,28 @@ impl SocketAgent {
             server,
             rules: cfg.rules.clone(),
             managed_enforcement: RwLock::new(HashMap::new()),
+            policy_mode: PolicyModeState::open(
+                cfg.agent_socket.with_file_name("policy-mode.json"),
+            ),
             grants: DashMap::new(),
         }))
+    }
+
+    pub fn policy_mode(&self) -> PolicyModeStatus {
+        self.policy_mode.status()
+    }
+
+    pub fn set_policy_mode(
+        &self,
+        mode: PolicyMode,
+        duration_secs: Option<u64>,
+    ) -> std::io::Result<PolicyModeStatus> {
+        let status = self.policy_mode.set(mode, duration_secs)?;
+        // Grants are scoped to the policy regime under which the user approved them. A mode
+        // transition must not let an old grant silently survive a return to stricter policy.
+        self.grants.clear();
+        tracing::info!(mode = ?status.mode, expires_at = ?status.expires_at, "policy mode changed");
+        Ok(status)
     }
 
     /// Atomically replace the default enforcement for managed secret and surface paths.
@@ -153,14 +178,20 @@ impl Authorizer for SocketAgent {
             }
         }
 
-        let decision = match enforcement {
+        let policy = self.policy_mode.evaluate(enforcement);
+        let decision = match policy.effective_enforcement {
+            Enforcement::Allow if policy.effective_enforcement != policy.configured_enforcement => {
+                Decision::allow("allowed by global audit-only mode")
+                    .with_rule("policy-mode:audit-only")
+            }
             Enforcement::Allow => attach(Decision::allow("allowed by rule"), rule_id),
             Enforcement::Deny => attach(Decision::deny("denied by rule"), rule_id),
             enf @ (Enforcement::Prompt | Enforcement::TouchId) => {
                 let key = grant_key(req.identity, repo.as_deref());
                 self.handle_prompt(req, enf, key)
             }
-        };
+        }
+        .with_policy(policy);
 
         // Stream every final decision to the app for its "recent access" view.
         self.server.send_event(&DaemonMsg::AccessEvent {
@@ -170,6 +201,7 @@ impl Authorizer for SocketAgent {
             operation: req.operation.as_str(),
             decision: decision.decision_str(),
             rule_id: decision.rule_id.as_deref(),
+            policy: decision.policy,
             identity: IdentityView::from_identity(req.identity),
         });
 
@@ -235,6 +267,7 @@ mod tests {
             server,
             rules: RuleSet::new(rules),
             managed_enforcement: RwLock::new(HashMap::new()),
+            policy_mode: PolicyModeState::open(dir.join("policy-mode.json")),
             grants: DashMap::new(),
         }
     }
@@ -441,5 +474,41 @@ mod tests {
 
         let d = agent.authorize(&req(&id, Operation::Read));
         assert!(!d.is_allowed());
+    }
+
+    #[test]
+    fn audit_only_allows_prompt_without_app_and_records_policy_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = prompt_only_agent(tmp.path());
+        agent.set_policy_mode(PolicyMode::AuditOnly, None).unwrap();
+        let id = ProcessIdentity::bare(1234, 501, 20);
+
+        let decision = agent.authorize(&req(&id, Operation::Read));
+
+        assert!(decision.is_allowed());
+        assert_eq!(decision.rule_id.as_deref(), Some("policy-mode:audit-only"));
+        let policy = decision.policy.expect("policy evaluation");
+        assert_eq!(policy.configured_enforcement, Enforcement::Prompt);
+        assert_eq!(policy.effective_enforcement, Enforcement::Allow);
+        assert_eq!(policy.mode, PolicyMode::AuditOnly);
+    }
+
+    #[test]
+    fn changing_policy_mode_clears_existing_grants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = prompt_only_agent(tmp.path());
+        let id = ProcessIdentity::bare(1234, 501, 20);
+        agent.grants.insert(
+            (
+                grant_key(&id, None),
+                "secrets/test-id".to_string(),
+                Operation::Read,
+            ),
+            Instant::now() + Duration::from_secs(600),
+        );
+
+        agent.set_policy_mode(PolicyMode::AuditOnly, Some(3600)).unwrap();
+
+        assert!(agent.grants.is_empty());
     }
 }

@@ -12,4 +12,4 @@ pub use protocol::{
     ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest, ControlResponse,
     ControlResult, ProtectedFile, ProtectedFileVersion, SecretValue,
 };
-pub use server::{CatalogObserver, ControlServer};
+pub use server::{CatalogObserver, ControlServer, RuntimePolicyController};

@@ -39,6 +39,12 @@ struct IdentityView: Codable {
     }
 }
 
+struct PolicyEvaluationView: Codable {
+    let configured_enforcement: String
+    let effective_enforcement: String
+    let mode: String
+}
+
 // Incoming (daemon -> app)
 
 struct PromptMsg: Decodable {
@@ -60,6 +66,7 @@ struct AccessEventMsg: Decodable {
     let operation: String
     let decision: String
     let rule_id: String?
+    let policy: PolicyEvaluationView?
     let identity: IdentityView
 }
 

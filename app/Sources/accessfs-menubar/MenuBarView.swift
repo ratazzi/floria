@@ -27,6 +27,7 @@ struct MenuBarView: View {
     var body: some View {
         VStack(spacing: 0) {
             MenuBarHeader(searchText: $searchText, count: filtered.count)
+            PolicyModeControl(state: state)
             Divider()
             if filtered.isEmpty {
                 emptyState
@@ -37,6 +38,7 @@ struct MenuBarView: View {
             MenuBarFooter(state: state)
         }
         .frame(width: 360)
+        .task { await state.reloadPolicyMode() }
     }
 
     // Plain VStack, not LazyVStack: the MenuBarExtra window sizes itself to the content's
@@ -77,6 +79,124 @@ struct MenuBarView: View {
         .frame(maxWidth: .infinity)
         .padding(.vertical, 28)
     }
+}
+
+enum AuditOnlyWindow: String, Identifiable {
+    case oneHour
+    case eightHours
+    case untilChanged
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .oneHour: "1 Hour"
+        case .eightHours: "8 Hours"
+        case .untilChanged: "Until Turned Off"
+        }
+    }
+
+    var durationSecs: UInt64? {
+        switch self {
+        case .oneHour: 3600
+        case .eightHours: 8 * 3600
+        case .untilChanged: nil
+        }
+    }
+}
+
+/// The daemon remains authoritative; this control only chooses and displays its runtime mode.
+private struct PolicyModeControl: View {
+    @Bindable var state: AppState
+    @State private var pendingWindow: AuditOnlyWindow?
+    @State private var showsConfirmation = false
+
+    var body: some View {
+        let auditOnly = state.policyMode.isAuditOnly()
+        Menu {
+            if auditOnly {
+                Button("Return to Normal", systemImage: "checkmark.shield") {
+                    Task { await state.setPolicyMode(.normal, durationSecs: nil) }
+                }
+            } else {
+                Section("Audit Only") {
+                    ForEach(
+                        [AuditOnlyWindow.oneHour, .eightHours, .untilChanged]
+                    ) { window in
+                        Button(window.title) { request(window) }
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 10) {
+                Image(systemName: auditOnly ? "eye.circle.fill" : "checkmark.shield.fill")
+                    .font(.title3)
+                    .foregroundStyle(auditOnly ? Color.orange : Color.green)
+                    .frame(width: 24)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(auditOnly ? "Audit Only" : "Protection: Normal")
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(auditOnly ? Color.orange : Color.primary)
+                    Text(statusDetail(at: Date()))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+            .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .padding(.horizontal, 10)
+        .padding(.bottom, state.policyModeError == nil ? 8 : 3)
+        .confirmationDialog(
+            "Enable Audit Only?", isPresented: $showsConfirmation,
+            presenting: pendingWindow
+        ) { window in
+            Button("Enable for \(window.title)", role: .destructive) {
+                Task {
+                    await state.setPolicyMode(.auditOnly, durationSecs: window.durationSecs)
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { _ in
+            Text(
+                "Ask and Touch ID items will be allowed without interaction. Every access will still be audited, and explicit deny rules remain blocked."
+            )
+        }
+        if let error = state.policyModeError {
+            Text(error)
+                .font(.caption2)
+                .foregroundStyle(.red)
+                .lineLimit(2)
+                .padding(.horizontal, 10)
+                .padding(.bottom, 6)
+        }
+    }
+
+    private func request(_ window: AuditOnlyWindow) {
+        pendingWindow = window
+        showsConfirmation = true
+    }
+
+    private func statusDetail(at date: Date) -> String {
+        guard state.policyMode.isAuditOnly(at: date) else {
+            return "Using each item's security level"
+        }
+        guard let expiry = state.policyMode.expirationDate else {
+            return "Allows without prompts until turned off"
+        }
+        return "Allows without prompts until \(Self.clock.string(from: expiry))"
+    }
+
+    private static let clock: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .none
+        formatter.timeStyle = .short
+        return formatter
+    }()
 }
 
 /// Search field + live count, like the reference design.
@@ -153,6 +273,12 @@ private struct AccessRow: View {
                 .padding(.vertical, 1)
                 .background((ev.operation == "write" ? Color.orange : Color.secondary).opacity(0.15))
                 .clipShape(Capsule())
+            if ev.wasGloballyOverridden {
+                Image(systemName: "eye.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .help("Allowed by global Audit Only mode")
+            }
             VStack(alignment: .leading, spacing: 1) {
                 Text(ev.exe)
                     .font(.callout)
@@ -181,6 +307,10 @@ private struct AccessRow: View {
         var lines = [ev.shownPath]
         if ev.display != nil { lines.append(ev.path) }
         lines.append("rule: \(ev.ruleId ?? "-")")
+        if let policy = ev.policy {
+            lines.append(
+                "policy: \(policy.configured_enforcement) → \(policy.effective_enforcement) (\(policy.mode))")
+        }
         lines.append("chain: \(ev.chain)")
         return lines.joined(separator: "\n")
     }

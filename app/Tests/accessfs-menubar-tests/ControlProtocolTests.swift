@@ -15,6 +15,29 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertNil(value["params"])
     }
 
+    func testPolicyModeRequestsMatchRustWireShape() throws {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let get = try ControlCommand.policyModeGet.requestData(requestID: 70, encoder: encoder)
+        let getValue = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: get) as? [String: Any])
+        XCTAssertEqual(getValue["method"] as? String, "policy_mode_get")
+        XCTAssertNil(getValue["params"])
+
+        let set = try ControlCommand.policyModeSet(mode: .auditOnly, durationSecs: 3600)
+            .requestData(requestID: 71, encoder: encoder)
+        let setValue = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: set) as? [String: Any])
+        let params = try XCTUnwrap(setValue["params"] as? [String: Any])
+        XCTAssertEqual(setValue["method"] as? String, "policy_mode_set")
+        XCTAssertEqual(params["mode"] as? String, "audit_only")
+        XCTAssertEqual(params["duration_secs"] as? UInt64, 3600)
+
+        let normal = try JSONDecoder().decode(
+            RuntimePolicyStatus.self, from: Data(#"{"mode":"normal"}"#.utf8))
+        XCTAssertEqual(normal, .normal)
+    }
+
     func testFileProtectRequestCarriesOnlyTheSelectedPath() throws {
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase

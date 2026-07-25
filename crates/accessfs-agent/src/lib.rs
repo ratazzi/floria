@@ -5,6 +5,7 @@
 //! the Swift menubar app over a Unix socket for interactive prompts.
 
 pub mod agent;
+mod policy_mode;
 pub mod protocol;
 pub mod socket;
 
