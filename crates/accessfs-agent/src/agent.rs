@@ -6,18 +6,19 @@
 //! as an access event.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use accessfs_core::authz::{
-    AuthRequest, Authorizer, Decision, Enforcement, Operation, PolicyMode, PolicyModeStatus,
+    AuthRequest, Authorizer, Decision, Enforcement, PolicyMode, PolicyModeStatus,
 };
 use accessfs_core::config::ResolvedConfig;
 use accessfs_core::identity::ProcessIdentity;
 use accessfs_core::rules::{repo_root, RuleSet};
 use accessfs_platform::SocketPeerVerifier;
-use dashmap::DashMap;
 
+use crate::grant_cache::{GrantCache, GrantKey};
 use crate::protocol::{DaemonMsg, IdentityView, SshSignView};
 use crate::policy_mode::PolicyModeState;
 use crate::socket::{PromptResult, SocketServer};
@@ -36,7 +37,7 @@ const PROMPT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default TTL for an "allow for a while" grant when the app doesn't specify one.
 const DEFAULT_TTL: Duration = Duration::from_secs(600);
 
-/// TTL used for "this app / this project" grants in M1 (real persistence is a later milestone).
+/// TTL used for "this app / this project" grants until the UI exposes explicit revocation.
 const PERSISTENT_TTL: Duration = Duration::from_secs(24 * 3600);
 
 pub struct SocketAgent {
@@ -48,17 +49,21 @@ pub struct SocketAgent {
     managed_enforcement: RwLock<HashMap<String, Enforcement>>,
     /// Daemon-wide runtime override, persisted independently from per-item catalog settings.
     policy_mode: PolicyModeState,
-    /// (grant_key, object, operation) -> grant expiry. The object is the path for file access and
-    /// path + public-key fingerprint for SSH signatures. Operation is part of the key so a read
-    /// grant never authorizes a write (and vice versa) — approving "read .env" must not let
-    /// the same subject silently rewrite it within the TTL.
-    grants: DashMap<(String, String, Operation), Instant>,
+    /// Persistent `(grant_key, object, operation) -> expiry` cache. The object is the path for file
+    /// access and path + public-key fingerprint for SSH signatures. Operation is part of the key
+    /// so approving "read .env" never permits rewriting it within the same TTL.
+    grants: GrantCache,
     /// Concurrent requests for the same grant key share one interactive prompt. The map contains
     /// only unresolved prompts; each access still receives and audits its own final decision.
-    prompt_flights: Mutex<HashMap<GrantCacheKey, Arc<PromptFlight>>>,
+    prompt_flights: Mutex<HashMap<PromptFlightKey, Arc<PromptFlight>>>,
+    /// Incremented whenever runtime or managed policy changes. An answer to a prompt created under
+    /// an older generation may resolve that access but must not install a grant afterward.
+    grant_generation: AtomicU64,
+    /// The first catalog snapshot is startup initialization, not a policy mutation.
+    managed_policy_initialized: AtomicBool,
 }
 
-type GrantCacheKey = (String, String, Operation);
+type PromptFlightKey = (GrantKey, u64);
 
 struct PromptFlight {
     result: Mutex<Option<Decision>>,
@@ -106,8 +111,10 @@ impl SocketAgent {
             policy_mode: PolicyModeState::open(
                 cfg.agent_socket.with_file_name("policy-mode.json"),
             ),
-            grants: DashMap::new(),
+            grants: GrantCache::open(cfg.agent_socket.with_file_name("grants.json")),
             prompt_flights: Mutex::new(HashMap::new()),
+            grant_generation: AtomicU64::new(0),
+            managed_policy_initialized: AtomicBool::new(false),
         }))
     }
 
@@ -120,10 +127,11 @@ impl SocketAgent {
         mode: PolicyMode,
         duration_secs: Option<u64>,
     ) -> std::io::Result<PolicyModeStatus> {
-        let status = self.policy_mode.set(mode, duration_secs)?;
         // Grants are scoped to the policy regime under which the user approved them. A mode
         // transition must not let an old grant silently survive a return to stricter policy.
-        self.grants.clear();
+        self.grant_generation.fetch_add(1, Ordering::AcqRel);
+        self.grants.clear()?;
+        let status = self.policy_mode.set(mode, duration_secs)?;
         tracing::info!(mode = ?status.mode, expires_at = ?status.expires_at, "policy mode changed");
         Ok(status)
     }
@@ -134,7 +142,13 @@ impl SocketAgent {
             Ok(mut current) => *current = values,
             Err(poisoned) => *poisoned.into_inner() = values,
         }
-        self.grants.clear();
+        if !self.managed_policy_initialized.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        self.grant_generation.fetch_add(1, Ordering::AcqRel);
+        if let Err(error) = self.grants.clear() {
+            tracing::warn!(%error, "clearing grants after managed policy change failed");
+        }
     }
 
     fn managed_enforcement(&self, path: &str) -> Option<Enforcement> {
@@ -160,7 +174,9 @@ impl SocketAgent {
         enforcement: Enforcement,
         grant_key: String,
     ) -> Decision {
-        let key = (grant_key, grant_object(req), req.operation);
+        let key = GrantKey::new(grant_key, grant_object(req), req.operation, enforcement);
+        let generation = self.grant_generation.load(Ordering::Acquire);
+        let flight_key = (key.clone(), generation);
 
         if self.grant_valid(&key) {
             return Decision::allow("cached grant").with_rule("grant");
@@ -178,11 +194,11 @@ impl SocketAgent {
                 return Decision::allow("cached grant").with_rule("grant");
             }
 
-            match flights.get(&key) {
+            match flights.get(&flight_key) {
                 Some(flight) => (Arc::clone(flight), false),
                 None => {
                     let flight = Arc::new(PromptFlight::pending());
-                    flights.insert(key.clone(), Arc::clone(&flight));
+                    flights.insert(flight_key.clone(), Arc::clone(&flight));
                     (flight, true)
                 }
             }
@@ -192,14 +208,17 @@ impl SocketAgent {
             return flight.wait();
         }
 
-        let decision = self.perform_prompt(req, enforcement, &key);
+        let decision = self.perform_prompt(req, enforcement, &key, generation);
         flight.complete(decision.clone());
         let mut flights = self
             .prompt_flights
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if flights.get(&key).is_some_and(|current| Arc::ptr_eq(current, &flight)) {
-            flights.remove(&key);
+        if flights
+            .get(&flight_key)
+            .is_some_and(|current| Arc::ptr_eq(current, &flight))
+        {
+            flights.remove(&flight_key);
         }
         decision
     }
@@ -208,7 +227,8 @@ impl SocketAgent {
         &self,
         req: &AuthRequest,
         enforcement: Enforcement,
-        key: &GrantCacheKey,
+        key: &GrantKey,
+        generation: u64,
     ) -> Decision {
         let result = self.server.prompt_and_wait(
             |req_id| DaemonMsg::Prompt {
@@ -225,8 +245,12 @@ impl SocketAgent {
 
         match result {
             PromptResult::Decision(d) if d.allow => {
-                if let Some(ttl) = grant_ttl(&d) {
-                    self.grants.insert(key.clone(), Instant::now() + ttl);
+                if self.grant_generation.load(Ordering::Acquire) == generation {
+                    if let Some(ttl) = grant_ttl(&d) {
+                        if let Err(error) = self.grants.insert(key.clone(), ttl) {
+                            tracing::warn!(%error, "persisting authorization grant failed");
+                        }
+                    }
                 }
                 Decision::allow("prompt: allowed").with_rule("prompt")
             }
@@ -241,19 +265,8 @@ impl SocketAgent {
     }
 
     /// True if a non-expired grant exists for `key`; expired grants are evicted.
-    fn grant_valid(&self, key: &(String, String, Operation)) -> bool {
-        // Copy the expiry out so the shard Ref from `get` is dropped before `remove`:
-        // dashmap self-deadlocks on a same-shard remove while a Ref is still alive
-        // (a match on `get` keeps the Ref for the whole match).
-        let exp = self.grants.get(key).map(|r| *r);
-        match exp {
-            Some(exp) if exp > Instant::now() => true,
-            Some(_) => {
-                self.grants.remove(key);
-                false
-            }
-            None => false,
-        }
+    fn grant_valid(&self, key: &GrantKey) -> bool {
+        self.grants.is_valid(key)
     }
 }
 
@@ -363,12 +376,13 @@ fn grant_ttl(d: &crate::protocol::ClientDecision) -> Option<Duration> {
 mod tests {
     use super::*;
     use crate::protocol::{read_msg, write_msg};
-    use accessfs_core::authz::{AccessContext, SshSignContext};
+    use accessfs_core::authz::{AccessContext, Operation, SshSignContext};
     use accessfs_core::rules::{any_path_glob, Rule, RuleOps, SubjectMatch};
     use accessfs_platform::SameUserPeerVerifier;
     use serde_json::{json, Value};
     use std::os::unix::net::UnixStream;
     use std::sync::Barrier;
+    use std::time::Instant;
 
     fn agent_with_rules(dir: &std::path::Path, rules: Vec<Rule>) -> SocketAgent {
         let server =
@@ -378,8 +392,10 @@ mod tests {
             rules: RuleSet::new(rules),
             managed_enforcement: RwLock::new(HashMap::new()),
             policy_mode: PolicyModeState::open(dir.join("policy-mode.json")),
-            grants: DashMap::new(),
+            grants: GrantCache::open(dir.join("grants.json")),
             prompt_flights: Mutex::new(HashMap::new()),
+            grant_generation: AtomicU64::new(0),
+            managed_policy_initialized: AtomicBool::new(false),
         }
     }
 
@@ -410,14 +426,8 @@ mod tests {
         }
     }
 
-    fn concurrent_prompt_roundtrip(
-        operations: &[Operation],
-        outcome: &str,
-    ) -> (usize, Vec<bool>) {
-        let tmp = tempfile::tempdir().unwrap();
-        let socket_path = tmp.path().join("agent.sock");
-        let agent = Arc::new(prompt_only_agent(tmp.path()));
-        let mut app = UnixStream::connect(&socket_path).unwrap();
+    fn connect_test_app(agent: &SocketAgent, socket_path: &std::path::Path) -> UnixStream {
+        let mut app = UnixStream::connect(socket_path).unwrap();
         app.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         write_msg(&mut app, &json!({"type": "hello", "version": 1})).unwrap();
         let connected_deadline = Instant::now() + Duration::from_secs(5);
@@ -428,6 +438,17 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+        app
+    }
+
+    fn concurrent_prompt_roundtrip(
+        operations: &[Operation],
+        outcome: &str,
+    ) -> (usize, Vec<bool>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket_path = tmp.path().join("agent.sock");
+        let agent = Arc::new(prompt_only_agent(tmp.path()));
+        let mut app = connect_test_app(&agent, &socket_path);
 
         let barrier = Arc::new(Barrier::new(operations.len() + 1));
         let workers = operations
@@ -518,20 +539,58 @@ mod tests {
     }
 
     #[test]
+    fn policy_change_during_prompt_prevents_a_stale_persistent_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket_path = tmp.path().join("agent.sock");
+        let agent = Arc::new(prompt_only_agent(tmp.path()));
+        let mut app = connect_test_app(&agent, &socket_path);
+        let worker = {
+            let agent = Arc::clone(&agent);
+            std::thread::spawn(move || {
+                let identity = ProcessIdentity::bare(4242, 501, 20);
+                agent.authorize(&req(&identity, Operation::Read)).is_allowed()
+            })
+        };
+
+        let prompt: Value = read_msg(&mut app).unwrap();
+        assert_eq!(prompt["type"], "prompt");
+        agent.set_policy_mode(PolicyMode::AuditOnly, None).unwrap();
+        write_msg(
+            &mut app,
+            &json!({
+                "type": "decision",
+                "req_id": prompt["req_id"],
+                "outcome": "allow",
+                "scope": "ttl",
+                "ttl_secs": 600
+            }),
+        )
+        .unwrap();
+
+        assert!(worker.join().unwrap());
+        assert!(agent.grants.is_empty());
+        assert!(GrantCache::open(tmp.path().join("grants.json")).is_empty());
+    }
+
+    #[test]
     fn read_grant_does_not_cover_write() {
         let tmp = tempfile::tempdir().unwrap();
         let agent = prompt_only_agent(tmp.path());
         let id = ProcessIdentity::bare(1234, 501, 20);
 
         // Seed a read grant, as if the user had answered "allow reads for 10 min".
-        agent.grants.insert(
-            (
-                grant_key(&id, None),
-                "secrets/test-id".to_string(),
-                Operation::Read,
-            ),
-            Instant::now() + Duration::from_secs(600),
-        );
+        agent
+            .grants
+            .insert(
+                GrantKey::new(
+                    grant_key(&id, None),
+                    "secrets/test-id".to_string(),
+                    Operation::Read,
+                    Enforcement::Prompt,
+                ),
+                Duration::from_secs(600),
+            )
+            .unwrap();
 
         // Read hits the cache.
         let d = agent.authorize(&req(&id, Operation::Read));
@@ -583,14 +642,18 @@ mod tests {
             context: Some(AccessContext::SshSign(first)),
             identity: &id,
         };
-        agent.grants.insert(
-            (
-                grant_key(&id, None),
-                grant_object(&first_request),
-                Operation::Sign,
-            ),
-            Instant::now() + Duration::from_secs(600),
-        );
+        agent
+            .grants
+            .insert(
+                GrantKey::new(
+                    grant_key(&id, None),
+                    grant_object(&first_request),
+                    Operation::Sign,
+                    Enforcement::Prompt,
+                ),
+                Duration::from_secs(600),
+            )
+            .unwrap();
 
         assert!(agent.authorize(&first_request).is_allowed());
         let second_request = AuthRequest {
@@ -654,6 +717,34 @@ mod tests {
         let decision = agent.authorize(&req(&id, Operation::Read));
         assert!(decision.is_allowed());
         assert_eq!(decision.rule_id.as_deref(), Some("security-level:allow"));
+    }
+
+    #[test]
+    fn prompt_grant_does_not_satisfy_touchid_security_level() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = prompt_only_agent(tmp.path());
+        let id = ProcessIdentity::bare(1234, 501, 20);
+        agent
+            .grants
+            .insert(
+                GrantKey::new(
+                    grant_key(&id, None),
+                    "secrets/test-id".to_string(),
+                    Operation::Read,
+                    Enforcement::Prompt,
+                ),
+                Duration::from_secs(600),
+            )
+            .unwrap();
+
+        let decision = agent.handle_prompt(
+            &req(&id, Operation::Read),
+            Enforcement::TouchId,
+            grant_key(&id, None),
+        );
+
+        assert!(!decision.is_allowed());
+        assert_eq!(decision.rule_id.as_deref(), Some("fail-closed"));
     }
 
     #[test]
@@ -736,23 +827,19 @@ mod tests {
         assert_eq!(decision.rule_id.as_deref(), Some("explicit-deny"));
     }
 
-    /// Regression: an EXPIRED grant used to deadlock `grant_valid` (dashmap remove while
-    /// the Ref from `get` was still alive), hanging the reader forever with no prompt.
-    /// Run authorize on a helper thread with a deadline so a regression fails the test
+    /// Run authorize on a helper thread with a deadline so expiry regressions fail the test
     /// instead of hanging the suite.
     #[test]
     fn expired_grant_reprompts_instead_of_deadlocking() {
         let tmp = tempfile::tempdir().unwrap();
         let agent = Arc::new(prompt_only_agent(tmp.path()));
         let id = ProcessIdentity::bare(1234, 501, 20);
-        agent.grants.insert(
-            (
-                grant_key(&id, None),
-                "secrets/test-id".to_string(),
-                Operation::Read,
-            ),
-            Instant::now() - Duration::from_secs(1), // already expired
-        );
+        agent.grants.insert_expired(GrantKey::new(
+            grant_key(&id, None),
+            "secrets/test-id".to_string(),
+            Operation::Read,
+            Enforcement::Prompt,
+        ));
 
         let handle = {
             let agent = Arc::clone(&agent);
@@ -780,14 +867,18 @@ mod tests {
         let agent = prompt_only_agent(tmp.path());
         let id = ProcessIdentity::bare(1234, 501, 20);
 
-        agent.grants.insert(
-            (
-                grant_key(&id, None),
-                "secrets/test-id".to_string(),
-                Operation::Write,
-            ),
-            Instant::now() + Duration::from_secs(600),
-        );
+        agent
+            .grants
+            .insert(
+                GrantKey::new(
+                    grant_key(&id, None),
+                    "secrets/test-id".to_string(),
+                    Operation::Write,
+                    Enforcement::Prompt,
+                ),
+                Duration::from_secs(600),
+            )
+            .unwrap();
 
         let d = agent.authorize(&req(&id, Operation::Write));
         assert!(d.is_allowed());
@@ -818,17 +909,49 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let agent = prompt_only_agent(tmp.path());
         let id = ProcessIdentity::bare(1234, 501, 20);
-        agent.grants.insert(
-            (
-                grant_key(&id, None),
-                "secrets/test-id".to_string(),
-                Operation::Read,
-            ),
-            Instant::now() + Duration::from_secs(600),
-        );
+        agent
+            .grants
+            .insert(
+                GrantKey::new(
+                    grant_key(&id, None),
+                    "secrets/test-id".to_string(),
+                    Operation::Read,
+                    Enforcement::Prompt,
+                ),
+                Duration::from_secs(600),
+            )
+            .unwrap();
 
         agent.set_policy_mode(PolicyMode::AuditOnly, Some(3600)).unwrap();
 
         assert!(agent.grants.is_empty());
+        assert!(GrantCache::open(tmp.path().join("grants.json")).is_empty());
+    }
+
+    #[test]
+    fn initial_managed_policy_install_preserves_grants_but_later_changes_clear_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = prompt_only_agent(tmp.path());
+        let id = ProcessIdentity::bare(1234, 501, 20);
+        let key = GrantKey::new(
+            grant_key(&id, None),
+            "secrets/test-id".to_string(),
+            Operation::Read,
+            Enforcement::Prompt,
+        );
+        agent.grants.insert(key.clone(), Duration::from_secs(600)).unwrap();
+
+        agent.replace_managed_enforcement(HashMap::from([(
+            "secrets/test-id".to_string(),
+            Enforcement::Prompt,
+        )]));
+        assert!(agent.grants.is_valid(&key));
+
+        agent.replace_managed_enforcement(HashMap::from([(
+            "secrets/test-id".to_string(),
+            Enforcement::TouchId,
+        )]));
+        assert!(agent.grants.is_empty());
+        assert!(GrantCache::open(tmp.path().join("grants.json")).is_empty());
     }
 }

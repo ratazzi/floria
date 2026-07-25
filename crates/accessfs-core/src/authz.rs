@@ -73,7 +73,7 @@ impl Operation {
 
 /// The enforcement level configured for a path: how strictly its access is gated.
 /// Attached per-file in config; consumed by the policy engine (agent).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Enforcement {
     /// Allow silently, audit only (monitor mode). The default.
