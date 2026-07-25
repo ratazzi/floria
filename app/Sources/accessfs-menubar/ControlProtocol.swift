@@ -252,6 +252,28 @@ struct DiscoveredSshIdentity: Codable, Hashable, Sendable {
     let comment: String
 }
 
+enum SshConfigIntegrationState: String, Codable, Sendable {
+    case disabled
+    case managed
+    case external
+    case needsRepair = "needs_repair"
+}
+
+struct SshConfigIntegrationStatus: Codable, Equatable, Sendable {
+    let state: SshConfigIntegrationState
+    let writable: Bool
+    let userConfig: String
+    let generatedConfig: String
+    let includeLine: String
+
+    enum CodingKeys: String, CodingKey {
+        case state, writable
+        case userConfig = "user_config"
+        case generatedConfig = "generated_config"
+        case includeLine = "include_line"
+    }
+}
+
 struct CatalogProtectedFile: Codable, Sendable {
     let id: String
     let sourcePath: String
@@ -282,6 +304,9 @@ enum ControlCommand: Sendable {
     case policyModeSet(mode: RuntimePolicyMode, durationSecs: UInt64?)
     case snapshot
     case sshAgentDiscover(endpoint: String)
+    case sshConfigStatus
+    case sshConfigInstall
+    case sshConfigRemove
     case protectedFiles
     case fileProtect(String)
     case protectedFileHistory(String)
@@ -320,6 +345,9 @@ enum ControlCommand: Sendable {
         case .policyModeSet: "policy_mode_set"
         case .snapshot: "snapshot"
         case .sshAgentDiscover: "ssh_agent_discover"
+        case .sshConfigStatus: "ssh_config_status"
+        case .sshConfigInstall: "ssh_config_install"
+        case .sshConfigRemove: "ssh_config_remove"
         case .protectedFiles: "protected_files"
         case .fileProtect: "file_protect"
         case .protectedFileHistory: "protected_file_history"
@@ -347,7 +375,8 @@ enum ControlCommand: Sendable {
 
     func requestData(requestID: UInt64, encoder: JSONEncoder) throws -> Data {
         switch self {
-        case .policyModeGet, .snapshot, .protectedFiles:
+        case .policyModeGet, .snapshot, .sshConfigStatus, .sshConfigInstall, .sshConfigRemove,
+            .protectedFiles:
             return try encoder.encode(ControlRequestWithoutParams(requestID: requestID, method: method))
         case .policyModeSet(let mode, let durationSecs):
             return try encoder.encode(

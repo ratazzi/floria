@@ -2523,12 +2523,77 @@ private struct SshAgentsCatalogView: View {
     let search: String
     let connectAgent: () -> Void
 
+    @State private var integration: SshConfigIntegrationStatus?
+    @State private var integrationCheckFailed = false
+    @State private var isUpdating = false
+    @State private var alert: IntegrationAlert?
+
+    private enum IntegrationAlert: Identifiable {
+        case install
+        case remove
+        case failure(String)
+
+        var id: String {
+            switch self {
+            case .install: "install"
+            case .remove: "remove"
+            case .failure(let message): "failure-\(message)"
+            }
+        }
+    }
+
     private var generatedConfig: String {
         (NSHomeDirectory() as NSString).appendingPathComponent(
             "Library/Application Support/floria/ssh/config")
     }
 
-    private var includeLine: String { "Include \"\(generatedConfig)\"" }
+    private var includeLine: String {
+        integration?.includeLine ?? "Include \"\(generatedConfig)\""
+    }
+
+    private var integrationTitle: String {
+        guard let integration else {
+            return integrationCheckFailed
+                ? "SSH host routing requires manual setup" : "Checking SSH host routing…"
+        }
+        switch integration.state {
+        case .disabled: return "SSH host routing is not enabled"
+        case .managed: return "SSH host routing is enabled"
+        case .external: return "SSH host routing is enabled manually"
+        case .needsRepair: return "SSH host routing needs repair"
+        }
+    }
+
+    private var integrationDetail: String {
+        guard let integration else {
+            return integrationCheckFailed
+                ? "Copy the Include line into ~/.ssh/config manually." : includeLine
+        }
+        if !integration.writable {
+            if integration.state == .needsRepair {
+                return "The marker block contains unrecognized settings; inspect it manually."
+            }
+            return "Copy the Include line into the source managed by your dotfiles tool."
+        }
+        switch integration.state {
+        case .disabled:
+            return "Floria can add a reversible block at the top of ~/.ssh/config."
+        case .managed:
+            return "Floria manages only its marked Include block; all other settings stay untouched."
+        case .external:
+            return "A top-level Include already exists, so Floria will not claim or remove it."
+        case .needsRepair:
+            return "The marked block is misplaced. Repair moves it before the first Host or Match."
+        }
+    }
+
+    private var integrationColor: Color {
+        guard let integration else { return .secondary }
+        switch integration.state {
+        case .managed, .external: return .green
+        case .disabled, .needsRepair: return .orange
+        }
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -2540,13 +2605,15 @@ private struct SshAgentsCatalogView: View {
                 .frame(maxHeight: .infinity)
             Divider()
             HStack(spacing: 12) {
-                Image(systemName: "terminal")
-                    .foregroundStyle(.secondary)
+                Image(
+                    systemName: integration?.state == .managed || integration?.state == .external
+                        ? "checkmark.circle.fill" : "terminal")
+                    .foregroundStyle(integrationColor)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Enable host routing once in ~/.ssh/config")
+                    Text(integrationTitle)
                         .font(.callout.weight(.medium))
-                    Text(includeLine)
-                        .font(.caption.monospaced())
+                    Text(integrationDetail)
+                        .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
@@ -2555,12 +2622,83 @@ private struct SshAgentsCatalogView: View {
                 Button("Copy Include", systemImage: "doc.on.doc") {
                     copyToPasteboard(includeLine)
                 }
+                if let integration, integration.writable {
+                    switch integration.state {
+                    case .disabled, .needsRepair:
+                        Button(integration.state == .disabled ? "Enable" : "Repair") {
+                            alert = .install
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(isUpdating)
+                    case .managed:
+                        Button("Disable") { alert = .remove }
+                            .disabled(isUpdating)
+                    case .external:
+                        EmptyView()
+                    }
+                } else if integration == nil && !integrationCheckFailed {
+                    ProgressView().controlSize(.small)
+                }
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 12)
             .background(.bar)
             .fixedSize(horizontal: false, vertical: true)
             .layoutPriority(1)
+        }
+        .task { await refreshIntegration() }
+        .alert(item: $alert) { alert in
+            switch alert {
+            case .install:
+                Alert(
+                    title: Text(
+                        integration?.state == .needsRepair
+                            ? "Repair SSH Host Routing?" : "Enable SSH Host Routing?"),
+                    message: Text(
+                        "Floria will place this marked Include block before the first Host or Match in ~/.ssh/config:\n\n\(includeLine)"),
+                    primaryButton: .default(Text("Continue")) { updateIntegration(install: true) },
+                    secondaryButton: .cancel())
+            case .remove:
+                Alert(
+                    title: Text("Disable SSH Host Routing?"),
+                    message: Text(
+                        "Floria will remove only its marked Include block. Generated routes and agent sockets remain available."),
+                    primaryButton: .destructive(Text("Remove Include")) {
+                        updateIntegration(install: false)
+                    },
+                    secondaryButton: .cancel())
+            case .failure(let message):
+                Alert(
+                    title: Text("Could not update SSH config"), message: Text(message),
+                    dismissButton: .default(Text("OK")))
+            }
+        }
+    }
+
+    @MainActor
+    private func refreshIntegration() async {
+        do {
+            integration = try await store.sshConfigStatus()
+            integrationCheckFailed = false
+        } catch {
+            integrationCheckFailed = true
+            alert = .failure(error.localizedDescription)
+        }
+    }
+
+    private func updateIntegration(install: Bool) {
+        Task { @MainActor in
+            isUpdating = true
+            defer { isUpdating = false }
+            do {
+                if install {
+                    integration = try await store.installSshConfig()
+                } else {
+                    integration = try await store.removeSshConfig()
+                }
+            } catch {
+                alert = .failure(error.localizedDescription)
+            }
         }
     }
 }

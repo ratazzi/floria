@@ -955,6 +955,21 @@ final class WorkspaceStore {
         return try await controlClient.discoverSshIdentities(endpoint: endpoint)
     }
 
+    func sshConfigStatus() async throws -> SshConfigIntegrationStatus {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        return try await controlClient.sshConfigStatus()
+    }
+
+    func installSshConfig() async throws -> SshConfigIntegrationStatus {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        return try await controlClient.installSshConfig()
+    }
+
+    func removeSshConfig() async throws -> SshConfigIntegrationStatus {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        return try await controlClient.removeSshConfig()
+    }
+
     @discardableResult
     func createSshAgentResource(
         name: String, endpoint: String, identities: [DiscoveredSshIdentity],

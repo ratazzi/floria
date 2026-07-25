@@ -58,6 +58,9 @@ pub enum ControlCommand {
     PolicyModeSet { mode: PolicyMode, duration_secs: Option<u64> },
     Snapshot,
     SshAgentDiscover { endpoint: PathBuf },
+    SshConfigStatus,
+    SshConfigInstall,
+    SshConfigRemove,
     ProtectedFiles,
     FileProtect { path: PathBuf },
     ProtectedFileHistory { id: String },
@@ -136,6 +139,7 @@ pub enum ControlResult {
     PolicyMode(PolicyModeStatus),
     Snapshot(CatalogSnapshot),
     SshAgentIdentities(Vec<SshIdentity>),
+    SshConfig(SshConfigStatus),
     ProtectedFiles(Vec<ProtectedFile>),
     FileProtected { file: ProtectedFile, created: bool },
     ProtectedFileHistory { id: String, versions: Vec<ProtectedFileVersion> },
@@ -154,6 +158,24 @@ pub struct SshIdentity {
     pub address: String,
     pub fingerprint: String,
     pub comment: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SshConfigState {
+    Disabled,
+    Managed,
+    External,
+    NeedsRepair,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshConfigStatus {
+    pub state: SshConfigState,
+    pub writable: bool,
+    pub user_config: PathBuf,
+    pub generated_config: PathBuf,
+    pub include_line: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -318,6 +340,31 @@ mod tests {
 
         assert_eq!(value["method"], "ssh_agent_discover");
         assert_eq!(value["params"]["endpoint"], "/private/tmp/fixture-agent.sock");
+    }
+
+    #[test]
+    fn ssh_config_commands_and_status_have_stable_wire_shapes() {
+        for (command, method) in [
+            (ControlCommand::SshConfigStatus, "ssh_config_status"),
+            (ControlCommand::SshConfigInstall, "ssh_config_install"),
+            (ControlCommand::SshConfigRemove, "ssh_config_remove"),
+        ] {
+            let value = serde_json::to_value(ControlRequest { request_id: 19, command }).unwrap();
+            assert_eq!(value["method"], method);
+            assert!(value.get("params").is_none());
+        }
+
+        let result = ControlResult::SshConfig(SshConfigStatus {
+            state: SshConfigState::Managed,
+            writable: true,
+            user_config: PathBuf::from("/fixture/.ssh/config"),
+            generated_config: PathBuf::from("/fixture/floria/ssh/config"),
+            include_line: "Include \"/fixture/floria/ssh/config\"".to_string(),
+        });
+        let value = serde_json::to_value(result).unwrap();
+        assert_eq!(value["type"], "ssh_config");
+        assert_eq!(value["value"]["state"], "managed");
+        assert_eq!(value["value"]["writable"], true);
     }
 
     #[test]

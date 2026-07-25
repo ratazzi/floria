@@ -9,8 +9,9 @@ use accessfs_catalog::{
     Catalog, CatalogSnapshot, ResourceSource, Surface, SurfaceKind,
 };
 use accessfs_control::{
-    CatalogObserver, ControlClient, ControlCommand, ControlResult, ControlServer,
-    RuntimePolicyController, SshIdentity, SshIdentityDiscovery,
+    CatalogObserver, ControlClient, ControlCommand, ControlResult, ControlRuntimeServices,
+    ControlServer, ManagedSshConfig, RuntimePolicyController, SshConfigManager,
+    SshIdentity, SshIdentityDiscovery,
 };
 use accessfs_core::audit::AuditLog;
 use accessfs_core::authz::{Authorizer, Enforcement, PolicyMode, PolicyModeStatus};
@@ -386,10 +387,11 @@ fn cmd_mount(config: &Path) -> Result<()> {
     agent.replace_managed_enforcement(managed_enforcement(&snapshot, &store.list()?));
     let audit = Arc::new(AuditLog::open(&cfg.audit_log).context("opening shared audit log")?);
     let ssh_authorizer: Arc<dyn Authorizer> = agent.clone();
+    let generated_ssh_config = support_dir.join("ssh/config");
     let ssh_runtime = Arc::new(
         accessfs_agent::SshAgentRuntime::new(
             support_dir.join("runtime/sockets"),
-            support_dir.join("ssh/config"),
+            &generated_ssh_config,
             ssh_authorizer,
             Arc::clone(&audit),
         )
@@ -409,14 +411,17 @@ fn cmd_mount(config: &Path) -> Result<()> {
         agent: Arc::clone(&agent),
     });
     let ssh_discovery: Arc<dyn SshIdentityDiscovery> = Arc::new(AgentSshIdentityDiscovery);
+    let home = std::env::var_os("HOME").context("HOME is required for SSH config integration")?;
+    let ssh_config: Arc<dyn SshConfigManager> = Arc::new(ManagedSshConfig::new(
+        PathBuf::from(home).join(".ssh/config"),
+        generated_ssh_config,
+    ));
     let _control = ControlServer::start_runtime_with_services(
         &control_path,
         catalog.clone(),
         Arc::clone(&store),
         cfg.mount_path.clone(),
-        observer,
-        policy,
-        ssh_discovery,
+        ControlRuntimeServices { observer, policy, ssh_discovery, ssh_config },
     )
         .with_context(|| format!("starting control socket at {}", control_path.display()))?;
     tracing::info!(socket = %control_path.display(), "control socket listening");
@@ -650,6 +655,9 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
         }
         ControlResult::SshAgentIdentities(identities) => {
             println!("{}", serde_json::to_string_pretty(&identities)?);
+        }
+        ControlResult::SshConfig(status) => {
+            println!("{}", serde_json::to_string_pretty(&status)?);
         }
         ControlResult::ProtectedFiles(files) => {
             println!("{}", serde_json::to_string_pretty(&files)?);

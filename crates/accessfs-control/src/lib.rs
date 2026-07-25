@@ -6,12 +6,16 @@
 mod client;
 mod protocol;
 mod server;
+mod ssh_config;
 
 pub use client::ControlClient;
 pub use protocol::{
     ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest, ControlResponse,
-    ControlResult, ProtectedFile, ProtectedFileVersion, SecretValue, SshIdentity,
+    ControlResult, ProtectedFile, ProtectedFileVersion, SecretValue, SshConfigState,
+    SshConfigStatus, SshIdentity,
 };
 pub use server::{
-    CatalogObserver, ControlServer, RuntimePolicyController, SshIdentityDiscovery,
+    CatalogObserver, ControlRuntimeServices, ControlServer, RuntimePolicyController,
+    SshConfigManager, SshIdentityDiscovery,
 };
+pub use ssh_config::ManagedSshConfig;

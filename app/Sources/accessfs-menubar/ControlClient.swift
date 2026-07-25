@@ -50,6 +50,29 @@ final class ControlClient: @unchecked Sendable {
         return identities
     }
 
+    func sshConfigStatus() async throws -> SshConfigIntegrationStatus {
+        try await sshConfigRequest(.sshConfigStatus)
+    }
+
+    func installSshConfig() async throws -> SshConfigIntegrationStatus {
+        try await sshConfigRequest(.sshConfigInstall)
+    }
+
+    func removeSshConfig() async throws -> SshConfigIntegrationStatus {
+        try await sshConfigRequest(.sshConfigRemove)
+    }
+
+    private func sshConfigRequest(_ command: ControlCommand) async throws
+        -> SshConfigIntegrationStatus
+    {
+        guard let status: SshConfigIntegrationStatus = try await request(
+            command, expecting: "ssh_config", as: SshConfigIntegrationStatus.self)
+        else {
+            throw ControlClientError.missingResult("ssh_config")
+        }
+        return status
+    }
+
     func protectedFiles() async throws -> [CatalogProtectedFile] {
         guard let files: [CatalogProtectedFile] = try await request(
             .protectedFiles, expecting: "protected_files", as: [CatalogProtectedFile].self)

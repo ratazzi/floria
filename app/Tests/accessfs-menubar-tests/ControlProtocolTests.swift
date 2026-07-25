@@ -79,6 +79,31 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(response.result?.value?.first?.comment, "Fixture key")
     }
 
+    func testSshConfigIntegrationRequestsAndStatusMatchRustWireShape() throws {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        for (command, method) in [
+            (ControlCommand.sshConfigStatus, "ssh_config_status"),
+            (.sshConfigInstall, "ssh_config_install"),
+            (.sshConfigRemove, "ssh_config_remove"),
+        ] {
+            let data = try command.requestData(requestID: 74, encoder: encoder)
+            let value = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: data) as? [String: Any])
+            XCTAssertEqual(value["method"] as? String, method)
+            XCTAssertNil(value["params"])
+        }
+
+        let status = try JSONDecoder().decode(
+            SshConfigIntegrationStatus.self,
+            from: Data(
+                #"{"state":"managed","writable":true,"user_config":"/fixture/.ssh/config","generated_config":"/fixture/floria/ssh/config","include_line":"Include \"/fixture/floria/ssh/config\""}"#.utf8))
+        XCTAssertEqual(status.state, .managed)
+        XCTAssertTrue(status.writable)
+        XCTAssertEqual(status.userConfig, "/fixture/.ssh/config")
+        XCTAssertEqual(status.includeLine, #"Include "/fixture/floria/ssh/config""#)
+    }
+
     func testFileProtectRequestCarriesOnlyTheSelectedPath() throws {
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase

@@ -15,7 +15,8 @@ use accessfs_surface::{decode_source, validate_secret_bytes};
 
 use crate::protocol::{
     read_msg, write_msg, ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest,
-    ControlResponse, ControlResult, ProtectedFile, ProtectedFileVersion, SshIdentity,
+    ControlResponse, ControlResult, ProtectedFile, ProtectedFileVersion, SshConfigStatus,
+    SshIdentity,
 };
 
 pub struct ControlServer {
@@ -43,11 +44,35 @@ pub trait SshIdentityDiscovery: Send + Sync + 'static {
     fn discover(&self, endpoint: &Path) -> io::Result<Vec<SshIdentity>>;
 }
 
+/// Narrow seam for the explicit, user-triggered integration with `~/.ssh/config`.
+pub trait SshConfigManager: Send + Sync + 'static {
+    fn status(&self) -> io::Result<SshConfigStatus>;
+    fn install(&self) -> io::Result<SshConfigStatus>;
+    fn remove(&self) -> io::Result<SshConfigStatus>;
+}
+
+pub struct ControlRuntimeServices {
+    pub observer: Arc<dyn CatalogObserver>,
+    pub policy: Arc<dyn RuntimePolicyController>,
+    pub ssh_discovery: Arc<dyn SshIdentityDiscovery>,
+    pub ssh_config: Arc<dyn SshConfigManager>,
+}
+
+#[derive(Clone, Default)]
+struct ControlDependencies {
+    store: Option<Arc<dyn SecretStore>>,
+    mount_path: Option<PathBuf>,
+    observer: Option<Arc<dyn CatalogObserver>>,
+    policy: Option<Arc<dyn RuntimePolicyController>>,
+    ssh_discovery: Option<Arc<dyn SshIdentityDiscovery>>,
+    ssh_config: Option<Arc<dyn SshConfigManager>>,
+}
+
 impl ControlServer {
     /// Start the catalog control socket. Each connection gets a dedicated request loop;
     /// authorization prompts continue to use the separate agent socket.
     pub fn start(path: &Path, catalog: Catalog) -> io::Result<Self> {
-        Self::start_inner(path, catalog, None, None, None, None, None)
+        Self::start_inner(path, catalog, ControlDependencies::default())
     }
 
     pub fn start_observed(
@@ -55,7 +80,11 @@ impl ControlServer {
         catalog: Catalog,
         observer: Arc<dyn CatalogObserver>,
     ) -> io::Result<Self> {
-        Self::start_inner(path, catalog, None, None, Some(observer), None, None)
+        Self::start_inner(
+            path,
+            catalog,
+            ControlDependencies { observer: Some(observer), ..ControlDependencies::default() },
+        )
     }
 
     pub fn start_runtime(
@@ -68,11 +97,12 @@ impl ControlServer {
         Self::start_inner(
             path,
             catalog,
-            Some(store),
-            Some(mount_path),
-            Some(observer),
-            None,
-            None,
+            ControlDependencies {
+                store: Some(store),
+                mount_path: Some(mount_path),
+                observer: Some(observer),
+                ..ControlDependencies::default()
+            },
         )
     }
 
@@ -87,11 +117,13 @@ impl ControlServer {
         Self::start_inner(
             path,
             catalog,
-            Some(store),
-            Some(mount_path),
-            Some(observer),
-            Some(policy),
-            None,
+            ControlDependencies {
+                store: Some(store),
+                mount_path: Some(mount_path),
+                observer: Some(observer),
+                policy: Some(policy),
+                ..ControlDependencies::default()
+            },
         )
     }
 
@@ -101,29 +133,26 @@ impl ControlServer {
         catalog: Catalog,
         store: Arc<dyn SecretStore>,
         mount_path: PathBuf,
-        observer: Arc<dyn CatalogObserver>,
-        policy: Arc<dyn RuntimePolicyController>,
-        ssh_discovery: Arc<dyn SshIdentityDiscovery>,
+        services: ControlRuntimeServices,
     ) -> io::Result<Self> {
         Self::start_inner(
             path,
             catalog,
-            Some(store),
-            Some(mount_path),
-            Some(observer),
-            Some(policy),
-            Some(ssh_discovery),
+            ControlDependencies {
+                store: Some(store),
+                mount_path: Some(mount_path),
+                observer: Some(services.observer),
+                policy: Some(services.policy),
+                ssh_discovery: Some(services.ssh_discovery),
+                ssh_config: Some(services.ssh_config),
+            },
         )
     }
 
     fn start_inner(
         path: &Path,
         catalog: Catalog,
-        store: Option<Arc<dyn SecretStore>>,
-        mount_path: Option<PathBuf>,
-        observer: Option<Arc<dyn CatalogObserver>>,
-        policy: Option<Arc<dyn RuntimePolicyController>>,
-        ssh_discovery: Option<Arc<dyn SshIdentityDiscovery>>,
+        dependencies: ControlDependencies,
     ) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -136,15 +165,7 @@ impl ControlServer {
         std::thread::Builder::new()
             .name("accessfs-control-accept".to_string())
             .spawn(move || {
-                accept_loop(
-                    listener,
-                    catalog,
-                    store,
-                    mount_path,
-                    observer,
-                    policy,
-                    ssh_discovery,
-                )
+                accept_loop(listener, catalog, dependencies)
             })?;
 
         Ok(ControlServer { socket_path: path.to_path_buf() })
@@ -158,11 +179,7 @@ impl ControlServer {
 fn accept_loop(
     listener: UnixListener,
     catalog: Arc<Catalog>,
-    store: Option<Arc<dyn SecretStore>>,
-    mount_path: Option<PathBuf>,
-    observer: Option<Arc<dyn CatalogObserver>>,
-    policy: Option<Arc<dyn RuntimePolicyController>>,
-    ssh_discovery: Option<Arc<dyn SshIdentityDiscovery>>,
+    dependencies: ControlDependencies,
 ) {
     for stream in listener.incoming() {
         let stream = match stream {
@@ -177,23 +194,11 @@ fn accept_loop(
             continue;
         }
         let catalog = Arc::clone(&catalog);
-        let store = store.clone();
-        let mount_path = mount_path.clone();
-        let observer = observer.clone();
-        let policy = policy.clone();
-        let ssh_discovery = ssh_discovery.clone();
+        let dependencies = dependencies.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("accessfs-control-conn".to_string())
             .spawn(move || {
-                handle_connection(
-                    stream,
-                    catalog,
-                    store,
-                    mount_path,
-                    observer,
-                    policy,
-                    ssh_discovery,
-                )
+                handle_connection(stream, catalog, dependencies)
             })
         {
             tracing::warn!(%error, "spawning control connection failed");
@@ -204,11 +209,7 @@ fn accept_loop(
 fn handle_connection(
     mut stream: UnixStream,
     catalog: Arc<Catalog>,
-    store: Option<Arc<dyn SecretStore>>,
-    mount_path: Option<PathBuf>,
-    observer: Option<Arc<dyn CatalogObserver>>,
-    policy: Option<Arc<dyn RuntimePolicyController>>,
-    ssh_discovery: Option<Arc<dyn SshIdentityDiscovery>>,
+    dependencies: ControlDependencies,
 ) {
     loop {
         let request: ControlRequest = match read_msg(&mut stream) {
@@ -222,15 +223,16 @@ fn handle_connection(
         let changes_runtime = changes_runtime(&request.command);
         let outcome = match dispatch(
             &catalog,
-            store.as_deref(),
-            mount_path.as_deref(),
-            policy.as_deref(),
-            ssh_discovery.as_deref(),
+            dependencies.store.as_deref(),
+            dependencies.mount_path.as_deref(),
+            dependencies.policy.as_deref(),
+            dependencies.ssh_discovery.as_deref(),
+            dependencies.ssh_config.as_deref(),
             request.command,
         ) {
             Ok(result) => {
                 if changes_runtime {
-                    notify_observer(&catalog, observer.as_deref());
+                    notify_observer(&catalog, dependencies.observer.as_deref());
                 }
                 ControlOutcome::Ok { result }
             }
@@ -285,6 +287,7 @@ enum DispatchError {
     Store(StoreError),
     Io { path: PathBuf, source: io::Error },
     Policy(io::Error),
+    SshConfig(io::Error),
     Validation(String),
     StoreUnavailable,
 }
@@ -315,6 +318,14 @@ impl DispatchError {
                 },
                 message: error.to_string(),
             },
+            DispatchError::SshConfig(error) => ControlErrorBody {
+                code: if error.kind() == io::ErrorKind::InvalidInput {
+                    "validation".to_string()
+                } else {
+                    "ssh_config_io".to_string()
+                },
+                message: error.to_string(),
+            },
             DispatchError::StoreUnavailable => ControlErrorBody {
                 code: "secret_store_unavailable".to_string(),
                 message: "secret store is unavailable on this control server".to_string(),
@@ -341,6 +352,7 @@ fn dispatch(
     mount_path: Option<&Path>,
     policy: Option<&dyn RuntimePolicyController>,
     ssh_discovery: Option<&dyn SshIdentityDiscovery>,
+    ssh_config: Option<&dyn SshConfigManager>,
     command: ControlCommand,
 ) -> Result<ControlResult, DispatchError> {
     match command {
@@ -382,6 +394,33 @@ fn dispatch(
                 .map(ControlResult::SshAgentIdentities)
                 .map_err(|source| DispatchError::Io { path: endpoint, source })
         }
+        ControlCommand::SshConfigStatus => ssh_config
+            .ok_or_else(|| {
+                DispatchError::Validation(
+                    "SSH config integration is unavailable on this control server".to_string(),
+                )
+            })?
+            .status()
+            .map(ControlResult::SshConfig)
+            .map_err(DispatchError::SshConfig),
+        ControlCommand::SshConfigInstall => ssh_config
+            .ok_or_else(|| {
+                DispatchError::Validation(
+                    "SSH config integration is unavailable on this control server".to_string(),
+                )
+            })?
+            .install()
+            .map(ControlResult::SshConfig)
+            .map_err(DispatchError::SshConfig),
+        ControlCommand::SshConfigRemove => ssh_config
+            .ok_or_else(|| {
+                DispatchError::Validation(
+                    "SSH config integration is unavailable on this control server".to_string(),
+                )
+            })?
+            .remove()
+            .map(ControlResult::SshConfig)
+            .map_err(DispatchError::SshConfig),
         ControlCommand::ProtectedFiles => protected_files(
             store.ok_or(DispatchError::StoreUnavailable)?,
             mount_path.ok_or(DispatchError::StoreUnavailable)?,
@@ -1502,11 +1541,7 @@ mod tests {
         let _server = ControlServer::start_inner(
             &socket,
             catalog,
-            None,
-            None,
-            None,
-            Some(policy),
-            None,
+            ControlDependencies { policy: Some(policy), ..ControlDependencies::default() },
         )
         .unwrap();
         let mut client = ControlClient::connect(&socket).unwrap();
@@ -1538,11 +1573,10 @@ mod tests {
         let _server = ControlServer::start_inner(
             &socket,
             catalog,
-            None,
-            None,
-            None,
-            None,
-            Some(discovery),
+            ControlDependencies {
+                ssh_discovery: Some(discovery),
+                ..ControlDependencies::default()
+            },
         )
         .unwrap();
         let mut client = ControlClient::connect(&socket).unwrap();
@@ -1558,6 +1592,59 @@ mod tests {
                 comment: endpoint.display().to_string(),
             }])
         );
+    }
+
+    #[test]
+    fn ssh_config_integration_roundtrips_through_the_control_seam() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let socket = dir.path().join("control.sock");
+        let user_config = dir.path().join(".ssh/config");
+        let generated_config = dir.path().join("floria/ssh/config");
+        let manager: Arc<dyn SshConfigManager> = Arc::new(crate::ManagedSshConfig::new(
+            &user_config,
+            &generated_config,
+        ));
+        let _server = ControlServer::start_inner(
+            &socket,
+            catalog,
+            ControlDependencies {
+                ssh_config: Some(manager),
+                ..ControlDependencies::default()
+            },
+        )
+        .unwrap();
+        let mut client = ControlClient::connect(&socket).unwrap();
+
+        let status = client.request(ControlCommand::SshConfigStatus).unwrap();
+        assert!(matches!(
+            status,
+            ControlResult::SshConfig(SshConfigStatus {
+                state: crate::SshConfigState::Disabled,
+                writable: true,
+                ..
+            })
+        ));
+        let status = client.request(ControlCommand::SshConfigInstall).unwrap();
+        assert!(matches!(
+            status,
+            ControlResult::SshConfig(SshConfigStatus {
+                state: crate::SshConfigState::Managed,
+                ..
+            })
+        ));
+        assert!(std::fs::read_to_string(&user_config)
+            .unwrap()
+            .contains(&generated_config.display().to_string()));
+
+        let status = client.request(ControlCommand::SshConfigRemove).unwrap();
+        assert!(matches!(
+            status,
+            ControlResult::SshConfig(SshConfigStatus {
+                state: crate::SshConfigState::Disabled,
+                ..
+            })
+        ));
     }
 
     #[test]
