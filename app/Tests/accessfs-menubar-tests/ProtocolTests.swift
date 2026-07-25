@@ -10,7 +10,10 @@ final class ProtocolTests: XCTestCase {
         let json = """
             {"type":"prompt","req_id":9,"path":"secrets/abc","display":"/Users/me/.env",
              "operation":"write","enforcement":"prompt",
-             "identity":{"pid":42,"uid":501,"exe":"/usr/bin/vim","cwd":"/tmp","chain":"login -> zsh -> vim"}}
+             "identity":{"pid":42,"uid":501,"exe":"/usr/bin/vim","cwd":"/tmp",
+             "cmdline":["vim","/Users/me/.env"],"bundle_id":null,"team_id":null,
+             "parent_chain":[{"pid":1,"name":"launchd","exe":"/sbin/launchd"},
+             {"pid":42,"name":"vim","exe":"/usr/bin/vim"}],"chain":"launchd -> vim"}}
             """
         let m = try JSONDecoder().decode(PromptMsg.self, from: Data(json.utf8))
         XCTAssertEqual(m.req_id, 9)
@@ -20,6 +23,8 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(m.enforcement, "prompt")
         XCTAssertEqual(m.identity.pid, 42)
         XCTAssertEqual(m.identity.exe, "/usr/bin/vim")
+        XCTAssertEqual(m.identity.cmdline, ["vim", "/Users/me/.env"])
+        XCTAssertEqual(m.identity.parent_chain?.map(\.name), ["launchd", "vim"])
     }
 
     func testDecodeAccessEventWithNullOptionals() throws {
@@ -45,6 +50,58 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(v["outcome"] as? String, "allow")
         XCTAssertEqual(v["scope"] as? String, "ttl")
         XCTAssertEqual(v["ttl_secs"] as? UInt64, 600)
+    }
+
+    func testPromptPresentationMakesSourceAndDirectReaderExplicit() {
+        let identity = IdentityView(
+            pid: 44, uid: 501, exe: "/bin/cat", cwd: "/Users/me/project",
+            chain: "launchd -> Terminal -> login -> zsh -> cat",
+            cmdline: ["cat", "/Users/me/.pgpass"],
+            parent_chain: [
+                ProcessView(pid: 1, name: "launchd", exe: "/sbin/launchd"),
+                ProcessView(
+                    pid: 10, name: "Terminal",
+                    exe: "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"),
+                ProcessView(pid: 20, name: "login", exe: "/usr/bin/login"),
+                ProcessView(pid: 30, name: "zsh", exe: "/bin/zsh"),
+                ProcessView(pid: 44, name: "cat", exe: "/bin/cat"),
+            ])
+        let prompt = PromptMsg(
+            req_id: 9, path: "secrets/fixture", display: "/Users/me/.pgpass",
+            operation: "read", enforcement: "touchid", identity: identity)
+
+        let presentation = PromptPresentation(prompt)
+
+        XCTAssertEqual(presentation.requester.displayName, "Terminal")
+        XCTAssertEqual(presentation.source.displayName, "Terminal")
+        XCTAssertEqual(presentation.reader.displayName, "cat")
+        XCTAssertEqual(presentation.processPath.map(\.displayName), ["Terminal", "login", "zsh", "cat"])
+        XCTAssertEqual(presentation.intermediateCount, 2)
+        XCTAssertEqual(presentation.targetName, ".pgpass")
+        XCTAssertEqual(presentation.mountPath, "secrets/fixture")
+        XCTAssertTrue(presentation.requiresTouchID)
+    }
+
+    func testPromptPresentationUsesDirectReaderForPureCLIChain() {
+        let identity = IdentityView(
+            pid: 44, uid: 501, exe: "/bin/cat", cwd: "/Users/me/project",
+            chain: "launchd -> zsh -> cat",
+            cmdline: ["cat", "/Users/me/.pgpass"],
+            parent_chain: [
+                ProcessView(pid: 1, name: "launchd", exe: "/sbin/launchd"),
+                ProcessView(pid: 30, name: "zsh", exe: "/bin/zsh"),
+                ProcessView(pid: 44, name: "cat", exe: "/bin/cat"),
+            ])
+        let prompt = PromptMsg(
+            req_id: 10, path: "secrets/fixture", display: "/Users/me/.pgpass",
+            operation: "read", enforcement: "prompt", identity: identity)
+
+        let presentation = PromptPresentation(prompt)
+
+        XCTAssertEqual(presentation.requester.displayName, "cat")
+        XCTAssertEqual(presentation.source.displayName, "zsh")
+        XCTAssertEqual(presentation.reader.displayName, "cat")
+        XCTAssertEqual(presentation.processPath.map(\.displayName), ["zsh", "cat"])
     }
 
     func testEncodeHelloMatchesRustSchema() throws {

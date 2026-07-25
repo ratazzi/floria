@@ -66,8 +66,20 @@ pub struct IdentityView {
     pub uid: u32,
     pub exe: Option<String>,
     pub cwd: Option<String>,
+    pub cmdline: Option<Vec<String>>,
+    pub bundle_id: Option<String>,
+    pub team_id: Option<String>,
+    /// Parent processes ordered from the root toward the direct reader.
+    pub parent_chain: Vec<ProcessView>,
     /// Parent-process chain, root-first, e.g. `login -> zsh -> node`.
     pub chain: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProcessView {
+    pub pid: i32,
+    pub name: String,
+    pub exe: Option<String>,
 }
 
 impl IdentityView {
@@ -77,6 +89,19 @@ impl IdentityView {
             uid: id.uid,
             exe: id.exe_path.as_ref().map(|p| p.display().to_string()),
             cwd: id.cwd.as_ref().map(|p| p.display().to_string()),
+            cmdline: id.cmdline.clone(),
+            bundle_id: id.bundle_id.clone(),
+            team_id: id.team_id.clone(),
+            parent_chain: id
+                .parent_chain
+                .iter()
+                .rev()
+                .map(|process| ProcessView {
+                    pid: process.pid,
+                    name: process.name.clone(),
+                    exe: process.exe_path.as_ref().map(|path| path.display().to_string()),
+                })
+                .collect(),
             chain: id.chain_display(),
         }
     }
@@ -139,11 +164,34 @@ mod tests {
         assert_eq!(v["path"], "secrets/abc");
         assert_eq!(v["rule_id"], "grant");
         assert_eq!(v["identity"]["pid"], 42);
+        assert_eq!(v["identity"]["parent_chain"], serde_json::json!([]));
     }
 
     #[test]
     fn prompt_wire_shape_includes_operation() {
-        let id = ProcessIdentity::bare(7, 501, 20);
+        let mut id = ProcessIdentity::bare(7, 501, 20);
+        id.exe_path = Some("/bin/cat".into());
+        id.cmdline = Some(vec!["cat".to_string(), "/fixture/file".to_string()]);
+        id.parent_chain = vec![
+            accessfs_core::identity::ProcSummary {
+                pid: 7,
+                ppid: 6,
+                name: "cat".to_string(),
+                exe_path: Some("/bin/cat".into()),
+            },
+            accessfs_core::identity::ProcSummary {
+                pid: 6,
+                ppid: 1,
+                name: "zsh".to_string(),
+                exe_path: Some("/bin/zsh".into()),
+            },
+            accessfs_core::identity::ProcSummary {
+                pid: 1,
+                ppid: 0,
+                name: "launchd".to_string(),
+                exe_path: Some("/sbin/launchd".into()),
+            },
+        ];
         let msg = DaemonMsg::Prompt {
             req_id: 9,
             path: "secrets/abc",
@@ -158,5 +206,8 @@ mod tests {
         assert_eq!(v["req_id"], 9);
         assert_eq!(v["operation"], "read");
         assert_eq!(v["enforcement"], "prompt");
+        assert_eq!(v["identity"]["cmdline"][0], "cat");
+        assert_eq!(v["identity"]["parent_chain"][0]["name"], "launchd");
+        assert_eq!(v["identity"]["parent_chain"][2]["name"], "cat");
     }
 }

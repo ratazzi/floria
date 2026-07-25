@@ -3,13 +3,40 @@ import Foundation
 // Wire types mirroring `accessfs-agent::protocol`. Framing is a 4-byte big-endian
 // length prefix followed by that many bytes of JSON.
 
+struct ProcessView: Codable, Hashable {
+    let pid: Int32
+    let name: String
+    let exe: String?
+}
+
 struct IdentityView: Codable {
     let pid: Int32
     let uid: UInt32
     let exe: String?
     let cwd: String?
+    let cmdline: [String]?
+    let bundle_id: String?
+    let team_id: String?
+    /// Parent processes in root-first order. Optional while decoding older fixture messages.
+    let parent_chain: [ProcessView]?
     /// Parent-process chain, root-first, e.g. "login -> zsh -> node".
     let chain: String
+
+    init(
+        pid: Int32, uid: UInt32, exe: String?, cwd: String?, chain: String,
+        cmdline: [String]? = nil, bundle_id: String? = nil, team_id: String? = nil,
+        parent_chain: [ProcessView]? = nil
+    ) {
+        self.pid = pid
+        self.uid = uid
+        self.exe = exe
+        self.cwd = cwd
+        self.cmdline = cmdline
+        self.bundle_id = bundle_id
+        self.team_id = team_id
+        self.parent_chain = parent_chain
+        self.chain = chain
+    }
 }
 
 // Incoming (daemon -> app)

@@ -1,6 +1,7 @@
 import AppKit
 import LocalAuthentication
 import os
+import SwiftUI
 
 /// Shows the modal authorization alert for a prompt and sends back the user's decision.
 /// Owns the focus dance: the alert steals focus from whatever the user was doing, and an
@@ -11,19 +12,7 @@ final class PromptPresenter {
     private static let log = Logger(subsystem: "dev.floria.hola.ac", category: "prompt")
 
     func show(_ p: PromptMsg, send: @escaping (DecisionMsg) -> Void) {
-        Self.log.info("showing alert req_id=\(p.req_id) path=\(p.path)")
-        let alert = NSAlert()
-        let friendly = p.display.map { ($0 as NSString).abbreviatingWithTildeInPath }
-        alert.messageText = "Allow \(p.operation) access to \(friendly ?? p.path)?"
-        let exe = (p.identity.exe as NSString?)?.lastPathComponent ?? "?"
-        var info =
-            "\(p.operation == "write" ? "Writer" : "Reader"): \(exe)\nChain: \(p.identity.chain)\nPID: \(p.identity.pid)   CWD: \(p.identity.cwd ?? "?")"
-        if friendly != nil { info += "\nMount path: \(p.path)" }
-        if p.enforcement == "touchid" { info += "\n\nTouch ID required to allow." }
-        alert.informativeText = info
-        alert.addButton(withTitle: "Allow once")
-        alert.addButton(withTitle: "Allow 10 min")
-        alert.addButton(withTitle: "Deny")
+        Self.log.info("showing authorization window req_id=\(p.req_id) path=\(p.path)")
 
         let previous = NSWorkspace.shared.frontmostApplication
         let refocus = {
@@ -37,15 +26,46 @@ final class PromptPresenter {
             send(DecisionMsg(req_id: p.req_id, outcome: "deny", scope: nil, ttl_secs: nil))
         }
 
+        enum Choice {
+            case deny
+            case allow(PromptGrantScope)
+        }
+        var choice = Choice.deny
+        let panelHeight: CGFloat = p.enforcement == "touchid" ? 490 : 420
+        let finish: () -> Void = { NSApp.stopModal() }
+        let content = AuthorizationPromptView(
+            prompt: p,
+            frameHeight: panelHeight,
+            deny: { finish() },
+            allow: { scope in
+                choice = .allow(scope)
+                finish()
+            })
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: panelHeight),
+            styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        panel.title = "Floria Access Request"
+        panel.isReleasedWhenClosed = false
+        panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.moveToActiveSpace]
+        panel.contentView = NSHostingView(rootView: content)
+        let panelDelegate = PromptPanelDelegate(onClose: finish)
+        panel.delegate = panelDelegate
+        panel.center()
+
         NSApp.activate(ignoringOtherApps: true)
-        switch alert.runModal() {
-        case .alertFirstButtonReturn:
-            confirmAllow(p, scope: "once", ttl: nil, send: send, deny: deny, then: refocus)
-        case .alertSecondButtonReturn:
-            confirmAllow(p, scope: "ttl", ttl: 600, send: send, deny: deny, then: refocus)
-        default:
+        panel.makeKeyAndOrderFront(nil)
+        NSApp.runModal(for: panel)
+        panel.orderOut(nil)
+
+        switch choice {
+        case .deny:
             deny()
             refocus()
+        case .allow(.once):
+            confirmAllow(p, scope: "once", ttl: nil, send: send, deny: deny, then: refocus)
+        case .allow(.tenMinutes):
+            confirmAllow(p, scope: "ttl", ttl: 600, send: send, deny: deny, then: refocus)
         }
     }
 
@@ -83,5 +103,19 @@ final class PromptPresenter {
         ctx.evaluatePolicy(policy, localizedReason: reason) { ok, _ in
             DispatchQueue.main.async { completion(ok) }
         }
+    }
+}
+
+@MainActor
+private final class PromptPanelDelegate: NSObject, NSWindowDelegate {
+    private let onClose: () -> Void
+
+    init(onClose: @escaping () -> Void) {
+        self.onClose = onClose
+    }
+
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        onClose()
+        return true
     }
 }
