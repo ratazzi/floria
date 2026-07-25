@@ -12,13 +12,15 @@ final class AuthorizationPromptViewTests: XCTestCase {
                 preset: .constant(.once),
                 customDuration: .constant(15),
                 customUnit: .constant(.minutes),
-                operation: "read"))
+                operation: "read")
+                .frame(width: 440))
         let custom = NSHostingView(
             rootView: AuthorizationScopePicker(
                 preset: .constant(.custom),
                 customDuration: .constant(3),
                 customUnit: .constant(.hours),
-                operation: "read"))
+                operation: "read")
+                .frame(width: 440))
 
         XCTAssertEqual(once.fittingSize.width, custom.fittingSize.width, accuracy: 0.5)
     }

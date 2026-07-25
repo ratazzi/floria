@@ -225,29 +225,18 @@ struct AuthorizationPromptView: View {
     var body: some View {
         VStack(spacing: 0) {
             ScrollView {
-                VStack(spacing: 18) {
+                VStack(spacing: 14) {
                     requestHeader
                     processSummary
                     securityNotice
-                    HStack(
-                        alignment: .top,
-                        spacing: AuthorizationPromptLayout.columnSpacing
-                    ) {
-                        Color.clear
-                            .frame(
-                                width: AuthorizationPromptLayout.visualColumnWidth,
-                                height: 1)
-                            .accessibilityHidden(true)
-                        AuthorizationScopePicker(
-                            preset: $grantPreset,
-                            customDuration: $customDuration,
-                            customUnit: $customUnit,
-                            operation: model.operation)
-                        Spacer(minLength: 0)
-                    }
+                    AuthorizationScopePicker(
+                        preset: $grantPreset,
+                        customDuration: $customDuration,
+                        customUnit: $customUnit,
+                        operation: model.operation)
                 }
                 .padding(.horizontal, 26)
-                .padding(.vertical, 22)
+                .padding(.vertical, 18)
             }
 
             Divider()
@@ -376,6 +365,10 @@ struct AuthorizationPromptView: View {
         }
         .padding(AuthorizationPromptLayout.cardPadding)
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.primary.opacity(0.08))
+        }
     }
 
     @ViewBuilder
@@ -517,23 +510,34 @@ struct AuthorizationScopePicker: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Authorization scope")
-                .font(.headline)
-            Picker("Authorization scope", selection: $preset) {
-                ForEach(PromptGrantPreset.allCases, id: \.self) { option in
-                    Text(option.title).tag(option)
-                }
-            }
-            .labelsHidden()
-            .pickerStyle(.menu)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            if preset == .custom {
-                HStack(spacing: 8) {
-                    Stepper(value: $customDuration, in: customUnit.range) {
-                        Text("\(customDuration)")
-                            .monospacedDigit()
-                            .frame(minWidth: 34, alignment: .trailing)
+            HStack(spacing: 12) {
+                Text("Authorization scope")
+                    .font(.headline)
+                Spacer()
+                Picker("Authorization scope", selection: $preset) {
+                    ForEach(PromptGrantPreset.allCases, id: \.self) { option in
+                        Text(option.title).tag(option)
                     }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 118, alignment: .trailing)
+            }
+            if preset == .custom {
+                Divider()
+                HStack(spacing: 8) {
+                    Text("Duration")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    TextField(
+                        "Duration",
+                        value: $customDuration,
+                        format: .number)
+                        .labelsHidden()
+                        .textFieldStyle(.roundedBorder)
+                        .multilineTextAlignment(.trailing)
+                        .frame(width: 58)
                     Picker("Unit", selection: $customUnit) {
                         ForEach(PromptGrantCustomUnit.allCases, id: \.self) { unit in
                             Text(unit.rawValue.capitalized).tag(unit)
@@ -541,6 +545,7 @@ struct AuthorizationScopePicker: View {
                     }
                     .labelsHidden()
                     .pickerStyle(.menu)
+                    .frame(width: 96, alignment: .trailing)
                 }
                 .onChange(of: customUnit) { _, unit in
                     customDuration = min(
@@ -555,7 +560,14 @@ struct AuthorizationScopePicker: View {
                     : "Reuse this approval for the same application or project and file for \(scope.title).")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
         }
-        .frame(width: 280, alignment: .leading)
+        .padding(AuthorizationPromptLayout.cardPadding)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.primary.opacity(0.08))
+        }
     }
 }

@@ -31,7 +31,7 @@ final class PromptPresenter {
             case allow(PromptGrantScope)
         }
         var choice = Choice.deny
-        let panelHeight: CGFloat = p.enforcement == "touchid" ? 490 : 420
+        let panelHeight: CGFloat = p.enforcement == "touchid" ? 450 : 370
         let finish: () -> Void = { NSApp.stopModal() }
         let content = AuthorizationPromptView(
             prompt: p,
