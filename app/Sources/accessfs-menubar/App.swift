@@ -1,11 +1,34 @@
 import AppKit
 import SwiftUI
 
-/// Menubar (accessory) app: a window-style dropdown (search + recent access + actions)
-/// plus modal authorization prompts driven by the daemon.
+enum FloriaImages {
+    static let applicationIcon = load(name: "AppIcon", extension: "icns")
+    static let menuBarTemplate: NSImage? = {
+        let image = load(name: "MenuBarTemplate", extension: "png")
+        image?.size = NSSize(width: 20, height: 20)
+        image?.isTemplate = true
+        return image
+    }()
+
+    private static func load(name: String, extension fileExtension: String) -> NSImage? {
+        guard
+            let url = Bundle.main.url(forResource: name, withExtension: fileExtension),
+            let image = NSImage(contentsOf: url)
+        else {
+            return nil
+        }
+        return image
+    }
+}
+
+/// Dock-and-menubar app: a full workspace window, a compact status dropdown,
+/// and modal authorization prompts driven by the daemon.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory)  // menubar only, no Dock icon
+        if let icon = FloriaImages.applicationIcon {
+            NSApp.applicationIconImage = icon
+        }
+        NSApp.setActivationPolicy(.regular)
     }
 }
 
@@ -22,11 +45,19 @@ struct FloriaMenuBarApp: App {
         } label: {
             // Do not put a TimelineView here: on macOS 26 a periodic status-item label caused
             // continuous invalidation (~99% CPU). AppState's refresh task drives mode changes.
-            Image(
-                systemName: state.policyMode.isAuditOnly()
-                    ? "eye.circle.fill" : "lock.shield")
-                .symbolRenderingMode(.hierarchical)
-                .foregroundStyle(state.policyMode.isAuditOnly() ? Color.orange : Color.primary)
+            if let image = FloriaImages.menuBarTemplate {
+                Image(nsImage: image)
+                    .renderingMode(.template)
+                    .foregroundStyle(
+                        state.policyMode.isAuditOnly() ? Color.orange : Color.primary)
+            } else {
+                Image(
+                    systemName: state.policyMode.isAuditOnly()
+                        ? "eye.circle.fill" : "lock.shield")
+                    .symbolRenderingMode(.hierarchical)
+                    .foregroundStyle(
+                        state.policyMode.isAuditOnly() ? Color.orange : Color.primary)
+            }
         }
         // `.window` turns the dropdown into a real anchored window that hosts arbitrary
         // SwiftUI (search field, hover rows, ...) instead of an NSMenu.

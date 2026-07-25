@@ -8,6 +8,8 @@
     <string>Floria</string>
     <key>CFBundleIdentifier</key>
     <string>dev.floria.hola.ac</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
@@ -20,8 +22,6 @@
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
     <string>15.0</string>
-	<key>LSUIElement</key>
-	<true/>
 	<key>LSMultipleInstancesProhibited</key>
 	<true/>
     <key>NSHighResolutionCapable</key>

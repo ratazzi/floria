@@ -1,6 +1,10 @@
 [tools]
 rust = "1.97.1"
 
+[tasks.generate-icons]
+description = "Generate the macOS app and menu-bar icons from the checked-in source image"
+run = "uv run --with pillow python scripts/generate-app-icons.py app/Assets/FloriaIconSource.png app/Assets"
+
 [tasks.install-app]
 description = "Build Floria.app (Rust daemon + Swift UI) and install it in /Applications"
 run = '''
@@ -30,6 +34,8 @@ cp "$BIN_DIR/$PRODUCT_NAME" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
 cp target/release/accessfs "$APP_BUNDLE/Contents/Resources/accessfs"
 cp accessfs.toml "$APP_BUNDLE/Contents/Resources/accessfs.toml"
 cp scripts/render-env "$APP_BUNDLE/Contents/Resources/scripts/render-env"
+cp app/Assets/AppIcon.icns "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
+cp app/Assets/MenuBarTemplate.png "$APP_BUNDLE/Contents/Resources/MenuBarTemplate.png"
 cp app/Info.plist "$APP_BUNDLE/Contents/Info.plist"
 plutil -replace CFBundleShortVersionString -string "$VERSION" "$APP_BUNDLE/Contents/Info.plist"
 plutil -replace CFBundleVersion -string "$BUILD_NUMBER" "$APP_BUNDLE/Contents/Info.plist"
