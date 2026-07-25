@@ -98,6 +98,20 @@ private extension RecentAccess {
     }
 }
 
+private extension ActiveGrant {
+    var shownTarget: String {
+        (target as NSString).abbreviatingWithTildeInPath
+    }
+
+    func matchesMenuBarSearch(_ query: String) -> Bool {
+        client.localizedCaseInsensitiveContains(query)
+            || shownTarget.localizedCaseInsensitiveContains(query)
+            || operation.localizedCaseInsensitiveContains(query)
+            || (executable?.localizedCaseInsensitiveContains(query) ?? false)
+            || (bundleID?.localizedCaseInsensitiveContains(query) ?? false)
+    }
+}
+
 /// The window-style dropdown: search header, recent-access list, footer actions.
 struct MenuBarView: View {
     @Bindable var state: AppState
@@ -115,17 +129,35 @@ struct MenuBarView: View {
         MenuBarAccessFeed.make(recents: state.recents, searchText: searchText)
     }
 
+    private var visibleActiveGrants: [ActiveGrant] {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let now = Date()
+        return state.activeGrants.filter {
+            $0.expirationDate > now
+                && (query.isEmpty || $0.matchesMenuBarSearch(query))
+        }
+    }
+
+    private var countLabel: String {
+        guard !visibleActiveGrants.isEmpty else { return accessFeed.countLabel }
+        return "\(visibleActiveGrants.count) active · \(accessFeed.countLabel)"
+    }
+
+    private var hasListContent: Bool {
+        !visibleActiveGrants.isEmpty || !accessFeed.groups.isEmpty
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            MenuBarHeader(searchText: $searchText, countLabel: accessFeed.countLabel)
+            MenuBarHeader(searchText: $searchText, countLabel: countLabel)
             PolicyModeControl(state: state) { window in
                 pendingConfirmation = .auditOnly(window)
             }
             Divider()
-            if accessFeed.groups.isEmpty {
-                emptyState
-            } else {
+            if hasListContent {
                 accessList
+            } else {
+                emptyState
             }
             Divider()
             MenuBarFooter(state: state) {
@@ -133,7 +165,10 @@ struct MenuBarView: View {
             }
         }
         .frame(width: 360)
-        .task { await state.reloadPolicyMode() }
+        .task {
+            await state.reloadPolicyMode()
+            await state.reloadActiveGrants()
+        }
         .overlay {
             if let pendingConfirmation {
                 MenuBarConfirmationOverlay(
@@ -156,9 +191,32 @@ struct MenuBarView: View {
     private var accessList: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 1) {
-                SectionLabel(icon: "clock", title: "Recent Access")
-                ForEach(accessFeed.groups) { group in
-                    AccessRow(group: group)
+                if !visibleActiveGrants.isEmpty {
+                    ActiveAccessHeader(count: visibleActiveGrants.count) {
+                        pendingConfirmation = .revokeAll(count: visibleActiveGrants.count)
+                    }
+                    ForEach(visibleActiveGrants) { grant in
+                        ActiveGrantRow(grant: grant) {
+                            Task { await state.revokeGrant(id: grant.id) }
+                        }
+                    }
+                    if let error = state.activeGrantsError {
+                        Text(error)
+                            .font(.caption2)
+                            .foregroundStyle(.red)
+                            .lineLimit(2)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                    }
+                    if !accessFeed.groups.isEmpty {
+                        Divider().padding(.vertical, 3)
+                    }
+                }
+                if !accessFeed.groups.isEmpty {
+                    SectionLabel(icon: "clock", title: "Recent Access")
+                    ForEach(accessFeed.groups) { group in
+                        AccessRow(group: group)
+                    }
                 }
             }
             .padding(.horizontal, 6)
@@ -199,6 +257,8 @@ struct MenuBarView: View {
         switch confirmation {
         case .clearRecent:
             state.clearRecents()
+        case .revokeAll:
+            Task { await state.clearActiveGrants() }
         case .auditOnly(let window):
             Task {
                 await state.setPolicyMode(.auditOnly, durationSecs: window.durationSecs)
@@ -233,11 +293,13 @@ enum AuditOnlyWindow: String, Identifiable {
 
 private enum MenuBarConfirmation: Equatable {
     case clearRecent(count: Int)
+    case revokeAll(count: Int)
     case auditOnly(AuditOnlyWindow)
 
     var title: String {
         switch self {
         case .clearRecent: "Clear recent activity?"
+        case .revokeAll: "Revoke active access?"
         case .auditOnly: "Enable Audit Only?"
         }
     }
@@ -246,6 +308,8 @@ private enum MenuBarConfirmation: Equatable {
         switch self {
         case .clearRecent:
             "This clears only the activity shown in Floria. The daemon audit log on disk is not deleted."
+        case .revokeAll:
+            "Apps using these temporary grants will need authorization again the next time they access the protected item."
         case .auditOnly:
             "Ask and Touch ID items will be allowed without interaction. Every access will still be audited, and explicit deny rules remain blocked."
         }
@@ -254,6 +318,7 @@ private enum MenuBarConfirmation: Equatable {
     var confirmTitle: String {
         switch self {
         case .clearRecent(let count): "Clear \(count) Events"
+        case .revokeAll(let count): "Revoke \(count) Grants"
         case .auditOnly(let window): "Enable for \(window.title)"
         }
     }
@@ -261,6 +326,7 @@ private enum MenuBarConfirmation: Equatable {
     var systemImage: String {
         switch self {
         case .clearRecent: "trash.fill"
+        case .revokeAll: "lock.rotation"
         case .auditOnly: "eye.circle.fill"
         }
     }
@@ -268,6 +334,7 @@ private enum MenuBarConfirmation: Equatable {
     var tint: Color {
         switch self {
         case .clearRecent: .red
+        case .revokeAll: .orange
         case .auditOnly: .orange
         }
     }
@@ -450,6 +517,112 @@ private struct SectionLabel: View {
     }
 }
 
+private struct ActiveAccessHeader: View {
+    let count: Int
+    let revokeAll: () -> Void
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Image(systemName: "clock.badge.checkmark")
+                .font(.caption2)
+            Text("Active Access")
+                .font(.caption.weight(.semibold))
+            Text("\(count)")
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.tertiary)
+            Spacer()
+            Button("Revoke All…", action: revokeAll)
+                .buttonStyle(.plain)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 4)
+    }
+}
+
+private struct ActiveGrantRow: View {
+    let grant: ActiveGrant
+    let revoke: () -> Void
+    @State private var hovered = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "checkmark.shield.fill")
+                .font(.caption)
+                .foregroundStyle(.blue)
+                .frame(width: 12)
+            Text(grant.operation)
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(operationColor)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1)
+                .background(operationColor.opacity(0.15))
+                .clipShape(Capsule())
+            VStack(alignment: .leading, spacing: 1) {
+                Text(grant.client)
+                    .font(.callout)
+                    .lineLimit(1)
+                Text(grant.shownTarget)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer(minLength: 4)
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                Text(remaining(at: context.date))
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Button(action: revoke) {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(hovered ? Color.orange : Color.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Revoke this temporary authorization")
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(hovered ? Color.primary.opacity(0.06) : Color.clear)
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .onHover { hovered = $0 }
+        .help(tooltip)
+    }
+
+    private func remaining(at date: Date) -> String {
+        let seconds = max(0, Int(grant.expirationDate.timeIntervalSince(date)))
+        if seconds >= 3600 {
+            return "\(seconds / 3600)h \((seconds % 3600) / 60)m"
+        }
+        return String(format: "%d:%02d", seconds / 60, seconds % 60)
+    }
+
+    private var tooltip: String {
+        var lines = [
+            grant.shownTarget,
+            "client: \(grant.client)",
+            "expires: \(grant.expirationDate.formatted(date: .omitted, time: .standard))",
+        ]
+        if let executable = grant.executable {
+            lines.append("executable: \(executable)")
+        }
+        if let bundleID = grant.bundleID {
+            lines.append("bundle: \(bundleID)")
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private var operationColor: Color {
+        switch grant.operation {
+        case "write": .orange
+        case "sign": .blue
+        default: .secondary
+        }
+    }
+}
+
 /// One access event: decision dot, read/write badge, exe + path, timestamp. Hover highlights
 /// and the tooltip carries the full path / rule / process chain.
 private struct AccessRow: View {
@@ -474,6 +647,12 @@ private struct AccessRow: View {
                     .font(.caption2)
                     .foregroundStyle(.orange)
                     .help("Allowed by global Audit Only mode")
+            }
+            if ev.ruleId == "grant" {
+                Image(systemName: "clock.badge.checkmark")
+                    .font(.caption2)
+                    .foregroundStyle(.blue)
+                    .help("Allowed by an active temporary grant")
             }
             VStack(alignment: .leading, spacing: 1) {
                 Text(ev.exe)
@@ -515,7 +694,7 @@ private struct AccessRow: View {
             lines.append("agent: \(ssh.surface_name)")
         }
         if ev.display != nil { lines.append(ev.path) }
-        lines.append("rule: \(ev.ruleId ?? "-")")
+        lines.append("rule: \(ev.ruleLabel)")
         if let policy = ev.policy {
             lines.append(
                 "policy: \(policy.configured_enforcement) → \(policy.effective_enforcement) (\(policy.mode))")

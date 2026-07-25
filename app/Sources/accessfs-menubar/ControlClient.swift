@@ -31,6 +31,33 @@ final class ControlClient: @unchecked Sendable {
         return status
     }
 
+    func activeGrants() async throws -> [ActiveGrant] {
+        guard let grants: [ActiveGrant] = try await request(
+            .grantList, expecting: "active_grants", as: [ActiveGrant].self)
+        else {
+            throw ControlClientError.missingResult("active_grants")
+        }
+        return grants
+    }
+
+    func revokeGrant(id: String) async throws -> [ActiveGrant] {
+        guard let grants: [ActiveGrant] = try await request(
+            .grantRevoke(id: id), expecting: "active_grants", as: [ActiveGrant].self)
+        else {
+            throw ControlClientError.missingResult("active_grants")
+        }
+        return grants
+    }
+
+    func clearGrants() async throws -> [ActiveGrant] {
+        guard let grants: [ActiveGrant] = try await request(
+            .grantClear, expecting: "active_grants", as: [ActiveGrant].self)
+        else {
+            throw ControlClientError.missingResult("active_grants")
+        }
+        return grants
+    }
+
     func accessHistory(limit: Int) async throws -> [AccessEventMsg] {
         guard let events: [AccessEventMsg] = try await request(
             .accessHistory(limit: limit), expecting: "access_history",

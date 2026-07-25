@@ -26,6 +26,7 @@ struct RecentAccess: Identifiable {
 
     /// What the list shows: the friendly name over the opaque `secrets/<uuid>` path.
     var shownPath: String { ssh?.key_label ?? display ?? path }
+    var ruleLabel: String { ruleId == "grant" ? "Active grant" : (ruleId ?? "-") }
 
     var time: String {
         guard let date else { return "" }
@@ -71,6 +72,8 @@ final class AppState {
     var workspace: WorkspaceStore
     var policyMode = RuntimePolicyStatus.normal
     var policyModeError: String?
+    var activeGrants: [ActiveGrant] = []
+    var activeGrantsError: String?
     var accessHistoryLoading = false
 
     @ObservationIgnored private var client: AgentClient!
@@ -101,6 +104,7 @@ final class AppState {
                     Task {
                         await self.workspace.reload()
                         await self.reloadPolicyMode()
+                        await self.reloadActiveGrants()
                         await self.loadAccessHistoryIfNeeded()
                     }
                 }
@@ -119,6 +123,7 @@ final class AppState {
         Task {
             await workspace.reload()
             await reloadPolicyMode()
+            await reloadActiveGrants()
             await loadAccessHistoryIfNeeded()
         }
         policyRefreshTask = Task { [weak self] in
@@ -126,6 +131,7 @@ final class AppState {
                 try? await Task.sleep(nanoseconds: 30_000_000_000)
                 guard let self, !Task.isCancelled else { return }
                 await self.reloadPolicyMode()
+                await self.reloadActiveGrants()
             }
         }
 
@@ -170,10 +176,38 @@ final class AppState {
         }
     }
 
+    func reloadActiveGrants() async {
+        do {
+            activeGrants = try await controlClient.activeGrants()
+            activeGrantsError = nil
+        } catch {
+            activeGrantsError = error.localizedDescription
+        }
+    }
+
+    func revokeGrant(id: String) async {
+        do {
+            activeGrants = try await controlClient.revokeGrant(id: id)
+            activeGrantsError = nil
+        } catch {
+            activeGrantsError = error.localizedDescription
+        }
+    }
+
+    func clearActiveGrants() async {
+        do {
+            activeGrants = try await controlClient.clearGrants()
+            activeGrantsError = nil
+        } catch {
+            activeGrantsError = error.localizedDescription
+        }
+    }
+
     func setPolicyMode(_ mode: RuntimePolicyMode, durationSecs: UInt64?) async {
         do {
             policyMode = try await controlClient.setPolicyMode(mode, durationSecs: durationSecs)
             policyModeError = nil
+            await reloadActiveGrants()
         } catch {
             policyModeError = error.localizedDescription
         }
@@ -185,6 +219,9 @@ final class AppState {
         recents.insert(recent, at: 0)
         if recents.count > Self.maxRecents {
             recents.removeLast(recents.count - Self.maxRecents)
+        }
+        if recent.ruleId == "prompt" {
+            Task { await reloadActiveGrants() }
         }
     }
 

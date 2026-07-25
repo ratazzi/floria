@@ -26,6 +26,29 @@ struct RuntimePolicyStatus: Codable, Equatable, Sendable {
     }
 }
 
+struct ActiveGrant: Codable, Equatable, Identifiable, Sendable {
+    let id: String
+    let subject: String
+    let object: String
+    let operation: String
+    let enforcement: String
+    let expiresAt: Int64
+    let client: String
+    let executable: String?
+    let bundleID: String?
+    let target: String
+
+    enum CodingKeys: String, CodingKey {
+        case id, subject, object, operation, enforcement, client, executable, target
+        case expiresAt = "expires_at"
+        case bundleID = "bundle_id"
+    }
+
+    var expirationDate: Date {
+        Date(timeIntervalSince1970: TimeInterval(expiresAt))
+    }
+}
+
 struct ItemLink: Codable, Hashable, Sendable {
     let label: String
     let url: String
@@ -472,6 +495,9 @@ struct CatalogProtectedFileVersion: Codable, Sendable {
 enum ControlCommand: Sendable {
     case policyModeGet
     case policyModeSet(mode: RuntimePolicyMode, durationSecs: UInt64?)
+    case grantList
+    case grantRevoke(id: String)
+    case grantClear
     case accessHistory(limit: Int)
     case snapshot
     case discover(path: String)
@@ -523,6 +549,9 @@ enum ControlCommand: Sendable {
         switch self {
         case .policyModeGet: "policy_mode_get"
         case .policyModeSet: "policy_mode_set"
+        case .grantList: "grant_list"
+        case .grantRevoke: "grant_revoke"
+        case .grantClear: "grant_clear"
         case .accessHistory: "access_history"
         case .snapshot: "snapshot"
         case .discover: "discover"
@@ -561,14 +590,19 @@ enum ControlCommand: Sendable {
 
     func requestData(requestID: UInt64, encoder: JSONEncoder) throws -> Data {
         switch self {
-        case .policyModeGet, .snapshot, .sshConfigStatus, .sshConfigInstall, .sshConfigRemove,
-            .protectedFiles:
+        case .policyModeGet, .grantList, .grantClear, .snapshot, .sshConfigStatus,
+            .sshConfigInstall, .sshConfigRemove, .protectedFiles:
             return try encoder.encode(ControlRequestWithoutParams(requestID: requestID, method: method))
         case .policyModeSet(let mode, let durationSecs):
             return try encoder.encode(
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: PolicyModeSetParams(mode: mode, durationSecs: durationSecs)))
+        case .grantRevoke(let id):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: GrantIDParams(id: id)))
         case .accessHistory(let limit):
             return try encoder.encode(
                 ControlRequest(
@@ -711,6 +745,7 @@ private struct PolicyModeSetParams: Encodable {
     let durationSecs: UInt64?
 }
 
+private struct GrantIDParams: Encodable { let id: String }
 private struct AccessHistoryParams: Encodable { let limit: Int }
 private struct DiscoverParams: Encodable { let path: String }
 private struct DiscoverApplyParams: Encodable {

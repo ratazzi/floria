@@ -136,7 +136,7 @@ struct AccessLogView: View {
             }
             .width(80)
             TableColumn("Rule") { ev in
-                Text(ev.ruleId ?? "-").foregroundStyle(.secondary)
+                Text(ev.ruleLabel).foregroundStyle(.secondary)
             }
             .width(min: 80, ideal: 110)
             TableColumn("Path") { ev in

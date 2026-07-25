@@ -180,6 +180,43 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(normal, .normal)
     }
 
+    func testActiveGrantRequestsAndResultMatchRustWireShape() throws {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+
+        let list = try ControlCommand.grantList.requestData(requestID: 170, encoder: encoder)
+        let listValue = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: list) as? [String: Any])
+        XCTAssertEqual(listValue["method"] as? String, "grant_list")
+        XCTAssertNil(listValue["params"])
+
+        let revoke = try ControlCommand.grantRevoke(id: "fixture-grant")
+            .requestData(requestID: 171, encoder: encoder)
+        let revokeValue = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: revoke) as? [String: Any])
+        XCTAssertEqual(revokeValue["method"] as? String, "grant_revoke")
+        XCTAssertEqual(
+            (revokeValue["params"] as? [String: Any])?["id"] as? String,
+            "fixture-grant")
+
+        let clear = try ControlCommand.grantClear.requestData(requestID: 172, encoder: encoder)
+        let clearValue = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: clear) as? [String: Any])
+        XCTAssertEqual(clearValue["method"] as? String, "grant_clear")
+        XCTAssertNil(clearValue["params"])
+
+        let response = Data(
+            #"{"request_id":170,"status":"ok","result":{"type":"active_grants","value":[{"id":"fixture-grant","subject":"exe:/usr/bin/cat","object":"secrets/fixture","operation":"read","enforcement":"prompt","expires_at":1800000600,"client":"cat","executable":"/usr/bin/cat","bundle_id":null,"target":"~/.pgpass"}]}}"#.utf8)
+        let decoded = try JSONDecoder().decode(
+            ControlResponseEnvelope<[ActiveGrant]>.self, from: response)
+        let grant = try XCTUnwrap(decoded.result?.value?.first)
+
+        XCTAssertEqual(decoded.result?.type, "active_grants")
+        XCTAssertEqual(grant.client, "cat")
+        XCTAssertEqual(grant.target, "~/.pgpass")
+        XCTAssertEqual(grant.expirationDate.timeIntervalSince1970, 1_800_000_600)
+    }
+
     func testAccessHistoryRequestAndResultMatchRustWireShape() throws {
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
