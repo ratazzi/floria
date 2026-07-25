@@ -1,14 +1,94 @@
 import AppKit
 import SwiftUI
 
-enum PromptGrantScope: String, CaseIterable {
+enum PromptGrantScope: Equatable {
     case once
-    case tenMinutes
+    case timed(seconds: UInt64)
 
     var title: String {
         switch self {
         case .once: "Once"
+        case .timed(let seconds): Self.durationTitle(seconds)
+        }
+    }
+
+    var wireScope: String {
+        switch self {
+        case .once: "once"
+        case .timed: "ttl"
+        }
+    }
+
+    var ttlSeconds: UInt64? {
+        switch self {
+        case .once: nil
+        case .timed(let seconds): seconds
+        }
+    }
+
+    private static func durationTitle(_ seconds: UInt64) -> String {
+        if seconds.isMultiple(of: 3_600) {
+            let hours = seconds / 3_600
+            return "\(hours) \(hours == 1 ? "hour" : "hours")"
+        }
+        let minutes = seconds / 60
+        return "\(minutes) \(minutes == 1 ? "minute" : "minutes")"
+    }
+}
+
+enum PromptGrantPreset: String, CaseIterable {
+    case once
+    case fiveMinutes
+    case tenMinutes
+    case thirtyMinutes
+    case oneHour
+    case custom
+
+    var title: String {
+        switch self {
+        case .once: "Once"
+        case .fiveMinutes: "5 minutes"
         case .tenMinutes: "10 minutes"
+        case .thirtyMinutes: "30 minutes"
+        case .oneHour: "1 hour"
+        case .custom: "Custom…"
+        }
+    }
+
+    func scope(customDuration: Int, unit: PromptGrantCustomUnit) -> PromptGrantScope {
+        switch self {
+        case .once:
+            return .once
+        case .fiveMinutes:
+            return .timed(seconds: 5 * 60)
+        case .tenMinutes:
+            return .timed(seconds: 10 * 60)
+        case .thirtyMinutes:
+            return .timed(seconds: 30 * 60)
+        case .oneHour:
+            return .timed(seconds: 60 * 60)
+        case .custom:
+            let bounded = min(max(customDuration, unit.range.lowerBound), unit.range.upperBound)
+            return .timed(seconds: UInt64(bounded) * unit.secondsMultiplier)
+        }
+    }
+}
+
+enum PromptGrantCustomUnit: String, CaseIterable {
+    case minutes
+    case hours
+
+    var range: ClosedRange<Int> {
+        switch self {
+        case .minutes: 1...1_440
+        case .hours: 1...24
+        }
+    }
+
+    var secondsMultiplier: UInt64 {
+        switch self {
+        case .minutes: 60
+        case .hours: 3_600
         }
     }
 }
@@ -125,10 +205,15 @@ struct AuthorizationPromptView: View {
     let deny: () -> Void
     let allow: (PromptGrantScope) -> Void
 
-    @State private var scope = PromptGrantScope.once
+    @State private var grantPreset = PromptGrantPreset.once
+    @State private var customDuration = 15
+    @State private var customUnit = PromptGrantCustomUnit.minutes
     @State private var showsFullPath = false
 
     private var model: PromptPresentation { PromptPresentation(prompt) }
+    private var scope: PromptGrantScope {
+        grantPreset.scope(customDuration: customDuration, unit: customUnit)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -137,7 +222,11 @@ struct AuthorizationPromptView: View {
                     requestHeader
                     processSummary
                     securityNotice
-                    AuthorizationScopePicker(scope: $scope, operation: model.operation)
+                    AuthorizationScopePicker(
+                        preset: $grantPreset,
+                        customDuration: $customDuration,
+                        customUnit: $customUnit,
+                        operation: model.operation)
                 }
                 .padding(.horizontal, 26)
                 .padding(.vertical, 22)
@@ -357,7 +446,7 @@ struct AuthorizationPromptView: View {
 
     private var primaryButtonTitle: String {
         if model.requiresTouchID { return "Use Touch ID" }
-        return scope == .once ? "Allow Once" : "Allow for 10 Minutes"
+        return scope == .once ? "Allow Once" : "Allow for \(scope.title.capitalized)"
     }
 
     private func icon(for process: PromptProcessNode) -> NSImage {
@@ -374,28 +463,56 @@ struct AuthorizationPromptView: View {
 }
 
 struct AuthorizationScopePicker: View {
-    @Binding var scope: PromptGrantScope
+    @Binding var preset: PromptGrantPreset
+    @Binding var customDuration: Int
+    @Binding var customUnit: PromptGrantCustomUnit
     let operation: String
+
+    private var scope: PromptGrantScope {
+        preset.scope(customDuration: customDuration, unit: customUnit)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Authorization scope")
                 .font(.headline)
-            Picker("Authorization scope", selection: $scope) {
-                ForEach(PromptGrantScope.allCases, id: \.self) { option in
+            Picker("Authorization scope", selection: $preset) {
+                ForEach(PromptGrantPreset.allCases, id: \.self) { option in
                     Text(option.title).tag(option)
                 }
             }
             .labelsHidden()
-            .pickerStyle(.segmented)
+            .pickerStyle(.menu)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            if preset == .custom {
+                HStack(spacing: 8) {
+                    Stepper(value: $customDuration, in: customUnit.range) {
+                        Text("\(customDuration)")
+                            .monospacedDigit()
+                            .frame(minWidth: 34, alignment: .trailing)
+                    }
+                    Picker("Unit", selection: $customUnit) {
+                        ForEach(PromptGrantCustomUnit.allCases, id: \.self) { unit in
+                            Text(unit.rawValue.capitalized).tag(unit)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                }
+                .onChange(of: customUnit) { _, unit in
+                    customDuration = min(
+                        max(customDuration, unit.range.lowerBound),
+                        unit.range.upperBound)
+                }
+            }
             Text(scope == .once
                 ? "Allow only this request."
                 : operation == "sign"
-                    ? "Reuse this approval for the same application or project and SSH identity for 10 minutes."
-                    : "Reuse this approval for the same application or project and file for 10 minutes.")
+                    ? "Reuse this approval for the same application or project and SSH identity for \(scope.title)."
+                    : "Reuse this approval for the same application or project and file for \(scope.title).")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
-        .frame(width: 240, alignment: .leading)
+        .frame(width: 280, alignment: .leading)
     }
 }

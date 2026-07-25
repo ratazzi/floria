@@ -64,10 +64,14 @@ final class PromptPresenter {
         case .deny:
             deny()
             refocus()
-        case .allow(.once):
-            confirmAllow(p, scope: "once", ttl: nil, send: send, deny: deny, then: refocus)
-        case .allow(.tenMinutes):
-            confirmAllow(p, scope: "ttl", ttl: 600, send: send, deny: deny, then: refocus)
+        case .allow(let scope):
+            confirmAllow(
+                p,
+                scope: scope.wireScope,
+                ttl: scope.ttlSeconds,
+                send: send,
+                deny: deny,
+                then: refocus)
         }
     }
 
