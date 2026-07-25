@@ -11,6 +11,14 @@ use accessfs_core::identity::{ProcessIdentity, ProcessInstance};
 mod codesign;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(target_os = "macos")]
+mod peer;
+
+#[cfg(target_os = "macos")]
+pub use peer::{
+    CodeSignedPeerVerifier, PeerPolicyError, PeerVerificationError, SameUserPeerVerifier,
+    SocketPeerVerifier, VerifiedPeer,
+};
 
 /// Enrich the process identity. `uid/gid/pid` come from the FUSE request; the rest relies on platform forensics.
 #[cfg(target_os = "macos")]

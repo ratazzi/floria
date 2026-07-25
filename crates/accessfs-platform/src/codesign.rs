@@ -10,11 +10,16 @@ use core_foundation::base::TCFType;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::number::CFNumber;
 use core_foundation::string::CFString;
+use core_foundation::url::CFURL;
 use core_foundation_sys::base::{CFRelease, CFTypeRef};
 use core_foundation_sys::dictionary::{CFDictionaryGetValue, CFDictionaryRef};
 use core_foundation_sys::string::CFStringRef;
+use core_foundation_sys::url::CFURLRef;
+use std::path::Path;
 
 type SecCodeRef = *const c_void;
+type SecRequirementRef = *const c_void;
+type SecStaticCodeRef = *const c_void;
 
 const KSEC_CS_DEFAULT_FLAGS: u32 = 0;
 const KSEC_CS_SIGNING_INFORMATION: u32 = 1 << 1;
@@ -32,9 +37,147 @@ extern "C" {
         flags: u32,
         information: *mut CFDictionaryRef,
     ) -> i32;
+    fn SecCodeCheckValidity(
+        code: SecCodeRef,
+        flags: u32,
+        requirement: SecRequirementRef,
+    ) -> i32;
+    fn SecCodeCopyDesignatedRequirement(
+        code: SecStaticCodeRef,
+        flags: u32,
+        requirement: *mut SecRequirementRef,
+    ) -> i32;
+    fn SecRequirementCopyString(
+        requirement: SecRequirementRef,
+        flags: u32,
+        text: *mut CFStringRef,
+    ) -> i32;
+    fn SecRequirementCreateWithString(
+        text: CFStringRef,
+        flags: u32,
+        requirement: *mut SecRequirementRef,
+    ) -> i32;
+    fn SecStaticCodeCheckValidity(
+        code: SecStaticCodeRef,
+        flags: u32,
+        requirement: SecRequirementRef,
+    ) -> i32;
+    fn SecStaticCodeCreateWithPath(
+        path: CFURLRef,
+        flags: u32,
+        code: *mut SecStaticCodeRef,
+    ) -> i32;
     static kSecGuestAttributePid: CFStringRef;
     static kSecCodeInfoTeamIdentifier: CFStringRef;
     static kSecCodeInfoIdentifier: CFStringRef;
+}
+
+pub(crate) fn designated_requirement(path: &Path) -> Result<String, String> {
+    let path = std::fs::canonicalize(path)
+        .map_err(|error| format!("resolving {}: {error}", path.display()))?;
+    let is_directory = path.is_dir();
+    let url = CFURL::from_path(&path, is_directory)
+        .ok_or_else(|| format!("converting {} to a code URL", path.display()))?;
+
+    // SAFETY: standard Security framework ownership rules. Every retained object is released
+    // exactly once before returning, including all error paths after creation.
+    unsafe {
+        let mut code: SecStaticCodeRef = std::ptr::null();
+        let status = SecStaticCodeCreateWithPath(
+            url.as_concrete_TypeRef(),
+            KSEC_CS_DEFAULT_FLAGS,
+            &mut code,
+        );
+        if status != 0 || code.is_null() {
+            return Err(format!(
+                "SecStaticCodeCreateWithPath failed for {} (OSStatus {status})",
+                path.display()
+            ));
+        }
+
+        let status =
+            SecStaticCodeCheckValidity(code, KSEC_CS_DEFAULT_FLAGS, std::ptr::null());
+        if status != 0 {
+            CFRelease(code as CFTypeRef);
+            return Err(format!(
+                "code signature is invalid for {} (OSStatus {status})",
+                path.display()
+            ));
+        }
+
+        let mut requirement: SecRequirementRef = std::ptr::null();
+        let status = SecCodeCopyDesignatedRequirement(
+            code,
+            KSEC_CS_DEFAULT_FLAGS,
+            &mut requirement,
+        );
+        CFRelease(code as CFTypeRef);
+        if status != 0 || requirement.is_null() {
+            return Err(format!(
+                "copying designated requirement for {} failed (OSStatus {status})",
+                path.display()
+            ));
+        }
+
+        let mut text: CFStringRef = std::ptr::null();
+        let status =
+            SecRequirementCopyString(requirement, KSEC_CS_DEFAULT_FLAGS, &mut text);
+        CFRelease(requirement as CFTypeRef);
+        if status != 0 || text.is_null() {
+            return Err(format!(
+                "rendering designated requirement for {} failed (OSStatus {status})",
+                path.display()
+            ));
+        }
+
+        Ok(CFString::wrap_under_create_rule(text).to_string())
+    }
+}
+
+pub(crate) fn satisfies_requirement(pid: i32, requirement_text: &str) -> Result<bool, String> {
+    // SAFETY: standard Security framework usage. The live SecCode and compiled requirement
+    // are retained by their create/copy calls and released before this function returns.
+    unsafe {
+        let code = copy_guest_code(pid)?;
+        let text = CFString::new(requirement_text);
+        let mut requirement: SecRequirementRef = std::ptr::null();
+        let status = SecRequirementCreateWithString(
+            text.as_concrete_TypeRef(),
+            KSEC_CS_DEFAULT_FLAGS,
+            &mut requirement,
+        );
+        if status != 0 || requirement.is_null() {
+            CFRelease(code as CFTypeRef);
+            return Err(format!(
+                "compiling trusted requirement failed (OSStatus {status})"
+            ));
+        }
+
+        let status = SecCodeCheckValidity(code, KSEC_CS_DEFAULT_FLAGS, requirement);
+        CFRelease(requirement as CFTypeRef);
+        CFRelease(code as CFTypeRef);
+        Ok(status == 0)
+    }
+}
+
+unsafe fn copy_guest_code(pid: i32) -> Result<SecCodeRef, String> {
+    let key = CFString::wrap_under_get_rule(kSecGuestAttributePid);
+    let val = CFNumber::from(pid);
+    let attrs = CFDictionary::from_CFType_pairs(&[(key.as_CFType(), val.as_CFType())]);
+    let mut code: SecCodeRef = std::ptr::null();
+    let status = SecCodeCopyGuestWithAttributes(
+        std::ptr::null(),
+        attrs.as_concrete_TypeRef(),
+        KSEC_CS_DEFAULT_FLAGS,
+        &mut code,
+    );
+    if status != 0 || code.is_null() {
+        Err(format!(
+            "SecCodeCopyGuestWithAttributes failed for pid {pid} (OSStatus {status})"
+        ))
+    } else {
+        Ok(code)
+    }
 }
 
 #[derive(Debug, Default)]

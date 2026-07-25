@@ -139,6 +139,7 @@ dependencies = [
  "core-foundation-sys",
  "libc",
  "libproc",
+ "thiserror 2.0.18",
  "tracing",
 ]
 
