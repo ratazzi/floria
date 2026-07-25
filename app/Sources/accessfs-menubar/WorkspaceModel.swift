@@ -339,10 +339,63 @@ struct ResolvedWorkspaceEntry: Identifiable, Hashable, Sendable {
     let resourceName: String
 }
 
+enum WorkspaceProtectedFileKind: String, Sendable {
+    case dotenv
+    case direnv
+    case pgpass
+    case awsCredentials
+    case file
+
+    static func infer(from path: String) -> WorkspaceProtectedFileKind {
+        let url = URL(fileURLWithPath: path)
+        let name = url.lastPathComponent
+        if name == ".envrc" { return .direnv }
+        if name == ".pgpass" { return .pgpass }
+        if name == "credentials", url.deletingLastPathComponent().lastPathComponent == ".aws" {
+            return .awsCredentials
+        }
+        if name == ".env" || name.hasPrefix(".env.") { return .dotenv }
+        return .file
+    }
+
+    var title: String {
+        switch self {
+        case .dotenv: "Dotenv"
+        case .direnv: "direnv"
+        case .pgpass: "PostgreSQL password file"
+        case .awsCredentials: "AWS credentials"
+        case .file: "Protected file"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .dotenv: "doc.text"
+        case .direnv: "terminal"
+        case .pgpass: "cylinder"
+        case .awsCredentials: "cloud"
+        case .file: "lock.fill"
+        }
+    }
+}
+
+struct WorkspaceProtectedFile: Identifiable, Hashable, Sendable {
+    let id: String
+    let path: String
+    let mode: UInt32
+    let size: UInt64
+    let currentVersion: UInt32
+
+    var kind: WorkspaceProtectedFileKind {
+        WorkspaceProtectedFileKind.infer(from: path)
+    }
+}
+
 @Observable @MainActor
 final class WorkspaceStore {
     var projects: [WorkspaceProject]
     var resources: [WorkspaceResource]
+    var protectedFiles: [WorkspaceProtectedFile]
     var selectedProjectID: WorkspaceProject.ID
     var selectedEnvironmentID: WorkspaceEnvironment.ID
     var selectedSurfaceID: WorkspaceSurface.ID
@@ -357,6 +410,7 @@ final class WorkspaceStore {
     ) {
         self.projects = projects
         self.resources = resources
+        protectedFiles = []
         self.controlClient = controlClient
         let project = projects.first(where: { $0.id == selectedProjectID }) ?? projects.first
         self.selectedProjectID = project?.id ?? ""
@@ -531,11 +585,27 @@ final class WorkspaceStore {
         isLoading = true
         defer { isLoading = false }
         do {
-            apply(try await controlClient.snapshot())
+            async let catalog = controlClient.snapshot()
+            async let files = controlClient.protectedFiles()
+            apply(try await catalog)
+            protectedFiles = try await files.map(WorkspaceProtectedFile.init)
             lastError = nil
         } catch {
             if reportErrors { lastError = error.localizedDescription }
         }
+    }
+
+    func protectFile(at path: String) async throws {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        let file = try await controlClient.protectFile(at: path)
+        let protected = WorkspaceProtectedFile(file)
+        if let index = protectedFiles.firstIndex(where: { $0.id == protected.id }) {
+            protectedFiles[index] = protected
+        } else {
+            protectedFiles.append(protected)
+            protectedFiles.sort { $0.path.localizedStandardCompare($1.path) == .orderedAscending }
+        }
+        lastError = nil
     }
 
     @discardableResult
@@ -1162,6 +1232,14 @@ private extension WorkspaceBindingScope {
         case .common: .common
         case .environment(let id): .environment(id)
         }
+    }
+}
+
+private extension WorkspaceProtectedFile {
+    init(_ file: CatalogProtectedFile) {
+        self.init(
+            id: file.id, path: file.sourcePath, mode: file.mode, size: file.size,
+            currentVersion: file.currentVersion)
     }
 }
 

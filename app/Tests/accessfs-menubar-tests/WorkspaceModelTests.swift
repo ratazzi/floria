@@ -185,6 +185,18 @@ final class WorkspaceModelTests: XCTestCase {
         XCTAssertNil(WorkspaceIniPreset.generic.pathEnvironmentKey)
     }
 
+    func testProtectedFileKindsAreInferredWithoutParsingContent() {
+        XCTAssertEqual(WorkspaceProtectedFileKind.infer(from: "/fixture/project/.env"), .dotenv)
+        XCTAssertEqual(
+            WorkspaceProtectedFileKind.infer(from: "/fixture/project/.env.production"), .dotenv)
+        XCTAssertEqual(WorkspaceProtectedFileKind.infer(from: "/fixture/project/.envrc"), .direnv)
+        XCTAssertEqual(WorkspaceProtectedFileKind.infer(from: "/fixture/home/.pgpass"), .pgpass)
+        XCTAssertEqual(
+            WorkspaceProtectedFileKind.infer(from: "/fixture/home/.aws/credentials"),
+            .awsCredentials)
+        XCTAssertEqual(WorkspaceProtectedFileKind.infer(from: "/fixture/opaque.bin"), .file)
+    }
+
     func testEachSurfaceResolvesOnlyItsExplicitMembers() {
         let resources = [
             WorkspaceResource(

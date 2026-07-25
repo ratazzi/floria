@@ -15,6 +15,32 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertNil(value["params"])
     }
 
+    func testFileProtectRequestCarriesOnlyTheSelectedPath() throws {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let data = try ControlCommand.fileProtect("/fixture/project/.env")
+            .requestData(requestID: 71, encoder: encoder)
+        let value = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let params = try XCTUnwrap(value["params"] as? [String: Any])
+
+        XCTAssertEqual(value["method"] as? String, "file_protect")
+        XCTAssertEqual(params["path"] as? String, "/fixture/project/.env")
+        XCTAssertEqual(params.count, 1)
+    }
+
+    func testDecodesProtectedFileMetadataWithoutPlaintext() throws {
+        let data = Data(
+            #"{"id":"00000000-0000-0000-0000-000000000001","source_path":"/fixture/project/.env","mode":384,"size":42,"current_version":3}"#.utf8)
+
+        let file = try JSONDecoder().decode(CatalogProtectedFile.self, from: data)
+
+        XCTAssertEqual(file.sourcePath, "/fixture/project/.env")
+        XCTAssertEqual(file.mode, 0o600)
+        XCTAssertEqual(file.size, 42)
+        XCTAssertEqual(file.currentVersion, 3)
+    }
+
     func testBindingRequestEncodesEnvironmentScope() throws {
         let command = ControlCommand.bindingUpsert(
             CatalogBinding(

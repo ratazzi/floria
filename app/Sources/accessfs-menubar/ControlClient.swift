@@ -19,6 +19,24 @@ final class ControlClient: @unchecked Sendable {
         return snapshot
     }
 
+    func protectedFiles() async throws -> [CatalogProtectedFile] {
+        guard let files: [CatalogProtectedFile] = try await request(
+            .protectedFiles, expecting: "protected_files", as: [CatalogProtectedFile].self)
+        else {
+            throw ControlClientError.missingResult("protected_files")
+        }
+        return files
+    }
+
+    func protectFile(at path: String) async throws -> CatalogProtectedFile {
+        guard let result: FileProtected = try await request(
+            .fileProtect(path), expecting: "file_protected", as: FileProtected.self)
+        else {
+            throw ControlClientError.missingResult("file_protected")
+        }
+        return result.file
+    }
+
     func createSharedSecret(
         resourceID: String, name: String, defaultEnvKey: String?, value: String
     ) async throws {
@@ -201,6 +219,11 @@ final class ControlClient: @unchecked Sendable {
 
     private struct EnvFileCreated: Decodable {
         let version: UInt32
+    }
+
+    private struct FileProtected: Decodable {
+        let file: CatalogProtectedFile
+        let created: Bool
     }
 
 }

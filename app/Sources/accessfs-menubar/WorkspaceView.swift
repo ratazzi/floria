@@ -28,6 +28,7 @@ private func availableEnvironmentFileName(
 private enum WorkspaceSidebarSelection: Hashable {
     case projects
     case project(WorkspaceProject.ID)
+    case protectedFiles
     case sharedSecrets
     case envFiles
     case accessLog
@@ -40,6 +41,7 @@ struct DashboardView: View {
     @State private var selection: WorkspaceSidebarSelection? = .projects
     @State private var search = ""
     @State private var showingNewProject = false
+    @State private var showingProtectFile = false
     @State private var showingNewSharedSecret = false
     @State private var showingNewEnvFile = false
 
@@ -64,6 +66,9 @@ struct DashboardView: View {
             NewProjectSheet(store: state.workspace) { projectID in
                 selection = .project(projectID)
             }
+        }
+        .sheet(isPresented: $showingProtectFile) {
+            ProtectExistingFileSheet(store: state.workspace)
         }
         .sheet(isPresented: $showingNewSharedSecret) {
             NewSharedSecretSheet(store: state.workspace)
@@ -103,6 +108,9 @@ struct DashboardView: View {
             Menu {
                 Button("New Project", systemImage: "folder.badge.plus") {
                     showingNewProject = true
+                }
+                Button("Protect Existing File", systemImage: "lock.fill") {
+                    showingProtectFile = true
                 }
                 Button("New Shared Secret", systemImage: "key.fill") {
                     showingNewSharedSecret = true
@@ -157,6 +165,9 @@ struct DashboardView: View {
                     sidebarSectionTitle("Workspace")
                     VStack(spacing: 3) {
                         sidebarRow("Projects", systemImage: "folder", tag: .projects)
+                        sidebarRow(
+                            "Protected Files", systemImage: "lock.fill",
+                            tag: .protectedFiles)
                         sidebarRow("Shared Secrets", systemImage: "key", tag: .sharedSecrets)
                         sidebarRow("Env Files", systemImage: "doc.badge.gearshape", tag: .envFiles)
                         sidebarRow(
@@ -261,6 +272,10 @@ struct DashboardView: View {
             } else {
                 ContentUnavailableView("Select a project", systemImage: "folder")
             }
+        case .protectedFiles:
+            ProtectedFilesView(
+                store: state.workspace, search: search,
+                protectFile: { showingProtectFile = true })
         case .sharedSecrets:
             ResourceCatalogView(
                 store: state.workspace, title: "Shared Secrets",
@@ -1389,6 +1404,96 @@ private struct ProjectCatalogView: View {
     }
 }
 
+private struct ProtectedFilesView: View {
+    @Bindable var store: WorkspaceStore
+    let search: String
+    let protectFile: () -> Void
+
+    private var filtered: [WorkspaceProtectedFile] {
+        guard !search.isEmpty else { return store.protectedFiles }
+        return store.protectedFiles.filter {
+            $0.path.localizedCaseInsensitiveContains(search)
+                || $0.kind.title.localizedCaseInsensitiveContains(search)
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Protected Files").font(.title2.bold())
+                    Text("Encrypted files that remain available at their original paths")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Protect Existing File", systemImage: "lock.fill", action: protectFile)
+                    .buttonStyle(.borderedProminent)
+            }
+            .padding(24)
+
+            List(filtered) { file in
+                HStack(spacing: 12) {
+                    Image(systemName: file.kind.systemImage)
+                        .font(.title3)
+                        .foregroundStyle(.blue)
+                        .frame(width: 36, height: 36)
+                        .background(Color.blue.opacity(0.1))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(URL(fileURLWithPath: file.path).lastPathComponent)
+                            .font(.body.weight(.medium))
+                        Text(file.path)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    Spacer()
+                    VStack(alignment: .trailing, spacing: 3) {
+                        Text(file.kind.title)
+                            .font(.caption.weight(.medium))
+                        Text(
+                            "v\(file.currentVersion) · \(ByteCountFormatter.string(fromByteCount: Int64(file.size), countStyle: .file)) · \(String(format: "%04o", file.mode))"
+                        )
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                    }
+                    Menu {
+                        Button("Open in Finder", systemImage: "folder") {
+                            NSWorkspace.shared.activateFileViewerSelecting(
+                                [URL(fileURLWithPath: file.path)])
+                        }
+                        Button("Copy Path", systemImage: "doc.on.doc") {
+                            copyToPasteboard(file.path)
+                        }
+                        Button("Copy Recovery ID", systemImage: "number") {
+                            copyToPasteboard(file.id)
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis")
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.vertical, 5)
+            }
+            .overlay {
+                if filtered.isEmpty {
+                    if search.isEmpty {
+                        ContentUnavailableView(
+                            "No protected files yet", systemImage: "lock.fill",
+                            description: Text(
+                                "Protect an existing .env, .envrc, .pgpass, AWS credentials file, or any other local file."))
+                    } else {
+                        ContentUnavailableView.search(text: search)
+                    }
+                }
+            }
+        }
+        .navigationTitle("Protected Files")
+    }
+}
+
 private struct ResourceCatalogView: View {
     @Bindable var store: WorkspaceStore
     let title: String
@@ -1757,6 +1862,134 @@ private struct AddBindingSheet: View {
         let decoded = encoded.replacingOccurrences(of: "~1", with: "/")
             .replacingOccurrences(of: "~0", with: "~")
         return (String(address[..<keys.lowerBound]), decoded)
+    }
+}
+
+private struct ProtectExistingFileSheet: View {
+    @Bindable var store: WorkspaceStore
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var path = ""
+    @State private var isSaving = false
+    @State private var confirmingProtection = false
+    @State private var errorMessage: String?
+
+    private var kind: WorkspaceProtectedFileKind {
+        WorkspaceProtectedFileKind.infer(from: path)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Protect Existing File").font(.title2.bold())
+                Text("Encrypt a local file and keep applications using its original path.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text("File").font(.callout.weight(.medium))
+                HStack {
+                    TextField("Choose .env, .envrc, .pgpass, or credentials", text: $path)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.body.monospaced())
+                    Button("Choose…", action: chooseFile)
+                }
+            }
+
+            if !path.isEmpty {
+                HStack(spacing: 10) {
+                    Image(systemName: kind.systemImage)
+                        .foregroundStyle(.blue)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(kind.title).font(.callout.weight(.medium))
+                        Text("Content is preserved byte-for-byte; this preset changes no syntax.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.blue.opacity(0.08))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+
+            VStack(alignment: .leading, spacing: 9) {
+                Label(
+                    "Floria encrypts the complete file before atomically replacing the original with a managed link.",
+                    systemImage: "lock.fill")
+                Label(
+                    "The same path remains readable and writable; each successful save creates an immutable version.",
+                    systemImage: "arrow.triangle.2.circlepath")
+                Label(
+                    "The encrypted store is the recovery copy. No plaintext backup is left beside the file.",
+                    systemImage: "externaldrive.fill")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            if kind == .direnv {
+                Label(
+                    "direnv reads this file from the shell session, so authorization cannot distinguish child processes that inherit its values.",
+                    systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+
+            Divider()
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Protect File") { confirmingProtection = true }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isSaving || path.isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(width: 620)
+        .alert("Replace the original with a Floria link?", isPresented: $confirmingProtection) {
+            Button("Cancel", role: .cancel) { }
+            Button("Protect File", action: protectFile)
+        } message: {
+            Text("The plaintext file is removed from disk only after its encrypted copy is safely stored. Applications continue using \(path).")
+        }
+        .alert(
+            "Could not protect file",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } })
+        ) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
+    }
+
+    private func chooseFile() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.showsHiddenFiles = true
+        panel.resolvesAliases = false
+        if panel.runModal() == .OK, let url = panel.url {
+            path = url.path
+        }
+    }
+
+    private func protectFile() {
+        Task {
+            isSaving = true
+            defer { isSaving = false }
+            do {
+                try await store.protectFile(at: path)
+                dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
     }
 }
 

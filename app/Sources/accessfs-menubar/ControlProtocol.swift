@@ -145,8 +145,24 @@ struct CatalogSnapshot: Codable, Sendable {
     let surfaces: [CatalogSurface]
 }
 
+struct CatalogProtectedFile: Codable, Sendable {
+    let id: String
+    let sourcePath: String
+    let mode: UInt32
+    let size: UInt64
+    let currentVersion: UInt32
+
+    enum CodingKeys: String, CodingKey {
+        case id, mode, size
+        case sourcePath = "source_path"
+        case currentVersion = "current_version"
+    }
+}
+
 enum ControlCommand: Sendable {
     case snapshot
+    case protectedFiles
+    case fileProtect(String)
     case sharedSecretCreate(resourceID: String, name: String, defaultEnvKey: String?, value: String)
     case envFileCreate(resourceID: String, name: String, codec: String, value: String)
     case projectCreate(CatalogProject, CatalogEnvironment, CatalogSurface)
@@ -162,6 +178,8 @@ enum ControlCommand: Sendable {
     var method: String {
         switch self {
         case .snapshot: "snapshot"
+        case .protectedFiles: "protected_files"
+        case .fileProtect: "file_protect"
         case .sharedSecretCreate: "shared_secret_create"
         case .envFileCreate: "env_file_create"
         case .projectCreate: "project_create"
@@ -178,8 +196,13 @@ enum ControlCommand: Sendable {
 
     func requestData(requestID: UInt64, encoder: JSONEncoder) throws -> Data {
         switch self {
-        case .snapshot:
+        case .snapshot, .protectedFiles:
             return try encoder.encode(ControlRequestWithoutParams(requestID: requestID, method: method))
+        case .fileProtect(let path):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: FileProtectParams(path: path)))
         case .sharedSecretCreate(let resourceID, let name, let defaultEnvKey, let value):
             return try encoder.encode(
                 ControlRequest(
@@ -245,6 +268,8 @@ private struct SharedSecretCreateParams: Encodable {
     let defaultEnvKey: String?
     let value: String
 }
+
+private struct FileProtectParams: Encodable { let path: String }
 
 private struct EnvFileCreateParams: Encodable {
     let resourceID: String
