@@ -6,7 +6,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use accessfs_catalog::{
     Catalog, CatalogSnapshot, ResourceKind, ResourceSource, Surface, SurfaceKind,
@@ -22,8 +22,8 @@ use accessfs_core::config::{Config, ResolvedConfig, SECRETS_DIR, SURFACES_DIR};
 use accessfs_platform::{CodeSignedPeerVerifier, SocketPeerVerifier};
 use accessfs_store::{AgeDirStore, NewSecret, SecretId, SecretRecord, SecretStore, SshKeyProvider};
 use accessfs_surface::{
-    ensure_file_surface_link, remove_file_surface_link, validate_secret_bytes, SurfaceLinkRemoval,
-    SurfaceLinkState, SurfaceRegistry,
+    ensure_file_surface_link, file_surface_instances, remove_file_surface_link,
+    validate_secret_bytes, SurfaceLinkRemoval, SurfaceLinkState, SurfaceRegistry,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -409,7 +409,9 @@ fn cmd_mount(config: &Path) -> Result<()> {
         .with_context(|| format!("opening catalog at {}", catalog_path.display()))?;
     let snapshot = catalog.snapshot().context("loading initial surface registry")?;
     let surface_registry = Arc::new(SurfaceRegistry::from_snapshot(&snapshot));
-    reconcile_file_links(&snapshot, &cfg.mount_path);
+    let linked_file_surfaces =
+        file_surface_instances(&snapshot).context("materializing project checkout links")?;
+    reconcile_file_links(&linked_file_surfaces, &cfg.mount_path);
     let store: Arc<dyn SecretStore> = Arc::new(open_store(&cfg)?);
     let agent = accessfs_agent::SocketAgent::start(&cfg, agent_peer_verifier)
         .context("starting agent socket")?;
@@ -438,6 +440,7 @@ fn cmd_mount(config: &Path) -> Result<()> {
         store: Arc::clone(&store),
         agent: Arc::clone(&agent),
         ssh_runtime: Arc::clone(&ssh_runtime),
+        linked_file_surfaces: Mutex::new(linked_file_surfaces),
     });
     let policy: Arc<dyn RuntimePolicyController> = Arc::new(AgentPolicyController {
         agent: Arc::clone(&agent),
@@ -559,19 +562,26 @@ struct RuntimeCatalogObserver {
     store: Arc<dyn SecretStore>,
     agent: Arc<accessfs_agent::SocketAgent>,
     ssh_runtime: Arc<accessfs_agent::SshAgentRuntime>,
+    linked_file_surfaces: Mutex<Vec<Surface>>,
 }
 
 impl CatalogObserver for RuntimeCatalogObserver {
     fn catalog_changed(&self, snapshot: &CatalogSnapshot) {
-        let previous = self
-            .surface_registry
-            .list()
-            .into_iter()
-            .map(|registered| registered.surface)
-            .collect::<Vec<_>>();
-        cleanup_removed_file_links(&previous, snapshot, &self.mount_path);
+        let next_links = match file_surface_instances(snapshot) {
+            Ok(links) => links,
+            Err(error) => {
+                tracing::warn!(%error, "materializing project checkout links failed");
+                return;
+            }
+        };
+        let mut previous_links = self
+            .linked_file_surfaces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        cleanup_removed_file_links(&previous_links, &next_links, &self.mount_path);
         self.surface_registry.replace(snapshot);
-        reconcile_file_links(snapshot, &self.mount_path);
+        reconcile_file_links(&next_links, &self.mount_path);
+        *previous_links = next_links;
         if let Err(error) = self.ssh_runtime.replace(snapshot) {
             tracing::warn!(%error, "refreshing SSH agent surfaces failed");
         }
@@ -632,11 +642,11 @@ fn stricter(left: Enforcement, right: Enforcement) -> Enforcement {
 
 fn cleanup_removed_file_links(
     previous: &[Surface],
-    snapshot: &CatalogSnapshot,
+    current: &[Surface],
     mount_path: &Path,
 ) {
     for surface in previous {
-        let still_present = snapshot.surfaces.iter().any(|current| {
+        let still_present = current.iter().any(|current| {
             current.id == surface.id
                 && current.path == surface.path
                 && matches!(
@@ -668,21 +678,8 @@ fn cleanup_removed_file_links(
     }
 }
 
-fn reconcile_file_links(snapshot: &CatalogSnapshot, mount_path: &Path) {
-    for surface in snapshot
-        .surfaces
-        .iter()
-        .filter(|surface| {
-            matches!(
-                surface.kind,
-                SurfaceKind::DotenvFile
-                    | SurfaceKind::DirenvFile
-                    | SurfaceKind::IniFile
-                    | SurfaceKind::EnvFileDirect
-                    | SurfaceKind::LinesFile
-            )
-        })
-    {
+fn reconcile_file_links(surfaces: &[Surface], mount_path: &Path) {
+    for surface in surfaces {
         match ensure_file_surface_link(surface, mount_path) {
             Ok(SurfaceLinkState::Created) => tracing::info!(
                 surface = %surface.id,

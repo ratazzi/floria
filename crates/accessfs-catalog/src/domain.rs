@@ -8,7 +8,47 @@ pub use accessfs_core::metadata::{ItemLink, ItemMetadata};
 pub struct Project {
     pub id: String,
     pub name: String,
+    /// Materialized path of the primary checkout. The catalog persists this on the corresponding
+    /// `ProjectCheckout`, keeping Project itself independent from local working directories.
     pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectCheckoutKind {
+    Primary,
+    Worktree,
+}
+
+impl ProjectCheckoutKind {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            ProjectCheckoutKind::Primary => "primary",
+            ProjectCheckoutKind::Worktree => "worktree",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "primary" => Some(ProjectCheckoutKind::Primary),
+            "worktree" => Some(ProjectCheckoutKind::Worktree),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectCheckout {
+    pub id: String,
+    pub project_id: String,
+    pub path: PathBuf,
+    /// Primary checkouts expose the project's explicitly configured links. Provisioned worktrees
+    /// select one environment so Production is never inferred from a branch name.
+    #[serde(default)]
+    pub environment_id: Option<String>,
+    pub kind: ProjectCheckoutKind,
+    #[serde(default)]
+    pub git_common_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -289,6 +329,8 @@ pub struct Surface {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogSnapshot {
     pub projects: Vec<Project>,
+    #[serde(default)]
+    pub checkouts: Vec<ProjectCheckout>,
     pub environments: Vec<Environment>,
     pub resources: Vec<Resource>,
     pub bindings: Vec<Binding>,

@@ -7,13 +7,14 @@ use accessfs_core::authz::Enforcement;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::domain::{
-    Binding, BindingScope, CatalogSnapshot, EntrySelection, Environment, Project,
-    ResolvedEnvironment, ResolvedExport, Resource, ResourceBindingUsage, ResourceCodec,
-    ResourceKind, ResourceSource, ResourceUsage, Surface, SurfaceInput, SurfaceKind, ValueShape,
+    Binding, BindingScope, CatalogSnapshot, EntrySelection, Environment, Project, ProjectCheckout,
+    ProjectCheckoutKind, ResolvedEnvironment, ResolvedExport, Resource, ResourceBindingUsage,
+    ResourceCodec, ResourceKind, ResourceSource, ResourceUsage, Surface, SurfaceInput, SurfaceKind,
+    ValueShape,
 };
 use crate::error::{CatalogError, CatalogResult};
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 #[derive(Debug, Clone)]
 pub struct Catalog {
@@ -79,18 +80,116 @@ impl Catalog {
 
     pub fn upsert_project(&self, project: &Project) -> CatalogResult<()> {
         validate_project(project)?;
-        self.connection()?.execute(
-            "INSERT INTO projects (id, name, path) VALUES (?1, ?2, ?3)
-             ON CONFLICT(id) DO UPDATE SET name = excluded.name, path = excluded.path,
+        let mut conn = self.connection()?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO projects (id, name) VALUES (?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name,
                  updated_at = CURRENT_TIMESTAMP",
-            params![project.id, project.name, path_string(&project.path)],
+            params![project.id, project.name],
         )?;
+        tx.execute(
+            "INSERT INTO project_checkouts
+                (id, project_id, path, environment_id, kind, git_common_dir)
+             VALUES (?1, ?1, ?2, NULL, 'primary', NULL)
+             ON CONFLICT(id) DO UPDATE SET path = excluded.path,
+                 updated_at = CURRENT_TIMESTAMP",
+            params![project.id, path_string(&project.path)],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn remove_project(&self, id: &str) -> CatalogResult<()> {
         require_id(id, "project id")?;
         remove_one(&self.connection()?, "projects", id, "project")
+    }
+
+    pub fn upsert_checkout(&self, checkout: &ProjectCheckout) -> CatalogResult<()> {
+        validate_checkout(checkout)?;
+        let mut conn = self.connection()?;
+        let tx = conn.transaction()?;
+        require_exists(&tx, "projects", &checkout.project_id, "project")?;
+        if let Some(environment_id) = &checkout.environment_id {
+            let owner = tx
+                .query_row(
+                    "SELECT project_id FROM environments WHERE id = ?1",
+                    [environment_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            match owner {
+                Some(owner) if owner == checkout.project_id => {}
+                Some(_) => {
+                    return Err(CatalogError::Validation(format!(
+                        "environment {environment_id:?} does not belong to project {:?}",
+                        checkout.project_id
+                    )))
+                }
+                None => {
+                    return Err(CatalogError::NotFound(format!(
+                        "environment {environment_id}"
+                    )))
+                }
+            }
+        }
+        let existing: Option<(String, String)> = tx
+            .query_row(
+                "SELECT project_id, kind FROM project_checkouts WHERE id = ?1",
+                [&checkout.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if existing
+            .as_ref()
+            .is_some_and(|(project_id, kind)| {
+                project_id != &checkout.project_id || kind != checkout.kind.as_str()
+            })
+        {
+            return Err(CatalogError::Validation(format!(
+                "checkout {:?} cannot move between projects or change kind",
+                checkout.id
+            )));
+        }
+        tx.execute(
+            "INSERT INTO project_checkouts
+                (id, project_id, path, environment_id, kind, git_common_dir)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET path = excluded.path,
+                 environment_id = excluded.environment_id,
+                 git_common_dir = excluded.git_common_dir,
+                 updated_at = CURRENT_TIMESTAMP",
+            params![
+                checkout.id,
+                checkout.project_id,
+                path_string(&checkout.path),
+                checkout.environment_id,
+                checkout.kind.as_str(),
+                checkout.git_common_dir.as_deref().map(path_string),
+            ],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn remove_checkout(&self, id: &str) -> CatalogResult<()> {
+        require_id(id, "checkout id")?;
+        let conn = self.connection()?;
+        let kind = conn
+            .query_row(
+                "SELECT kind FROM project_checkouts WHERE id = ?1",
+                [id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .ok_or_else(|| CatalogError::NotFound(format!("checkout {id}")))?;
+        if kind == ProjectCheckoutKind::Primary.as_str() {
+            return Err(CatalogError::Validation(
+                "primary checkout is owned by its project and cannot be removed separately"
+                    .to_string(),
+            ));
+        }
+        remove_one(&conn, "project_checkouts", id, "checkout")
     }
 
     pub fn upsert_environment(&self, environment: &Environment) -> CatalogResult<()> {
@@ -404,26 +503,23 @@ impl Catalog {
         let tx = conn.transaction()?;
         require_exists(&tx, "environments", &surface.environment_id, "environment")?;
         let project_path = PathBuf::from(tx.query_row(
-            "SELECT projects.path
+            "SELECT project_checkouts.path
              FROM environments
-             JOIN projects ON projects.id = environments.project_id
+             JOIN project_checkouts
+               ON project_checkouts.project_id = environments.project_id
+              AND project_checkouts.kind = 'primary'
              WHERE environments.id = ?1",
             [&surface.environment_id],
             |row| row.get::<_, String>(0),
         )?);
-        if surface.path == project_path || !surface.path.starts_with(&project_path) {
-            return Err(CatalogError::Validation(format!(
-                "surface path {} must be inside project directory {}",
-                surface.path.display(),
-                project_path.display()
-            )));
-        }
+        let relative_path = surface_relative_path(&surface.path, &project_path)?;
         tx.execute(
             "INSERT INTO surfaces
-                (id, environment_id, name, kind, path, input_json, enforcement, position)
+                (id, environment_id, name, kind, relative_path, input_json, enforcement, position)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(id) DO UPDATE SET environment_id = excluded.environment_id,
-                 name = excluded.name, kind = excluded.kind, path = excluded.path,
+                 name = excluded.name, kind = excluded.kind,
+                 relative_path = excluded.relative_path,
                  input_json = excluded.input_json, enforcement = excluded.enforcement,
                  position = excluded.position,
                  updated_at = CURRENT_TIMESTAMP",
@@ -432,7 +528,7 @@ impl Catalog {
                 surface.environment_id,
                 surface.name,
                 surface.kind.as_str(),
-                path_string(&surface.path),
+                path_string(relative_path),
                 serde_json::to_string(&surface.input)?,
                 surface.enforcement.as_str(),
                 surface.position,
@@ -484,11 +580,24 @@ fn migrate(conn: &mut Connection) -> CatalogResult<()> {
         "CREATE TABLE projects (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
-            path TEXT NOT NULL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
-        CREATE UNIQUE INDEX projects_path_idx ON projects(path);
+
+        CREATE TABLE project_checkouts (
+            id TEXT PRIMARY KEY,
+            project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            path TEXT NOT NULL UNIQUE,
+            environment_id TEXT REFERENCES environments(id) ON DELETE RESTRICT,
+            kind TEXT NOT NULL,
+            git_common_dir TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE UNIQUE INDEX project_primary_checkout_idx
+            ON project_checkouts(project_id) WHERE kind = 'primary';
+        CREATE INDEX project_checkouts_project_idx
+            ON project_checkouts(project_id, kind, path);
 
         CREATE TABLE environments (
             id TEXT PRIMARY KEY,
@@ -536,7 +645,7 @@ fn migrate(conn: &mut Connection) -> CatalogResult<()> {
             environment_id TEXT NOT NULL REFERENCES environments(id) ON DELETE CASCADE,
             name TEXT NOT NULL,
             kind TEXT NOT NULL,
-            path TEXT NOT NULL,
+            relative_path TEXT NOT NULL,
             input_json TEXT NOT NULL,
             enforcement TEXT NOT NULL,
             position INTEGER NOT NULL DEFAULT 0,
@@ -544,7 +653,7 @@ fn migrate(conn: &mut Connection) -> CatalogResult<()> {
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         CREATE INDEX surfaces_environment_idx ON surfaces(environment_id, position);
-        PRAGMA user_version = 7;",
+        PRAGMA user_version = 8;",
     )?;
     tx.commit()?;
     Ok(())
@@ -552,7 +661,14 @@ fn migrate(conn: &mut Connection) -> CatalogResult<()> {
 
 fn snapshot_from(conn: &Connection) -> CatalogResult<CatalogSnapshot> {
     let projects = {
-        let mut stmt = conn.prepare("SELECT id, name, path FROM projects ORDER BY name, id")?;
+        let mut stmt = conn.prepare(
+            "SELECT projects.id, projects.name, project_checkouts.path
+             FROM projects
+             JOIN project_checkouts
+               ON project_checkouts.project_id = projects.id
+              AND project_checkouts.kind = 'primary'
+             ORDER BY projects.name, projects.id",
+        )?;
         let values = stmt.query_map([], |row| {
             Ok(Project {
                 id: row.get(0)?,
@@ -561,6 +677,29 @@ fn snapshot_from(conn: &Connection) -> CatalogResult<CatalogSnapshot> {
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
+        values
+    };
+
+    let checkouts = {
+        let mut stmt = conn.prepare(
+            "SELECT id, project_id, path, environment_id, kind, git_common_dir
+             FROM project_checkouts
+             ORDER BY project_id, kind = 'primary' DESC, path, id",
+        )?;
+        let values = stmt
+            .query_map([], |row| {
+                let kind: String = row.get(4)?;
+                Ok(ProjectCheckout {
+                    id: row.get(0)?,
+                    project_id: row.get(1)?,
+                    path: PathBuf::from(row.get::<_, String>(2)?),
+                    environment_id: row.get(3)?,
+                    kind: ProjectCheckoutKind::parse(&kind)
+                        .ok_or_else(|| invalid_value(4, kind))?,
+                    git_common_dir: row.get::<_, Option<String>>(5)?.map(PathBuf::from),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
         values
     };
 
@@ -639,29 +778,38 @@ fn snapshot_from(conn: &Connection) -> CatalogResult<CatalogSnapshot> {
 
     let surfaces = {
         let mut stmt = conn.prepare(
-            "SELECT id, environment_id, name, kind, path, input_json, enforcement, position
-             FROM surfaces ORDER BY environment_id, position, name, id",
+            "SELECT surfaces.id, surfaces.environment_id, surfaces.name, surfaces.kind,
+                    project_checkouts.path, surfaces.relative_path, surfaces.input_json,
+                    surfaces.enforcement, surfaces.position
+             FROM surfaces
+             JOIN environments ON environments.id = surfaces.environment_id
+             JOIN project_checkouts
+               ON project_checkouts.project_id = environments.project_id
+              AND project_checkouts.kind = 'primary'
+             ORDER BY surfaces.environment_id, surfaces.position, surfaces.name, surfaces.id",
         )?;
         let values = stmt.query_map([], |row| {
             let kind: String = row.get(3)?;
-            let enforcement: String = row.get(6)?;
+            let enforcement: String = row.get(7)?;
+            let primary_path = PathBuf::from(row.get::<_, String>(4)?);
+            let relative_path = PathBuf::from(row.get::<_, String>(5)?);
             Ok(Surface {
                 id: row.get(0)?,
                 environment_id: row.get(1)?,
                 name: row.get(2)?,
                 kind: SurfaceKind::parse(&kind).ok_or_else(|| invalid_value(3, kind))?,
-                path: PathBuf::from(row.get::<_, String>(4)?),
-                input: decode_json(5, &row.get::<_, String>(5)?)?,
+                path: primary_path.join(relative_path),
+                input: decode_json(6, &row.get::<_, String>(6)?)?,
                 enforcement: Enforcement::parse(&enforcement)
-                    .ok_or_else(|| invalid_value(6, enforcement))?,
-                position: row.get(7)?,
+                    .ok_or_else(|| invalid_value(7, enforcement))?,
+                position: row.get(8)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
         values
     };
 
-    Ok(CatalogSnapshot { projects, environments, resources, bindings, surfaces })
+    Ok(CatalogSnapshot { projects, checkouts, environments, resources, bindings, surfaces })
 }
 
 pub fn resolve_catalog_snapshot(
@@ -1156,6 +1304,37 @@ fn validate_project(project: &Project) -> CatalogResult<()> {
     require_normalized_absolute_path(&project.path, "project path")
 }
 
+fn validate_checkout(checkout: &ProjectCheckout) -> CatalogResult<()> {
+    require_id(&checkout.id, "checkout id")?;
+    require_id(&checkout.project_id, "checkout project id")?;
+    require_normalized_absolute_path(&checkout.path, "checkout path")?;
+    if let Some(git_common_dir) = &checkout.git_common_dir {
+        require_normalized_absolute_path(git_common_dir, "checkout git common directory")?;
+    }
+    match checkout.kind {
+        ProjectCheckoutKind::Primary => {
+            if checkout.id != checkout.project_id {
+                return Err(CatalogError::Validation(
+                    "primary checkout id must match its project id".to_string(),
+                ));
+            }
+            if checkout.environment_id.is_some() {
+                return Err(CatalogError::Validation(
+                    "primary checkout cannot select one environment".to_string(),
+                ));
+            }
+        }
+        ProjectCheckoutKind::Worktree => {
+            if checkout.environment_id.is_none() {
+                return Err(CatalogError::Validation(
+                    "worktree checkout must select an environment".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_environment(environment: &Environment) -> CatalogResult<()> {
     require_id(&environment.id, "environment id")?;
     require_id(&environment.project_id, "environment project id")?;
@@ -1534,6 +1713,32 @@ fn require_normalized_absolute_path(path: &Path, label: &str) -> CatalogResult<(
     Ok(())
 }
 
+fn surface_relative_path<'a>(path: &'a Path, project_path: &Path) -> CatalogResult<&'a Path> {
+    let relative = path.strip_prefix(project_path).map_err(|_| {
+        CatalogError::Validation(format!(
+            "surface path {} must be inside project directory {}",
+            path.display(),
+            project_path.display()
+        ))
+    })?;
+    if relative.as_os_str().is_empty() {
+        return Err(CatalogError::Validation(format!(
+            "surface path {} must be inside project directory {}",
+            path.display(),
+            project_path.display()
+        )));
+    }
+    if relative.components().any(|component| {
+        !matches!(component, std::path::Component::Normal(_))
+    }) {
+        return Err(CatalogError::Validation(format!(
+            "surface relative path must contain only normal components: {}",
+            relative.display()
+        )));
+    }
+    Ok(relative)
+}
+
 fn require_path_component(value: &str, label: &str) -> CatalogResult<()> {
     let mut components = Path::new(value).components();
     let is_one_component = matches!(
@@ -1699,7 +1904,7 @@ mod tests {
         let error = migrate(&mut conn).unwrap_err();
         assert!(matches!(
             error,
-            CatalogError::UnsupportedSchema { found: 1, expected: 7 }
+            CatalogError::UnsupportedSchema { found: 1, expected: 8 }
         ));
     }
 
@@ -1861,6 +2066,17 @@ mod tests {
 
         let snapshot = catalog.snapshot().unwrap();
         assert_eq!(snapshot.projects, vec![project()]);
+        assert_eq!(
+            snapshot.checkouts,
+            vec![ProjectCheckout {
+                id: "floria".to_string(),
+                project_id: "floria".to_string(),
+                path: PathBuf::from("/workspace/floria"),
+                environment_id: None,
+                kind: ProjectCheckoutKind::Primary,
+                git_common_dir: None,
+            }]
+        );
         assert_eq!(snapshot.environments, vec![environment()]);
         assert_eq!(snapshot.resources, vec![resource]);
         assert_eq!(snapshot.bindings.len(), 1);
@@ -1869,6 +2085,67 @@ mod tests {
         assert_eq!(snapshot.resources[0].enforcement, Enforcement::TouchId);
         let json = serde_json::to_string(&snapshot).unwrap();
         assert!(!json.contains("plaintext"));
+    }
+
+    #[test]
+    fn worktree_checkout_requires_an_environment_from_the_same_project() {
+        let (_dir, catalog) = catalog();
+        let checkout = ProjectCheckout {
+            id: "floria-feature".to_string(),
+            project_id: "floria".to_string(),
+            path: PathBuf::from("/workspace/floria-feature"),
+            environment_id: Some("development".to_string()),
+            kind: ProjectCheckoutKind::Worktree,
+            git_common_dir: Some(PathBuf::from("/workspace/floria/.git")),
+        };
+        catalog.upsert_checkout(&checkout).unwrap();
+        assert_eq!(catalog.snapshot().unwrap().checkouts[1], checkout);
+
+        let mut without_environment = checkout.clone();
+        without_environment.id = "floria-unassigned".to_string();
+        without_environment.path = PathBuf::from("/workspace/floria-unassigned");
+        without_environment.environment_id = None;
+        assert!(matches!(
+            catalog.upsert_checkout(&without_environment),
+            Err(CatalogError::Validation(message))
+                if message.contains("must select an environment")
+        ));
+
+        assert!(matches!(
+            catalog.remove_checkout("floria"),
+            Err(CatalogError::Validation(message))
+                if message.contains("cannot be removed separately")
+        ));
+        catalog.remove_checkout(&checkout.id).unwrap();
+        assert_eq!(catalog.snapshot().unwrap().checkouts.len(), 1);
+    }
+
+    #[test]
+    fn surface_paths_are_persisted_relative_to_the_primary_checkout() {
+        let (_dir, catalog) = catalog();
+        let surface = Surface {
+            id: "fixture-dotenv".to_string(),
+            environment_id: "development".to_string(),
+            name: ".config/dev.env".to_string(),
+            kind: SurfaceKind::DotenvFile,
+            path: PathBuf::from("/workspace/floria/.config/dev.env"),
+            input: SurfaceInput::Bindings { binding_ids: Vec::new() },
+            enforcement: Enforcement::Prompt,
+            position: 0,
+        };
+        catalog.upsert_surface(&surface).unwrap();
+
+        let relative: String = catalog
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT relative_path FROM surfaces WHERE id = ?1",
+                [&surface.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(relative, ".config/dev.env");
+        assert_eq!(catalog.snapshot().unwrap().surfaces, vec![surface]);
     }
 
     #[test]

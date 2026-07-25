@@ -2,7 +2,7 @@ use std::io;
 use std::os::unix::fs::symlink;
 use std::path::{Component, Path};
 
-use accessfs_catalog::{Surface, SurfaceKind};
+use accessfs_catalog::{CatalogSnapshot, ProjectCheckoutKind, Surface, SurfaceKind};
 use accessfs_core::config::SURFACES_DIR;
 
 use crate::error::{SurfaceError, SurfaceResult};
@@ -20,20 +20,69 @@ pub enum SurfaceLinkRemoval {
     Preserved,
 }
 
+/// Materialize each configured file Surface at the primary checkout and every provisioned
+/// worktree that selected the Surface's Environment. The mounted target remains the one canonical
+/// Surface id; only project-facing links multiply.
+pub fn file_surface_instances(snapshot: &CatalogSnapshot) -> SurfaceResult<Vec<Surface>> {
+    let mut instances = Vec::new();
+    for surface in snapshot.surfaces.iter().filter(|surface| is_file_surface(surface.kind)) {
+        instances.push(surface.clone());
+        let environment = snapshot
+            .environments
+            .iter()
+            .find(|environment| environment.id == surface.environment_id)
+            .ok_or_else(|| SurfaceError::CheckoutMaterialization {
+                surface_id: surface.id.clone(),
+                reason: format!("environment {:?} is missing", surface.environment_id),
+            })?;
+        let project = snapshot
+            .projects
+            .iter()
+            .find(|project| project.id == environment.project_id)
+            .ok_or_else(|| SurfaceError::CheckoutMaterialization {
+                surface_id: surface.id.clone(),
+                reason: format!("project {:?} is missing", environment.project_id),
+            })?;
+        let relative = surface.path.strip_prefix(&project.path).map_err(|_| {
+            SurfaceError::CheckoutMaterialization {
+                surface_id: surface.id.clone(),
+                reason: format!(
+                    "path {} is outside primary checkout {}",
+                    surface.path.display(),
+                    project.path.display()
+                ),
+            }
+        })?;
+        if relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(SurfaceError::CheckoutMaterialization {
+                surface_id: surface.id.clone(),
+                reason: format!("relative path {} is invalid", relative.display()),
+            });
+        }
+        for checkout in snapshot.checkouts.iter().filter(|checkout| {
+            checkout.project_id == project.id
+                && checkout.kind == ProjectCheckoutKind::Worktree
+                && checkout.environment_id.as_deref() == Some(environment.id.as_str())
+        }) {
+            let mut instance = surface.clone();
+            instance.path = checkout.path.join(relative);
+            instances.push(instance);
+        }
+    }
+    Ok(instances)
+}
+
 /// Ensure that a project-facing file path is a symlink to its mounted surface inode.
 /// Existing files and links with a different target are never replaced.
 pub fn ensure_file_surface_link(
     surface: &Surface,
     mount_path: &Path,
 ) -> SurfaceResult<SurfaceLinkState> {
-    if !matches!(
-        surface.kind,
-        SurfaceKind::DotenvFile
-            | SurfaceKind::DirenvFile
-            | SurfaceKind::IniFile
-            | SurfaceKind::EnvFileDirect
-            | SurfaceKind::LinesFile
-    ) {
+    if !is_file_surface(surface.kind) {
         return Err(SurfaceError::UnsupportedSurface {
             surface_id: surface.id.clone(),
             kind: format!("{:?}", surface.kind),
@@ -61,14 +110,7 @@ pub fn remove_file_surface_link(
     surface: &Surface,
     mount_path: &Path,
 ) -> SurfaceResult<SurfaceLinkRemoval> {
-    if !matches!(
-        surface.kind,
-        SurfaceKind::DotenvFile
-            | SurfaceKind::DirenvFile
-            | SurfaceKind::IniFile
-            | SurfaceKind::EnvFileDirect
-            | SurfaceKind::LinesFile
-    ) {
+    if !is_file_surface(surface.kind) {
         return Ok(SurfaceLinkRemoval::Preserved);
     }
     validate_surface_id(&surface.id)?;
@@ -103,6 +145,17 @@ pub fn remove_file_surface_link(
         source,
     })?;
     Ok(SurfaceLinkRemoval::Removed)
+}
+
+fn is_file_surface(kind: SurfaceKind) -> bool {
+    matches!(
+        kind,
+        SurfaceKind::DotenvFile
+            | SurfaceKind::DirenvFile
+            | SurfaceKind::IniFile
+            | SurfaceKind::EnvFileDirect
+            | SurfaceKind::LinesFile
+    )
 }
 
 fn validate_surface_id(id: &str) -> SurfaceResult<()> {
@@ -176,7 +229,9 @@ fn link_conflict(path: &Path, expected: &Path, reason: impl Into<String>) -> Sur
 #[cfg(test)]
 mod tests {
     use super::*;
-    use accessfs_catalog::SurfaceInput;
+    use accessfs_catalog::{
+        CatalogSnapshot, Environment, Project, ProjectCheckout, ProjectCheckoutKind, SurfaceInput,
+    };
     use std::path::PathBuf;
 
     fn fixture_surface(path: PathBuf) -> Surface {
@@ -209,6 +264,69 @@ mod tests {
         assert_eq!(
             ensure_file_surface_link(&surface, &mount).unwrap(),
             SurfaceLinkState::Ready
+        );
+    }
+
+    #[test]
+    fn materializes_selected_environment_surfaces_in_each_worktree() {
+        let primary = PathBuf::from("/workspace/floria");
+        let development = fixture_surface(primary.join(".env"));
+        let mut staging = fixture_surface(primary.join(".env.staging"));
+        staging.id = "fixture-staging".to_string();
+        staging.environment_id = "fixture-staging".to_string();
+        let snapshot = CatalogSnapshot {
+            projects: vec![Project {
+                id: "fixture-project".to_string(),
+                name: "Fixture".to_string(),
+                path: primary.clone(),
+            }],
+            checkouts: vec![
+                ProjectCheckout {
+                    id: "fixture-project".to_string(),
+                    project_id: "fixture-project".to_string(),
+                    path: primary,
+                    environment_id: None,
+                    kind: ProjectCheckoutKind::Primary,
+                    git_common_dir: None,
+                },
+                ProjectCheckout {
+                    id: "fixture-feature".to_string(),
+                    project_id: "fixture-project".to_string(),
+                    path: PathBuf::from("/workspace/floria-feature"),
+                    environment_id: Some("fixture-development".to_string()),
+                    kind: ProjectCheckoutKind::Worktree,
+                    git_common_dir: Some(PathBuf::from("/workspace/floria/.git")),
+                },
+            ],
+            environments: vec![
+                Environment {
+                    id: "fixture-development".to_string(),
+                    project_id: "fixture-project".to_string(),
+                    name: "Development".to_string(),
+                    position: 0,
+                },
+                Environment {
+                    id: "fixture-staging".to_string(),
+                    project_id: "fixture-project".to_string(),
+                    name: "Staging".to_string(),
+                    position: 1,
+                },
+            ],
+            surfaces: vec![development, staging],
+            ..CatalogSnapshot::default()
+        };
+
+        let instances = file_surface_instances(&snapshot).unwrap();
+        assert_eq!(
+            instances
+                .iter()
+                .map(|surface| (surface.id.as_str(), surface.path.as_path()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("fixture-dotenv", Path::new("/workspace/floria/.env")),
+                ("fixture-dotenv", Path::new("/workspace/floria-feature/.env")),
+                ("fixture-staging", Path::new("/workspace/floria/.env.staging")),
+            ]
         );
     }
 

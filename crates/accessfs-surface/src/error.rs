@@ -60,6 +60,9 @@ pub enum SurfaceError {
     #[error("cannot link surface at {path}: {reason}; expected target {expected}")]
     LinkConflict { path: PathBuf, expected: PathBuf, reason: String },
 
+    #[error("cannot materialize surface {surface_id:?} for project checkouts: {reason}")]
+    CheckoutMaterialization { surface_id: String, reason: String },
+
     #[error("surface link I/O error while {operation} {path}: {source}")]
     LinkIo {
         operation: &'static str,
