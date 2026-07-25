@@ -218,6 +218,19 @@ final class WorkspaceModelTests: XCTestCase {
         XCTAssertEqual(routed.sshRoute?.hostPatterns, ["ec2-*", "bastion"])
     }
 
+    func testSshAgentRuntimeSocketPathMatchesDaemonAndFitsMacOSAddress() {
+        let surfaceID = "ssh-agent-d56d57b2-3503-40e9-86d0-48a6ca9168fd"
+
+        XCTAssertEqual(
+            SshAgentRuntimeSocket.fileName(for: surfaceID),
+            "3YUjhPR-lx4my6EW.sock")
+        XCTAssertLessThan(
+            SshAgentRuntimeSocket.path(
+                for: surfaceID, homeDirectory: "/Users/fixture-account"
+            ).utf8.count,
+            104)
+    }
+
     func testProtectedFileKindsAreInferredWithoutParsingContent() {
         XCTAssertEqual(WorkspaceProtectedFileKind.infer(from: "/fixture/project/.env"), .dotenv)
         XCTAssertEqual(

@@ -33,6 +33,7 @@ const MAX_AGENT_FRAME: usize = 1 << 20;
 const DOWNSTREAM_POLL: Duration = Duration::from_secs(1);
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECTION_THREADS: usize = 16;
+const RUNTIME_SOCKET_HASH_BYTES: usize = 12;
 
 const SSH_AGENT_FAILURE: u8 = 5;
 const SSH_AGENT_IDENTITIES_ANSWER: u8 = 12;
@@ -166,7 +167,7 @@ impl SshAgentRuntime {
     }
 
     pub fn socket_path(&self, surface_id: &str) -> PathBuf {
-        self.runtime_dir.join(format!("{surface_id}.sock"))
+        runtime_socket_path(&self.runtime_dir, surface_id)
     }
 }
 
@@ -237,7 +238,7 @@ fn compile_surface_specs(
                 )))
             }
         };
-        let socket_path = runtime_dir.join(format!("{}.sock", surface.id));
+        let socket_path = runtime_socket_path(runtime_dir, &surface.id);
         let mut providers = Vec::<ProviderSpec>::new();
         let mut provider_indexes = HashMap::<&str, usize>::new();
         let mut identities = Vec::new();
@@ -299,6 +300,12 @@ fn compile_surface_specs(
         });
     }
     Ok(specs)
+}
+
+fn runtime_socket_path(runtime_dir: &Path, surface_id: &str) -> PathBuf {
+    let digest = Sha256::digest(surface_id.as_bytes());
+    let name = URL_SAFE_NO_PAD.encode(&digest[..RUNTIME_SOCKET_HASH_BYTES]);
+    runtime_dir.join(format!("{name}.sock"))
 }
 
 fn write_generated_config(path: &Path, specs: &[SurfaceSpec]) -> io::Result<()> {
@@ -1011,6 +1018,7 @@ fn remove_exact_socket(path: &Path, inode: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStrExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use accessfs_catalog::{
@@ -1020,6 +1028,25 @@ mod tests {
 
     const KEY_A: &[u8] = b"fixture-public-identity-a-v1";
     const KEY_B: &[u8] = b"fixture-public-identity-b-v1";
+
+    #[test]
+    fn runtime_socket_path_fits_unix_socket_address_for_catalog_surface_ids() {
+        let runtime_dir = Path::new(
+            "/Users/fixture-account/Library/Application Support/floria/runtime/sockets",
+        );
+        let surface_id = "ssh-agent-d56d57b2-3503-40e9-86d0-48a6ca9168fd";
+        let path = runtime_socket_path(runtime_dir, surface_id);
+        let address = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+
+        assert_eq!(path.file_name().unwrap(), "3YUjhPR-lx4my6EW.sock");
+        assert!(
+            path.as_os_str().as_bytes().len() < address.sun_path.len(),
+            "{} uses {} bytes but sockaddr_un.sun_path only has {}",
+            path.display(),
+            path.as_os_str().as_bytes().len(),
+            address.sun_path.len(),
+        );
+    }
 
     struct RecordingAuthorizer {
         allow: AtomicBool,

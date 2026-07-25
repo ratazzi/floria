@@ -1,6 +1,25 @@
+import CryptoKit
 import Darwin
 import Foundation
 import Observation
+
+enum SshAgentRuntimeSocket {
+    private static let hashByteCount = 12
+
+    static func fileName(for surfaceID: String) -> String {
+        let digest = SHA256.hash(data: Data(surfaceID.utf8))
+        let prefix = Data(digest.prefix(hashByteCount)).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+        return "\(prefix).sock"
+    }
+
+    static func path(for surfaceID: String, homeDirectory: String = NSHomeDirectory()) -> String {
+        (homeDirectory as NSString).appendingPathComponent(
+            "Library/Application Support/floria/runtime/sockets/\(fileName(for: surfaceID))")
+    }
+}
 
 enum WorkspaceSecurityLevel: String, CaseIterable, Hashable, Sendable {
     case auditOnly = "allow"
@@ -1483,8 +1502,7 @@ final class WorkspaceStore {
 
     func expectedLinkTarget(for surface: WorkspaceSurface) -> String {
         if surface.kind == .unixSocket {
-            return (NSHomeDirectory() as NSString).appendingPathComponent(
-                "Library/Application Support/floria/runtime/sockets/\(surface.id).sock")
+            return SshAgentRuntimeSocket.path(for: surface.id)
         }
         return (NSHomeDirectory() as NSString).appendingPathComponent(
             ".accessfs/surfaces/\(surface.id)")
@@ -1748,10 +1766,10 @@ private extension WorkspaceSurface {
             input = .resource(resourceID)
         default: return nil
         }
-        let expectedTarget = (NSHomeDirectory() as NSString).appendingPathComponent(
-            kind == .unixSocket
-                ? "Library/Application Support/floria/runtime/sockets/\(surface.id).sock"
-                : ".accessfs/surfaces/\(surface.id)")
+        let expectedTarget = kind == .unixSocket
+            ? SshAgentRuntimeSocket.path(for: surface.id)
+            : (NSHomeDirectory() as NSString).appendingPathComponent(
+                ".accessfs/surfaces/\(surface.id)")
         let linkTarget = try? FileManager.default.destinationOfSymbolicLink(atPath: surface.path)
         let status: WorkspaceSurfaceStatus = linkTarget == expectedTarget
             ? (kind == .unixSocket ? .listening : .linked) : .stopped
