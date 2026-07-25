@@ -29,15 +29,34 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(params.count, 1)
 
         let response = Data(
-            #"{"request_id":8,"status":"ok","result":{"type":"discovery","value":{"path":"/fixture/project","project":{"name":"project","path":"/fixture/project"},"files":[{"path":"/fixture/project/.env","relative_path":".env","kind":"dotenv","codec":"dotenv","environment":"development","tags":["dotenv","development"],"entries":[{"address":"keys/API_TOKEN","key":"API_TOKEN","section":null,"action":{"type":"reuse_shared_secret","resource_id":"fixture-shared"}}],"warnings":[],"action":"compose"}],"summary":{"files":1,"entries":1,"new_secrets":0,"reused_secrets":1,"warnings":0}}}}"#.utf8)
+            #"{"request_id":8,"status":"ok","result":{"type":"discovery","value":{"path":"/fixture/project","project":{"name":"project","path":"/fixture/project"},"files":[{"path":"/fixture/project/.env","relative_path":".env","kind":"dotenv","codec":"dotenv","environment":"development","tags":["dotenv","development"],"entries":[{"address":"keys/API_TOKEN","key":"API_TOKEN","section":null,"action":{"type":"reuse_shared_secret","resource_id":"fixture-shared","resource_name":"Fixture Shared Secret"}}],"warnings":[],"action":"compose"}],"summary":{"files":1,"entries":1,"new_secrets":0,"reused_secrets":1,"warnings":0}}}}"#.utf8)
         let decoded = try JSONDecoder().decode(
             ControlResponseEnvelope<DiscoveryPlan>.self, from: response)
         let plan = try XCTUnwrap(decoded.result?.value)
 
         XCTAssertEqual(plan.files.first?.relativePath, ".env")
         XCTAssertEqual(plan.files.first?.entries.first?.action.resourceID, "fixture-shared")
+        XCTAssertEqual(
+            plan.files.first?.entries.first?.action.resourceName,
+            "Fixture Shared Secret")
         XCTAssertEqual(plan.summary.reusedSecrets, 1)
         XCTAssertFalse(String(decoding: response, as: UTF8.self).contains("secret_value"))
+    }
+
+    func testDiscoveryCandidateGroupingMatchesRustWireShape() throws {
+        let create = try JSONDecoder().decode(
+            DiscoveredEntryAction.self,
+            from: Data(
+                #"{"type":"create_shared_secret","group_id":"discovered-1"}"#.utf8))
+        let reuse = try JSONDecoder().decode(
+            DiscoveredEntryAction.self,
+            from: Data(
+                #"{"type":"reuse_discovered_secret","group_id":"discovered-1"}"#.utf8))
+
+        XCTAssertEqual(create.type, "create_shared_secret")
+        XCTAssertEqual(create.groupID, "discovered-1")
+        XCTAssertEqual(reuse.type, "reuse_discovered_secret")
+        XCTAssertEqual(reuse.groupID, create.groupID)
     }
 
     func testDiscoverApplyRequestAndResultMatchRustWireShape() throws {
@@ -45,7 +64,12 @@ final class ControlProtocolTests: XCTestCase {
         encoder.keyEncodingStrategy = .convertToSnakeCase
         let data = try ControlCommand.discoverApply(
             path: "/fixture/project",
-            files: ["/fixture/project/.env", "/fixture/project/.env.production"])
+            files: ["/fixture/project/.env", "/fixture/project/.env.production"],
+            separateEntries: [
+                DiscoverySeparateEntry(
+                    path: "/fixture/project/.env.production",
+                    address: "keys/API_TOKEN")
+            ])
             .requestData(requestID: 9, encoder: encoder)
         let request = try XCTUnwrap(
             JSONSerialization.jsonObject(with: data) as? [String: Any])
@@ -56,6 +80,11 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(
             (request["params"] as? [String: Any])?["files"] as? [String],
             ["/fixture/project/.env", "/fixture/project/.env.production"])
+        let separateEntries = try XCTUnwrap(
+            (request["params"] as? [String: Any])?["separate_entries"]
+                as? [[String: String]])
+        XCTAssertEqual(separateEntries.first?["path"], "/fixture/project/.env.production")
+        XCTAssertEqual(separateEntries.first?["address"], "keys/API_TOKEN")
 
         let response = Data(
             #"{"request_id":9,"status":"ok","result":{"type":"discovery_applied","value":{"project_id":"fixture-project","created_resources":2,"reused_resources":1,"protected_files":1,"imported_ssh_identities":0,"files":[{"path":"/fixture/project/.env","outcome":"imported","detail":"Imported as reusable secrets and a composed output"}]}}}"#.utf8)

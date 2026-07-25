@@ -317,10 +317,14 @@ struct DiscoveredEntry: Codable, Hashable, Sendable, Identifiable {
 struct DiscoveredEntryAction: Codable, Hashable, Sendable {
     let type: String
     let resourceID: String?
+    let resourceName: String?
+    let groupID: String?
 
     enum CodingKeys: String, CodingKey {
         case type
         case resourceID = "resource_id"
+        case resourceName = "resource_name"
+        case groupID = "group_id"
     }
 }
 
@@ -353,6 +357,11 @@ struct DiscoveryAppliedFile: Codable, Hashable, Sendable, Identifiable {
     let path: String
     let outcome: String
     let detail: String
+}
+
+struct DiscoverySeparateEntry: Codable, Hashable, Sendable {
+    let path: String
+    let address: String
 }
 
 struct DiscoveredSshIdentity: Codable, Hashable, Sendable {
@@ -414,7 +423,8 @@ enum ControlCommand: Sendable {
     case accessHistory(limit: Int)
     case snapshot
     case discover(path: String)
-    case discoverApply(path: String, files: [String])
+    case discoverApply(
+        path: String, files: [String], separateEntries: [DiscoverySeparateEntry])
     case sshAgentDiscover(endpoint: String)
     case sshIdentityImport(
         resourceID: String, name: String, path: String, passphrase: String?,
@@ -514,11 +524,12 @@ enum ControlCommand: Sendable {
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: DiscoverParams(path: path)))
-        case .discoverApply(let path, let files):
+        case .discoverApply(let path, let files, let separateEntries):
             return try encoder.encode(
                 ControlRequest(
                     requestID: requestID, method: method,
-                    params: DiscoverApplyParams(path: path, files: files)))
+                    params: DiscoverApplyParams(
+                        path: path, files: files, separateEntries: separateEntries)))
         case .sshAgentDiscover(let endpoint):
             return try encoder.encode(
                 ControlRequest(
@@ -644,6 +655,7 @@ private struct DiscoverParams: Encodable { let path: String }
 private struct DiscoverApplyParams: Encodable {
     let path: String
     let files: [String]
+    let separateEntries: [DiscoverySeparateEntry]
 }
 private struct SshAgentDiscoverParams: Encodable { let endpoint: String }
 

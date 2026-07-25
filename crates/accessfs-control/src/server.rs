@@ -435,12 +435,13 @@ fn dispatch(
             let existing = existing_discovery_secrets(catalog, store)?;
             Ok(ControlResult::Discovery(discovery.plan(&existing)))
         }
-        ControlCommand::DiscoverApply { path, files } => apply_discovery(
+        ControlCommand::DiscoverApply { path, files, separate_entries } => apply_discovery(
             catalog,
             store.ok_or(DispatchError::StoreUnavailable)?,
             mount_path.ok_or(DispatchError::StoreUnavailable)?,
             &path,
             files.as_deref(),
+            &separate_entries,
         ),
         ControlCommand::SshAgentDiscover { endpoint } => {
             if !endpoint.is_absolute() {
@@ -784,6 +785,7 @@ fn apply_discovery(
     mount_path: &Path,
     path: &Path,
     selected_files: Option<&[PathBuf]>,
+    separate_entries: &[crate::protocol::DiscoveryEntryRef],
 ) -> Result<ControlResult, DispatchError> {
     let discovery =
         discover(path).map_err(|error| DispatchError::Validation(error.to_string()))?;
@@ -808,6 +810,33 @@ fn apply_discovery(
                     .join(", ")
             )));
         }
+    }
+    let valid_separate_entries = contents
+        .iter()
+        .filter(|file| {
+            matches!(
+                file.kind,
+                DiscoveredFileKind::Dotenv | DiscoveredFileKind::Direnv
+            )
+        })
+        .flat_map(|file| {
+            file.entries
+                .iter()
+                .map(|entry| (file.path.clone(), entry.address.clone()))
+        })
+        .collect::<HashSet<_>>();
+    let separate_entries = separate_entries
+        .iter()
+        .map(|entry| (entry.path.clone(), entry.address.clone()))
+        .collect::<HashSet<_>>();
+    if let Some((path, address)) = separate_entries
+        .iter()
+        .find(|entry| !valid_separate_entries.contains(*entry))
+    {
+        return Err(DispatchError::Validation(format!(
+            "separate-secret choice was not part of the reviewed discovery: {} ({address})",
+            path.display()
+        )));
     }
     let needs_project = contents
         .iter()
@@ -887,7 +916,7 @@ fn apply_discovery(
                     });
                     Ok(false)
                 }
-            DiscoveredFileAction::Compose => {
+                DiscoveredFileAction::Compose => {
                     let Some(project_id) = project_id.as_deref() else {
                         return Err(DispatchError::Validation(
                             "discovery composition requires a project".to_string(),
@@ -898,7 +927,10 @@ fn apply_discovery(
                         store,
                         mount_path,
                         project_id,
-                        &mut existing,
+                        DiscoveryReuseState {
+                            existing: &mut existing,
+                            separate_entries: &separate_entries,
+                        },
                         &mut result,
                         file,
                     )
@@ -936,12 +968,17 @@ fn apply_discovery(
     Ok(ControlResult::DiscoveryApplied(result))
 }
 
+struct DiscoveryReuseState<'a> {
+    existing: &'a mut Vec<ExistingSecret>,
+    separate_entries: &'a HashSet<(PathBuf, String)>,
+}
+
 fn apply_composed_discovery(
     catalog: &Catalog,
     store: &dyn SecretStore,
     mount_path: &Path,
     project_id: &str,
-    existing: &mut Vec<ExistingSecret>,
+    reuse: DiscoveryReuseState<'_>,
     result: &mut DiscoveryApplyResult,
     file: DiscoveredContent,
 ) -> Result<bool, DispatchError> {
@@ -966,10 +1003,17 @@ fn apply_composed_discovery(
     match file.kind {
         DiscoveredFileKind::Dotenv | DiscoveredFileKind::Direnv => {
             for (position, entry) in file.entries.iter().enumerate() {
-                let resource_id = if let Some(candidate) = existing.iter().find(|candidate| {
-                    candidate.key == entry.key
-                        && candidate.value.as_slice() == entry.value.as_bytes()
-                }) {
+                let force_separate =
+                    reuse
+                        .separate_entries
+                        .contains(&(file.path.clone(), entry.address.clone()));
+                let reusable = (!force_separate).then(|| {
+                    reuse.existing.iter().find(|candidate| {
+                        candidate.key == entry.key
+                            && candidate.value.as_slice() == entry.value.as_bytes()
+                    })
+                });
+                let resource_id = if let Some(candidate) = reusable.flatten() {
                     result.reused_resources += 1;
                     candidate.resource_id.clone()
                 } else {
@@ -987,11 +1031,14 @@ fn apply_composed_discovery(
                         },
                     )?;
                     mutation.created_resources.push(resource_id.clone());
-                    existing.push(ExistingSecret {
-                        resource_id: resource_id.clone(),
-                        key: entry.key.clone(),
-                        value: zeroize::Zeroizing::new(entry.value.as_bytes().to_vec()),
-                    });
+                    if !force_separate {
+                        reuse.existing.push(ExistingSecret {
+                            resource_id: resource_id.clone(),
+                            name: entry.key.clone(),
+                            key: entry.key.clone(),
+                            value: zeroize::Zeroizing::new(entry.value.as_bytes().to_vec()),
+                        });
+                    }
                     result.created_resources += 1;
                     resource_id
                 };
@@ -1309,7 +1356,12 @@ fn existing_discovery_secrets(
                 continue;
             }
         };
-        existing.push(ExistingSecret { resource_id: resource.id, key, value });
+        existing.push(ExistingSecret {
+            resource_id: resource.id,
+            name: resource.name,
+            key,
+            value,
+        });
     }
     Ok(existing)
 }
@@ -2544,7 +2596,10 @@ mod tests {
         assert_eq!(plan.summary.new_secrets, 1);
         assert!(matches!(
             plan.files[0].entries[0].action,
-            accessfs_discover::DiscoveredEntryAction::ReuseSharedSecret { ref resource_id }
+            accessfs_discover::DiscoveredEntryAction::ReuseSharedSecret {
+                ref resource_id,
+                ..
+            }
                 if resource_id == "fixture-shared-api-token"
         ));
     }
@@ -2575,6 +2630,7 @@ mod tests {
             ControlCommand::DiscoverApply {
                 path: project_path.clone(),
                 files: Some(vec![source_path.clone()]),
+                separate_entries: Vec::new(),
             },
         )
         .unwrap();
@@ -2633,6 +2689,7 @@ mod tests {
             ControlCommand::DiscoverApply {
                 path: project_path,
                 files: Some(vec![production_path.clone()]),
+                separate_entries: Vec::new(),
             },
         )
         .unwrap();
@@ -2650,6 +2707,105 @@ mod tests {
         let snapshot = catalog.snapshot().unwrap();
         assert_eq!(snapshot.surfaces.len(), 1);
         assert_eq!(snapshot.environments[0].name, "Production");
+    }
+
+    #[test]
+    fn discovery_apply_shares_exact_matches_within_the_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("fixture-project");
+        let development_path = project_path.join(".env");
+        let production_path = project_path.join(".env.production");
+        let mount_path = dir.path().join("mount");
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
+        std::fs::create_dir_all(mount_path.join(accessfs_core::config::SURFACES_DIR)).unwrap();
+        std::fs::write(
+            &development_path,
+            "DISCOVERED_TOKEN=fixture-shared-value\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &production_path,
+            "DISCOVERED_TOKEN=fixture-shared-value\n",
+        )
+        .unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let store = FixtureStore::new();
+
+        let applied = dispatch(
+            &catalog,
+            DispatchServices {
+                store: Some(&store),
+                mount_path: Some(&mount_path),
+                ..DispatchServices::default()
+            },
+            ControlCommand::DiscoverApply {
+                path: project_path,
+                files: Some(vec![development_path, production_path]),
+                separate_entries: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let ControlResult::DiscoveryApplied(result) = applied else {
+            panic!("expected discovery apply result");
+        };
+        assert_eq!(result.created_resources, 1);
+        assert_eq!(result.reused_resources, 1);
+        let snapshot = catalog.snapshot().unwrap();
+        assert_eq!(snapshot.resources.len(), 1);
+        assert_eq!(snapshot.bindings.len(), 2);
+        assert_eq!(snapshot.surfaces.len(), 2);
+    }
+
+    #[test]
+    fn discovery_apply_can_keep_an_exact_match_as_a_separate_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("fixture-project");
+        let development_path = project_path.join(".env");
+        let production_path = project_path.join(".env.production");
+        let mount_path = dir.path().join("mount");
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
+        std::fs::create_dir_all(mount_path.join(accessfs_core::config::SURFACES_DIR)).unwrap();
+        std::fs::write(
+            &development_path,
+            "DISCOVERED_TOKEN=fixture-shared-value\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &production_path,
+            "DISCOVERED_TOKEN=fixture-shared-value\n",
+        )
+        .unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let store = FixtureStore::new();
+
+        let applied = dispatch(
+            &catalog,
+            DispatchServices {
+                store: Some(&store),
+                mount_path: Some(&mount_path),
+                ..DispatchServices::default()
+            },
+            ControlCommand::DiscoverApply {
+                path: project_path,
+                files: Some(vec![development_path, production_path.clone()]),
+                separate_entries: vec![crate::protocol::DiscoveryEntryRef {
+                    path: production_path,
+                    address: "keys/DISCOVERED_TOKEN".to_string(),
+                }],
+            },
+        )
+        .unwrap();
+
+        let ControlResult::DiscoveryApplied(result) = applied else {
+            panic!("expected discovery apply result");
+        };
+        assert_eq!(result.created_resources, 2);
+        assert_eq!(result.reused_resources, 0);
+        let snapshot = catalog.snapshot().unwrap();
+        assert_eq!(snapshot.resources.len(), 2);
+        assert_eq!(snapshot.bindings.len(), 2);
+        assert_eq!(snapshot.surfaces.len(), 2);
     }
 
     #[test]
@@ -2674,6 +2830,7 @@ mod tests {
             ControlCommand::DiscoverApply {
                 path: project_path.clone(),
                 files: Some(vec![project_path.join(".env.not-reviewed")]),
+                separate_entries: Vec::new(),
             },
         )
         .unwrap_err();
@@ -2714,6 +2871,7 @@ mod tests {
             ControlCommand::DiscoverApply {
                 path: project_path,
                 files: Some(vec![dotenv_path.clone(), ssh_path.clone()]),
+                separate_entries: Vec::new(),
             },
         )
         .unwrap();
@@ -2767,6 +2925,7 @@ mod tests {
             ControlCommand::DiscoverApply {
                 path: project_path,
                 files: Some(vec![source_path.clone()]),
+                separate_entries: Vec::new(),
             },
         )
         .unwrap();

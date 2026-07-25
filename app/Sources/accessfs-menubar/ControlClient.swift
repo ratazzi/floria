@@ -59,9 +59,13 @@ final class ControlClient: @unchecked Sendable {
         return plan
     }
 
-    func applyDiscovery(path: String, files: [String]) async throws -> DiscoveryApplyResult {
+    func applyDiscovery(
+        path: String, files: [String], separateEntries: [DiscoverySeparateEntry]
+    ) async throws -> DiscoveryApplyResult {
         guard let result: DiscoveryApplyResult = try await request(
-            .discoverApply(path: path, files: files), expecting: "discovery_applied",
+            .discoverApply(
+                path: path, files: files, separateEntries: separateEntries),
+            expecting: "discovery_applied",
             as: DiscoveryApplyResult.self)
         else {
             throw ControlClientError.missingResult("discovery_applied")

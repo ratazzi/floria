@@ -103,8 +103,16 @@ pub struct DiscoveredEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DiscoveredEntryAction {
-    CreateSharedSecret,
-    ReuseSharedSecret { resource_id: String },
+    CreateSharedSecret {
+        group_id: String,
+    },
+    ReuseSharedSecret {
+        resource_id: String,
+        resource_name: String,
+    },
+    ReuseDiscoveredSecret {
+        group_id: String,
+    },
     CreateEnvFileEntry,
     KeepInProtectedFile,
 }
@@ -118,6 +126,7 @@ pub struct DiscoveryWarning {
 /// Existing scalar resource used only for exact, in-memory reuse matching.
 pub struct ExistingSecret {
     pub resource_id: String,
+    pub name: String,
     pub key: String,
     pub value: Zeroizing<Vec<u8>>,
 }
@@ -224,59 +233,66 @@ impl Discovery {
     pub fn plan(&self, existing: &[ExistingSecret]) -> DiscoveryPlan {
         let mut reused_secrets = 0;
         let mut new_secrets = 0;
-        let files = self
-            .files
-            .iter()
-            .map(|file| {
-                let entries = file
-                    .entries
-                    .iter()
-                    .map(|entry| {
-                        let action = match file.entry_disposition {
-                            EntryDisposition::SharedSecret => existing
-                                .iter()
-                                .find(|candidate| {
-                                    candidate.key == entry.key
-                                        && candidate.value.as_slice() == entry.value.as_bytes()
-                                })
-                                .map(|candidate| {
-                                    reused_secrets += 1;
-                                    DiscoveredEntryAction::ReuseSharedSecret {
-                                        resource_id: candidate.resource_id.clone(),
-                                    }
-                                })
-                                .unwrap_or_else(|| {
-                                    new_secrets += 1;
-                                    DiscoveredEntryAction::CreateSharedSecret
-                                }),
-                            EntryDisposition::EnvFile => {
-                                DiscoveredEntryAction::CreateEnvFileEntry
+        let mut discovered_groups = Vec::<(&str, &[u8], String)>::new();
+        let mut files = Vec::with_capacity(self.files.len());
+        for file in &self.files {
+            let mut entries = Vec::with_capacity(file.entries.len());
+            for entry in &file.entries {
+                let action = match file.entry_disposition {
+                    EntryDisposition::SharedSecret => {
+                        if let Some(candidate) = existing.iter().find(|candidate| {
+                            candidate.key == entry.key
+                                && candidate.value.as_slice() == entry.value.as_bytes()
+                        }) {
+                            reused_secrets += 1;
+                            DiscoveredEntryAction::ReuseSharedSecret {
+                                resource_id: candidate.resource_id.clone(),
+                                resource_name: candidate.name.clone(),
                             }
-                            EntryDisposition::ProtectedFile => {
-                                DiscoveredEntryAction::KeepInProtectedFile
+                        } else if let Some((_, _, group_id)) =
+                            discovered_groups.iter().find(|(key, value, _)| {
+                                *key == entry.key && *value == entry.value.as_bytes()
+                            })
+                        {
+                            reused_secrets += 1;
+                            DiscoveredEntryAction::ReuseDiscoveredSecret {
+                                group_id: group_id.clone(),
                             }
-                        };
-                        DiscoveredEntry {
-                            address: entry.address.clone(),
-                            key: entry.key.clone(),
-                            section: entry.section.clone(),
-                            action,
+                        } else {
+                            new_secrets += 1;
+                            let group_id = format!("discovered-{new_secrets}");
+                            discovered_groups.push((
+                                entry.key.as_str(),
+                                entry.value.as_bytes(),
+                                group_id.clone(),
+                            ));
+                            DiscoveredEntryAction::CreateSharedSecret { group_id }
                         }
-                    })
-                    .collect();
-                DiscoveredFile {
-                    path: file.path.clone(),
-                    relative_path: file.relative_path.clone(),
-                    kind: file.kind,
-                    codec: file.codec,
-                    environment: file.environment.clone(),
-                    tags: file.tags.clone(),
-                    entries,
-                    warnings: file.warnings.clone(),
-                    action: file.action,
-                }
-            })
-            .collect::<Vec<_>>();
+                    }
+                    EntryDisposition::EnvFile => DiscoveredEntryAction::CreateEnvFileEntry,
+                    EntryDisposition::ProtectedFile => {
+                        DiscoveredEntryAction::KeepInProtectedFile
+                    }
+                };
+                entries.push(DiscoveredEntry {
+                    address: entry.address.clone(),
+                    key: entry.key.clone(),
+                    section: entry.section.clone(),
+                    action,
+                });
+            }
+            files.push(DiscoveredFile {
+                path: file.path.clone(),
+                relative_path: file.relative_path.clone(),
+                kind: file.kind,
+                codec: file.codec,
+                environment: file.environment.clone(),
+                tags: file.tags.clone(),
+                entries,
+                warnings: file.warnings.clone(),
+                action: file.action,
+            });
+        }
         let entries = files.iter().map(|file| file.entries.len()).sum();
         let warnings = files.iter().map(|file| file.warnings.len()).sum();
 
@@ -799,6 +815,7 @@ mod tests {
         let discovery = discover(&file).unwrap();
         let existing = [ExistingSecret {
             resource_id: "shared-api-token".to_string(),
+            name: "Shared API token".to_string(),
             key: "API_TOKEN".to_string(),
             value: Zeroizing::new(b"fixture-shared-value".to_vec()),
         }];
@@ -811,9 +828,40 @@ mod tests {
         assert_eq!(
             plan.files[0].entries[0].action,
             DiscoveredEntryAction::ReuseSharedSecret {
-                resource_id: "shared-api-token".to_string()
+                resource_id: "shared-api-token".to_string(),
+                resource_name: "Shared API token".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn repeated_values_in_one_discovery_share_a_redacted_candidate_group() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        fs::write(root.join(".env"), "API_TOKEN=fixture-shared-value\n").unwrap();
+        fs::write(
+            root.join(".env.production"),
+            "API_TOKEN=fixture-shared-value\n",
+        )
+        .unwrap();
+
+        let plan = discover(root).unwrap().plan(&[]);
+
+        assert_eq!(plan.summary.new_secrets, 1);
+        assert_eq!(plan.summary.reused_secrets, 1);
+        let first_action = &plan.files[0].entries[0].action;
+        let second_action = &plan.files[1].entries[0].action;
+        let DiscoveredEntryAction::CreateSharedSecret { group_id } = first_action else {
+            panic!("expected first entry to create the candidate group");
+        };
+        assert_eq!(
+            second_action,
+            &DiscoveredEntryAction::ReuseDiscoveredSecret {
+                group_id: group_id.clone()
+            }
+        );
+        let serialized = serde_json::to_string(&plan).unwrap();
+        assert!(!serialized.contains("fixture-shared-value"));
     }
 
     #[test]

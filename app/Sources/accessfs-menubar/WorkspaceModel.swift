@@ -783,11 +783,18 @@ final class WorkspaceStore {
         return plan
     }
 
-    func applyDiscovery(at path: String, files: [String]) async throws -> DiscoveryApplyResult {
+    func applyDiscovery(
+        at path: String, files: [String], separateEntries: [DiscoverySeparateEntry]
+    ) async throws -> DiscoveryApplyResult {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
         let result = try await controlClient.applyDiscovery(
             path: (path as NSString).standardizingPath,
-            files: files.map { ($0 as NSString).standardizingPath })
+            files: files.map { ($0 as NSString).standardizingPath },
+            separateEntries: separateEntries.map {
+                DiscoverySeparateEntry(
+                    path: ($0.path as NSString).standardizingPath,
+                    address: $0.address)
+            })
         apply(try await controlClient.snapshot(), selectingProject: result.projectID)
         protectedFiles = try await controlClient.protectedFiles().map(WorkspaceProtectedFile.init)
         lastError = nil

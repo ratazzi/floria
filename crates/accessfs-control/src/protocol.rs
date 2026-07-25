@@ -63,6 +63,7 @@ pub enum ControlCommand {
     DiscoverApply {
         path: PathBuf,
         files: Option<Vec<PathBuf>>,
+        separate_entries: Vec<DiscoveryEntryRef>,
     },
     SshAgentDiscover { endpoint: PathBuf },
     SshIdentityImport {
@@ -229,6 +230,12 @@ pub struct DiscoveryApplyResult {
     pub protected_files: usize,
     pub imported_ssh_identities: usize,
     pub files: Vec<DiscoveryAppliedFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DiscoveryEntryRef {
+    pub path: PathBuf,
+    pub address: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -425,6 +432,10 @@ mod tests {
             command: ControlCommand::DiscoverApply {
                 path: PathBuf::from("/fixture/project"),
                 files: Some(vec![PathBuf::from("/fixture/project/.env")]),
+                separate_entries: vec![DiscoveryEntryRef {
+                    path: PathBuf::from("/fixture/project/.env"),
+                    address: "keys/API_TOKEN".to_string(),
+                }],
             },
         };
         let value = serde_json::to_value(request).unwrap();
@@ -434,6 +445,13 @@ mod tests {
         assert_eq!(
             value["params"]["files"],
             serde_json::json!(["/fixture/project/.env"])
+        );
+        assert_eq!(
+            value["params"]["separate_entries"],
+            serde_json::json!([{
+                "path": "/fixture/project/.env",
+                "address": "keys/API_TOKEN"
+            }])
         );
     }
 

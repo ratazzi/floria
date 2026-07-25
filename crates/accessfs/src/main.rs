@@ -674,7 +674,11 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
             let path = std::fs::canonicalize(&path)
                 .with_context(|| format!("resolving discovery path {}", path.display()))?;
             if apply {
-                ControlCommand::DiscoverApply { path, files: None }
+                ControlCommand::DiscoverApply {
+                    path,
+                    files: None,
+                    separate_entries: Vec::new(),
+                }
             } else {
                 ControlCommand::Discover { path }
             }

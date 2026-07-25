@@ -101,9 +101,10 @@ struct DashboardView: View {
         .sheet(item: $discovery) { presentation in
             DiscoveryReviewSheet(
                 plan: presentation.plan,
-                apply: { files in
+                apply: { files, separateEntries in
                     try await state.workspace.applyDiscovery(
-                        at: presentation.plan.path, files: files)
+                        at: presentation.plan.path, files: files,
+                        separateEntries: separateEntries)
                 },
                 openProject: { projectID in
                     selectedProjectID = projectID
@@ -1330,16 +1331,18 @@ private struct CompactBindingRow: View {
 private struct DiscoveryReviewSheet: View {
     @Environment(\.dismiss) private var dismiss
     let plan: DiscoveryPlan
-    let apply: ([String]) async throws -> DiscoveryApplyResult
+    let apply: ([String], [DiscoverySeparateEntry]) async throws -> DiscoveryApplyResult
     let openProject: (String) -> Void
     @State private var isApplying = false
     @State private var appliedResult: DiscoveryApplyResult?
     @State private var applyError: String?
     @State private var selectedFilePaths: Set<String>
+    @State private var separateEntryIDs: Set<String> = []
 
     init(
         plan: DiscoveryPlan,
-        apply: @escaping ([String]) async throws -> DiscoveryApplyResult,
+        apply: @escaping ([String], [DiscoverySeparateEntry]) async throws
+            -> DiscoveryApplyResult,
         openProject: @escaping (String) -> Void
     ) {
         self.plan = plan
@@ -1375,8 +1378,8 @@ private struct DiscoveryReviewSheet: View {
                 VStack(alignment: .leading, spacing: 18) {
                     HStack(spacing: 10) {
                         SummaryMetric(value: plan.summary.files, label: "Files")
-                        SummaryMetric(value: plan.summary.newSecrets, label: "New")
-                        SummaryMetric(value: plan.summary.reusedSecrets, label: "Reused")
+                        SummaryMetric(value: selectedSecretSummary.new, label: "New")
+                        SummaryMetric(value: selectedSecretSummary.reused, label: "Reused")
                         SummaryMetric(value: plan.summary.warnings, label: "Warnings")
                     }
                     if let appliedResult {
@@ -1402,7 +1405,11 @@ private struct DiscoveryReviewSheet: View {
                                     }
                                 }),
                             result: appliedResult?.files.first { $0.path == file.path },
-                            locked: appliedResult != nil)
+                            locked: appliedResult != nil,
+                            separateEntryIDs: $separateEntryIDs,
+                            sharedGroupCounts: sharedGroupCounts,
+                            automaticGroupCounts: automaticGroupCounts,
+                            automaticGroupPrimaryEntryIDs: automaticGroupPrimaryEntryIDs)
                     }
                     if plan.files.isEmpty {
                         ContentUnavailableView(
@@ -1502,7 +1509,18 @@ private struct DiscoveryReviewSheet: View {
         Task {
             defer { isApplying = false }
             do {
-                appliedResult = try await apply(selectedFilePaths.sorted())
+                let selectedFiles = plan.files.filter {
+                    selectedFilePaths.contains($0.path)
+                }
+                let separateEntries = selectedFiles.flatMap { file in
+                    file.entries.compactMap { entry in
+                        separateEntryIDs.contains(entrySelectionID(file: file, entry: entry))
+                            ? DiscoverySeparateEntry(path: file.path, address: entry.address)
+                            : nil
+                    }
+                }
+                appliedResult = try await apply(
+                    selectedFilePaths.sorted(), separateEntries)
             } catch {
                 applyError = error.localizedDescription
             }
@@ -1519,6 +1537,68 @@ private struct DiscoveryReviewSheet: View {
         if skipped > 0 { parts.append("\(skipped) skipped") }
         if failed > 0 { parts.append("\(failed) failed") }
         return parts.joined(separator: ", ") + "."
+    }
+
+    private var sharedGroupCounts: [String: Int] {
+        plan.files
+            .flatMap(\.entries)
+            .compactMap(\.action.groupID)
+            .reduce(into: [:]) { counts, groupID in counts[groupID, default: 0] += 1 }
+    }
+
+    private var automaticGroupMembership: [String: [String]] {
+        var membership: [String: [String]] = [:]
+        for file in plan.files where selectedFilePaths.contains(file.path) {
+            for entry in file.entries {
+                let selectionID = entrySelectionID(file: file, entry: entry)
+                guard
+                    !separateEntryIDs.contains(selectionID),
+                    let groupID = entry.action.groupID
+                else { continue }
+                membership[groupID, default: []].append(selectionID)
+            }
+        }
+        return membership
+    }
+
+    private var automaticGroupCounts: [String: Int] {
+        automaticGroupMembership.mapValues(\.count)
+    }
+
+    private var automaticGroupPrimaryEntryIDs: Set<String> {
+        Set(automaticGroupMembership.values.compactMap(\.first))
+    }
+
+    private var selectedSecretSummary: (new: Int, reused: Int) {
+        var new = 0
+        var reused = 0
+        var seenGroups = Set<String>()
+        for file in plan.files where selectedFilePaths.contains(file.path) {
+            for entry in file.entries {
+                let selectionID = entrySelectionID(file: file, entry: entry)
+                if separateEntryIDs.contains(selectionID) {
+                    new += 1
+                    continue
+                }
+                switch entry.action.type {
+                case "reuse_shared_secret":
+                    reused += 1
+                case "create_shared_secret", "reuse_discovered_secret":
+                    guard let groupID = entry.action.groupID else {
+                        new += 1
+                        continue
+                    }
+                    if seenGroups.insert(groupID).inserted {
+                        new += 1
+                    } else {
+                        reused += 1
+                    }
+                default:
+                    break
+                }
+            }
+        }
+        return (new, reused)
     }
 }
 
@@ -1543,6 +1623,10 @@ private struct DiscoveryFileCard: View {
     @Binding var selected: Bool
     let result: DiscoveryAppliedFile?
     let locked: Bool
+    @Binding var separateEntryIDs: Set<String>
+    let sharedGroupCounts: [String: Int]
+    let automaticGroupCounts: [String: Int]
+    let automaticGroupPrimaryEntryIDs: Set<String>
 
     var body: some View {
         VStack(alignment: .leading, spacing: 11) {
@@ -1575,12 +1659,7 @@ private struct DiscoveryFileCard: View {
                             Text(entry.section.map { "[\($0)] \(entry.key)" } ?? entry.key)
                                 .font(.caption.monospaced())
                             Spacer()
-                            Text(
-                                entryActionTitle(entry.action.type))
-                                .font(.caption)
-                                .foregroundStyle(
-                                    entry.action.type == "reuse_shared_secret"
-                                        ? Color.green : Color.secondary)
+                            entryAction(entry)
                         }
                     }
                 }
@@ -1672,6 +1751,86 @@ private struct DiscoveryFileCard: View {
         }
     }
 
+    @ViewBuilder
+    private func entryAction(_ entry: DiscoveredEntry) -> some View {
+        let selectionID = entrySelectionID(file: file, entry: entry)
+        let isSeparate = separateEntryIDs.contains(selectionID)
+        if supportsIsolationChoice(entry) {
+            Menu {
+                Button {
+                    separateEntryIDs.remove(selectionID)
+                } label: {
+                    if isSeparate {
+                        Text(automaticEntryActionTitle(entry, selectionID: selectionID))
+                    } else {
+                        Label(
+                            automaticEntryActionTitle(entry, selectionID: selectionID),
+                            systemImage: "checkmark")
+                    }
+                }
+                Button {
+                    separateEntryIDs.insert(selectionID)
+                } label: {
+                    if isSeparate {
+                        Label("Create separate secret", systemImage: "checkmark")
+                    } else {
+                        Text("Create separate secret")
+                    }
+                }
+            } label: {
+                HStack(spacing: 3) {
+                    Text(
+                        isSeparate
+                            ? "Separate"
+                            : automaticEntryActionTitle(entry, selectionID: selectionID))
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 8, weight: .semibold))
+                }
+                .font(.caption)
+                .foregroundStyle(isSeparate ? Color.orange : Color.green)
+                .frame(maxWidth: 220, alignment: .trailing)
+            }
+            .menuStyle(.borderlessButton)
+            .disabled(locked || !selected || !file.canApplyDiscovery)
+        } else {
+            Text(automaticEntryActionTitle(entry, selectionID: selectionID))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func supportsIsolationChoice(_ entry: DiscoveredEntry) -> Bool {
+        switch entry.action.type {
+        case "reuse_shared_secret", "reuse_discovered_secret":
+            true
+        case "create_shared_secret":
+            entry.action.groupID.map { sharedGroupCounts[$0, default: 0] > 1 } ?? false
+        default:
+            false
+        }
+    }
+
+    private func automaticEntryActionTitle(
+        _ entry: DiscoveredEntry, selectionID: String
+    ) -> String {
+        switch entry.action.type {
+        case "reuse_shared_secret":
+            return entry.action.resourceName.map { "Reuse \($0)" } ?? "Reuse existing"
+        case "create_shared_secret", "reuse_discovered_secret":
+            guard
+                let groupID = entry.action.groupID,
+                automaticGroupCounts[groupID, default: 0] > 1
+            else { return "New secret" }
+            return automaticGroupPrimaryEntryIDs.contains(selectionID)
+                ? "New shared secret"
+                : "Share in import"
+        default:
+            return entryActionTitle(entry.action.type)
+        }
+    }
+
     private var icon: String {
         switch file.kind {
         case .dotenv: "doc.text"
@@ -1690,6 +1849,10 @@ private struct DiscoveryFileCard: View {
         case .review: .secondary
         }
     }
+}
+
+private func entrySelectionID(file: DiscoveredFile, entry: DiscoveredEntry) -> String {
+    "\(file.path)\u{1f}\(entry.address)"
 }
 
 private extension DiscoveredFile {
