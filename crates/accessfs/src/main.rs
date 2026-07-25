@@ -18,10 +18,13 @@ use accessfs_control::{
 };
 use accessfs_core::audit::AuditLog;
 use accessfs_core::authz::{Authorizer, Enforcement, PolicyMode, PolicyModeStatus};
-use accessfs_core::config::{Config, ResolvedConfig, SECRETS_DIR, SURFACES_DIR};
+use accessfs_core::config::{Config, ResolvedConfig, StoreKeySource, SECRETS_DIR, SURFACES_DIR};
 use accessfs_discover::{GitCheckoutMonitor, MonitoredGitProject};
 use accessfs_platform::{CodeSignedPeerVerifier, SocketPeerVerifier};
-use accessfs_store::{AgeDirStore, NewSecret, SecretId, SecretRecord, SecretStore, SshKeyProvider};
+use accessfs_store::{
+    AgeDirStore, KeychainKeyProvider, NewSecret, SecretId, SecretRecord, SecretStore,
+    SshKeyProvider,
+};
 use accessfs_surface::{
     ensure_file_surface_link, file_surface_instances, remove_file_surface_link,
     validate_secret_bytes, SurfaceLinkRemoval, SurfaceLinkState, SurfaceRegistry,
@@ -117,6 +120,25 @@ enum Cmd {
         #[arg(short, long, default_value = "accessfs.toml")]
         config: PathBuf,
     },
+    /// Manage the store's decryption key.
+    Keys {
+        #[command(subcommand)]
+        command: KeysCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeysCmd {
+    /// Copy the store's ssh private key into the login Keychain (decrypted; passphrase from
+    /// FLORIA_KEY_PASSPHRASE if the key is protected). With the file gone, `key_source = "auto"`
+    /// reads the Keychain instead.
+    Import {
+        /// Delete the on-disk private key file after a successful import and verification.
+        #[arg(long)]
+        remove_file: bool,
+        #[arg(short, long, default_value = "accessfs.toml")]
+        config: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -185,19 +207,92 @@ fn main() -> Result<()> {
         Cmd::Rollback { target, version, config } => cmd_rollback(&target, version, &config),
         Cmd::List { config } => cmd_list(&config),
         Cmd::Control { command, socket, config } => cmd_control(command, socket, &config),
+        Cmd::Keys { command } => match command {
+            KeysCmd::Import { remove_file, config } => cmd_keys_import(remove_file, &config),
+        },
+    }
+}
+
+/// Pick the store's key provider from config. `auto` prefers the on-disk ssh key (dev: zero
+/// Keychain interaction) and falls back to the Keychain when the file is absent (after
+/// `keys import --remove-file`). Both sources hold the same key, so blobs stay interchangeable.
+fn store_key_provider(cfg: &ResolvedConfig) -> (Arc<dyn accessfs_store::KeyProvider>, &'static str) {
+    let ssh = || -> Arc<dyn accessfs_store::KeyProvider> {
+        let passphrase = std::env::var("FLORIA_KEY_PASSPHRASE")
+            .ok()
+            .map(zeroize::Zeroizing::new);
+        Arc::new(SshKeyProvider::new(cfg.store_ssh_key.clone(), passphrase))
+    };
+    match cfg.store_key_source {
+        StoreKeySource::Ssh => (ssh(), "ssh"),
+        StoreKeySource::Keychain => (Arc::new(KeychainKeyProvider), "keychain"),
+        StoreKeySource::Auto => {
+            if cfg.store_ssh_key.exists() {
+                (ssh(), "auto: ssh file")
+            } else {
+                (Arc::new(KeychainKeyProvider), "auto: keychain")
+            }
+        }
     }
 }
 
 /// Open the secret store from config. The private key passphrase, if any, comes from
 /// `FLORIA_KEY_PASSPHRASE` (dev convenience; interactive/Touch ID unlock is a later milestone).
 fn open_store(cfg: &ResolvedConfig) -> Result<AgeDirStore> {
-    let passphrase = std::env::var("FLORIA_KEY_PASSPHRASE")
-        .ok()
-        .map(zeroize::Zeroizing::new);
-    let keys = Arc::new(SshKeyProvider::new(cfg.store_ssh_key.clone(), passphrase));
+    let (keys, source) = store_key_provider(cfg);
+    tracing::info!(source, "store key source");
     let store = AgeDirStore::open(cfg.store_root.clone(), keys)
         .with_context(|| format!("opening store at {}", cfg.store_root.display()))?;
     Ok(store)
+}
+
+fn cmd_keys_import(remove_file: bool, config: &Path) -> Result<()> {
+    let cfg = load(config)?;
+    let key_path = &cfg.store_ssh_key;
+    let data = std::fs::read(key_path)
+        .with_context(|| format!("reading ssh private key {}", key_path.display()))?;
+    let key = ssh_key::PrivateKey::from_openssh(&data[..])
+        .with_context(|| format!("parsing ssh private key {}", key_path.display()))?;
+    let key = if key.is_encrypted() {
+        let passphrase = std::env::var("FLORIA_KEY_PASSPHRASE").context(
+            "the key is passphrase-protected; set FLORIA_KEY_PASSPHRASE for the import",
+        )?;
+        let passphrase = zeroize::Zeroizing::new(passphrase);
+        key.decrypt(passphrase.as_bytes())
+            .context("decrypting ssh private key (wrong FLORIA_KEY_PASSPHRASE?)")?
+    } else {
+        key
+    };
+    let decrypted = key
+        .to_openssh(ssh_key::LineEnding::LF)
+        .context("re-encoding decrypted ssh private key")?;
+    KeychainKeyProvider::import(decrypted.as_bytes())?;
+
+    // Verify the roundtrip end to end before touching the file: the Keychain copy must decrypt
+    // exactly like the file-based provider encrypts.
+    let provider = KeychainKeyProvider;
+    accessfs_store::KeyProvider::identity(&provider)?;
+    accessfs_store::KeyProvider::recipients(&provider)?;
+    println!(
+        "imported {} into the login Keychain ({}/{})",
+        key_path.display(),
+        accessfs_store::KEYCHAIN_SERVICE,
+        accessfs_store::KEYCHAIN_ACCOUNT
+    );
+
+    if remove_file {
+        std::fs::remove_file(key_path)
+            .with_context(|| format!("removing {}", key_path.display()))?;
+        println!(
+            "removed {}; key_source = \"auto\" now reads the Keychain",
+            key_path.display()
+        );
+    } else {
+        println!(
+            "the on-disk key is kept; \"auto\" keeps preferring it until the file is removed"
+        );
+    }
+    Ok(())
 }
 
 fn cmd_protect(path: &Path, link: bool, remove: bool, force: bool, config: &Path) -> Result<()> {
@@ -1064,6 +1159,19 @@ fn cmd_doctor(config: &Path) -> Result<()> {
                 &format!("parent directory of {} does not exist", cfg.mount_path.display()),
             );
             ok &= mp_ok;
+
+            let (provider, key_source) = store_key_provider(&cfg);
+            match provider.recipients() {
+                Ok(_) => report(&format!("store key source ({key_source})"), true, ""),
+                Err(error) => {
+                    report(
+                        &format!("store key source ({key_source})"),
+                        false,
+                        &error.to_string(),
+                    );
+                    ok = false;
+                }
+            }
 
             match (support_dir(&cfg), exact_mount(&cfg.mount_path)) {
                 (Ok(support_dir), Ok(mount)) => {

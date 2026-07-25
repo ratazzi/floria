@@ -76,6 +76,19 @@ pub struct StoreCfg {
     pub root: Option<PathBuf>,
     /// SSH private key used as the age identity. Defaults to `~/.ssh/id_ed25519`.
     pub ssh_key: Option<PathBuf>,
+    /// Where the decryption key comes from: `auto` (ssh file if present, else Keychain),
+    /// `ssh`, or `keychain`. Defaults to `auto`.
+    pub key_source: Option<String>,
+}
+
+/// Source of the store's decryption key. `Auto` keys off the ssh private key file's presence:
+/// a dev machine keeps the file and never touches the Keychain; removing the file (after
+/// `keys import`) flips the machine to Keychain without a config edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreKeySource {
+    Auto,
+    Ssh,
+    Keychain,
 }
 
 #[derive(Debug, Deserialize)]
@@ -108,6 +121,8 @@ pub struct ResolvedConfig {
     pub store_root: PathBuf,
     /// SSH private key used as the store's age identity.
     pub store_ssh_key: PathBuf,
+    /// Where the store's decryption key comes from.
+    pub store_key_source: StoreKeySource,
     pub files: Vec<FileEntry>,
     /// Policy rules, evaluated first-match by priority. Synthesized from `[[rule]]` blocks,
     /// per-file `enforcement`, and a trailing catch-all default.
@@ -165,7 +180,8 @@ impl Config {
             .map(|p| expand_tilde(&p))
             .unwrap_or_else(default_agent_socket);
 
-        let store = self.store.unwrap_or(StoreCfg { root: None, ssh_key: None });
+        let store =
+            self.store.unwrap_or(StoreCfg { root: None, ssh_key: None, key_source: None });
         let store_root = store
             .root
             .map(|p| expand_tilde(&p))
@@ -174,6 +190,16 @@ impl Config {
             .ssh_key
             .map(|p| expand_tilde(&p))
             .unwrap_or_else(default_ssh_key);
+        let store_key_source = match store.key_source.as_deref() {
+            None | Some("auto") => StoreKeySource::Auto,
+            Some("ssh") => StoreKeySource::Ssh,
+            Some("keychain") => StoreKeySource::Keychain,
+            Some(other) => {
+                return Err(CoreError::config(format!(
+                    "store.key_source must be \"auto\", \"ssh\", or \"keychain\", got {other:?}"
+                )))
+            }
+        };
 
         let mut files = Vec::with_capacity(self.files.len());
         let mut seen = std::collections::HashSet::new();
@@ -197,6 +223,7 @@ impl Config {
             agent_socket,
             store_root,
             store_ssh_key,
+            store_key_source,
             files,
             rules,
         })
@@ -517,6 +544,31 @@ mod tests {
             normalize_virtual_path("env/demo/dev.env").unwrap(),
             vec!["env", "demo", "dev.env"]
         );
+    }
+
+    #[test]
+    fn parses_store_key_source() {
+        let resolve = |body: &str| {
+            toml::from_str::<Config>(&format!(
+                "[mount]\npath = \"/tmp/fixture-mount\"\n{body}"
+            ))
+            .unwrap()
+            .resolve(Path::new("/tmp"))
+        };
+        assert_eq!(resolve("").unwrap().store_key_source, StoreKeySource::Auto);
+        assert_eq!(
+            resolve("[store]\nkey_source = \"auto\"").unwrap().store_key_source,
+            StoreKeySource::Auto
+        );
+        assert_eq!(
+            resolve("[store]\nkey_source = \"ssh\"").unwrap().store_key_source,
+            StoreKeySource::Ssh
+        );
+        assert_eq!(
+            resolve("[store]\nkey_source = \"keychain\"").unwrap().store_key_source,
+            StoreKeySource::Keychain
+        );
+        assert!(resolve("[store]\nkey_source = \"vault\"").is_err());
     }
 
     #[test]

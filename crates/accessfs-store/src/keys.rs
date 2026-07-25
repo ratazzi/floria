@@ -81,6 +81,89 @@ impl KeyProvider for SshKeyProvider {
     }
 }
 
+/// Keychain item coordinates for the store's decryption key. One fixed generic-password item in
+/// the user's login keychain holds the *decrypted* OpenSSH ed25519 private key, written by
+/// `accessfs keys import`. Reading it needs no passphrase or KDF; macOS gates access per binary
+/// signature instead.
+pub const KEYCHAIN_SERVICE: &str = "dev.floria.hola.ac.store";
+pub const KEYCHAIN_ACCOUNT: &str = "store-ssh-key";
+
+/// Decrypt with the OpenSSH key held in the macOS login Keychain.
+///
+/// Unlike [`SshKeyProvider`] there is no on-disk private key and no passphrase: `keys import`
+/// stores the key already decrypted, and both recipients and identity are derived from that one
+/// Keychain item (the `.pub` file is not consulted).
+pub struct KeychainKeyProvider;
+
+impl KeychainKeyProvider {
+    fn read_key() -> StoreResult<Zeroizing<Vec<u8>>> {
+        security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+            .map(Zeroizing::new)
+            .map_err(|e| {
+                StoreError::Key(format!(
+                    "read Keychain item {KEYCHAIN_SERVICE}/{KEYCHAIN_ACCOUNT}: {e} \
+                     (run `accessfs keys import` to store the key)"
+                ))
+            })
+    }
+
+    /// Whether the Keychain item exists (without exporting its data where possible).
+    pub fn item_exists() -> bool {
+        security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+            .is_ok()
+    }
+
+    /// Store `private_key` (a *decrypted* OpenSSH private key) in the Keychain, replacing any
+    /// previous item. Verifies the material parses as a supported age ssh identity first.
+    pub fn import(private_key: &[u8]) -> StoreResult<()> {
+        parse_identity(private_key, "keychain import")?;
+        security_framework::passwords::set_generic_password(
+            KEYCHAIN_SERVICE,
+            KEYCHAIN_ACCOUNT,
+            private_key,
+        )
+        .map_err(|e| {
+            StoreError::Key(format!(
+                "write Keychain item {KEYCHAIN_SERVICE}/{KEYCHAIN_ACCOUNT}: {e}"
+            ))
+        })
+    }
+}
+
+impl KeyProvider for KeychainKeyProvider {
+    fn recipients(&self) -> StoreResult<Vec<Box<dyn age::Recipient + Send>>> {
+        let data = Self::read_key()?;
+        let key = ssh_key::PrivateKey::from_openssh(&data[..])
+            .map_err(|e| StoreError::Key(format!("parse Keychain ssh private key: {e}")))?;
+        let public = key
+            .public_key()
+            .to_openssh()
+            .map_err(|e| StoreError::Key(format!("derive ssh public key: {e}")))?;
+        let recipient = age::ssh::Recipient::from_str(public.trim())
+            .map_err(|e| StoreError::Key(format!("parse derived ssh public key: {e:?}")))?;
+        Ok(vec![Box::new(recipient)])
+    }
+
+    fn identity(&self) -> StoreResult<Box<dyn age::Identity>> {
+        let data = Self::read_key()?;
+        parse_identity(&data, "keychain")
+    }
+}
+
+fn parse_identity(data: &[u8], context: &str) -> StoreResult<Box<dyn age::Identity>> {
+    let identity = age::ssh::Identity::from_buffer(BufReader::new(data), Some(context.to_string()))
+        .map_err(|e| StoreError::Key(format!("parse ssh private key ({context}): {e:?}")))?;
+    match &identity {
+        age::ssh::Identity::Unsupported(kind) => {
+            Err(StoreError::Key(format!("unsupported ssh key ({context}): {kind:?}")))
+        }
+        age::ssh::Identity::Encrypted(_) => Err(StoreError::Key(format!(
+            "ssh key is still passphrase-protected ({context}); import stores it decrypted"
+        ))),
+        _ => Ok(Box::new(identity)),
+    }
+}
+
 /// Non-interactive callbacks that answer the private key's passphrase prompt from a preset value.
 #[derive(Clone)]
 struct PassCallbacks(Zeroizing<String>);
