@@ -3,13 +3,13 @@
 //! This crate owns private-key parsing, canonicalization, public identity derivation, and raw SSH
 //! signature encoding. Catalog, control, and agent callers never depend on a concrete key library.
 
-use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use base64::Engine;
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs8::DecodePrivateKey;
 use sha2::{Digest, Sha256, Sha512};
-use signature::{SignatureEncoding, Signer};
-use ssh_key::{Algorithm, HashAlg, LineEnding, PrivateKey, Signature};
+use signature::{SignatureEncoding, Signer, Verifier};
+use ssh_key::{Algorithm, Certificate, HashAlg, LineEnding, PrivateKey, PublicKey, Signature};
 use zeroize::Zeroizing;
 
 #[derive(Debug, thiserror::Error)]
@@ -28,6 +28,8 @@ pub enum ManagedKeyError {
     UnsupportedFlags(u32),
     #[error("SSH signing failed")]
     SigningFailed,
+    #[error("invalid SSH public-key signature: {0}")]
+    InvalidPublicSignature(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,11 +98,49 @@ pub fn sign(
     Ok(encoded)
 }
 
+/// Verify an RFC4253 signature blob against an SSH public-key blob. OpenSSH uses this to prove
+/// that a `session-bind@openssh.com` request came from the host that completed the key exchange.
+/// Certificate host keys are verified with the public key embedded in the certificate.
+pub fn verify_public_signature(
+    key_blob: &[u8],
+    message: &[u8],
+    signature_blob: &[u8],
+) -> Result<(), ManagedKeyError> {
+    let signature = Signature::try_from(signature_blob)
+        .map_err(|error| ManagedKeyError::InvalidPublicSignature(error.to_string()))?;
+    let algorithm = ssh_algorithm_name(key_blob)?;
+    if algorithm.ends_with("-cert-v01@openssh.com") {
+        let certificate = Certificate::from_bytes(key_blob)
+            .map_err(|error| ManagedKeyError::InvalidPublicSignature(error.to_string()))?;
+        Verifier::verify(certificate.public_key(), message, &signature)
+            .map_err(|_| ManagedKeyError::InvalidPublicSignature("verification failed".into()))
+    } else {
+        let public_key = PublicKey::from_bytes(key_blob)
+            .map_err(|error| ManagedKeyError::InvalidPublicSignature(error.to_string()))?;
+        Verifier::verify(&public_key, message, &signature)
+            .map_err(|_| ManagedKeyError::InvalidPublicSignature("verification failed".into()))
+    }
+}
+
+fn ssh_algorithm_name(key_blob: &[u8]) -> Result<&str, ManagedKeyError> {
+    let length = key_blob
+        .get(..4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u32::from_be_bytes)
+        .ok_or_else(|| ManagedKeyError::InvalidPublicSignature("truncated key blob".into()))?
+        as usize;
+    let value = key_blob
+        .get(4..4 + length)
+        .ok_or_else(|| ManagedKeyError::InvalidPublicSignature("truncated key algorithm".into()))?;
+    std::str::from_utf8(value)
+        .map_err(|_| ManagedKeyError::InvalidPublicSignature("key algorithm is not UTF-8".into()))
+}
+
 fn parse_and_decrypt(
     encoded: &[u8],
     passphrase: Option<&[u8]>,
 ) -> Result<PrivateKey, ManagedKeyError> {
-    let private_key = match PrivateKey::from_openssh(encoded) {
+    let private_key = match parse_openssh_private_key(encoded) {
         Ok(private_key) => private_key,
         Err(open_ssh_error) => parse_legacy_rsa(encoded).map_err(|legacy_error| {
             ManagedKeyError::Invalid(format!(
@@ -117,6 +157,64 @@ fn parse_and_decrypt(
     private_key
         .decrypt(passphrase)
         .map_err(|_| ManagedKeyError::DecryptionFailed)
+}
+
+/// `ssh-encoding` intentionally decodes OpenSSH PEM at OpenSSH's historical 70-character wrap
+/// width. In practice, several key managers emit the same container using RFC 7468's 64-character
+/// width, which OpenSSH itself accepts. Fall back to decoding the armor independently and then
+/// parse the exact OpenSSH binary container.
+fn parse_openssh_private_key(encoded: &[u8]) -> Result<PrivateKey, String> {
+    match PrivateKey::from_openssh(encoded) {
+        Ok(private_key) => Ok(private_key),
+        Err(strict_error) => {
+            let decoded = decode_openssh_armor(encoded).map_err(|armor_error| {
+                format!("{strict_error}; flexible PEM parse failed ({armor_error})")
+            })?;
+            PrivateKey::from_bytes(decoded.as_slice()).map_err(|binary_error| {
+                format!("{strict_error}; decoded OpenSSH parse failed ({binary_error})")
+            })
+        }
+    }
+}
+
+fn decode_openssh_armor(encoded: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
+    const BEGIN: &str = concat!("-----BEGIN OPENSSH ", "PRIVATE KEY-----");
+    const END: &str = concat!("-----END OPENSSH ", "PRIVATE KEY-----");
+
+    let text = std::str::from_utf8(encoded).map_err(|_| "armor is not UTF-8".to_string())?;
+    let mut lines = text.lines();
+    if lines.next() != Some(BEGIN) {
+        return Err("missing OpenSSH private-key header".to_string());
+    }
+
+    let mut body = Zeroizing::new(String::new());
+    let mut found_end = false;
+    for line in &mut lines {
+        if line == END {
+            found_end = true;
+            break;
+        }
+        if line.is_empty() || !line.bytes().all(is_base64_byte) {
+            return Err("armor body contains invalid Base64 text".to_string());
+        }
+        body.push_str(line);
+    }
+    if !found_end {
+        return Err("missing OpenSSH private-key footer".to_string());
+    }
+    if lines.any(|line| !line.trim().is_empty()) {
+        return Err("unexpected data after OpenSSH private-key footer".to_string());
+    }
+
+    let mut decoded = Zeroizing::new(Vec::new());
+    STANDARD
+        .decode_vec(body.as_bytes(), &mut decoded)
+        .map_err(|_| "armor body contains invalid Base64 text".to_string())?;
+    Ok(decoded)
+}
+
+fn is_base64_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')
 }
 
 fn require_supported_algorithm(private_key: &PrivateKey) -> Result<(), ManagedKeyError> {
@@ -256,6 +354,34 @@ mod tests {
     }
 
     #[test]
+    fn verifies_generated_host_key_signature_and_rejects_tampering() {
+        use ssh_key::EcdsaCurve;
+
+        for algorithm in [
+            Algorithm::Ed25519,
+            Algorithm::Ecdsa {
+                curve: EcdsaCurve::NistP256,
+            },
+        ] {
+            let private_key = PrivateKey::random(&mut OsRng, algorithm).unwrap();
+            let message = b"fixture SSH session identifier";
+            let signature = private_key.try_sign(message).unwrap();
+            let signature_blob = Vec::<u8>::try_from(signature).unwrap();
+            let key_blob = private_key.public_key().to_bytes().unwrap();
+
+            verify_public_signature(&key_blob, message, &signature_blob).unwrap();
+            assert!(matches!(
+                verify_public_signature(
+                    &key_blob,
+                    b"different session identifier",
+                    &signature_blob
+                ),
+                Err(ManagedKeyError::InvalidPublicSignature(_))
+            ));
+        }
+    }
+
+    #[test]
     fn encrypted_import_requires_and_consumes_passphrase() {
         let private_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
         let encrypted = private_key.encrypt(&mut OsRng, b"fixture passphrase").unwrap();
@@ -267,6 +393,16 @@ mod tests {
         ));
         let imported = import_private_key(source.as_bytes(), Some(b"fixture passphrase")).unwrap();
         assert!(identity_from_private_key(imported.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn imports_openssh_key_with_64_character_base64_lines() {
+        let private_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let source = private_key.to_openssh(LineEnding::LF).unwrap();
+        let rewrapped = rewrap_fixture(&source, 64);
+
+        let imported = import_private_key(rewrapped.as_bytes(), None).unwrap();
+        assert_eq!(imported.identity.key_blob, private_key.public_key().to_bytes().unwrap());
     }
 
     #[test]
@@ -327,6 +463,21 @@ mod tests {
             import_private_key(source.as_bytes(), None),
             Err(ManagedKeyError::WeakRsaKey)
         ));
+    }
+
+    fn rewrap_fixture(source: &str, width: usize) -> Zeroizing<String> {
+        let lines = source.lines().collect::<Vec<_>>();
+        let body = Zeroizing::new(lines[1..lines.len() - 1].concat());
+        let mut rewrapped = Zeroizing::new(String::new());
+        rewrapped.push_str(lines[0]);
+        rewrapped.push('\n');
+        for chunk in body.as_bytes().chunks(width) {
+            rewrapped.push_str(std::str::from_utf8(chunk).unwrap());
+            rewrapped.push('\n');
+        }
+        rewrapped.push_str(lines[lines.len() - 1]);
+        rewrapped.push('\n');
+        rewrapped
     }
 
     struct Reader<'a> {

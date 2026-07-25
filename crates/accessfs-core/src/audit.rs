@@ -27,6 +27,19 @@ pub struct AuditDependency {
     pub version: Option<u32>,
 }
 
+/// Public destination context for one SSH signing event. The requested name is display-only;
+/// the host-key fingerprint and forwarding count come from a verified OpenSSH session binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct SshSessionAudit<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_destination: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified_host_key_fingerprint: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_user: Option<&'a str>,
+    pub forwarding_hops: usize,
+}
+
 impl AuditLog {
     pub fn open(path: &Path) -> Result<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
@@ -150,6 +163,7 @@ impl AuditLog {
         resource_id: &str,
         key_fingerprint: &str,
         result: &str,
+        ssh_session: Option<SshSessionAudit<'_>>,
     ) {
         self.write(&SshSignEvent {
             ts: now_rfc3339(),
@@ -170,6 +184,7 @@ impl AuditLog {
             resource_id,
             key_fingerprint,
             result,
+            ssh_session,
         });
     }
 
@@ -270,6 +285,8 @@ struct SshSignEvent<'a> {
     resource_id: &'a str,
     key_fingerprint: &'a str,
     result: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ssh_session: Option<SshSessionAudit<'a>>,
 }
 
 #[derive(Serialize)]
@@ -342,12 +359,20 @@ mod tests {
             "fixture-provider",
             "SHA256:fixtureFingerprint",
             "signed",
+            Some(SshSessionAudit {
+                requested_destination: Some("fixture.example"),
+                verified_host_key_fingerprint: Some("SHA256:fixtureHostKey"),
+                ssh_user: Some("fixture-user"),
+                forwarding_hops: 1,
+            }),
         );
 
         let line = std::fs::read_to_string(path).unwrap();
         assert!(line.contains("\"event\":\"ssh_sign\""));
         assert!(line.contains("SHA256:fixtureFingerprint"));
         assert!(line.contains("\"result\":\"signed\""));
+        assert!(line.contains("SHA256:fixtureHostKey"));
+        assert!(line.contains("\"forwarding_hops\":1"));
         assert!(!line.contains("fixture-bytes-to-sign"));
         assert!(!line.contains("fixture-signature"));
     }

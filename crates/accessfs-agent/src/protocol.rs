@@ -76,6 +76,12 @@ pub struct SshSignView<'a> {
     pub key_label: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_destination: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub verified_host_key_fingerprint: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_user: Option<&'a str>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub forwarding_hops: usize,
 }
 
 impl<'a> SshSignView<'a> {
@@ -88,8 +94,15 @@ impl<'a> SshSignView<'a> {
             key_fingerprint: sign.key_fingerprint,
             key_label: sign.key_label,
             requested_destination: sign.requested_destination,
+            verified_host_key_fingerprint: sign.verified_host_key_fingerprint,
+            ssh_user: sign.ssh_user,
+            forwarding_hops: sign.forwarding_hops,
         })
     }
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// The reader identity as shown to the app (display-only projection of [`ProcessIdentity`]).
@@ -249,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn ssh_sign_view_includes_display_only_requested_destination() {
+    fn ssh_sign_view_includes_requested_and_verified_session_context() {
         let context = AccessContext::SshSign(accessfs_core::authz::SshSignContext {
             surface_id: "fixture-surface",
             surface_name: "Fixture identities",
@@ -257,10 +270,19 @@ mod tests {
             key_fingerprint: "SHA256:fixture-fingerprint",
             key_label: "Fixture identity",
             requested_destination: Some("git@github.com"),
+            verified_host_key_fingerprint: Some("SHA256:fixture-host-key"),
+            ssh_user: Some("git"),
+            forwarding_hops: 1,
         });
 
         let value = serde_json::to_value(SshSignView::from_context(Some(context))).unwrap();
 
         assert_eq!(value["requested_destination"], "git@github.com");
+        assert_eq!(
+            value["verified_host_key_fingerprint"],
+            "SHA256:fixture-host-key"
+        );
+        assert_eq!(value["ssh_user"], "git");
+        assert_eq!(value["forwarding_hops"], 1);
     }
 }

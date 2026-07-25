@@ -36,7 +36,7 @@ tempfile = "3"
 rusqlite = { version = "0.40", features = ["bundled"] }
 signature = "2"
 rsa = "0.9.10"
-ssh-key = { version = "0.6.7", features = ["ed25519", "encryption", "getrandom", "rsa"] }
+ssh-key = { version = "0.6.7", features = ["ed25519", "encryption", "getrandom", "p256", "p384", "p521", "rsa"] }
 
 accessfs-core = { path = "crates/accessfs-core" }
 accessfs-platform = { path = "crates/accessfs-platform" }

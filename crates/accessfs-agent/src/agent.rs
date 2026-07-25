@@ -372,6 +372,9 @@ mod tests {
             key_fingerprint: "SHA256:fixture-first",
             key_label: "First key",
             requested_destination: None,
+            verified_host_key_fingerprint: None,
+            ssh_user: None,
+            forwarding_hops: 0,
         };
         let second = SshSignContext {
             key_fingerprint: "SHA256:fixture-second",
@@ -485,6 +488,9 @@ mod tests {
             key_fingerprint: "SHA256:fixture-managed",
             key_label: "Managed key",
             requested_destination: None,
+            verified_host_key_fingerprint: None,
+            ssh_user: None,
+            forwarding_hops: 0,
         };
         let decision = agent.authorize(&AuthRequest {
             path: "surfaces/fixture-agent",

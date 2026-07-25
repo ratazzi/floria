@@ -53,6 +53,12 @@ struct SshSignView: Codable {
     let key_label: String
     /// Display-only token from the local ssh command. It is not a verified destination identity.
     let requested_destination: String?
+    /// Host-key fingerprint proven by OpenSSH's session-bind extension; identifies a key, not a name.
+    let verified_host_key_fingerprint: String?
+    /// Account from the user-auth request tied to the verified session.
+    let ssh_user: String?
+    /// Verified forwarding bindings before the final authentication session.
+    let forwarding_hops: Int?
 }
 
 // Incoming (daemon -> app)

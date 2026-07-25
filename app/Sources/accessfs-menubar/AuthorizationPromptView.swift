@@ -44,10 +44,16 @@ struct PromptPresentation {
     let requiresTouchID: Bool
     let ssh: SshSignView?
     let sshDestination: String?
+    let sshHostKeyFingerprint: String?
+    let sshUser: String?
+    let sshForwardingHops: Int
 
     init(_ prompt: PromptMsg) {
         ssh = prompt.ssh
         sshDestination = prompt.ssh?.requested_destination
+        sshHostKeyFingerprint = prompt.ssh?.verified_host_key_fingerprint
+        sshUser = prompt.ssh?.ssh_user
+        sshForwardingHops = prompt.ssh?.forwarding_hops ?? 0
         if let ssh = prompt.ssh {
             targetName = ssh.key_label
             targetPath = ssh.key_fingerprint
@@ -169,7 +175,7 @@ struct AuthorizationPromptView: View {
                     HStack(spacing: 6) {
                         Image(systemName: "server.rack")
                         Text("Requested server")
-                        Text(destination)
+                        Text(displayDestination(destination))
                             .font(.callout.monospaced())
                             .lineLimit(1)
                             .truncationMode(.middle)
@@ -178,9 +184,38 @@ struct AuthorizationPromptView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 }
+                if let fingerprint = model.sshHostKeyFingerprint {
+                    HStack(spacing: 6) {
+                        Image(systemName: "checkmark.shield")
+                            .foregroundStyle(.green)
+                        Text("Verified host key")
+                        Text(fingerprint)
+                            .font(.caption.monospaced())
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .textSelection(.enabled)
+                        if let user = model.sshUser,
+                            model.sshDestination == nil || model.sshForwardingHops > 0
+                        {
+                            Text("· \(user)")
+                        }
+                        if model.sshForwardingHops > 0 {
+                            Text("· \(model.sshForwardingHops) hops")
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                }
             }
             Spacer(minLength: 0)
         }
+    }
+
+    private func displayDestination(_ destination: String) -> String {
+        guard model.sshForwardingHops == 0,
+            let user = model.sshUser, !destination.contains("@")
+        else { return destination }
+        return "\(user)@\(destination)"
     }
 
     private var processSummary: some View {

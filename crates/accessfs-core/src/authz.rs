@@ -42,6 +42,13 @@ pub struct SshSignContext<'a> {
     /// Destination token claimed by the local ssh process. Display-only: the SSH agent protocol
     /// does not authenticate hostnames, so policy must not treat this as a destination constraint.
     pub requested_destination: Option<&'a str>,
+    /// SHA-256 fingerprint of the host key whose KEX signature was verified by OpenSSH
+    /// `session-bind`. This identifies a cryptographic key, not a hostname.
+    pub verified_host_key_fingerprint: Option<&'a str>,
+    /// Server account parsed from the user-auth request tied to the verified session.
+    pub ssh_user: Option<&'a str>,
+    /// Number of verified forwarding bindings preceding the final authentication session.
+    pub forwarding_hops: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -20,7 +20,7 @@ use accessfs_catalog::{
     Binding, CatalogSnapshot, EntrySelection, Resource, ResourceKind, ResourceSource, SurfaceInput,
     SurfaceKind, SshRouteSpec, ValueShape,
 };
-use accessfs_core::audit::AuditLog;
+use accessfs_core::audit::{AuditLog, SshSessionAudit};
 use accessfs_core::authz::{
     AccessContext, AuthRequest, Authorizer, Operation, SshSignContext,
 };
@@ -43,6 +43,11 @@ const SSH_AGENTC_SIGN_REQUEST: u8 = 13;
 const SSH_AGENT_SIGN_RESPONSE: u8 = 14;
 const SSH_AGENTC_EXTENSION: u8 = 27;
 const SSH_AGENT_EXTENSION_FAILURE: u8 = 28;
+const SSH_AGENT_EXTENSION_RESPONSE: u8 = 29;
+const SSH_AGENT_SUCCESS: u8 = 6;
+const SESSION_BIND_EXTENSION: &[u8] = b"session-bind@openssh.com";
+const MAX_SESSION_BINDINGS: usize = 16;
+const MAX_SESSION_ID_LEN: usize = 128;
 
 /// Public metadata advertised by an upstream SSH agent. Key blobs are intentionally converted to
 /// stable addresses/fingerprints here so callers never need to persist protocol payloads.
@@ -352,6 +357,9 @@ fn write_generated_config(path: &Path, specs: &[SurfaceSpec]) -> io::Result<()> 
         body.push_str("\n    IdentityAgent ");
         body.push_str(&ssh_config_quote(&spec.socket_path));
         body.push('\n');
+        // A routed host must not fall back to ~/.ssh/id_* and sign outside Floria's
+        // authorization and audit boundary. Agent identities remain available.
+        body.push_str("    IdentityFile none\n");
         if let Some(hostname) = &route.hostname {
             body.push_str("    HostName ");
             body.push_str(&ssh_config_quote(Path::new(hostname)));
@@ -651,6 +659,12 @@ struct AvailableIdentity {
     label: String,
 }
 
+struct ConnectionState {
+    providers: Vec<ProviderSession>,
+    available: HashMap<Vec<u8>, AvailableIdentity>,
+    session_bindings: SessionBindings,
+}
+
 fn serve_connection(
     mut downstream: UnixStream,
     spec: SurfaceSpec,
@@ -662,17 +676,20 @@ fn serve_connection(
 ) -> io::Result<()> {
     downstream.set_read_timeout(Some(DOWNSTREAM_POLL))?;
     downstream.set_write_timeout(Some(UPSTREAM_TIMEOUT))?;
-    let mut providers = spec
-        .providers
-        .iter()
-        .cloned()
-        .map(|spec| ProviderSession {
-            spec,
-            stream: None,
-            managed_keys: Arc::clone(&managed_keys),
-        })
-        .collect::<Vec<_>>();
-    let mut available = HashMap::<Vec<u8>, AvailableIdentity>::new();
+    let mut state = ConnectionState {
+        providers: spec
+            .providers
+            .iter()
+            .cloned()
+            .map(|spec| ProviderSession {
+                spec,
+                stream: None,
+                managed_keys: Arc::clone(&managed_keys),
+            })
+            .collect(),
+        available: HashMap::new(),
+        session_bindings: SessionBindings::default(),
+    };
 
     while !stop.load(Ordering::Acquire) {
         let request = match read_frame_interruptible(&mut downstream, &stop) {
@@ -682,7 +699,11 @@ fn serve_connection(
         };
         let response = match request.first().copied() {
             Some(SSH_AGENTC_REQUEST_IDENTITIES) if request.len() == 1 => {
-                match refresh_identities(&spec, &mut providers, &mut available) {
+                match refresh_identities(
+                    &spec,
+                    &mut state.providers,
+                    &mut state.available,
+                ) {
                     Ok(response) => response,
                     Err(error) => {
                         tracing::warn!(surface = %spec.id, %error, "refreshing SSH identities failed");
@@ -696,13 +717,17 @@ fn serve_connection(
                 &authorizer,
                 &audit,
                 &request,
-                &mut providers,
-                &mut available,
+                &mut state,
             ),
-            // Destination constraints arrive through this extension. Phase one fails closed
-            // instead of pretending to verify session-bind; verified forwarding support lands
-            // as a separate protocol capability.
-            Some(SSH_AGENTC_EXTENSION) => vec![SSH_AGENT_EXTENSION_FAILURE],
+            Some(SSH_AGENTC_EXTENSION) => {
+                match handle_extension(&request, &mut state.session_bindings) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        tracing::warn!(surface = %spec.id, %error, "SSH agent extension failed");
+                        vec![SSH_AGENT_EXTENSION_FAILURE]
+                    }
+                }
+            }
             _ => vec![SSH_AGENT_FAILURE],
         };
         write_frame(&mut downstream, &response)?;
@@ -762,17 +787,18 @@ fn handle_sign(
     authorizer: &Arc<dyn Authorizer>,
     audit: &AuditLog,
     request: &[u8],
-    providers: &mut [ProviderSession],
-    available: &mut HashMap<Vec<u8>, AvailableIdentity>,
+    state: &mut ConnectionState,
 ) -> Vec<u8> {
     let parsed = match parse_sign_request(request) {
         Ok(parsed) => parsed,
         Err(_) => return vec![SSH_AGENT_FAILURE],
     };
-    if available.is_empty() && refresh_identities(spec, providers, available).is_err() {
+    if state.available.is_empty()
+        && refresh_identities(spec, &mut state.providers, &mut state.available).is_err()
+    {
         return vec![SSH_AGENT_FAILURE];
     }
-    let Some(selected) = available.get(parsed.key) else {
+    let Some(selected) = state.available.get(parsed.key) else {
         let (_, fingerprint) = identity_names(parsed.key);
         audit.log_ssh_sign(
             &format!("surfaces/{}", spec.id),
@@ -785,6 +811,7 @@ fn handle_sign(
             "unselected",
             &fingerprint,
             "identity_not_selected",
+            None,
         );
         return vec![SSH_AGENT_FAILURE];
     };
@@ -794,6 +821,17 @@ fn handle_sign(
         .cmdline
         .as_deref()
         .and_then(ssh_requested_destination);
+    let verified_session = state.session_bindings.context_for_sign(&parsed);
+    let ssh_session_audit = SshSessionAudit {
+        requested_destination,
+        verified_host_key_fingerprint: verified_session
+            .as_ref()
+            .map(|session| session.host_key_fingerprint),
+        ssh_user: verified_session.as_ref().map(|session| session.ssh_user),
+        forwarding_hops: verified_session
+            .as_ref()
+            .map_or(0, |session| session.forwarding_hops),
+    };
     let context = AccessContext::SshSign(SshSignContext {
         surface_id: &spec.id,
         surface_name: &spec.name,
@@ -801,6 +839,13 @@ fn handle_sign(
         key_fingerprint: &selected.fingerprint,
         key_label: &selected.label,
         requested_destination,
+        verified_host_key_fingerprint: verified_session
+            .as_ref()
+            .map(|session| session.host_key_fingerprint),
+        ssh_user: verified_session.as_ref().map(|session| session.ssh_user),
+        forwarding_hops: verified_session
+            .as_ref()
+            .map_or(0, |session| session.forwarding_hops),
     });
     let decision = authorizer.authorize(&AuthRequest {
         path: &path,
@@ -821,11 +866,12 @@ fn handle_sign(
             &selected.resource_id,
             &selected.fingerprint,
             "authorization_denied",
+            Some(ssh_session_audit),
         );
         return vec![SSH_AGENT_FAILURE];
     }
 
-    let (response, result) = match providers[selected.provider_index].sign(request, &parsed) {
+    let (response, result) = match state.providers[selected.provider_index].sign(request, &parsed) {
         Ok(response) if response.first() == Some(&SSH_AGENT_SIGN_RESPONSE) => (response, "signed"),
         Ok(response) if response.first() == Some(&SSH_AGENT_FAILURE) => {
             (response, "upstream_refused")
@@ -847,12 +893,14 @@ fn handle_sign(
         &selected.resource_id,
         &selected.fingerprint,
         result,
+        Some(ssh_session_audit),
     );
     response
 }
 
 /// Extract the destination token from a direct OpenSSH invocation for display. This intentionally
-/// does not resolve aliases or claim the host is verified; the agent protocol carries neither.
+/// does not resolve aliases or claim the name is verified; session-bind authenticates a host key,
+/// not the hostname that the user typed.
 fn ssh_requested_destination(cmdline: &[String]) -> Option<&str> {
     let program = Path::new(cmdline.first()?).file_name()?.to_str()?;
     if program != "ssh" {
@@ -949,6 +997,150 @@ struct ParsedSignRequest<'a> {
     key: &'a [u8],
     data: &'a [u8],
     flags: u32,
+}
+
+#[derive(Default)]
+struct SessionBindings {
+    entries: Vec<SessionBinding>,
+}
+
+struct SessionBinding {
+    host_key: Vec<u8>,
+    host_key_fingerprint: String,
+    session_id: Vec<u8>,
+    forwarded: bool,
+}
+
+struct VerifiedSshSession<'a> {
+    host_key_fingerprint: &'a str,
+    ssh_user: &'a str,
+    forwarding_hops: usize,
+}
+
+impl SessionBindings {
+    fn bind(&mut self, request: &[u8]) -> io::Result<()> {
+        let mut reader = WireReader::new(request);
+        if reader.byte()? != SSH_AGENTC_EXTENSION
+            || reader.string()? != SESSION_BIND_EXTENSION
+        {
+            return Err(invalid("not an OpenSSH session-bind request"));
+        }
+        let host_key = reader.string()?;
+        let session_id = reader.string()?;
+        let signature = reader.string()?;
+        let forwarded = reader.byte()? != 0;
+        reader.finish()?;
+
+        if session_id.is_empty() {
+            return Err(invalid("SSH session identifier is empty"));
+        }
+        if session_id.len() > MAX_SESSION_ID_LEN {
+            return Err(invalid("SSH session identifier is too long"));
+        }
+        accessfs_ssh::verify_public_signature(host_key, session_id, signature)
+            .map_err(|error| invalid(error.to_string()))?;
+
+        for existing in &self.entries {
+            if !existing.forwarded {
+                return Err(invalid(
+                    "agent connection was already bound for authentication",
+                ));
+            }
+            if existing.session_id == session_id {
+                if existing.host_key == host_key {
+                    return Ok(());
+                }
+                return Err(invalid(
+                    "SSH session identifier was already bound to another host key",
+                ));
+            }
+        }
+        if self.entries.len() >= MAX_SESSION_BINDINGS {
+            return Err(invalid("too many SSH session bindings"));
+        }
+
+        let (_, host_key_fingerprint) = identity_names(host_key);
+        self.entries.push(SessionBinding {
+            host_key: host_key.to_vec(),
+            host_key_fingerprint,
+            session_id: session_id.to_vec(),
+            forwarded,
+        });
+        Ok(())
+    }
+
+    fn context_for_sign<'a>(
+        &'a self,
+        request: &ParsedSignRequest<'a>,
+    ) -> Option<VerifiedSshSession<'a>> {
+        let binding = self.entries.last()?;
+        if binding.forwarded {
+            return None;
+        }
+
+        let mut reader = WireReader::new(request.data);
+        let session_id = reader.string().ok()?;
+        if reader.byte().ok()? != 50 {
+            return None;
+        }
+        let ssh_user = std::str::from_utf8(reader.string().ok()?).ok()?;
+        if reader.string().ok()? != b"ssh-connection" {
+            return None;
+        }
+        let method = reader.string().ok()?;
+        if reader.byte().ok()? != 1 {
+            return None;
+        }
+        let _algorithm = reader.string().ok()?;
+        if reader.string().ok()? != request.key {
+            return None;
+        }
+        let signed_host_key = match method {
+            b"publickey" => None,
+            b"publickey-hostbound-v00@openssh.com" => Some(reader.string().ok()?),
+            _ => return None,
+        };
+        reader.finish().ok()?;
+
+        if session_id != binding.session_id {
+            return None;
+        }
+        if self.entries.len() > 1 && signed_host_key.is_none() {
+            return None;
+        }
+        if signed_host_key.is_some_and(|host_key| host_key != binding.host_key) {
+            return None;
+        }
+        Some(VerifiedSshSession {
+            host_key_fingerprint: &binding.host_key_fingerprint,
+            ssh_user,
+            forwarding_hops: self.entries.len().saturating_sub(1),
+        })
+    }
+}
+
+fn handle_extension(
+    request: &[u8],
+    session_bindings: &mut SessionBindings,
+) -> io::Result<Vec<u8>> {
+    let mut reader = WireReader::new(request);
+    if reader.byte()? != SSH_AGENTC_EXTENSION {
+        return Err(invalid("not an SSH agent extension request"));
+    }
+    match reader.string()? {
+        b"query" => {
+            reader.finish()?;
+            let mut response = vec![SSH_AGENT_EXTENSION_RESPONSE];
+            put_string(&mut response, b"query");
+            put_string(&mut response, SESSION_BIND_EXTENSION);
+            Ok(response)
+        }
+        SESSION_BIND_EXTENSION => {
+            session_bindings.bind(request)?;
+            Ok(vec![SSH_AGENT_SUCCESS])
+        }
+        _ => Ok(vec![SSH_AGENT_EXTENSION_FAILURE]),
+    }
 }
 
 fn parse_sign_request(request: &[u8]) -> io::Result<ParsedSignRequest<'_>> {
@@ -1463,6 +1655,112 @@ mod tests {
         request
     }
 
+    fn session_bind_request(
+        host_key: &ssh_key::PrivateKey,
+        session_id: &[u8],
+        forwarded: bool,
+    ) -> Vec<u8> {
+        use signature::Signer as _;
+
+        let signature = host_key.try_sign(session_id).unwrap();
+        let mut request = vec![SSH_AGENTC_EXTENSION];
+        put_string(&mut request, SESSION_BIND_EXTENSION);
+        put_string(&mut request, &host_key.public_key().to_bytes().unwrap());
+        put_string(&mut request, session_id);
+        put_string(&mut request, &Vec::<u8>::try_from(signature).unwrap());
+        request.push(u8::from(forwarded));
+        request
+    }
+
+    fn userauth_sign_request(
+        identity_key: &[u8],
+        host_key: &[u8],
+        session_id: &[u8],
+    ) -> Vec<u8> {
+        let mut data = Vec::new();
+        put_string(&mut data, session_id);
+        data.push(50);
+        put_string(&mut data, b"fixture-user");
+        put_string(&mut data, b"ssh-connection");
+        put_string(&mut data, b"publickey-hostbound-v00@openssh.com");
+        data.push(1);
+        put_string(&mut data, b"ssh-ed25519");
+        put_string(&mut data, identity_key);
+        put_string(&mut data, host_key);
+
+        let mut request = vec![SSH_AGENTC_SIGN_REQUEST];
+        put_string(&mut request, identity_key);
+        put_string(&mut request, &data);
+        request.extend_from_slice(&0u32.to_be_bytes());
+        request
+    }
+
+    #[test]
+    fn verifies_session_bind_and_ties_prompt_context_to_userauth_payload() {
+        use ssh_key::rand_core::OsRng;
+        use ssh_key::{Algorithm, PrivateKey};
+
+        let first_host = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let final_host = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let mut bindings = SessionBindings::default();
+        let mut query = vec![SSH_AGENTC_EXTENSION];
+        put_string(&mut query, b"query");
+        let query_response = handle_extension(&query, &mut bindings).unwrap();
+        let mut query_reader = WireReader::new(&query_response);
+        assert_eq!(query_reader.byte().unwrap(), SSH_AGENT_EXTENSION_RESPONSE);
+        assert_eq!(query_reader.string().unwrap(), b"query");
+        assert_eq!(query_reader.string().unwrap(), SESSION_BIND_EXTENSION);
+        query_reader.finish().unwrap();
+
+        let first_session = b"fixture-forwarded-session";
+        let final_session = b"fixture-authentication-session";
+        bindings
+            .bind(&session_bind_request(&first_host, first_session, true))
+            .unwrap();
+        bindings
+            .bind(&session_bind_request(&final_host, final_session, false))
+            .unwrap();
+
+        let final_host_blob = final_host.public_key().to_bytes().unwrap();
+        let request = userauth_sign_request(KEY_A, &final_host_blob, final_session);
+        let parsed = parse_sign_request(&request).unwrap();
+        let context = bindings.context_for_sign(&parsed).unwrap();
+        assert_eq!(context.ssh_user, "fixture-user");
+        assert_eq!(context.forwarding_hops, 1);
+        assert_eq!(
+            context.host_key_fingerprint,
+            identity_names(&final_host_blob).1
+        );
+
+        let wrong_session = userauth_sign_request(KEY_A, &final_host_blob, b"wrong-session");
+        assert!(bindings
+            .context_for_sign(&parse_sign_request(&wrong_session).unwrap())
+            .is_none());
+    }
+
+    #[test]
+    fn rejects_tampered_and_conflicting_session_bindings() {
+        use ssh_key::rand_core::OsRng;
+        use ssh_key::{Algorithm, PrivateKey};
+
+        let host = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let mut tampered = session_bind_request(&host, b"fixture-session", false);
+        let session_offset = tampered
+            .windows(b"fixture-session".len())
+            .position(|window| window == b"fixture-session")
+            .unwrap();
+        tampered[session_offset] ^= 1;
+        assert!(SessionBindings::default().bind(&tampered).is_err());
+
+        let mut bindings = SessionBindings::default();
+        bindings
+            .bind(&session_bind_request(&host, b"fixture-session", false))
+            .unwrap();
+        assert!(bindings
+            .bind(&session_bind_request(&host, b"second-session", false))
+            .is_err());
+    }
+
     #[test]
     fn surface_filters_identities_and_authorizes_each_signature() {
         let dir = tempfile::tempdir().unwrap();
@@ -1490,6 +1788,7 @@ mod tests {
         let config = fs::read_to_string(dir.path().join("ssh/config")).unwrap();
         assert!(config.contains("Host fixture-*.internal fixture-alias"));
         assert!(config.contains("IdentityAgent \""));
+        assert!(config.contains("IdentityFile none"));
         assert!(config.contains("HostName \"fixture.internal\""));
         assert!(config.contains("User \"fixture-user\""));
         assert!(config.contains("Port 2222"));
@@ -1704,5 +2003,113 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_eq!(policy.requests.lock().unwrap().len(), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn openssh_accepts_the_session_bind_response() {
+        use ssh_key::rand_core::OsRng;
+        use ssh_key::{Algorithm, LineEnding, PrivateKey};
+        use std::net::{TcpListener, TcpStream};
+        use std::process::{Command, Stdio};
+        use std::time::Instant;
+
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        fs::create_dir(&project).unwrap();
+        let private_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let source = private_key.to_openssh(LineEnding::LF).unwrap();
+        let imported = accessfs_ssh::import_private_key(source.as_bytes(), None).unwrap();
+        let managed_keys: Arc<dyn ManagedKeyReader> = Arc::new(FixtureManagedKeys {
+            entries: [(
+                "fixture-managed-key".to_string(),
+                imported.as_bytes().to_vec(),
+            )]
+            .into_iter()
+            .collect(),
+        });
+        let runtime = SshAgentRuntime::new(
+            dir.path().join("runtime"),
+            dir.path().join("ssh/config"),
+            Arc::new(RecordingAuthorizer::allowing()),
+            Arc::new(AuditLog::open(&dir.path().join("audit.jsonl")).unwrap()),
+            managed_keys,
+        )
+        .unwrap();
+        runtime
+            .replace(&managed_snapshot(&project, &imported.identity))
+            .unwrap();
+
+        let host_key = dir.path().join("sshd-host-key");
+        let keygen = Command::new("/usr/bin/ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+            .arg(&host_key)
+            .output()
+            .unwrap();
+        assert!(
+            keygen.status.success(),
+            "ssh-keygen failed: {}",
+            String::from_utf8_lossy(&keygen.stderr)
+        );
+
+        let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let mut sshd = Command::new("/usr/sbin/sshd")
+            .args(["-D", "-e", "-f", "/dev/null", "-h"])
+            .arg(&host_key)
+            .args(["-p", &port.to_string()])
+            .args(["-o", "ListenAddress=127.0.0.1"])
+            .args(["-o", "PasswordAuthentication=no"])
+            .args(["-o", "KbdInteractiveAuthentication=no"])
+            .args(["-o", "UsePAM=no"])
+            .args(["-o", "AuthorizedKeysFile=none"])
+            .args(["-o", "StrictModes=no"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while TcpStream::connect(("127.0.0.1", port)).is_err() {
+            if let Some(status) = sshd.try_wait().unwrap() {
+                let output = sshd.wait_with_output().unwrap();
+                panic!(
+                    "sshd exited with {status}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            assert!(Instant::now() < deadline, "sshd did not start");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let output = Command::new("/usr/bin/ssh")
+            .args(["-vvv", "-F", "/dev/null"])
+            .args(["-o", "BatchMode=yes"])
+            .args(["-o", "ConnectTimeout=3"])
+            .args(["-o", "IdentityFile=none"])
+            .arg("-o")
+            .arg(format!(
+                "IdentityAgent={}",
+                project.join("agent.sock").display()
+            ))
+            .args(["-o", "PreferredAuthentications=publickey"])
+            .args(["-o", "StrictHostKeyChecking=no"])
+            .args(["-o", "UserKnownHostsFile=/dev/null"])
+            .args(["-o", "GlobalKnownHostsFile=/dev/null"])
+            .args(["-p", &port.to_string(), "nobody@127.0.0.1", "true"])
+            .output()
+            .unwrap();
+        let _ = sshd.kill();
+        let _ = sshd.wait();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("get_agent_identities: agent returned 1 keys"),
+            "OpenSSH did not reach the agent identity request:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("ssh_agent_bind_hostkey: invalid format"),
+            "OpenSSH rejected Floria's session-bind response:\n{stderr}"
+        );
     }
 }
