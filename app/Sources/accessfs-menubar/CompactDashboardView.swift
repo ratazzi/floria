@@ -9,7 +9,7 @@ private struct DiscoveryPresentation: Identifiable {
 
 private struct WorkspacePresentation: Identifiable {
     let id = UUID()
-    let projectID: WorkspaceProject.ID?
+    let selection: WorkspaceSidebarSelection
 }
 
 private enum DashboardIssueAction {
@@ -52,7 +52,7 @@ struct DashboardView: View {
                         recentAccess: visibleAccess,
                         openAdvanced: {
                             workspacePresentation = WorkspacePresentation(
-                                projectID: selectedProject.id)
+                                selection: .project(selectedProject.id))
                         })
                 } else {
                     ScrollView {
@@ -89,7 +89,7 @@ struct DashboardView: View {
             }
         }
         .sheet(item: $workspacePresentation) { presentation in
-            AdvancedWorkspaceView(state: state, initialProjectID: presentation.projectID)
+            AdvancedWorkspaceView(state: state, initialSelection: presentation.selection)
                 .frame(minWidth: 1080, minHeight: 680)
         }
         .sheet(isPresented: $showingAccessLog) {
@@ -208,6 +208,7 @@ struct DashboardView: View {
             }
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
+            .accessibilityLabel("More actions")
         }
         .padding(.leading, 82)
         .padding(.trailing, 16)
@@ -445,8 +446,25 @@ struct DashboardView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                 Spacer()
-                Button("Open Library") {
-                    openWorkspace()
+                Menu {
+                    Button("Protected Files", systemImage: "lock.fill") {
+                        openWorkspace(.protectedFiles)
+                    }
+                    Button("Shared Secrets", systemImage: "key") {
+                        openWorkspace(.sharedSecrets)
+                    }
+                    Button("Env Files", systemImage: "doc.badge.gearshape") {
+                        openWorkspace(.envFiles)
+                    }
+                    Button("SSH Identities", systemImage: "key.horizontal") {
+                        openWorkspace(.sshAgents)
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Text("Open Library")
+                        Image(systemName: "chevron.down")
+                            .font(.caption2)
+                    }
                 }
                 .buttonStyle(.bordered)
             }
@@ -639,8 +657,8 @@ struct DashboardView: View {
         search = ""
     }
 
-    private func openWorkspace() {
-        workspacePresentation = WorkspacePresentation(projectID: nil)
+    private func openWorkspace(_ selection: WorkspaceSidebarSelection = .projects) {
+        workspacePresentation = WorkspacePresentation(selection: selection)
     }
 
     private func handle(_ action: DashboardIssueAction) {
@@ -693,7 +711,7 @@ struct DashboardView: View {
     }()
 }
 
-private struct FloriaMark: View {
+struct FloriaMark: View {
     var body: some View {
         ZStack {
             ForEach(0..<8, id: \.self) { index in
@@ -1167,6 +1185,7 @@ private struct CompactSurfaceRow: View {
             }
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
+            .accessibilityLabel("\(surface.name) actions")
         }
         .padding(.horizontal, 14)
         .frame(minHeight: 54)
@@ -1222,6 +1241,8 @@ private struct CompactBindingRow: View {
             .labelsHidden()
             .toggleStyle(.switch)
             .controlSize(.small)
+            .accessibilityLabel("Enable \(resource?.name ?? "binding")")
+            .accessibilityValue(binding.isEnabled ? "Enabled" : "Disabled")
         }
         .padding(.horizontal, 14)
         .frame(minHeight: 54)

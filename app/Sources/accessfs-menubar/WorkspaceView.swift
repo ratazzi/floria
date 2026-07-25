@@ -221,7 +221,7 @@ private func availableEnvironmentFileName(
     return "\(base).\(suffix)"
 }
 
-private enum WorkspaceSidebarSelection: Hashable {
+enum WorkspaceSidebarSelection: Hashable {
     case projects
     case project(WorkspaceProject.ID)
     case protectedFiles
@@ -235,7 +235,7 @@ private enum WorkspaceSidebarSelection: Hashable {
 /// then inspect the concrete file/socket surfaces exposed to local processes.
 struct AdvancedWorkspaceView: View {
     @Bindable var state: AppState
-    private let initialProjectID: WorkspaceProject.ID?
+    private let initialSelection: WorkspaceSidebarSelection
     @State private var selection: WorkspaceSidebarSelection?
     @State private var search = ""
     @State private var showingNewProject = false
@@ -247,11 +247,13 @@ struct AdvancedWorkspaceView: View {
     @State private var pendingAuditWindow: AuditOnlyWindow?
     @State private var showingAuditConfirmation = false
 
-    init(state: AppState, initialProjectID: WorkspaceProject.ID? = nil) {
+    init(
+        state: AppState,
+        initialSelection: WorkspaceSidebarSelection = .projects
+    ) {
         self.state = state
-        self.initialProjectID = initialProjectID
-        _selection = State(
-            initialValue: initialProjectID.map(WorkspaceSidebarSelection.project) ?? .projects)
+        self.initialSelection = initialSelection
+        _selection = State(initialValue: initialSelection)
     }
 
     var body: some View {
@@ -268,9 +270,9 @@ struct AdvancedWorkspaceView: View {
         }
         .ignoresSafeArea(.container, edges: .top)
         .onAppear {
-            guard let initialProjectID else { return }
-            state.workspace.selectProject(initialProjectID)
-            selection = .project(initialProjectID)
+            guard case .project(let projectID) = initialSelection else { return }
+            state.workspace.selectProject(projectID)
+            selection = initialSelection
         }
         .onChange(of: selection) {
             guard case .project(let id) = selection else { return }
@@ -424,8 +426,12 @@ struct AdvancedWorkspaceView: View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
-                    Text("floria")
-                        .font(.title2.bold())
+                    HStack(spacing: 8) {
+                        FloriaMark()
+                            .frame(width: 26, height: 26)
+                        Text("Floria")
+                            .font(.title2.bold())
+                    }
                         .padding(.horizontal, 18)
                         .padding(.top, 55)
                         .padding(.bottom, 24)
@@ -456,7 +462,7 @@ struct AdvancedWorkspaceView: View {
                         ForEach(filteredProjects) { project in
                             sidebarRow(
                                 project.name,
-                                systemImage: "shippingbox",
+                                systemImage: "folder",
                                 tag: .project(project.id))
                         }
                     }
