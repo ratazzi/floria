@@ -1547,6 +1547,7 @@ mod tests {
                 name: "Fixture".to_string(),
                 path: project.to_path_buf(),
             }],
+            checkouts: vec![],
             environments: vec![Environment {
                 id: "fixture-development".to_string(),
                 project_id: "fixture-project".to_string(),
