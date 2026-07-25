@@ -4,6 +4,27 @@ import XCTest
 
 @MainActor
 final class WorkspaceModelTests: XCTestCase {
+    func testUnmanagedWorktreeCountIgnoresPrimaryAndManagedCheckouts() throws {
+        let store = WorkspaceStore.preview()
+        let projectID = try XCTUnwrap(store.projects.first?.id)
+        store.checkoutDiscoveries[projectID] = ProjectCheckoutDiscovery(
+            projectID: projectID,
+            commonDir: "/fixture/.git",
+            checkouts: [
+                ProjectCheckoutCandidate(
+                    path: "/fixture", gitPrimary: true,
+                    managedCheckoutID: projectID),
+                ProjectCheckoutCandidate(
+                    path: "/fixture/managed", gitPrimary: false,
+                    managedCheckoutID: "fixture-managed"),
+                ProjectCheckoutCandidate(
+                    path: "/fixture/new", gitPrimary: false,
+                    managedCheckoutID: nil),
+            ])
+
+        XCTAssertEqual(store.unmanagedCheckoutCount(projectID: projectID), 1)
+    }
+
     func testPreviewEnvironmentResolvesBindingsAndSurfaces() {
         let store = WorkspaceStore.preview()
 

@@ -1017,9 +1017,23 @@ private struct CompactProjectDetailView: View {
                     Button {
                         showingWorktrees = true
                     } label: {
-                        Label("Worktrees", systemImage: "arrow.triangle.branch")
+                        HStack(spacing: 5) {
+                            Label("Worktrees", systemImage: "arrow.triangle.branch")
+                            if unmanagedWorktreeCount > 0 {
+                                Text("\(unmanagedWorktreeCount)")
+                                    .font(.caption2.weight(.bold))
+                                    .foregroundStyle(Color.white)
+                                    .padding(.horizontal, 5)
+                                    .frame(minHeight: 16)
+                                    .background(Color.orange, in: Capsule())
+                            }
+                        }
                     }
                     .buttonStyle(.bordered)
+                    .accessibilityLabel(
+                        unmanagedWorktreeCount == 0
+                            ? "Worktrees"
+                            : "Worktrees, \(unmanagedWorktreeCount) newly discovered")
 
                     Button(action: openAdvanced) {
                         Label("Manage Project", systemImage: "slider.horizontal.3")
@@ -1197,6 +1211,10 @@ private struct CompactProjectDetailView: View {
         project.environments.flatMap(\.surfaces).allSatisfy(\.status.isHealthy)
     }
 
+    private var unmanagedWorktreeCount: Int {
+        state.workspace.unmanagedCheckoutCount(projectID: project.id)
+    }
+
     private func bindingScope(_ binding: WorkspaceBinding) -> String {
         switch binding.scope {
         case .common:
@@ -1249,6 +1267,10 @@ private struct ProjectCheckoutsSheet: View {
         .frame(width: 680, height: sheetHeight)
         .task {
             await discover()
+        }
+        .onChange(of: store.checkoutDiscoveries[projectID]) { _, discovery in
+            guard let discovery else { return }
+            apply(discovery)
         }
     }
 
@@ -1473,16 +1495,20 @@ private struct ProjectCheckoutsSheet: View {
         defer { isDiscovering = false }
         do {
             let result = try await store.discoverProjectCheckouts(projectID: projectID)
-            discovery = result
-            for candidate in result.checkouts {
-                guard let id = candidate.managedCheckoutID,
-                    let environmentID = store.checkouts.first(where: { $0.id == id })?.environmentID
-                else { continue }
-                environmentSelections[candidate.path] = environmentID
-            }
+            apply(result)
         } catch {
             discovery = nil
             errorMessage = error.localizedDescription
+        }
+    }
+
+    private func apply(_ result: ProjectCheckoutDiscovery) {
+        discovery = result
+        for candidate in result.checkouts {
+            guard let id = candidate.managedCheckoutID,
+                let environmentID = store.checkouts.first(where: { $0.id == id })?.environmentID
+            else { continue }
+            environmentSelections[candidate.path] = environmentID
         }
     }
 

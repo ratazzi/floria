@@ -539,6 +539,7 @@ struct WorkspaceProtectedFileVersion: Identifiable, Hashable, Sendable {
 final class WorkspaceStore {
     var projects: [WorkspaceProject]
     var checkouts: [CatalogProjectCheckout]
+    var checkoutDiscoveries: [WorkspaceProject.ID: ProjectCheckoutDiscovery]
     var resources: [WorkspaceResource]
     var protectedFiles: [WorkspaceProtectedFile]
     var selectedProjectID: WorkspaceProject.ID
@@ -555,6 +556,7 @@ final class WorkspaceStore {
     ) {
         self.projects = projects
         checkouts = []
+        checkoutDiscoveries = [:]
         self.resources = resources
         protectedFiles = []
         self.controlClient = controlClient
@@ -574,6 +576,12 @@ final class WorkspaceStore {
 
     var selectedProjectCheckouts: [CatalogProjectCheckout] {
         checkouts.filter { $0.projectID == selectedProjectID }
+    }
+
+    func unmanagedCheckoutCount(projectID: WorkspaceProject.ID) -> Int {
+        checkoutDiscoveries[projectID]?.checkouts.count {
+            !$0.gitPrimary && $0.managedCheckoutID == nil
+        } ?? 0
     }
 
     var selectedEnvironment: WorkspaceEnvironment? {
@@ -826,8 +834,23 @@ final class WorkspaceStore {
             throw WorkspaceStoreError.invalid("Choose a project first")
         }
         let result = try await controlClient.discoverProjectCheckouts(projectID: projectID)
+        checkoutDiscoveries[projectID] = result
         lastError = nil
         return result
+    }
+
+    func refreshProjectCheckoutDiscoveries() async {
+        guard let controlClient else { return }
+        let projectIDs = Set(projects.map(\.id))
+        var next = checkoutDiscoveries.filter { projectIDs.contains($0.key) }
+        for project in projects {
+            guard
+                let discovery = try? await controlClient.discoverProjectCheckouts(
+                    projectID: project.id)
+            else { continue }
+            next[project.id] = discovery
+        }
+        checkoutDiscoveries = next
     }
 
     func provisionProjectCheckout(

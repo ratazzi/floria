@@ -79,6 +79,7 @@ final class AppState {
     @ObservationIgnored private var client: AgentClient!
     @ObservationIgnored private let controlClient: ControlClient
     @ObservationIgnored private var policyRefreshTask: Task<Void, Never>?
+    @ObservationIgnored private var checkoutRefreshTask: Task<Void, Never>?
     @ObservationIgnored private let prompter = PromptPresenter()
     @ObservationIgnored private let daemonManager = DaemonManager()
     @ObservationIgnored private var accessHistoryLoaded = false
@@ -103,6 +104,7 @@ final class AppState {
                 if up {
                     Task {
                         await self.workspace.reload()
+                        await self.workspace.refreshProjectCheckoutDiscoveries()
                         await self.reloadPolicyMode()
                         await self.reloadActiveGrants()
                         await self.loadAccessHistoryIfNeeded()
@@ -122,6 +124,7 @@ final class AppState {
         client.start()
         Task {
             await workspace.reload()
+            await workspace.refreshProjectCheckoutDiscoveries()
             await reloadPolicyMode()
             await reloadActiveGrants()
             await loadAccessHistoryIfNeeded()
@@ -132,6 +135,13 @@ final class AppState {
                 guard let self, !Task.isCancelled else { return }
                 await self.reloadPolicyMode()
                 await self.reloadActiveGrants()
+            }
+        }
+        checkoutRefreshTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                guard let self, !Task.isCancelled else { return }
+                await self.workspace.refreshProjectCheckoutDiscoveries()
             }
         }
 
