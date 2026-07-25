@@ -255,11 +255,10 @@ impl Catalog {
                 .iter()
                 .filter(|surface| {
                     environment_ids.contains(&surface.environment_id)
-                        && matches!(
-                            &surface.input,
-                            SurfaceInput::Bindings { binding_ids }
-                                if binding_ids.contains(&binding.id)
-                        )
+                        && surface
+                            .input
+                            .binding_ids()
+                            .is_some_and(|binding_ids| binding_ids.contains(&binding.id))
                 })
                 .map(|surface| surface.id.clone())
                 .collect();
@@ -369,16 +368,24 @@ impl Catalog {
             return Err(CatalogError::NotFound(format!("binding {id}")));
         }
         for surface in &snapshot.surfaces {
-            let SurfaceInput::Bindings { binding_ids } = &surface.input else { continue };
+            let Some(binding_ids) = surface.input.binding_ids() else { continue };
             if !binding_ids.iter().any(|binding_id| binding_id == id) {
                 continue;
             }
-            let input = SurfaceInput::Bindings {
-                binding_ids: binding_ids
-                    .iter()
-                    .filter(|binding_id| binding_id.as_str() != id)
-                    .cloned()
-                    .collect(),
+            let retained = binding_ids
+                .iter()
+                .filter(|binding_id| binding_id.as_str() != id)
+                .cloned()
+                .collect();
+            let input = match &surface.input {
+                SurfaceInput::Bindings { .. } => {
+                    SurfaceInput::Bindings { binding_ids: retained }
+                }
+                SurfaceInput::SshAgent { route, .. } => SurfaceInput::SshAgent {
+                    binding_ids: retained,
+                    route: route.clone(),
+                },
+                SurfaceInput::Resource { .. } => unreachable!("binding input checked above"),
             };
             tx.execute(
                 "UPDATE surfaces SET input_json = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
@@ -808,6 +815,7 @@ fn resolve_exports(
 fn validate_snapshot_conflicts(snapshot: &CatalogSnapshot) -> CatalogResult<()> {
     validate_binding_selections(snapshot)?;
     validate_surface_inputs(snapshot)?;
+    validate_ssh_route_conflicts(snapshot)?;
     for surface in &snapshot.surfaces {
         match surface.kind {
             SurfaceKind::DotenvFile | SurfaceKind::DirenvFile => {
@@ -878,9 +886,13 @@ fn validate_surface_inputs(snapshot: &CatalogSnapshot) -> CatalogResult<()> {
                 SurfaceKind::DotenvFile
                     | SurfaceKind::DirenvFile
                     | SurfaceKind::IniFile
-                    | SurfaceKind::LinesFile
-                    | SurfaceKind::UnixSocket,
+                    | SurfaceKind::LinesFile,
                 SurfaceInput::Bindings { binding_ids },
+            )
+            | (
+                SurfaceKind::UnixSocket,
+                SurfaceInput::Bindings { binding_ids }
+                | SurfaceInput::SshAgent { binding_ids, .. },
             ) => {
                 let mut unique = HashSet::new();
                 for binding_id in binding_ids {
@@ -1043,7 +1055,7 @@ fn validate_ssh_agent_surface_conflicts(
     snapshot: &CatalogSnapshot,
     surface: &Surface,
 ) -> CatalogResult<()> {
-    let SurfaceInput::Bindings { binding_ids } = &surface.input else {
+    let Some(binding_ids) = surface.input.binding_ids() else {
         return Err(CatalogError::Validation(format!(
             "SSH agent surface {:?} requires binding input",
             surface.id
@@ -1356,8 +1368,78 @@ fn validate_surface(surface: &Surface) -> CatalogResult<()> {
                 require_id(binding_id, "surface binding id")?;
             }
         }
+        SurfaceInput::SshAgent { binding_ids, route } => {
+            if surface.kind != SurfaceKind::UnixSocket {
+                return Err(CatalogError::Validation(
+                    "ssh_agent input is only valid for a unix_socket surface".to_string(),
+                ));
+            }
+            for binding_id in binding_ids {
+                require_id(binding_id, "surface binding id")?;
+            }
+            if let Some(route) = route {
+                validate_ssh_route(route)?;
+            }
+        }
         SurfaceInput::Resource { resource_id } => {
             require_id(resource_id, "surface resource id")?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_ssh_route(route: &crate::domain::SshRouteSpec) -> CatalogResult<()> {
+    if route.host_patterns.is_empty() {
+        return Err(CatalogError::Validation(
+            "SSH route requires at least one host pattern".to_string(),
+        ));
+    }
+    let mut patterns = HashSet::new();
+    for pattern in &route.host_patterns {
+        if pattern.is_empty()
+            || pattern.starts_with('#')
+            || pattern.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+        {
+            return Err(CatalogError::Validation(format!(
+                "invalid SSH host pattern {pattern:?}"
+            )));
+        }
+        if !patterns.insert(pattern) {
+            return Err(CatalogError::Validation(format!(
+                "SSH route repeats host pattern {pattern:?}"
+            )));
+        }
+    }
+    for (label, value) in [("HostName", &route.hostname), ("User", &route.user)] {
+        if value.as_ref().is_some_and(|value| {
+            value.trim().is_empty() || value.chars().any(|ch| ch == '\n' || ch == '\r' || ch == '\0')
+        }) {
+            return Err(CatalogError::Validation(format!(
+                "SSH route {label} contains invalid characters"
+            )));
+        }
+    }
+    if route.port == Some(0) {
+        return Err(CatalogError::Validation(
+            "SSH route port must be greater than zero".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_ssh_route_conflicts(snapshot: &CatalogSnapshot) -> CatalogResult<()> {
+    let mut owners = HashMap::<&str, &str>::new();
+    for surface in &snapshot.surfaces {
+        let SurfaceInput::SshAgent { route: Some(route), .. } = &surface.input else {
+            continue;
+        };
+        for pattern in route.host_patterns.iter().filter(|pattern| !pattern.starts_with('!')) {
+            if let Some(existing) = owners.insert(pattern, &surface.id) {
+                return Err(CatalogError::Validation(format!(
+                    "SSH host pattern {pattern:?} is routed by both {existing:?} and {:?}",
+                    surface.id
+                )));
+            }
         }
     }
     Ok(())
@@ -1490,7 +1572,7 @@ fn invalid_value(column: usize, value: String) -> rusqlite::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::EntrySpec;
+    use crate::domain::{EntrySpec, SshRouteSpec};
 
     fn project() -> Project {
         Project {
@@ -2152,13 +2234,45 @@ mod tests {
             name: "AWS fleet".to_string(),
             kind: SurfaceKind::UnixSocket,
             path: PathBuf::from("/workspace/floria/.floria/agent.sock"),
-            input: SurfaceInput::Bindings {
+            input: SurfaceInput::SshAgent {
                 binding_ids: vec![selected.id.clone()],
+                route: Some(SshRouteSpec {
+                    host_patterns: vec!["ec2-*.example.internal".to_string()],
+                    hostname: None,
+                    user: Some("ubuntu".to_string()),
+                    port: None,
+                    forward_agent: true,
+                }),
             },
             enforcement: Enforcement::TouchId,
             position: 0,
         };
         catalog.upsert_surface(&surface).unwrap();
+
+        let conflicting_route = Surface {
+            id: "fixture-agent-surface-two".to_string(),
+            name: "Duplicate route".to_string(),
+            path: PathBuf::from("/workspace/floria/.floria/agent-two.sock"),
+            ..surface.clone()
+        };
+        let error = catalog.upsert_surface(&conflicting_route).unwrap_err();
+        assert!(matches!(error, CatalogError::Validation(message) if message.contains("ec2-*.example.internal")));
+
+        let invalid_route = Surface {
+            input: SurfaceInput::SshAgent {
+                binding_ids: vec!["fixture-agent-binding".to_string()],
+                route: Some(SshRouteSpec {
+                    host_patterns: vec!["fixture\nHost injected".to_string()],
+                    hostname: None,
+                    user: None,
+                    port: None,
+                    forward_agent: false,
+                }),
+            },
+            ..surface.clone()
+        };
+        let error = catalog.upsert_surface(&invalid_route).unwrap_err();
+        assert!(matches!(error, CatalogError::Validation(message) if message.contains("host pattern")));
 
         let direct = Surface {
             input: SurfaceInput::Resource {

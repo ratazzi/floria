@@ -376,19 +376,41 @@ struct WorkspaceSurface: Identifiable, Hashable, Sendable {
     }
 
     var bindingIDs: [WorkspaceBinding.ID] {
-        guard case .bindings(let ids) = input else { return [] }
-        return ids
+        switch input {
+        case .bindings(let ids), .sshAgent(let ids, _): ids
+        case .resource: []
+        }
     }
 
     var resourceID: WorkspaceResource.ID? {
         guard case .resource(let id) = input else { return nil }
         return id
     }
+
+    var sshRoute: WorkspaceSshRoute? {
+        guard case .sshAgent(_, let route) = input else { return nil }
+        return route
+    }
 }
 
 enum WorkspaceSurfaceInput: Hashable, Sendable {
     case bindings([WorkspaceBinding.ID])
+    case sshAgent([WorkspaceBinding.ID], WorkspaceSshRoute?)
     case resource(WorkspaceResource.ID)
+}
+
+struct WorkspaceSshRoute: Hashable, Sendable {
+    let hostPatterns: [String]
+    let hostname: String?
+    let user: String?
+    let port: UInt16?
+    let forwardAgent: Bool
+
+    var catalogValue: CatalogSshRoute {
+        CatalogSshRoute(
+            hostPatterns: hostPatterns, hostname: hostname, user: user, port: port,
+            forwardAgent: forwardAgent)
+    }
 }
 
 struct WorkspaceEnvironment: Identifiable, Hashable, Sendable {
@@ -1145,7 +1167,7 @@ final class WorkspaceStore {
     @discardableResult
     func createSshAgentSurface(
         resourceID: WorkspaceResource.ID, selectedEntries: Set<String>, socketName: String,
-        securityLevel: WorkspaceSecurityLevel
+        securityLevel: WorkspaceSecurityLevel, route: WorkspaceSshRoute?
     ) async throws -> WorkspaceSurface.ID {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
         guard let project = selectedProject, let environment = selectedEnvironment else {
@@ -1172,7 +1194,8 @@ final class WorkspaceStore {
             try await controlClient.upsertSurface(
                 CatalogSurface(
                     id: surfaceID, environmentID: environment.id, name: output.name,
-                    kind: "unix_socket", path: output.path, input: .bindings([bindingID]),
+                    kind: "unix_socket", path: output.path,
+                    input: .sshAgent([bindingID], route: route?.catalogValue),
                     enforcement: securityLevel.rawValue,
                     position: Int64(environment.surfaces.count)))
         } catch {
@@ -1266,7 +1289,8 @@ final class WorkspaceStore {
                 CatalogSurface(
                     id: surface.id, environmentID: environment.id, name: surface.name,
                     kind: surface.kind.catalogValue, path: surface.path,
-                    input: .bindings(surface.bindingIDs + [bindingID]),
+                    input: surface.input.catalogInput(
+                        replacingBindingIDs: surface.bindingIDs + [bindingID]),
                     enforcement: surface.securityLevel.rawValue,
                     position: Int64(
                         environment.surfaces.firstIndex(where: { $0.id == surface.id }) ?? 0)))
@@ -1337,7 +1361,7 @@ final class WorkspaceStore {
 
     func updateSurface(
         _ id: WorkspaceSurface.ID, fileName: String, kind: WorkspaceSurfaceKind,
-        bindingIDs: [WorkspaceBinding.ID]
+        bindingIDs: [WorkspaceBinding.ID], sshRoute: WorkspaceSshRoute? = nil
     ) async throws {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
         guard let project = selectedProject, let environment = selectedEnvironment,
@@ -1360,7 +1384,19 @@ final class WorkspaceStore {
                 throw WorkspaceStoreError.invalid(
                     "One or more bindings cannot feed the selected format")
             }
-            input = .bindings(bindingIDs)
+            input = kind == .unixSocket
+                ? .sshAgent(bindingIDs, route: sshRoute?.catalogValue)
+                : .bindings(bindingIDs)
+        case .sshAgent:
+            guard surface.kind == .unixSocket, kind == .unixSocket else {
+                throw WorkspaceStoreError.invalid("SSH routes require a Unix Socket output")
+            }
+            let allowed = Set(compatibleBindings(for: .unixSocket).map(\.id))
+            guard bindingIDs.allSatisfy(allowed.contains) else {
+                throw WorkspaceStoreError.invalid(
+                    "One or more bindings cannot feed the selected SSH agent")
+            }
+            input = .sshAgent(bindingIDs, route: sshRoute?.catalogValue)
         case .resource(let resourceID):
             guard kind == surface.kind else {
                 throw WorkspaceStoreError.invalid("Direct outputs keep their source format")
@@ -1399,7 +1435,8 @@ final class WorkspaceStore {
             CatalogSurface(
                 id: surface.id, environmentID: environment.id, name: surface.name,
                 kind: surface.kind.catalogValue, path: surface.path,
-                input: .bindings(bindingIDs), enforcement: surface.securityLevel.rawValue,
+                input: surface.input.catalogInput(replacingBindingIDs: bindingIDs),
+                enforcement: surface.securityLevel.rawValue,
                 position: Int64(position)))
         apply(try await controlClient.snapshot())
         selectedSurfaceID = id
@@ -1687,6 +1724,10 @@ private extension WorkspaceSurface {
         let input: WorkspaceSurfaceInput
         switch surface.input.type {
         case "bindings": input = .bindings(surface.input.bindingIDs ?? [])
+        case "ssh_agent":
+            input = .sshAgent(
+                surface.input.bindingIDs ?? [],
+                surface.input.route.map(WorkspaceSshRoute.init))
         case "resource":
             guard let resourceID = surface.input.resourceID else { return nil }
             input = .resource(resourceID)
@@ -1710,8 +1751,25 @@ private extension WorkspaceSurfaceInput {
     var catalogInput: CatalogSurfaceInput {
         switch self {
         case .bindings(let ids): .bindings(ids)
+        case .sshAgent(let ids, let route): .sshAgent(ids, route: route?.catalogValue)
         case .resource(let id): .resource(id)
         }
+    }
+
+    func catalogInput(replacingBindingIDs ids: [WorkspaceBinding.ID]) -> CatalogSurfaceInput {
+        switch self {
+        case .bindings: .bindings(ids)
+        case .sshAgent(_, let route): .sshAgent(ids, route: route?.catalogValue)
+        case .resource(let id): .resource(id)
+        }
+    }
+}
+
+private extension WorkspaceSshRoute {
+    init(_ route: CatalogSshRoute) {
+        self.init(
+            hostPatterns: route.hostPatterns, hostname: route.hostname, user: route.user,
+            port: route.port, forwardAgent: route.forwardAgent)
     }
 }
 

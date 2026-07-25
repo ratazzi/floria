@@ -1,6 +1,10 @@
 import AppKit
 import SwiftUI
 
+private extension String {
+    var nilIfEmpty: String? { isEmpty ? nil : self }
+}
+
 private func copyToPasteboard(_ value: String) {
     NSPasteboard.general.clearContents()
     NSPasteboard.general.setString(value, forType: .string)
@@ -545,11 +549,9 @@ struct DashboardView: View {
                 kinds: [.envFile], search: search,
                 addResourceTitle: "Add Env File", addResource: { showingNewEnvFile = true })
         case .sshAgents:
-            ResourceCatalogView(
-                store: state.workspace, title: "SSH Agents",
-                subtitle: "Public identities discovered from existing agent sockets",
-                kinds: [.sshAgent], search: search,
-                addResourceTitle: "Connect Agent", addResource: { showingNewSshAgent = true })
+            SshAgentsCatalogView(
+                store: state.workspace, search: search,
+                connectAgent: { showingNewSshAgent = true })
         case .accessLog:
             AccessLogView(state: state)
         case nil:
@@ -1470,12 +1472,23 @@ private struct ManageSurfaceSheet: View {
     @State private var selectedBindingIDs: Set<WorkspaceBinding.ID> = []
     @State private var fileName: String
     @State private var selectedKind: WorkspaceSurfaceKind
+    @State private var sshHostPatterns: String
+    @State private var sshHostname: String
+    @State private var sshUser: String
+    @State private var sshPort: String
+    @State private var sshForwardAgent: Bool
 
     init(store: WorkspaceStore, surface: WorkspaceSurface) {
         self.store = store
         self.surface = surface
         _fileName = State(initialValue: surface.name)
         _selectedKind = State(initialValue: surface.kind)
+        _sshHostPatterns = State(
+            initialValue: surface.sshRoute?.hostPatterns.joined(separator: " ") ?? "")
+        _sshHostname = State(initialValue: surface.sshRoute?.hostname ?? "")
+        _sshUser = State(initialValue: surface.sshRoute?.user ?? "")
+        _sshPort = State(initialValue: surface.sshRoute?.port.map(String.init) ?? "")
+        _sshForwardAgent = State(initialValue: surface.sshRoute?.forwardAgent ?? false)
     }
 
     private var isFileSurface: Bool {
@@ -1560,6 +1573,28 @@ private struct ManageSurfaceSheet: View {
                         Text("No compatible bindings")
                             .foregroundStyle(.secondary)
                     }
+                }
+            }
+
+
+            if isSocketSurface {
+                InspectorSection(title: "SSH host route") {
+                    TextField("Host patterns", text: $sshHostPatterns)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.body.monospaced())
+                    TextField("HostName override", text: $sshHostname)
+                        .textFieldStyle(.roundedBorder)
+                    HStack {
+                        TextField("User", text: $sshUser)
+                            .textFieldStyle(.roundedBorder)
+                        TextField("Port", text: $sshPort)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 80)
+                    }
+                    Toggle("Forward Agent", isOn: $sshForwardAgent)
+                    Text("Space-separated patterns compile to one generated OpenSSH Host block.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
 
@@ -1659,14 +1694,37 @@ private struct ManageSurfaceSheet: View {
             defer { isWorking = false }
             do {
                 let ordered = bindingCandidates.map(\.id).filter(selectedBindingIDs.contains)
+                let route = try sshRoute()
                 try await store.updateSurface(
                     surface.id, fileName: fileName, kind: selectedKind,
-                    bindingIDs: ordered)
+                    bindingIDs: ordered, sshRoute: route)
                 dismiss()
             } catch {
                 errorMessage = error.localizedDescription
             }
         }
+    }
+
+    private func sshRoute() throws -> WorkspaceSshRoute? {
+        guard isSocketSurface else { return nil }
+        let patterns = sshHostPatterns.split(whereSeparator: \.isWhitespace).map(String.init)
+        let port: UInt16?
+        if sshPort.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            port = nil
+        } else if let parsed = UInt16(sshPort), parsed > 0 {
+            port = parsed
+        } else {
+            throw WorkspaceStoreError.invalid("SSH port must be between 1 and 65535")
+        }
+        let hostname = sshHostname.trimmingCharacters(in: .whitespacesAndNewlines)
+        let user = sshUser.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasOptions = !hostname.isEmpty || !user.isEmpty || port != nil || sshForwardAgent
+        guard !patterns.isEmpty || !hasOptions else {
+            throw WorkspaceStoreError.invalid("Add a Host pattern before route options")
+        }
+        return patterns.isEmpty ? nil : WorkspaceSshRoute(
+            hostPatterns: patterns, hostname: hostname.nilIfEmpty, user: user.nilIfEmpty,
+            port: port, forwardAgent: sshForwardAgent)
     }
 
     private func bindingSelection(_ id: WorkspaceBinding.ID) -> Binding<Bool> {
@@ -2293,6 +2351,11 @@ private struct AddSshAgentSurfaceSheet: View {
     @State private var selectedEntries: Set<String> = []
     @State private var socketName = "agent.sock"
     @State private var securityLevel = WorkspaceSecurityLevel.confirmation
+    @State private var hostPatterns = ""
+    @State private var hostname = ""
+    @State private var user = ""
+    @State private var port = ""
+    @State private var forwardAgent = false
     @State private var isSaving = false
     @State private var errorMessage: String?
 
@@ -2349,6 +2412,29 @@ private struct AddSshAgentSurfaceSheet: View {
                     }
                 }
 
+                GroupBox("SSH host route (optional)") {
+                    VStack(alignment: .leading, spacing: 9) {
+                        TextField("Host patterns, e.g. ec2-* github.com", text: $hostPatterns)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.body.monospaced())
+                        HStack {
+                            TextField("HostName override", text: $hostname)
+                                .textFieldStyle(.roundedBorder)
+                            TextField("User", text: $user)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 130)
+                            TextField("Port", text: $port)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(width: 75)
+                        }
+                        Toggle("Forward this filtered agent to the remote host", isOn: $forwardAgent)
+                        Text("Floria writes a generated Include file; it does not edit ~/.ssh/config.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(8)
+                }
+
                 SecurityLevelPicker(selection: $securityLevel)
             }
 
@@ -2403,13 +2489,78 @@ private struct AddSshAgentSurfaceSheet: View {
             isSaving = true
             defer { isSaving = false }
             do {
+                let patterns = hostPatterns.split(whereSeparator: \.isWhitespace).map(String.init)
+                let portValue: UInt16?
+                if port.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    portValue = nil
+                } else if let parsed = UInt16(port), parsed > 0 {
+                    portValue = parsed
+                } else {
+                    throw WorkspaceStoreError.invalid("SSH port must be between 1 and 65535")
+                }
+                let hasOptions = !hostname.isEmpty || !user.isEmpty || portValue != nil || forwardAgent
+                guard !patterns.isEmpty || !hasOptions else {
+                    throw WorkspaceStoreError.invalid("Add a Host pattern before route options")
+                }
+                let route = patterns.isEmpty ? nil : WorkspaceSshRoute(
+                    hostPatterns: patterns,
+                    hostname: hostname.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
+                    user: user.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
+                    port: portValue, forwardAgent: forwardAgent)
                 try await store.createSshAgentSurface(
                     resourceID: resourceID, selectedEntries: selectedEntries,
-                    socketName: socketName, securityLevel: securityLevel)
+                    socketName: socketName, securityLevel: securityLevel, route: route)
                 dismiss()
             } catch {
                 errorMessage = error.localizedDescription
             }
+        }
+    }
+}
+
+private struct SshAgentsCatalogView: View {
+    @Bindable var store: WorkspaceStore
+    let search: String
+    let connectAgent: () -> Void
+
+    private var generatedConfig: String {
+        (NSHomeDirectory() as NSString).appendingPathComponent(
+            "Library/Application Support/floria/ssh/config")
+    }
+
+    private var includeLine: String { "Include \"\(generatedConfig)\"" }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            ResourceCatalogView(
+                store: store, title: "SSH Agents",
+                subtitle: "Public identities discovered from existing agent sockets",
+                kinds: [.sshAgent], search: search,
+                addResourceTitle: "Connect Agent", addResource: connectAgent)
+                .frame(maxHeight: .infinity)
+            Divider()
+            HStack(spacing: 12) {
+                Image(systemName: "terminal")
+                    .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Enable host routing once in ~/.ssh/config")
+                        .font(.callout.weight(.medium))
+                    Text(includeLine)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                Spacer()
+                Button("Copy Include", systemImage: "doc.on.doc") {
+                    copyToPasteboard(includeLine)
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
+            .background(.bar)
+            .fixedSize(horizontal: false, vertical: true)
+            .layoutPriority(1)
         }
     }
 }

@@ -193,7 +193,7 @@ pub fn validate_secret_bytes(
         .filter(|surface| surface.kind == SurfaceKind::LinesFile)
         .filter_map(|surface| match &surface.input {
             SurfaceInput::Bindings { binding_ids } => Some(binding_ids.as_slice()),
-            SurfaceInput::Resource { .. } => None,
+            SurfaceInput::SshAgent { .. } | SurfaceInput::Resource { .. } => None,
         })
         .flatten()
         .collect::<std::collections::HashSet<_>>();

@@ -123,19 +123,40 @@ struct CatalogSurfaceInput: Codable, Sendable {
     let type: String
     let bindingIDs: [String]?
     let resourceID: String?
+    let route: CatalogSshRoute?
 
     enum CodingKeys: String, CodingKey {
         case type
         case bindingIDs = "binding_ids"
         case resourceID = "resource_id"
+        case route
     }
 
     static func bindings(_ ids: [String]) -> CatalogSurfaceInput {
-        CatalogSurfaceInput(type: "bindings", bindingIDs: ids, resourceID: nil)
+        CatalogSurfaceInput(type: "bindings", bindingIDs: ids, resourceID: nil, route: nil)
     }
 
     static func resource(_ id: String) -> CatalogSurfaceInput {
-        CatalogSurfaceInput(type: "resource", bindingIDs: nil, resourceID: id)
+        CatalogSurfaceInput(type: "resource", bindingIDs: nil, resourceID: id, route: nil)
+    }
+
+    static func sshAgent(_ ids: [String], route: CatalogSshRoute?) -> CatalogSurfaceInput {
+        CatalogSurfaceInput(
+            type: "ssh_agent", bindingIDs: ids, resourceID: nil, route: route)
+    }
+}
+
+struct CatalogSshRoute: Codable, Hashable, Sendable {
+    let hostPatterns: [String]
+    let hostname: String?
+    let user: String?
+    let port: UInt16?
+    let forwardAgent: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case hostname, user, port
+        case hostPatterns = "host_patterns"
+        case forwardAgent = "forward_agent"
     }
 }
 

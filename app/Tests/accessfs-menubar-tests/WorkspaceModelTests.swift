@@ -206,6 +206,16 @@ final class WorkspaceModelTests: XCTestCase {
         preview.selectedSurfaceID = "floria-dev-ssh-socket"
         let socket = preview.selectedSurface!
         XCTAssertTrue(preview.expectedLinkTarget(for: socket).hasSuffix(".sock"))
+
+        let route = WorkspaceSshRoute(
+            hostPatterns: ["ec2-*", "bastion"], hostname: nil, user: "ubuntu",
+            port: nil, forwardAgent: true)
+        let routed = WorkspaceSurface(
+            id: "routed", name: "agent.sock", kind: .unixSocket,
+            path: "/tmp/fixture/agent.sock", status: .listening,
+            input: .sshAgent([binding.id], route))
+        XCTAssertEqual(routed.bindingIDs, [binding.id])
+        XCTAssertEqual(routed.sshRoute?.hostPatterns, ["ec2-*", "bastion"])
     }
 
     func testProtectedFileKindsAreInferredWithoutParsingContent() {

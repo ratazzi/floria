@@ -233,7 +233,38 @@ impl SurfaceKind {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SurfaceInput {
     Bindings { binding_ids: Vec<String> },
+    SshAgent {
+        binding_ids: Vec<String>,
+        #[serde(default)]
+        route: Option<SshRouteSpec>,
+    },
     Resource { resource_id: String },
+}
+
+impl SurfaceInput {
+    pub fn binding_ids(&self) -> Option<&[String]> {
+        match self {
+            SurfaceInput::Bindings { binding_ids }
+            | SurfaceInput::SshAgent { binding_ids, .. } => Some(binding_ids),
+            SurfaceInput::Resource { .. } => None,
+        }
+    }
+}
+
+/// One OpenSSH `Host` route selecting a filtered agent surface. Multiple patterns share the same
+/// socket and identity set; richer DSLs can compile to additional surfaces without changing the
+/// runtime contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshRouteSpec {
+    pub host_patterns: Vec<String>,
+    #[serde(default)]
+    pub hostname: Option<String>,
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub forward_agent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

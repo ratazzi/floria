@@ -389,6 +389,7 @@ fn cmd_mount(config: &Path) -> Result<()> {
     let ssh_runtime = Arc::new(
         accessfs_agent::SshAgentRuntime::new(
             support_dir.join("runtime/sockets"),
+            support_dir.join("ssh/config"),
             ssh_authorizer,
             Arc::clone(&audit),
         )

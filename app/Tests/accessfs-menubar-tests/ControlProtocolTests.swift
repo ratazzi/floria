@@ -344,6 +344,34 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(snapshot.surfaces.first?.enforcement, "touchid")
     }
 
+    func testSshAgentSurfaceRouteMatchesRustWireShape() throws {
+        let surface = CatalogSurface(
+            id: "fixture-agent", environmentID: "fixture-development", name: "agent.sock",
+            kind: "unix_socket", path: "/tmp/fixture/agent.sock",
+            input: .sshAgent(
+                ["fixture-binding"],
+                route: CatalogSshRoute(
+                    hostPatterns: ["ec2-*", "bastion"], hostname: nil, user: "ubuntu",
+                    port: 2222, forwardAgent: true)),
+            position: 2)
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let data = try ControlCommand.surfaceUpsert(surface)
+            .requestData(requestID: 81, encoder: encoder)
+        let value = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let encodedSurface = try XCTUnwrap(
+            (value["params"] as? [String: Any])?["surface"] as? [String: Any])
+        let input = try XCTUnwrap(encodedSurface["input"] as? [String: Any])
+        let route = try XCTUnwrap(input["route"] as? [String: Any])
+
+        XCTAssertEqual(input["type"] as? String, "ssh_agent")
+        XCTAssertEqual(input["binding_ids"] as? [String], ["fixture-binding"])
+        XCTAssertEqual(route["host_patterns"] as? [String], ["ec2-*", "bastion"])
+        XCTAssertEqual(route["user"] as? String, "ubuntu")
+        XCTAssertEqual(route["port"] as? UInt16, 2222)
+        XCTAssertEqual(route["forward_agent"] as? Bool, true)
+    }
+
     func testDecodesIniSurfaceFromRustSnapshot() throws {
         let data = Data(
             #"{"projects":[],"environments":[],"resources":[],"bindings":[],"surfaces":[{"id":"fixture-ini","environment_id":"fixture-development","name":"credentials.ini","kind":"ini_file","path":"/tmp/fixture/credentials.ini","input":{"type":"bindings","binding_ids":["fixture-binding"]},"enforcement":"prompt","position":1}]}"#.utf8)
