@@ -29,7 +29,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(params.count, 1)
 
         let response = Data(
-            #"{"request_id":8,"status":"ok","result":{"type":"discovery","value":{"path":"/fixture/project","project":{"name":"project","path":"/fixture/project"},"files":[{"path":"/fixture/project/.env","relative_path":".env","kind":"dotenv","codec":"dotenv","environment":"development","tags":["dotenv","development"],"entries":[{"address":"keys/API_TOKEN","key":"API_TOKEN","section":null,"action":{"type":"reuse_shared_secret","resource_id":"fixture-shared","resource_name":"Fixture Shared Secret"}}],"warnings":[],"action":"compose"}],"summary":{"files":1,"entries":1,"new_secrets":0,"reused_secrets":1,"warnings":0}}}}"#.utf8)
+            #"{"request_id":8,"status":"ok","result":{"type":"discovery","value":{"path":"/fixture/project","project":{"name":"project","path":"/fixture/project"},"files":[{"path":"/fixture/project/.env","relative_path":".env","kind":"dotenv","codec":"dotenv","environment":"development","tags":["dotenv","development"],"entries":[{"address":"keys/API_TOKEN","key":"API_TOKEN","section":null,"action":{"type":"reuse_shared_secret","resource_id":"fixture-shared","resource_name":"Fixture Shared Secret"}}],"warnings":[],"action":"compose"}],"summary":{"files":1,"entries":1,"new_secrets":0,"reused_secrets":1,"missing_reference_entries":0,"warnings":0}}}}"#.utf8)
         let decoded = try JSONDecoder().decode(
             ControlResponseEnvelope<DiscoveryPlan>.self, from: response)
         let plan = try XCTUnwrap(decoded.result?.value)
@@ -109,11 +109,12 @@ final class ControlProtocolTests: XCTestCase {
         let file = try JSONDecoder().decode(
             DiscoveredFile.self,
             from: Data(
-                #"{"path":"/fixture/project/.env.example","relative_path":".env.example","kind":"dotenv","codec":"dotenv","environment":"development","tags":["dotenv","development","reference"],"entries":[{"address":"keys/API_TOKEN","key":"API_TOKEN","section":null,"action":{"type":"reference_entry"}}],"warnings":[],"action":"reference"}"#.utf8))
+                #"{"path":"/fixture/project/.env.example","relative_path":".env.example","kind":"dotenv","codec":"dotenv","environment":"development","tags":["dotenv","development","reference"],"entries":[{"address":"keys/API_TOKEN","key":"API_TOKEN","section":null,"action":{"type":"reference_entry","matched":false}}],"warnings":[],"action":"reference"}"#.utf8))
 
         XCTAssertEqual(file.action, .reference)
         XCTAssertEqual(file.environment, "development")
         XCTAssertEqual(file.entries.first?.action.type, "reference_entry")
+        XCTAssertEqual(file.entries.first?.action.matched, false)
     }
 
     func testPolicyModeRequestsMatchRustWireShape() throws {

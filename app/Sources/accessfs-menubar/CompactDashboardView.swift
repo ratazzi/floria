@@ -1501,6 +1501,12 @@ private struct DiscoveryReviewSheet: View {
                 "\(referenceCount) reference file\(referenceCount == 1 ? "" : "s") will remain unchanged."
             )
         }
+        let missingCount = plan.summary.missingReferenceEntries
+        if missingCount > 0 {
+            notes.append(
+                "\(missingCount) declared key\(missingCount == 1 ? "" : "s") have no discovered value."
+            )
+        }
         let base = notes.joined(separator: " ")
         if selectedFilePaths.isEmpty {
             return plan.files.contains(where: \.canApplyDiscovery)
@@ -1814,7 +1820,7 @@ private struct DiscoveryFileCard: View {
         } else {
             Text(automaticEntryActionTitle(entry, selectionID: selectionID))
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(entryActionColor(entry))
         }
     }
 
@@ -1843,9 +1849,16 @@ private struct DiscoveryFileCard: View {
             return automaticGroupPrimaryEntryIDs.contains(selectionID)
                 ? "New shared secret"
                 : "Share in import"
+        case "reference_entry":
+            return entry.action.matched == true ? "Covered" : "Missing value"
         default:
             return entryActionTitle(entry.action.type)
         }
+    }
+
+    private func entryActionColor(_ entry: DiscoveredEntry) -> Color {
+        guard entry.action.type == "reference_entry" else { return .secondary }
+        return entry.action.matched == true ? .green : .orange
     }
 
     private var icon: String {

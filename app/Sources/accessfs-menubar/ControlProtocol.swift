@@ -263,12 +263,14 @@ struct DiscoverySummary: Codable, Hashable, Sendable {
     let entries: Int
     let newSecrets: Int
     let reusedSecrets: Int
+    let missingReferenceEntries: Int
     let warnings: Int
 
     enum CodingKeys: String, CodingKey {
         case files, entries, warnings
         case newSecrets = "new_secrets"
         case reusedSecrets = "reused_secrets"
+        case missingReferenceEntries = "missing_reference_entries"
     }
 }
 
@@ -320,9 +322,10 @@ struct DiscoveredEntryAction: Codable, Hashable, Sendable {
     let resourceID: String?
     let resourceName: String?
     let groupID: String?
+    let matched: Bool?
 
     enum CodingKeys: String, CodingKey {
-        case type
+        case type, matched
         case resourceID = "resource_id"
         case resourceName = "resource_name"
         case groupID = "group_id"

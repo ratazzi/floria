@@ -3,6 +3,7 @@
 //! Discovery never executes project code. It produces a redacted plan for review while retaining
 //! plaintext only in zeroizing values long enough to compare candidates with existing resources.
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -56,6 +57,7 @@ pub struct DiscoverySummary {
     pub entries: usize,
     pub new_secrets: usize,
     pub reused_secrets: usize,
+    pub missing_reference_entries: usize,
     pub warnings: usize,
 }
 
@@ -116,7 +118,9 @@ pub enum DiscoveredEntryAction {
     },
     CreateEnvFileEntry,
     KeepInProtectedFile,
-    ReferenceEntry,
+    ReferenceEntry {
+        matched: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -236,7 +240,18 @@ impl Discovery {
     pub fn plan(&self, existing: &[ExistingSecret]) -> DiscoveryPlan {
         let mut reused_secrets = 0;
         let mut new_secrets = 0;
+        let mut missing_reference_entries = 0;
         let mut discovered_groups = Vec::<(&str, &[u8], String)>::new();
+        let mut discovered_dotenv_keys = HashMap::<Option<&str>, HashSet<&str>>::new();
+        for file in self.files.iter().filter(|file| {
+            file.kind == DiscoveredFileKind::Dotenv
+                && file.action == DiscoveredFileAction::Compose
+        }) {
+            let keys = discovered_dotenv_keys
+                .entry(file.environment.as_deref())
+                .or_default();
+            keys.extend(file.entries.iter().map(|entry| entry.key.as_str()));
+        }
         let mut files = Vec::with_capacity(self.files.len());
         for file in &self.files {
             let mut entries = Vec::with_capacity(file.entries.len());
@@ -276,7 +291,15 @@ impl Discovery {
                     EntryDisposition::ProtectedFile => {
                         DiscoveredEntryAction::KeepInProtectedFile
                     }
-                    EntryDisposition::Reference => DiscoveredEntryAction::ReferenceEntry,
+                    EntryDisposition::Reference => {
+                        let matched = discovered_dotenv_keys
+                            .get(&file.environment.as_deref())
+                            .is_some_and(|keys| keys.contains(entry.key.as_str()));
+                        if !matched {
+                            missing_reference_entries += 1;
+                        }
+                        DiscoveredEntryAction::ReferenceEntry { matched }
+                    }
                 };
                 entries.push(DiscoveredEntry {
                     address: entry.address.clone(),
@@ -308,6 +331,7 @@ impl Discovery {
                 entries,
                 new_secrets,
                 reused_secrets,
+                missing_reference_entries,
                 warnings,
             },
             files,
@@ -968,7 +992,17 @@ mod tests {
         assert!(example
             .entries
             .iter()
-            .all(|entry| entry.action == DiscoveredEntryAction::ReferenceEntry));
+            .any(|entry| {
+                entry.key == "API_TOKEN"
+                    && entry.action
+                        == DiscoveredEntryAction::ReferenceEntry { matched: true }
+            }));
+        assert!(example.entries.iter().any(|entry| {
+            entry.key == "OPTIONAL_FLAG"
+                && entry.action
+                    == DiscoveredEntryAction::ReferenceEntry { matched: false }
+        }));
+        assert_eq!(plan.summary.missing_reference_entries, 2);
 
         let production = plan
             .files
