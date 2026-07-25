@@ -105,6 +105,17 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(file.action, .review)
     }
 
+    func testDiscoveryReferenceActionMatchesRustWireShape() throws {
+        let file = try JSONDecoder().decode(
+            DiscoveredFile.self,
+            from: Data(
+                #"{"path":"/fixture/project/.env.example","relative_path":".env.example","kind":"dotenv","codec":"dotenv","environment":"development","tags":["dotenv","development","reference"],"entries":[{"address":"keys/API_TOKEN","key":"API_TOKEN","section":null,"action":{"type":"reference_entry"}}],"warnings":[],"action":"reference"}"#.utf8))
+
+        XCTAssertEqual(file.action, .reference)
+        XCTAssertEqual(file.environment, "development")
+        XCTAssertEqual(file.entries.first?.action.type, "reference_entry")
+    }
+
     func testPolicyModeRequestsMatchRustWireShape() throws {
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase

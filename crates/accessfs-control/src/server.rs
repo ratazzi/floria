@@ -814,10 +814,11 @@ fn apply_discovery(
     let valid_separate_entries = contents
         .iter()
         .filter(|file| {
-            matches!(
-                file.kind,
-                DiscoveredFileKind::Dotenv | DiscoveredFileKind::Direnv
-            )
+            file.action == DiscoveredFileAction::Compose
+                && matches!(
+                    file.kind,
+                    DiscoveredFileKind::Dotenv | DiscoveredFileKind::Direnv
+                )
         })
         .flat_map(|file| {
             file.entries
@@ -941,6 +942,14 @@ fn apply_discovery(
                         outcome: DiscoveryApplyOutcome::Skipped,
                         detail: "Detected for review; automatic import is not supported yet"
                             .to_string(),
+                    });
+                    Ok(false)
+                }
+                DiscoveredFileAction::Reference => {
+                    result.files.push(DiscoveryAppliedFile {
+                        path: file.path,
+                        outcome: DiscoveryApplyOutcome::Skipped,
+                        detail: "Reference configuration left unchanged".to_string(),
                     });
                     Ok(false)
                 }
@@ -2707,6 +2716,53 @@ mod tests {
         let snapshot = catalog.snapshot().unwrap();
         assert_eq!(snapshot.surfaces.len(), 1);
         assert_eq!(snapshot.environments[0].name, "Production");
+    }
+
+    #[test]
+    fn discovery_apply_leaves_dotenv_reference_files_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("fixture-project");
+        let source_path = project_path.join(".env");
+        let reference_path = project_path.join(".env.example");
+        let mount_path = dir.path().join("mount");
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
+        std::fs::create_dir_all(mount_path.join(accessfs_core::config::SURFACES_DIR)).unwrap();
+        std::fs::write(&source_path, "DISCOVERED_TOKEN=fixture-real-value\n").unwrap();
+        let reference_bytes = b"DISCOVERED_TOKEN=replace-me\n";
+        std::fs::write(&reference_path, reference_bytes).unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let store = FixtureStore::new();
+
+        let applied = dispatch(
+            &catalog,
+            DispatchServices {
+                store: Some(&store),
+                mount_path: Some(&mount_path),
+                ..DispatchServices::default()
+            },
+            ControlCommand::DiscoverApply {
+                path: project_path,
+                files: None,
+                separate_entries: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let ControlResult::DiscoveryApplied(result) = applied else {
+            panic!("expected discovery apply result");
+        };
+        assert!(std::fs::symlink_metadata(&source_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::symlink_metadata(&reference_path).unwrap().is_file());
+        assert_eq!(std::fs::read(&reference_path).unwrap(), reference_bytes);
+        assert!(result.files.iter().any(|file| {
+            file.path == reference_path && file.outcome == DiscoveryApplyOutcome::Skipped
+        }));
+        let snapshot = catalog.snapshot().unwrap();
+        assert_eq!(snapshot.resources.len(), 1);
+        assert_eq!(snapshot.surfaces.len(), 1);
     }
 
     #[test]

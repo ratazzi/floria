@@ -285,6 +285,7 @@ enum DiscoveredFileAction: String, Codable, Hashable, Sendable {
     case compose
     case protect
     case importSshIdentity = "import_ssh_identity"
+    case reference
     case review
 }
 

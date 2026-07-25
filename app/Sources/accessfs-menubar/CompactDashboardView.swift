@@ -1494,9 +1494,18 @@ private struct DiscoveryReviewSheet: View {
     }
 
     private var discoveryNote: String {
-        let base = "Static scan only; project code was not executed."
+        var notes = ["Static scan only; project code was not executed."]
+        let referenceCount = plan.files.filter { $0.action == .reference }.count
+        if referenceCount > 0 {
+            notes.append(
+                "\(referenceCount) reference file\(referenceCount == 1 ? "" : "s") will remain unchanged."
+            )
+        }
+        let base = notes.joined(separator: " ")
         if selectedFilePaths.isEmpty {
-            return "\(base) Select at least one importable item."
+            return plan.files.contains(where: \.canApplyDiscovery)
+                ? "\(base) Select at least one importable item."
+                : "\(base) No importable items were found."
         }
         guard plan.summary.warnings > 0 else { return base }
         let suffix = plan.summary.warnings == 1 ? "" : "s"
@@ -1691,7 +1700,10 @@ private struct DiscoveryFileCard: View {
     private var detail: String {
         var parts = [file.kind.displayTitle]
         if let environment = file.environment { parts.append(environment) }
-        if !file.tags.isEmpty { parts.append(file.tags.joined(separator: ", ")) }
+        for tag in file.tags
+        where !parts.contains(where: { $0.localizedCaseInsensitiveCompare(tag) == .orderedSame }) {
+            parts.append(tag)
+        }
         return parts.joined(separator: " · ")
     }
 
@@ -1700,6 +1712,7 @@ private struct DiscoveryFileCard: View {
         case .compose: "\(file.entries.count) value\(file.entries.count == 1 ? "" : "s")"
         case .protect: "Protect in place"
         case .importSshIdentity: "Import identity"
+        case .reference: "Reference only"
         case .review: "Review only"
         }
     }
@@ -1717,7 +1730,9 @@ private struct DiscoveryFileCard: View {
     }
 
     private var statusColor: Color {
-        guard let result else { return file.action == .review ? .secondary : color }
+        guard let result else {
+            return file.action == .review || file.action == .reference ? .secondary : color
+        }
         return switch result.outcome {
         case "imported", "protected": .green
         case "failed": .red
@@ -1726,6 +1741,9 @@ private struct DiscoveryFileCard: View {
     }
 
     private var selectionHelp: String {
+        if file.action == .reference {
+            return "Reference configuration is used for review and remains unchanged."
+        }
         if file.action == .review {
             return "Detected for review; automatic import is not supported yet."
         }
@@ -1739,6 +1757,9 @@ private struct DiscoveryFileCard: View {
     }
 
     private func entryActionTitle(_ type: String) -> String {
+        if file.action == .reference {
+            return "Declared key"
+        }
         if file.action == .review {
             return "Detected"
         }
@@ -1842,6 +1863,7 @@ private struct DiscoveryFileCard: View {
         case .compose: .blue
         case .protect: .orange
         case .importSshIdentity: .green
+        case .reference: .secondary
         case .review: .secondary
         }
     }
@@ -1854,7 +1876,7 @@ private func entrySelectionID(file: DiscoveredFile, entry: DiscoveredEntry) -> S
 private extension DiscoveredFile {
     var canApplyDiscovery: Bool {
         switch action {
-        case .review:
+        case .reference, .review:
             false
         case .compose:
             !entries.isEmpty && warnings.isEmpty

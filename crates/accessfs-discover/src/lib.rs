@@ -89,6 +89,7 @@ pub enum DiscoveredFileAction {
     Compose,
     Protect,
     ImportSshIdentity,
+    Reference,
     Review,
 }
 
@@ -115,6 +116,7 @@ pub enum DiscoveredEntryAction {
     },
     CreateEnvFileEntry,
     KeepInProtectedFile,
+    ReferenceEntry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -184,6 +186,7 @@ enum EntryDisposition {
     SharedSecret,
     EnvFile,
     ProtectedFile,
+    Reference,
 }
 
 /// Discover supported files below `path` without executing any project-controlled content.
@@ -273,6 +276,7 @@ impl Discovery {
                     EntryDisposition::ProtectedFile => {
                         DiscoveredEntryAction::KeepInProtectedFile
                     }
+                    EntryDisposition::Reference => DiscoveredEntryAction::ReferenceEntry,
                 };
                 entries.push(DiscoveredEntry {
                     address: entry.address.clone(),
@@ -464,6 +468,11 @@ fn discover_dotenv(root: &Path, path: &Path, bytes: &[u8]) -> InternalFile {
         .is_some_and(|name| name.split('.').any(|part| part == "local"))
     {
         file.tags.push("local".to_string());
+    }
+    if dotenv_reference_marker(path).is_some() {
+        file.tags.push("reference".to_string());
+        file.action = DiscoveredFileAction::Reference;
+        file.entry_disposition = EntryDisposition::Reference;
     }
     file
 }
@@ -707,9 +716,22 @@ fn dotenv_environment(path: &Path) -> Option<String> {
     let suffix = name.strip_prefix(".env.")?;
     suffix
         .split('.')
-        .find(|part| !part.is_empty() && *part != "local")
+        .find(|part| {
+            !part.is_empty()
+                && *part != "local"
+                && !DOTENV_REFERENCE_MARKERS.contains(part)
+        })
         .map(str::to_string)
         .or_else(|| Some("development".to_string()))
+}
+
+const DOTENV_REFERENCE_MARKERS: &[&str] = &["example", "sample", "template", "dist"];
+
+fn dotenv_reference_marker(path: &Path) -> Option<&'static str> {
+    let name = path.file_name()?.to_str()?;
+    name.strip_prefix(".env.")?
+        .split('.')
+        .find_map(|part| DOTENV_REFERENCE_MARKERS.iter().copied().find(|marker| *marker == part))
 }
 
 fn relative_to(root: &Path, path: &Path) -> PathBuf {
@@ -914,5 +936,46 @@ mod tests {
 
         assert_eq!(plan.files[0].environment.as_deref(), Some("development"));
         assert!(plan.files[0].tags.iter().any(|tag| tag == "local"));
+    }
+
+    #[test]
+    fn classifies_dotenv_examples_as_references_without_secret_candidates() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        fs::write(root.join(".env"), "API_TOKEN=fixture-real-value\n").unwrap();
+        fs::write(
+            root.join(".env.example"),
+            "API_TOKEN=replace-me\nOPTIONAL_FLAG=false\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join(".env.production.sample"),
+            "API_TOKEN=replace-production\n",
+        )
+        .unwrap();
+
+        let plan = discover(root).unwrap().plan(&[]);
+
+        assert_eq!(plan.summary.new_secrets, 1);
+        let example = plan
+            .files
+            .iter()
+            .find(|file| file.relative_path == Path::new(".env.example"))
+            .unwrap();
+        assert_eq!(example.action, DiscoveredFileAction::Reference);
+        assert_eq!(example.environment.as_deref(), Some("development"));
+        assert!(example.tags.iter().any(|tag| tag == "reference"));
+        assert!(example
+            .entries
+            .iter()
+            .all(|entry| entry.action == DiscoveredEntryAction::ReferenceEntry));
+
+        let production = plan
+            .files
+            .iter()
+            .find(|file| file.relative_path == Path::new(".env.production.sample"))
+            .unwrap();
+        assert_eq!(production.action, DiscoveredFileAction::Reference);
+        assert_eq!(production.environment.as_deref(), Some("production"));
     }
 }
