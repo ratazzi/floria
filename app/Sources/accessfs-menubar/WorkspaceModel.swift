@@ -538,6 +538,7 @@ struct WorkspaceProtectedFileVersion: Identifiable, Hashable, Sendable {
 @Observable @MainActor
 final class WorkspaceStore {
     var projects: [WorkspaceProject]
+    var checkouts: [CatalogProjectCheckout]
     var resources: [WorkspaceResource]
     var protectedFiles: [WorkspaceProtectedFile]
     var selectedProjectID: WorkspaceProject.ID
@@ -553,6 +554,7 @@ final class WorkspaceStore {
         selectedProjectID: WorkspaceProject.ID = "", controlClient: ControlClient? = nil
     ) {
         self.projects = projects
+        checkouts = []
         self.resources = resources
         protectedFiles = []
         self.controlClient = controlClient
@@ -568,6 +570,10 @@ final class WorkspaceStore {
 
     var selectedProject: WorkspaceProject? {
         projects.first(where: { $0.id == selectedProjectID })
+    }
+
+    var selectedProjectCheckouts: [CatalogProjectCheckout] {
+        checkouts.filter { $0.projectID == selectedProjectID }
     }
 
     var selectedEnvironment: WorkspaceEnvironment? {
@@ -810,6 +816,56 @@ final class WorkspaceStore {
         apply(try await controlClient.snapshot())
         lastError = nil
         return result
+    }
+
+    func discoverProjectCheckouts(
+        projectID: WorkspaceProject.ID
+    ) async throws -> ProjectCheckoutDiscovery {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        guard projects.contains(where: { $0.id == projectID }) else {
+            throw WorkspaceStoreError.invalid("Choose a project first")
+        }
+        let result = try await controlClient.discoverProjectCheckouts(projectID: projectID)
+        lastError = nil
+        return result
+    }
+
+    func provisionProjectCheckout(
+        projectID: WorkspaceProject.ID, path: String,
+        environmentID: WorkspaceEnvironment.ID, commonDir: String,
+        checkoutID: String? = nil
+    ) async throws {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        guard let project = projects.first(where: { $0.id == projectID }) else {
+            throw WorkspaceStoreError.invalid("Choose a project first")
+        }
+        guard project.environments.contains(where: { $0.id == environmentID }) else {
+            throw WorkspaceStoreError.invalid("Choose an environment for this worktree")
+        }
+        let path = (path as NSString).standardizingPath
+        guard path != (project.path as NSString).standardizingPath else {
+            throw WorkspaceStoreError.invalid("The primary checkout is already managed")
+        }
+        try await controlClient.upsertProjectCheckout(
+            CatalogProjectCheckout(
+                id: checkoutID ?? Self.newID("checkout"),
+                projectID: projectID,
+                path: path,
+                environmentID: environmentID,
+                kind: .worktree,
+                gitCommonDir: (commonDir as NSString).standardizingPath))
+        apply(try await controlClient.snapshot())
+        lastError = nil
+    }
+
+    func removeProjectCheckout(_ id: CatalogProjectCheckout.ID) async throws {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        guard checkouts.contains(where: { $0.id == id && $0.kind == .worktree }) else {
+            throw WorkspaceStoreError.invalid("Choose a managed worktree first")
+        }
+        try await controlClient.removeProjectCheckout(id)
+        apply(try await controlClient.snapshot())
+        lastError = nil
     }
 
     func protectFile(at path: String) async throws {
@@ -1703,6 +1759,7 @@ final class WorkspaceStore {
         let projectUsage = Dictionary(grouping: snapshot.bindings, by: \.resourceID)
             .mapValues { Set($0.map(\.projectID)).count }
 
+        checkouts = snapshot.checkouts
         resources = snapshot.resources.compactMap { resource in
             guard
                 let kind = WorkspaceResourceKind(catalogValue: resource.kind),

@@ -86,6 +86,27 @@ struct CatalogProject: Codable, Sendable {
     let path: String
 }
 
+enum CatalogProjectCheckoutKind: String, Codable, Sendable {
+    case primary
+    case worktree
+}
+
+struct CatalogProjectCheckout: Codable, Hashable, Identifiable, Sendable {
+    let id: String
+    let projectID: String
+    let path: String
+    let environmentID: String?
+    let kind: CatalogProjectCheckoutKind
+    let gitCommonDir: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, path, kind
+        case projectID = "project_id"
+        case environmentID = "environment_id"
+        case gitCommonDir = "git_common_dir"
+    }
+}
+
 struct CatalogEnvironment: Codable, Sendable {
     let id: String
     let projectID: String
@@ -263,10 +284,62 @@ struct CatalogSurface: Codable, Sendable {
 
 struct CatalogSnapshot: Codable, Sendable {
     let projects: [CatalogProject]
+    let checkouts: [CatalogProjectCheckout]
     let environments: [CatalogEnvironment]
     let resources: [CatalogResource]
     let bindings: [CatalogBinding]
     let surfaces: [CatalogSurface]
+
+    private enum CodingKeys: String, CodingKey {
+        case projects, checkouts, environments, resources, bindings, surfaces
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        projects = try container.decode([CatalogProject].self, forKey: .projects)
+        checkouts =
+            try container.decodeIfPresent([CatalogProjectCheckout].self, forKey: .checkouts) ?? []
+        environments = try container.decode([CatalogEnvironment].self, forKey: .environments)
+        resources = try container.decode([CatalogResource].self, forKey: .resources)
+        bindings = try container.decode([CatalogBinding].self, forKey: .bindings)
+        surfaces = try container.decode([CatalogSurface].self, forKey: .surfaces)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(projects, forKey: .projects)
+        try container.encode(checkouts, forKey: .checkouts)
+        try container.encode(environments, forKey: .environments)
+        try container.encode(resources, forKey: .resources)
+        try container.encode(bindings, forKey: .bindings)
+        try container.encode(surfaces, forKey: .surfaces)
+    }
+}
+
+struct ProjectCheckoutDiscovery: Codable, Hashable, Sendable {
+    let projectID: String
+    let commonDir: String
+    let checkouts: [ProjectCheckoutCandidate]
+
+    enum CodingKeys: String, CodingKey {
+        case checkouts
+        case projectID = "project_id"
+        case commonDir = "common_dir"
+    }
+}
+
+struct ProjectCheckoutCandidate: Codable, Hashable, Identifiable, Sendable {
+    let path: String
+    let gitPrimary: Bool
+    let managedCheckoutID: String?
+
+    var id: String { path }
+
+    enum CodingKeys: String, CodingKey {
+        case path
+        case gitPrimary = "git_primary"
+        case managedCheckoutID = "managed_checkout_id"
+    }
 }
 
 struct DiscoveryPlan: Codable, Hashable, Sendable {
@@ -505,6 +578,9 @@ enum ControlCommand: Sendable {
         path: String, files: [String], separateEntries: [DiscoverySeparateEntry])
     case discoverReferenceResolve(
         surfaceID: String, key: String, source: DiscoveryReferenceSource)
+    case projectCheckoutDiscover(projectID: String)
+    case projectCheckoutUpsert(CatalogProjectCheckout)
+    case projectCheckoutRemove(id: String)
     case sshAgentDiscover(endpoint: String)
     case sshIdentityImport(
         resourceID: String, name: String, path: String, passphrase: String?,
@@ -557,6 +633,9 @@ enum ControlCommand: Sendable {
         case .discover: "discover"
         case .discoverApply: "discover_apply"
         case .discoverReferenceResolve: "discover_reference_resolve"
+        case .projectCheckoutDiscover: "project_checkout_discover"
+        case .projectCheckoutUpsert: "project_checkout_upsert"
+        case .projectCheckoutRemove: "project_checkout_remove"
         case .sshAgentDiscover: "ssh_agent_discover"
         case .sshIdentityImport: "ssh_identity_import"
         case .sshIdentityRemove: "ssh_identity_remove"
@@ -625,6 +704,21 @@ enum ControlCommand: Sendable {
                     requestID: requestID, method: method,
                     params: DiscoverReferenceResolveParams(
                         surfaceID: surfaceID, key: key, source: source)))
+        case .projectCheckoutDiscover(let projectID):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: ProjectCheckoutDiscoverParams(projectID: projectID)))
+        case .projectCheckoutUpsert(let checkout):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: ProjectCheckoutUpsertParams(checkout: checkout)))
+        case .projectCheckoutRemove(let id):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: RemoveParams(id: id)))
         case .sshAgentDiscover(let endpoint):
             return try encoder.encode(
                 ControlRequest(
@@ -758,6 +852,8 @@ private struct DiscoverReferenceResolveParams: Encodable {
     let key: String
     let source: DiscoveryReferenceSource
 }
+private struct ProjectCheckoutDiscoverParams: Encodable { let projectID: String }
+private struct ProjectCheckoutUpsertParams: Encodable { let checkout: CatalogProjectCheckout }
 private struct SshAgentDiscoverParams: Encodable { let endpoint: String }
 
 private struct SshIdentityImportParams: Encodable {

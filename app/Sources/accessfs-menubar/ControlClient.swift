@@ -113,6 +113,25 @@ final class ControlClient: @unchecked Sendable {
         return result
     }
 
+    func discoverProjectCheckouts(projectID: String) async throws -> ProjectCheckoutDiscovery {
+        guard let result: ProjectCheckoutDiscovery = try await request(
+            .projectCheckoutDiscover(projectID: projectID),
+            expecting: "project_checkout_discovery",
+            as: ProjectCheckoutDiscovery.self)
+        else {
+            throw ControlClientError.missingResult("project_checkout_discovery")
+        }
+        return result
+    }
+
+    func upsertProjectCheckout(_ checkout: CatalogProjectCheckout) async throws {
+        try await requestEmpty(.projectCheckoutUpsert(checkout))
+    }
+
+    func removeProjectCheckout(_ id: String) async throws {
+        try await requestEmpty(.projectCheckoutRemove(id: id))
+    }
+
     func discoverSshIdentities(endpoint: String) async throws -> [DiscoveredSshIdentity] {
         guard let identities: [DiscoveredSshIdentity] = try await request(
             .sshAgentDiscover(endpoint: endpoint), expecting: "ssh_agent_identities",

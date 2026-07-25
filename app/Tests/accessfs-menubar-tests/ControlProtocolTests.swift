@@ -543,6 +543,52 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(surface["enforcement"] as? String, "prompt")
     }
 
+    func testProjectCheckoutRequestsAndDiscoveryMatchRustWireShape() throws {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+
+        let discover = try ControlCommand.projectCheckoutDiscover(projectID: "fixture-project")
+            .requestData(requestID: 31, encoder: encoder)
+        let discoverValue = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: discover) as? [String: Any])
+        XCTAssertEqual(discoverValue["method"] as? String, "project_checkout_discover")
+        XCTAssertEqual(
+            (discoverValue["params"] as? [String: Any])?["project_id"] as? String,
+            "fixture-project")
+
+        let checkout = CatalogProjectCheckout(
+            id: "fixture-worktree", projectID: "fixture-project",
+            path: "/tmp/fixture-worktree", environmentID: "fixture-development",
+            kind: .worktree, gitCommonDir: "/tmp/fixture/.git")
+        let upsert = try ControlCommand.projectCheckoutUpsert(checkout)
+            .requestData(requestID: 32, encoder: encoder)
+        let upsertValue = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: upsert) as? [String: Any])
+        let encodedCheckout = try XCTUnwrap(
+            (upsertValue["params"] as? [String: Any])?["checkout"] as? [String: Any])
+        XCTAssertEqual(upsertValue["method"] as? String, "project_checkout_upsert")
+        XCTAssertEqual(encodedCheckout["environment_id"] as? String, "fixture-development")
+        XCTAssertEqual(encodedCheckout["kind"] as? String, "worktree")
+
+        let response = Data(
+            #"{"request_id":31,"status":"ok","result":{"type":"project_checkout_discovery","value":{"project_id":"fixture-project","common_dir":"/tmp/fixture/.git","checkouts":[{"path":"/tmp/fixture","git_primary":true,"managed_checkout_id":"fixture-project"},{"path":"/tmp/fixture-worktree","git_primary":false,"managed_checkout_id":null}]}}}"#.utf8)
+        let decoded = try JSONDecoder().decode(
+            ControlResponseEnvelope<ProjectCheckoutDiscovery>.self, from: response)
+        let result = try XCTUnwrap(decoded.result?.value)
+        XCTAssertEqual(result.projectID, "fixture-project")
+        XCTAssertTrue(result.checkouts.first?.gitPrimary == true)
+        XCTAssertNil(result.checkouts.last?.managedCheckoutID)
+
+        let remove = try ControlCommand.projectCheckoutRemove(id: "fixture-worktree")
+            .requestData(requestID: 33, encoder: encoder)
+        let removeValue = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: remove) as? [String: Any])
+        XCTAssertEqual(removeValue["method"] as? String, "project_checkout_remove")
+        XCTAssertEqual(
+            (removeValue["params"] as? [String: Any])?["id"] as? String,
+            "fixture-worktree")
+    }
+
     func testLifecycleRemoveCommandsMatchRustWireShape() throws {
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
@@ -579,12 +625,15 @@ final class ControlProtocolTests: XCTestCase {
 
     func testDecodesCatalogForeignKeysFromRustSnapshot() throws {
         let data = Data(
-            #"{"projects":[],"environments":[{"id":"fixture-development","project_id":"fixture-project","name":"Development","position":0}],"resources":[],"bindings":[],"surfaces":[{"id":"fixture-dotenv","environment_id":"fixture-development","name":".env","kind":"dotenv_file","path":"/tmp/fixture/.env","input":{"type":"bindings","binding_ids":[]},"enforcement":"allow","position":0}]}"#.utf8)
+            #"{"projects":[],"checkouts":[{"id":"fixture-worktree","project_id":"fixture-project","path":"/tmp/fixture-worktree","environment_id":"fixture-development","kind":"worktree","git_common_dir":"/tmp/fixture/.git"}],"environments":[{"id":"fixture-development","project_id":"fixture-project","name":"Development","position":0}],"resources":[],"bindings":[],"surfaces":[{"id":"fixture-dotenv","environment_id":"fixture-development","name":".env","kind":"dotenv_file","path":"/tmp/fixture/.env","input":{"type":"bindings","binding_ids":[]},"enforcement":"allow","position":0}]}"#.utf8)
         let decoder = JSONDecoder()
 
         let snapshot = try decoder.decode(CatalogSnapshot.self, from: data)
 
         XCTAssertEqual(snapshot.environments.first?.projectID, "fixture-project")
+        XCTAssertEqual(snapshot.checkouts.first?.projectID, "fixture-project")
+        XCTAssertEqual(snapshot.checkouts.first?.environmentID, "fixture-development")
+        XCTAssertEqual(snapshot.checkouts.first?.kind, .worktree)
         XCTAssertEqual(snapshot.surfaces.first?.environmentID, "fixture-development")
         XCTAssertEqual(snapshot.surfaces.first?.enforcement, "allow")
     }

@@ -955,6 +955,7 @@ private struct CompactProjectDetailView: View {
     let search: String
     let recentAccess: [RecentAccess]
     let openAdvanced: () -> Void
+    @State private var showingWorktrees = false
 
     var body: some View {
         ScrollView {
@@ -969,6 +970,9 @@ private struct CompactProjectDetailView: View {
             .padding(.bottom, 28)
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .sheet(isPresented: $showingWorktrees) {
+            ProjectCheckoutsSheet(store: state.workspace, projectID: project.id)
+        }
     }
 
     private var projectHeader: some View {
@@ -1007,6 +1011,13 @@ private struct CompactProjectDetailView: View {
                         ])
                     } label: {
                         Label("Finder", systemImage: "folder")
+                    }
+                    .buttonStyle(.bordered)
+
+                    Button {
+                        showingWorktrees = true
+                    } label: {
+                        Label("Worktrees", systemImage: "arrow.triangle.branch")
                     }
                     .buttonStyle(.bordered)
 
@@ -1205,6 +1216,304 @@ private struct CompactProjectDetailView: View {
         formatter.unitsStyle = .abbreviated
         return formatter
     }()
+}
+
+private struct ProjectCheckoutsSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @Bindable var store: WorkspaceStore
+    let projectID: WorkspaceProject.ID
+
+    @State private var discovery: ProjectCheckoutDiscovery?
+    @State private var environmentSelections: [String: WorkspaceEnvironment.ID] = [:]
+    @State private var isDiscovering = false
+    @State private var busyPath: String?
+    @State private var errorMessage: String?
+
+    private var project: WorkspaceProject? {
+        store.projects.first { $0.id == projectID }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            header
+            Divider()
+            content
+            Divider()
+            footer
+        }
+        .frame(width: 680)
+        .frame(minHeight: 430, idealHeight: 500, maxHeight: 620)
+        .task {
+            await discover()
+        }
+    }
+
+    private var header: some View {
+        HStack(alignment: .center, spacing: 14) {
+            Image(systemName: "arrow.triangle.branch")
+                .font(.system(size: 22, weight: .medium))
+                .foregroundStyle(Color.accentColor)
+                .frame(width: 42, height: 42)
+                .background(Color.accentColor.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+            VStack(alignment: .leading, spacing: 3) {
+                Text("Project Worktrees")
+                    .font(.title2.bold())
+                Text("Expose one project environment in each Git checkout.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button {
+                Task { await discover() }
+            } label: {
+                Label("Discover", systemImage: "arrow.clockwise")
+            }
+            .disabled(isDiscovering || busyPath != nil)
+        }
+        .padding(22)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if isDiscovering && discovery == nil {
+            VStack(spacing: 10) {
+                ProgressView()
+                Text("Discovering Git worktrees…")
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else if let discovery {
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(Array(discovery.checkouts.enumerated()), id: \.element.id) {
+                        index, candidate in
+                        checkoutRow(candidate, commonDir: discovery.commonDir)
+                        if index != discovery.checkouts.count - 1 {
+                            Divider().padding(.leading, 58)
+                        }
+                    }
+                }
+                .background(Color(nsColor: .controlBackgroundColor))
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 12)
+                        .stroke(Color.secondary.opacity(0.16), lineWidth: 1)
+                }
+                .padding(22)
+            }
+        } else {
+            VStack(spacing: 12) {
+                Image(systemName: "folder.badge.questionmark")
+                    .font(.system(size: 30))
+                    .foregroundStyle(.secondary)
+                Text("No Git worktrees found")
+                    .font(.headline)
+                Text(errorMessage ?? "This project does not appear to be a Git checkout.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 440)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
+
+    private func checkoutRow(
+        _ candidate: ProjectCheckoutCandidate, commonDir: String
+    ) -> some View {
+        let managed = candidate.managedCheckoutID.flatMap { id in
+            store.checkouts.first { $0.id == id }
+        }
+        let selection = Binding<WorkspaceEnvironment.ID>(
+            get: {
+                environmentSelections[candidate.path] ?? managed?.environmentID ?? ""
+            },
+            set: { environmentSelections[candidate.path] = $0 })
+        let selectedEnvironmentID = selection.wrappedValue
+        let selectionChanged =
+            managed?.environmentID != selectedEnvironmentID && !selectedEnvironmentID.isEmpty
+
+        return HStack(spacing: 14) {
+            Image(systemName: candidate.gitPrimary ? "folder.fill" : "folder")
+                .font(.system(size: 19))
+                .foregroundStyle(candidate.gitPrimary ? Color.accentColor : Color.blue.opacity(0.78))
+                .frame(width: 34, height: 34)
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 7) {
+                    Text(displayName(for: candidate.path))
+                        .font(.callout.weight(.semibold))
+                    if candidate.gitPrimary {
+                        checkoutBadge("Primary", color: .secondary)
+                    } else if managed != nil {
+                        checkoutBadge("Managed", color: .green)
+                    }
+                }
+                Text((candidate.path as NSString).abbreviatingWithTildeInPath)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+
+            Spacer(minLength: 16)
+
+            Button {
+                NSWorkspace.shared.open(URL(fileURLWithPath: candidate.path))
+            } label: {
+                Image(systemName: "folder")
+            }
+            .buttonStyle(.borderless)
+            .help("Open in Finder")
+
+            if candidate.gitPrimary {
+                Text("All configured outputs")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 160, alignment: .trailing)
+            } else {
+                Picker("Environment", selection: selection) {
+                    Text("Choose Environment").tag("")
+                    ForEach(project?.environments ?? []) { environment in
+                        Text(environment.name).tag(environment.id)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 160)
+                .disabled(busyPath != nil)
+
+                Button(managed == nil ? "Link" : "Update") {
+                    Task {
+                        await provision(
+                            candidate, commonDir: commonDir,
+                            environmentID: selectedEnvironmentID,
+                            checkoutID: managed?.id)
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(
+                    selectedEnvironmentID.isEmpty || busyPath != nil
+                        || (managed != nil && !selectionChanged))
+
+                if let managed {
+                    Button {
+                        Task { await remove(managed) }
+                    } label: {
+                        Image(systemName: "minus.circle")
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+                    .disabled(busyPath != nil)
+                    .help("Stop managing this worktree")
+                } else {
+                    Color.clear.frame(width: 16, height: 16)
+                }
+            }
+
+            Group {
+                if busyPath == candidate.path {
+                    ProgressView()
+                        .controlSize(.small)
+                } else {
+                    Color.clear
+                }
+            }
+            .frame(width: 16, height: 16)
+        }
+        .padding(.horizontal, 16)
+        .frame(minHeight: 66)
+    }
+
+    private var footer: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let errorMessage, discovery != nil {
+                Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .lineLimit(2)
+            }
+            HStack(alignment: .center, spacing: 12) {
+                Image(systemName: "checkmark.shield")
+                    .foregroundStyle(.green)
+                Text("Floria only creates and removes its own output links. Git worktrees and project files are never changed.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(.horizontal, 22)
+        .padding(.vertical, 16)
+    }
+
+    private func checkoutBadge(_ title: String, color: Color) -> some View {
+        Text(title)
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(color)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(color.opacity(0.1), in: Capsule())
+    }
+
+    private func displayName(for path: String) -> String {
+        let name = (path as NSString).lastPathComponent
+        return name.isEmpty ? path : name
+    }
+
+    @MainActor
+    private func discover() async {
+        isDiscovering = true
+        errorMessage = nil
+        defer { isDiscovering = false }
+        do {
+            let result = try await store.discoverProjectCheckouts(projectID: projectID)
+            discovery = result
+            for candidate in result.checkouts {
+                guard let id = candidate.managedCheckoutID,
+                    let environmentID = store.checkouts.first(where: { $0.id == id })?.environmentID
+                else { continue }
+                environmentSelections[candidate.path] = environmentID
+            }
+        } catch {
+            discovery = nil
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    @MainActor
+    private func provision(
+        _ candidate: ProjectCheckoutCandidate, commonDir: String,
+        environmentID: WorkspaceEnvironment.ID, checkoutID: String?
+    ) async {
+        busyPath = candidate.path
+        errorMessage = nil
+        defer { busyPath = nil }
+        do {
+            try await store.provisionProjectCheckout(
+                projectID: projectID, path: candidate.path,
+                environmentID: environmentID, commonDir: commonDir,
+                checkoutID: checkoutID)
+            await discover()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    @MainActor
+    private func remove(_ checkout: CatalogProjectCheckout) async {
+        busyPath = checkout.path
+        errorMessage = nil
+        defer { busyPath = nil }
+        do {
+            try await store.removeProjectCheckout(checkout.id)
+            environmentSelections.removeValue(forKey: checkout.path)
+            await discover()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
 }
 
 private struct CompactSurfaceRow: View {
