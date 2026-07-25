@@ -6,7 +6,6 @@
 //! sends prompts through the shared writer and blocks on a per-request channel.
 
 use std::io;
-use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +13,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use accessfs_platform::SocketPeerVerifier;
 use dashmap::DashMap;
 use serde::Serialize;
 
@@ -36,6 +36,7 @@ pub enum PromptResult {
 const SEND_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct SocketServer {
+    peer_verifier: Arc<dyn SocketPeerVerifier>,
     /// Writable handle to the current app connection, if any, tagged with its generation so
     /// a dying connection's cleanup never clears a newer one that already replaced it.
     conn: Mutex<Option<Conn>>,
@@ -53,7 +54,10 @@ struct Conn {
 impl SocketServer {
     /// Bind the socket and spawn the accept/read thread. The socket file is created
     /// with mode 0600; a stale file at the path is removed first.
-    pub fn start(path: &Path) -> io::Result<Arc<SocketServer>> {
+    pub fn start(
+        path: &Path,
+        peer_verifier: Arc<dyn SocketPeerVerifier>,
+    ) -> io::Result<Arc<SocketServer>> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
@@ -63,6 +67,7 @@ impl SocketServer {
         std::fs::set_permissions(path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
 
         let server = Arc::new(SocketServer {
+            peer_verifier,
             conn: Mutex::new(None),
             pending: DashMap::new(),
             next_req: AtomicU64::new(1),
@@ -91,10 +96,13 @@ impl SocketServer {
                     continue;
                 }
             };
-            if !same_uid(&stream) {
-                tracing::warn!("rejecting agent connection from a different uid");
-                continue;
-            }
+            let peer = match self.peer_verifier.verify(&stream) {
+                Ok(peer) => peer,
+                Err(error) => {
+                    tracing::warn!(%error, "rejecting untrusted agent connection");
+                    continue;
+                }
+            };
             let writer = match stream.try_clone() {
                 Ok(w) => w,
                 Err(e) => {
@@ -108,7 +116,14 @@ impl SocketServer {
             }
             let gen = self.conn_gen.fetch_add(1, Ordering::Relaxed);
             *self.conn.lock().expect("conn poisoned") = Some(Conn { gen, stream: writer });
-            tracing::info!(gen, "menubar app connected");
+            tracing::info!(
+                gen,
+                pid = peer.identity.pid,
+                executable = ?peer.identity.exe_path,
+                bundle_id = ?peer.identity.bundle_id,
+                team_id = ?peer.identity.team_id,
+                "trusted menubar app connected"
+            );
 
             let srv = Arc::clone(&self);
             let spawned = std::thread::Builder::new()
@@ -198,21 +213,14 @@ impl SocketServer {
     }
 }
 
-/// Verify the connecting peer runs as the same uid as this process.
-fn same_uid(stream: &UnixStream) -> bool {
-    let mut uid: libc::uid_t = 0;
-    let mut gid: libc::gid_t = 0;
-    // SAFETY: valid fd from the accepted stream; out-params are stack locals.
-    let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
-    // SAFETY: geteuid is always-safe.
-    rc == 0 && uid == unsafe { libc::geteuid() }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::protocol::IdentityView;
     use accessfs_core::identity::ProcessIdentity;
+    use accessfs_platform::{
+        PeerVerificationError, SameUserPeerVerifier, SocketPeerVerifier, VerifiedPeer,
+    };
     use serde_json::{json, Value};
     use std::path::PathBuf;
     use std::time::Instant;
@@ -232,6 +240,22 @@ mod tests {
 
     fn current_gen(srv: &SocketServer) -> Option<u64> {
         srv.conn.lock().unwrap().as_ref().map(|c| c.gen)
+    }
+
+    fn start(path: &Path) -> Arc<SocketServer> {
+        SocketServer::start(path, Arc::new(SameUserPeerVerifier)).unwrap()
+    }
+
+    struct RejectAllPeers;
+
+    impl SocketPeerVerifier for RejectAllPeers {
+        fn verify(&self, _stream: &UnixStream) -> Result<VerifiedPeer, PeerVerificationError> {
+            Err(PeerVerificationError::UntrustedCode {
+                pid: std::process::id() as i32,
+                executable: "fixture client".to_string(),
+                trusted: "fixture trusted app".to_string(),
+            })
+        }
     }
 
     fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
@@ -261,7 +285,7 @@ mod tests {
     #[test]
     fn prompt_without_app_is_noapp() {
         let path = sock_path("noapp");
-        let srv = SocketServer::start(&path).unwrap();
+        let srv = start(&path);
         assert!(matches!(
             srv.prompt_and_wait(prompt_msg, Duration::from_millis(200)),
             PromptResult::NoApp
@@ -270,9 +294,23 @@ mod tests {
     }
 
     #[test]
+    fn rejected_peer_never_becomes_the_decision_connection() {
+        let path = sock_path("rejected");
+        let srv = SocketServer::start(&path, Arc::new(RejectAllPeers)).unwrap();
+        let _client = UnixStream::connect(&path).expect("connect");
+        std::thread::sleep(Duration::from_millis(50));
+
+        assert!(current_gen(&srv).is_none());
+        assert!(matches!(
+            srv.prompt_and_wait(prompt_msg, Duration::from_millis(50)),
+            PromptResult::NoApp
+        ));
+    }
+
+    #[test]
     fn decision_resolves_pending_prompt() {
         let path = sock_path("roundtrip");
-        let srv = SocketServer::start(&path).unwrap();
+        let srv = start(&path);
         let client = connect(&path);
         wait_until(|| current_gen(&srv).is_some(), "app connected");
 
@@ -304,7 +342,7 @@ mod tests {
     #[test]
     fn silent_app_times_out_and_clears_pending() {
         let path = sock_path("timeout");
-        let srv = SocketServer::start(&path).unwrap();
+        let srv = start(&path);
         let _client = connect(&path);
         wait_until(|| current_gen(&srv).is_some(), "app connected");
 
@@ -321,7 +359,7 @@ mod tests {
     #[test]
     fn prompts_go_to_the_newest_connection() {
         let path = sock_path("reconnect");
-        let srv = SocketServer::start(&path).unwrap();
+        let srv = start(&path);
         let old = connect(&path);
         wait_until(|| current_gen(&srv).is_some(), "first connection served");
         let first_gen = current_gen(&srv).unwrap();
@@ -354,7 +392,7 @@ mod tests {
     #[test]
     fn stalled_app_cannot_block_send_forever() {
         let path = sock_path("stall");
-        let srv = SocketServer::start(&path).unwrap();
+        let srv = start(&path);
         let client = connect(&path); // sends hello, then never reads
         wait_until(|| current_gen(&srv).is_some(), "app connected");
 
@@ -384,7 +422,7 @@ mod tests {
     #[test]
     fn stale_reader_exit_keeps_newer_connection() {
         let path = sock_path("gen");
-        let srv = SocketServer::start(&path).unwrap();
+        let srv = start(&path);
         let old = connect(&path);
         wait_until(|| current_gen(&srv).is_some(), "first connection served");
         let first_gen = current_gen(&srv).unwrap();

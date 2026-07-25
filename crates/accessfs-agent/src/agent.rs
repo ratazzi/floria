@@ -15,6 +15,7 @@ use accessfs_core::authz::{
 use accessfs_core::config::ResolvedConfig;
 use accessfs_core::identity::ProcessIdentity;
 use accessfs_core::rules::{repo_root, RuleSet};
+use accessfs_platform::SocketPeerVerifier;
 use dashmap::DashMap;
 
 use crate::protocol::{DaemonMsg, IdentityView, SshSignView};
@@ -56,8 +57,11 @@ pub struct SocketAgent {
 
 impl SocketAgent {
     /// Start the socket server and build the agent from resolved config.
-    pub fn start(cfg: &ResolvedConfig) -> std::io::Result<Arc<SocketAgent>> {
-        let server = SocketServer::start(&cfg.agent_socket)?;
+    pub fn start(
+        cfg: &ResolvedConfig,
+        peer_verifier: Arc<dyn SocketPeerVerifier>,
+    ) -> std::io::Result<Arc<SocketAgent>> {
+        let server = SocketServer::start(&cfg.agent_socket, peer_verifier)?;
         tracing::info!(
             socket = %cfg.agent_socket.display(),
             rules = cfg.rules.len(),
@@ -283,9 +287,11 @@ mod tests {
     use super::*;
     use accessfs_core::authz::{AccessContext, SshSignContext};
     use accessfs_core::rules::{any_path_glob, Rule, RuleOps, SubjectMatch};
+    use accessfs_platform::SameUserPeerVerifier;
 
     fn agent_with_rules(dir: &std::path::Path, rules: Vec<Rule>) -> SocketAgent {
-        let server = SocketServer::start(&dir.join("agent.sock")).unwrap();
+        let server =
+            SocketServer::start(&dir.join("agent.sock"), Arc::new(SameUserPeerVerifier)).unwrap();
         SocketAgent {
             server,
             rules: RuleSet::new(rules),

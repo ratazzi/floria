@@ -15,6 +15,7 @@ accessfs-fs = { workspace = true }
 accessfs-store = { workspace = true }
 accessfs-catalog = { workspace = true }
 accessfs-control = { workspace = true }
+accessfs-platform = { workspace = true }
 accessfs-surface = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }

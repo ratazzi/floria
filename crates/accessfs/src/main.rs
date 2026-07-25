@@ -16,6 +16,7 @@ use accessfs_control::{
 use accessfs_core::audit::AuditLog;
 use accessfs_core::authz::{Authorizer, Enforcement, PolicyMode, PolicyModeStatus};
 use accessfs_core::config::{Config, ResolvedConfig, SECRETS_DIR, SURFACES_DIR};
+use accessfs_platform::{CodeSignedPeerVerifier, SocketPeerVerifier};
 use accessfs_store::{AgeDirStore, NewSecret, SecretId, SecretRecord, SecretStore, SshKeyProvider};
 use accessfs_surface::{
     ensure_file_surface_link, remove_file_surface_link, validate_secret_bytes, SurfaceLinkRemoval,
@@ -378,6 +379,22 @@ fn load(config: &Path) -> Result<ResolvedConfig> {
 
 fn cmd_mount(config: &Path) -> Result<()> {
     let cfg = load(config)?;
+    let daemon_executable =
+        std::env::current_exe().context("resolving daemon executable for peer policy")?;
+    let gui_executable = trusted_gui_executable(&daemon_executable)?;
+    let agent_peer_verifier: Arc<dyn SocketPeerVerifier> = Arc::new(
+        CodeSignedPeerVerifier::from_executables([&gui_executable])
+            .context("building agent socket peer policy")?,
+    );
+    let control_peer_verifier: Arc<dyn SocketPeerVerifier> = Arc::new(
+        CodeSignedPeerVerifier::from_executables([&gui_executable, &daemon_executable])
+            .context("building control socket peer policy")?,
+    );
+    tracing::info!(
+        gui = %gui_executable.display(),
+        daemon = %daemon_executable.display(),
+        "loaded local socket code-signing policy"
+    );
     std::fs::create_dir_all(&cfg.mount_path)
         .with_context(|| format!("creating mount point {}", cfg.mount_path.display()))?;
     let support_dir = support_dir(&cfg)?;
@@ -389,7 +406,8 @@ fn cmd_mount(config: &Path) -> Result<()> {
     let surface_registry = Arc::new(SurfaceRegistry::from_snapshot(&snapshot));
     reconcile_file_links(&snapshot, &cfg.mount_path);
     let store: Arc<dyn SecretStore> = Arc::new(open_store(&cfg)?);
-    let agent = accessfs_agent::SocketAgent::start(&cfg).context("starting agent socket")?;
+    let agent = accessfs_agent::SocketAgent::start(&cfg, agent_peer_verifier)
+        .context("starting agent socket")?;
     agent.replace_managed_enforcement(managed_enforcement(&snapshot, &store.list()?));
     let audit = Arc::new(AuditLog::open(&cfg.audit_log).context("opening shared audit log")?);
     let ssh_authorizer: Arc<dyn Authorizer> = agent.clone();
@@ -436,6 +454,7 @@ fn cmd_mount(config: &Path) -> Result<()> {
             ssh_discovery,
             ssh_config,
             audit_log: cfg.audit_log.clone(),
+            peer_verifier: control_peer_verifier,
         },
     )
         .with_context(|| format!("starting control socket at {}", control_path.display()))?;
@@ -762,6 +781,46 @@ fn support_dir(cfg: &ResolvedConfig) -> Result<&Path> {
     })
 }
 
+fn bundled_gui_executable(daemon_executable: &Path) -> Option<PathBuf> {
+    let resources = daemon_executable.parent()?;
+    if resources.file_name()? != "Resources" {
+        return None;
+    }
+    let contents = resources.parent()?;
+    if contents.file_name()? != "Contents" {
+        return None;
+    }
+    Some(contents.join("MacOS/Floria"))
+}
+
+fn trusted_gui_executable(daemon_executable: &Path) -> Result<PathBuf> {
+    if let Some(path) = bundled_gui_executable(daemon_executable) {
+        if path.is_file() {
+            return Ok(path);
+        }
+    }
+
+    if let Some(path) = std::env::var_os("FLORIA_TRUSTED_GUI_EXECUTABLE").map(PathBuf::from) {
+        if path.is_file() {
+            return Ok(path);
+        }
+        anyhow::bail!(
+            "FLORIA_TRUSTED_GUI_EXECUTABLE does not point to a file: {}",
+            path.display()
+        );
+    }
+
+    let installed = PathBuf::from("/Applications/Floria.app/Contents/MacOS/Floria");
+    if installed.is_file() {
+        return Ok(installed);
+    }
+
+    anyhow::bail!(
+        "could not locate the trusted Floria GUI executable; install Floria.app or set \
+         FLORIA_TRUSTED_GUI_EXECUTABLE for an unbundled development run"
+    )
+}
+
 fn cmd_unmount(path: Option<PathBuf>, config: &Path) -> Result<()> {
     let target = match path {
         Some(p) => p,
@@ -887,6 +946,26 @@ mod tests {
             allow_override: false,
             position: 0,
         }
+    }
+
+    #[test]
+    fn bundled_daemon_resolves_the_gui_in_the_same_app() {
+        assert_eq!(
+            bundled_gui_executable(Path::new(
+                "/Applications/Floria.app/Contents/Resources/accessfs"
+            )),
+            Some(PathBuf::from(
+                "/Applications/Floria.app/Contents/MacOS/Floria"
+            ))
+        );
+    }
+
+    #[test]
+    fn unbundled_daemon_does_not_infer_a_gui_peer() {
+        assert_eq!(
+            bundled_gui_executable(Path::new("/workspace/floria/target/release/accessfs")),
+            None
+        );
     }
 
     #[test]

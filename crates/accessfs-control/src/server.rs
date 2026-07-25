@@ -1,7 +1,6 @@
 use std::collections::HashSet;
 use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,6 +16,7 @@ use accessfs_discover::{
     discover, DiscoveredContent, DiscoveredFileAction, DiscoveredFileKind, ExistingEnvironment,
     ExistingProject, ExistingSecret, ExistingSurface,
 };
+use accessfs_platform::SocketPeerVerifier;
 use accessfs_ssh::ManagedKeyError;
 use accessfs_store::{NewSecret, SecretId, SecretOrigin, SecretRecord, SecretStore, StoreError};
 use accessfs_surface::{decode_source, ensure_file_surface_link, validate_secret_bytes};
@@ -67,6 +67,7 @@ pub struct ControlRuntimeServices {
     pub ssh_discovery: Arc<dyn SshIdentityDiscovery>,
     pub ssh_config: Arc<dyn SshConfigManager>,
     pub audit_log: PathBuf,
+    pub peer_verifier: Arc<dyn SocketPeerVerifier>,
 }
 
 #[derive(Clone, Default)]
@@ -83,19 +84,25 @@ struct ControlDependencies {
 impl ControlServer {
     /// Start the catalog control socket. Each connection gets a dedicated request loop;
     /// authorization prompts continue to use the separate agent socket.
-    pub fn start(path: &Path, catalog: Catalog) -> io::Result<Self> {
-        Self::start_inner(path, catalog, ControlDependencies::default())
+    pub fn start(
+        path: &Path,
+        catalog: Catalog,
+        peer_verifier: Arc<dyn SocketPeerVerifier>,
+    ) -> io::Result<Self> {
+        Self::start_inner(path, catalog, ControlDependencies::default(), peer_verifier)
     }
 
     pub fn start_observed(
         path: &Path,
         catalog: Catalog,
         observer: Arc<dyn CatalogObserver>,
+        peer_verifier: Arc<dyn SocketPeerVerifier>,
     ) -> io::Result<Self> {
         Self::start_inner(
             path,
             catalog,
             ControlDependencies { observer: Some(observer), ..ControlDependencies::default() },
+            peer_verifier,
         )
     }
 
@@ -105,6 +112,7 @@ impl ControlServer {
         store: Arc<dyn SecretStore>,
         mount_path: PathBuf,
         observer: Arc<dyn CatalogObserver>,
+        peer_verifier: Arc<dyn SocketPeerVerifier>,
     ) -> io::Result<Self> {
         Self::start_inner(
             path,
@@ -115,6 +123,7 @@ impl ControlServer {
                 observer: Some(observer),
                 ..ControlDependencies::default()
             },
+            peer_verifier,
         )
     }
 
@@ -125,6 +134,7 @@ impl ControlServer {
         mount_path: PathBuf,
         observer: Arc<dyn CatalogObserver>,
         policy: Arc<dyn RuntimePolicyController>,
+        peer_verifier: Arc<dyn SocketPeerVerifier>,
     ) -> io::Result<Self> {
         Self::start_inner(
             path,
@@ -136,9 +146,9 @@ impl ControlServer {
                 policy: Some(policy),
                 ..ControlDependencies::default()
             },
+            peer_verifier,
         )
     }
-
 
     pub fn start_runtime_with_services(
         path: &Path,
@@ -159,6 +169,7 @@ impl ControlServer {
                 ssh_config: Some(services.ssh_config),
                 audit_log: Some(services.audit_log),
             },
+            services.peer_verifier,
         )
     }
 
@@ -166,6 +177,7 @@ impl ControlServer {
         path: &Path,
         catalog: Catalog,
         dependencies: ControlDependencies,
+        peer_verifier: Arc<dyn SocketPeerVerifier>,
     ) -> io::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -177,9 +189,7 @@ impl ControlServer {
         let catalog = Arc::new(catalog);
         std::thread::Builder::new()
             .name("accessfs-control-accept".to_string())
-            .spawn(move || {
-                accept_loop(listener, catalog, dependencies)
-            })?;
+            .spawn(move || accept_loop(listener, catalog, dependencies, peer_verifier))?;
 
         Ok(ControlServer { socket_path: path.to_path_buf() })
     }
@@ -193,6 +203,7 @@ fn accept_loop(
     listener: UnixListener,
     catalog: Arc<Catalog>,
     dependencies: ControlDependencies,
+    peer_verifier: Arc<dyn SocketPeerVerifier>,
 ) {
     for stream in listener.incoming() {
         let stream = match stream {
@@ -202,10 +213,20 @@ fn accept_loop(
                 continue;
             }
         };
-        if !same_uid(&stream) {
-            tracing::warn!("rejecting control connection from a different uid");
-            continue;
-        }
+        let peer = match peer_verifier.verify(&stream) {
+            Ok(peer) => peer,
+            Err(error) => {
+                tracing::warn!(%error, "rejecting untrusted control connection");
+                continue;
+            }
+        };
+        tracing::info!(
+            pid = peer.identity.pid,
+            executable = ?peer.identity.exe_path,
+            bundle_id = ?peer.identity.bundle_id,
+            team_id = ?peer.identity.team_id,
+            "trusted control client connected"
+        );
         let catalog = Arc::clone(&catalog);
         let dependencies = dependencies.clone();
         if let Err(error) = std::thread::Builder::new()
@@ -2415,21 +2436,15 @@ fn update_resource_metadata(
     Ok(ControlResult::Empty)
 }
 
-fn same_uid(stream: &UnixStream) -> bool {
-    let mut uid: libc::uid_t = 0;
-    let mut gid: libc::gid_t = 0;
-    // SAFETY: valid socket fd and writable stack out-parameters.
-    let result = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
-    // SAFETY: geteuid has no preconditions.
-    result == 0 && uid == unsafe { libc::geteuid() }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use accessfs_catalog::SurfaceInput;
     use accessfs_core::audit::AuditLog;
     use accessfs_core::identity::{ProcSummary, ProcessIdentity};
+    use accessfs_platform::{
+        PeerVerificationError, SameUserPeerVerifier, SocketPeerVerifier, VerifiedPeer,
+    };
     use crate::client::ControlClient;
     use accessfs_catalog::{
         Binding, BindingScope, EntrySelection, Environment, ItemLink, Project, Surface, SurfaceKind,
@@ -2443,6 +2458,22 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use zeroize::Zeroizing;
+
+    fn test_peer_verifier() -> Arc<dyn SocketPeerVerifier> {
+        Arc::new(SameUserPeerVerifier)
+    }
+
+    struct RejectAllPeers;
+
+    impl SocketPeerVerifier for RejectAllPeers {
+        fn verify(&self, _stream: &UnixStream) -> Result<VerifiedPeer, PeerVerificationError> {
+            Err(PeerVerificationError::UntrustedCode {
+                pid: std::process::id() as i32,
+                executable: "fixture client".to_string(),
+                trusted: "fixture trusted app".to_string(),
+            })
+        }
+    }
 
     const FIXTURE_SECRET_ID: &str = "00000000-0000-0000-0000-000000000101";
 
@@ -2662,6 +2693,7 @@ mod tests {
             &socket,
             catalog,
             ControlDependencies { policy: Some(policy), ..ControlDependencies::default() },
+            test_peer_verifier(),
         )
         .unwrap();
         let mut client = ControlClient::connect(&socket).unwrap();
@@ -3234,7 +3266,11 @@ mod tests {
         std::fs::write(&dotenv_path, "DISCOVERED_TOKEN=fixture-value\n").unwrap();
         std::fs::write(
             &ssh_path,
-            "-----BEGIN OPENSSH FIXTURE MATERIAL-----\ninvalid\n-----END OPENSSH FIXTURE MATERIAL-----\n",
+            concat!(
+                "-----BEGIN OPENSSH ",
+                "PRIVATE KEY-----\ninvalid\n-----END OPENSSH ",
+                "PRIVATE KEY-----\n"
+            ),
         )
         .unwrap();
         let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
@@ -3346,6 +3382,7 @@ mod tests {
                 ssh_discovery: Some(discovery),
                 ..ControlDependencies::default()
             },
+            test_peer_verifier(),
         )
         .unwrap();
         let mut client = ControlClient::connect(&socket).unwrap();
@@ -3391,6 +3428,7 @@ mod tests {
             Arc::clone(&store) as Arc<dyn SecretStore>,
             dir.path().join("mount"),
             Arc::clone(&observer) as Arc<dyn CatalogObserver>,
+            test_peer_verifier(),
         )
         .unwrap();
         let mut client = ControlClient::connect(&socket).unwrap();
@@ -3454,6 +3492,7 @@ mod tests {
                 ssh_config: Some(manager),
                 ..ControlDependencies::default()
             },
+            test_peer_verifier(),
         )
         .unwrap();
         let mut client = ControlClient::connect(&socket).unwrap();
@@ -3494,7 +3533,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
         let socket = dir.path().join("control.sock");
-        let server = ControlServer::start(&socket, catalog).unwrap();
+        let server = ControlServer::start(&socket, catalog, test_peer_verifier()).unwrap();
         assert_eq!(
             std::fs::metadata(server.socket_path()).unwrap().permissions().mode() & 0o777,
             0o600
@@ -3535,6 +3574,18 @@ mod tests {
     }
 
     #[test]
+    fn untrusted_client_cannot_issue_control_commands() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let socket = dir.path().join("control.sock");
+        let _server =
+            ControlServer::start(&socket, catalog, Arc::new(RejectAllPeers)).unwrap();
+        let mut client = ControlClient::connect(&socket).unwrap();
+
+        assert!(client.request(ControlCommand::Ping).is_err());
+    }
+
+    #[test]
     fn project_create_builds_workspace_with_one_observer_notification() {
         let dir = tempfile::tempdir().unwrap();
         let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
@@ -3547,6 +3598,7 @@ mod tests {
             &socket,
             catalog.clone(),
             Arc::clone(&observer) as Arc<dyn CatalogObserver>,
+            test_peer_verifier(),
         )
         .unwrap();
         let mut client = ControlClient::connect(&socket).unwrap();
@@ -3589,7 +3641,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
         let socket = dir.path().join("control.sock");
-        let _server = ControlServer::start(&socket, catalog.clone()).unwrap();
+        let _server =
+            ControlServer::start(&socket, catalog.clone(), test_peer_verifier()).unwrap();
         let mut client = ControlClient::connect(&socket).unwrap();
 
         let error = client
@@ -3630,7 +3683,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
         let socket = dir.path().join("control.sock");
-        let _server = ControlServer::start(&socket, catalog).unwrap();
+        let _server = ControlServer::start(&socket, catalog, test_peer_verifier()).unwrap();
         let mut stream = UnixStream::connect(&socket).unwrap();
         write_msg(
             &mut stream,
@@ -3667,6 +3720,7 @@ mod tests {
             &socket,
             catalog,
             Arc::clone(&observer) as Arc<dyn CatalogObserver>,
+            test_peer_verifier(),
         )
         .unwrap();
         let mut client = ControlClient::connect(&socket).unwrap();
@@ -3705,6 +3759,7 @@ mod tests {
             Arc::clone(&store) as Arc<dyn SecretStore>,
             dir.path().join("mount"),
             observer,
+            test_peer_verifier(),
         )
         .unwrap();
         let mut client = ControlClient::connect(&socket).unwrap();
@@ -3833,6 +3888,7 @@ mod tests {
             Arc::clone(&store) as Arc<dyn SecretStore>,
             dir.path().join("mount"),
             observer,
+            test_peer_verifier(),
         )
         .unwrap();
         let mut client = ControlClient::connect(&socket).unwrap();
@@ -3904,6 +3960,7 @@ mod tests {
             Arc::clone(&store) as Arc<dyn SecretStore>,
             mount.clone(),
             observer,
+            test_peer_verifier(),
         )
         .unwrap();
         let mut client = ControlClient::connect(&socket).unwrap();
@@ -4063,6 +4120,7 @@ mod tests {
             Arc::clone(&store) as Arc<dyn SecretStore>,
             dir.path().join("mount"),
             observer,
+            test_peer_verifier(),
         )
         .unwrap();
         let mut client = ControlClient::connect(&socket).unwrap();
@@ -4140,6 +4198,7 @@ mod tests {
             Arc::clone(&store) as Arc<dyn SecretStore>,
             dir.path().join("mount"),
             observer,
+            test_peer_verifier(),
         )
         .unwrap();
         let mut client = ControlClient::connect(&socket).unwrap();
