@@ -77,6 +77,19 @@ final class ControlClient: @unchecked Sendable {
             expecting: "shared_secret_created", as: SharedSecretCreated.self)
     }
 
+    func updateSharedSecret(
+        resourceID: String, name: String, defaultEnvKey: String?, value: String?
+    ) async throws {
+        try await requestEmpty(
+            .sharedSecretUpdate(
+                resourceID: resourceID, name: name, defaultEnvKey: defaultEnvKey,
+                value: value))
+    }
+
+    func deleteSharedSecret(resourceID: String) async throws {
+        try await requestEmpty(.sharedSecretRemove(resourceID: resourceID))
+    }
+
     func createEnvFile(
         resourceID: String, name: String, codec: WorkspaceResourceCodec, value: String
     ) async throws {

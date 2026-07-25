@@ -165,6 +165,8 @@ fn mutates_catalog(command: &ControlCommand) -> bool {
             | ControlCommand::SurfaceUpsert { .. }
             | ControlCommand::SurfaceRemove { .. }
             | ControlCommand::SharedSecretCreate { .. }
+            | ControlCommand::SharedSecretUpdate { .. }
+            | ControlCommand::SharedSecretRemove { .. }
             | ControlCommand::EnvFileCreate { .. }
     )
 }
@@ -279,6 +281,21 @@ fn dispatch(
             name,
             default_env_key,
             value,
+        ),
+        ControlCommand::SharedSecretUpdate { resource_id, name, default_env_key, value } => {
+            update_shared_secret(
+                catalog,
+                store.ok_or(DispatchError::StoreUnavailable)?,
+                resource_id,
+                name,
+                default_env_key,
+                value,
+            )
+        }
+        ControlCommand::SharedSecretRemove { resource_id } => remove_shared_secret(
+            catalog,
+            store.ok_or(DispatchError::StoreUnavailable)?,
+            resource_id,
         ),
         ControlCommand::SharedSecretRotate { resource_id, value } => rotate_shared_secret(
             catalog,
@@ -818,6 +835,106 @@ fn validate_resource_value(
     validate_snapshot_values(&snapshot, store)
 }
 
+fn update_shared_secret(
+    catalog: &Catalog,
+    store: &dyn SecretStore,
+    resource_id: String,
+    name: String,
+    default_env_key: Option<String>,
+    value: Option<crate::protocol::SecretValue>,
+) -> Result<ControlResult, DispatchError> {
+    if value.as_ref().is_some_and(|value| value.as_bytes().is_empty()) {
+        return Err(DispatchError::Validation(
+            "shared secret value cannot be empty".to_string(),
+        ));
+    }
+    let original = catalog.resource(&resource_id)?;
+    let mut resource = original.clone();
+    if resource.kind != ResourceKind::SharedSecret {
+        return Err(DispatchError::Validation(format!(
+            "resource {resource_id:?} is not a shared secret"
+        )));
+    }
+    if resource.entries.len() != 1 || resource.entries[0].address != "value" {
+        return Err(DispatchError::Validation(format!(
+            "shared secret {resource_id:?} does not have exactly one value entry"
+        )));
+    }
+
+    resource.name = name;
+    resource.default_env_key = default_env_key.clone();
+    resource.entries[0].label = resource.name.clone();
+    resource.entries[0].key = default_env_key;
+    catalog.validate_resource(&resource)?;
+    validate_resource_value(catalog, Some(store), &resource)?;
+    let ResourceSource::SecretRef { secret_id } = &resource.source else {
+        return Err(DispatchError::Validation(format!(
+            "resource {resource_id:?} does not reference a stored secret"
+        )));
+    };
+    let secret_id: SecretId = secret_id.parse()?;
+    if let Some(value) = &value {
+        let mut snapshot = catalog.snapshot()?;
+        let existing = snapshot
+            .resources
+            .iter_mut()
+            .find(|item| item.id == resource.id)
+            .expect("the updated shared secret was loaded from this catalog");
+        *existing = resource.clone();
+        validate_secret_bytes(&snapshot, secret_id.as_str(), value.as_bytes())
+            .map_err(|error| DispatchError::Validation(error.to_string()))?;
+    }
+
+    catalog.upsert_resource(&resource)?;
+    if let Some(value) = value {
+        if let Err(error) = store.append_version(&secret_id, value.as_bytes()) {
+            if let Err(restore_error) = catalog.upsert_resource(&original) {
+                tracing::error!(
+                    %resource_id,
+                    %error,
+                    %restore_error,
+                    "shared secret rotation failed and catalog rollback also failed"
+                );
+            }
+            return Err(DispatchError::Store(error));
+        }
+    }
+    Ok(ControlResult::Empty)
+}
+
+fn remove_shared_secret(
+    catalog: &Catalog,
+    store: &dyn SecretStore,
+    resource_id: String,
+) -> Result<ControlResult, DispatchError> {
+    let resource = catalog.resource(&resource_id)?;
+    if resource.kind != ResourceKind::SharedSecret {
+        return Err(DispatchError::Validation(format!(
+            "resource {resource_id:?} is not a shared secret"
+        )));
+    }
+    let ResourceSource::SecretRef { secret_id } = &resource.source else {
+        return Err(DispatchError::Validation(format!(
+            "resource {resource_id:?} does not reference a stored secret"
+        )));
+    };
+    let secret_id: SecretId = secret_id.parse()?;
+
+    catalog.remove_resource(&resource_id)?;
+    if let Err(error) = store.delete(&secret_id) {
+        if let Err(restore_error) = catalog.create_resource(&resource) {
+            tracing::error!(
+                %resource_id,
+                %error,
+                %restore_error,
+                "shared secret storage deletion failed and catalog rollback also failed"
+            );
+        }
+        return Err(DispatchError::Store(error));
+    }
+    Ok(ControlResult::Empty)
+}
+
 fn validate_snapshot_values(
     snapshot: &CatalogSnapshot,
     store: Option<&dyn SecretStore>,
@@ -947,7 +1064,9 @@ mod tests {
     use super::*;
     use accessfs_catalog::SurfaceInput;
     use crate::client::ControlClient;
-    use accessfs_catalog::{Environment, Project, Surface, SurfaceKind};
+    use accessfs_catalog::{
+        Binding, BindingScope, EntrySelection, Environment, Project, Surface, SurfaceKind,
+    };
     use accessfs_store::{
         SecretOrigin, SecretRecord, StoreResult, VersionRecord,
     };
@@ -1308,7 +1427,7 @@ mod tests {
     }
 
     #[test]
-    fn shared_secret_create_and_rotate_over_ipc_only_store_reference_in_catalog() {
+    fn shared_secret_lifecycle_over_ipc_keeps_plaintext_out_of_catalog() {
         let dir = tempfile::tempdir().unwrap();
         let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
         let socket = dir.path().join("control.sock");
@@ -1364,6 +1483,113 @@ mod tests {
         let secret_id: SecretId = FIXTURE_SECRET_ID.parse().unwrap();
         assert_eq!(store.get_version(&secret_id, 1).unwrap().as_slice(), b"fixture-value-one");
         assert_eq!(store.get_version(&secret_id, 2).unwrap().as_slice(), b"fixture-value-two");
+
+        assert_eq!(
+            client
+                .request(ControlCommand::SharedSecretUpdate {
+                    resource_id: "fixture-shared-secret".to_string(),
+                    name: "Renamed Shared Secret".to_string(),
+                    default_env_key: Some("RENAMED_TOKEN".to_string()),
+                    value: Some(crate::protocol::SecretValue::new("fixture-value-three")),
+                })
+                .unwrap(),
+            ControlResult::Empty
+        );
+        let resource = catalog.resource("fixture-shared-secret").unwrap();
+        assert_eq!(resource.name, "Renamed Shared Secret");
+        assert_eq!(resource.default_env_key.as_deref(), Some("RENAMED_TOKEN"));
+        assert_eq!(resource.entries[0].label, "Renamed Shared Secret");
+        assert_eq!(resource.entries[0].key.as_deref(), Some("RENAMED_TOKEN"));
+        assert_eq!(store.get(&secret_id).unwrap().as_slice(), b"fixture-value-three");
+        assert_eq!(store.record(&secret_id).unwrap().unwrap().current_version, 3);
+
+        client
+            .request(ControlCommand::SharedSecretUpdate {
+                resource_id: "fixture-shared-secret".to_string(),
+                name: "Metadata Only Rename".to_string(),
+                default_env_key: Some("RENAMED_TOKEN".to_string()),
+                value: None,
+            })
+            .unwrap();
+        assert_eq!(store.record(&secret_id).unwrap().unwrap().current_version, 3);
+
+        assert_eq!(
+            client
+                .request(ControlCommand::SharedSecretRemove {
+                    resource_id: "fixture-shared-secret".to_string(),
+                })
+                .unwrap(),
+            ControlResult::Empty
+        );
+        assert!(matches!(
+            catalog.resource("fixture-shared-secret"),
+            Err(CatalogError::NotFound(_))
+        ));
+        assert!(store.record(&secret_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn shared_secret_remove_refuses_to_orphan_project_bindings() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let socket = dir.path().join("control.sock");
+        let store = Arc::new(FixtureStore::new());
+        let observer: Arc<dyn CatalogObserver> = Arc::new(SnapshotObserver {
+            notifications: AtomicUsize::new(0),
+            latest: Mutex::new(None),
+        });
+        let _server = ControlServer::start_runtime(
+            &socket,
+            catalog.clone(),
+            Arc::clone(&store) as Arc<dyn SecretStore>,
+            dir.path().join("mount"),
+            observer,
+        )
+        .unwrap();
+        let mut client = ControlClient::connect(&socket).unwrap();
+
+        client
+            .request(ControlCommand::SharedSecretCreate {
+                resource_id: "fixture-shared-secret".to_string(),
+                name: "Fixture Shared Secret".to_string(),
+                default_env_key: Some("FIXTURE_TOKEN".to_string()),
+                value: crate::protocol::SecretValue::new("fixture-bound-value"),
+            })
+            .unwrap();
+        client
+            .request(ControlCommand::ProjectUpsert {
+                project: Project {
+                    id: "fixture-project".to_string(),
+                    name: "Fixture Project".to_string(),
+                    path: PathBuf::from("/fixture/project"),
+                },
+            })
+            .unwrap();
+        client
+            .request(ControlCommand::BindingUpsert {
+                binding: Binding {
+                    id: "fixture-binding".to_string(),
+                    project_id: "fixture-project".to_string(),
+                    scope: BindingScope::Common,
+                    resource_id: "fixture-shared-secret".to_string(),
+                    selection: EntrySelection::All,
+                    key_override: None,
+                    enabled: true,
+                    allow_override: false,
+                    position: 0,
+                },
+            })
+            .unwrap();
+
+        let error = client
+            .request(ControlCommand::SharedSecretRemove {
+                resource_id: "fixture-shared-secret".to_string(),
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("resource_in_use"));
+        assert!(catalog.resource("fixture-shared-secret").is_ok());
+        let secret_id: SecretId = FIXTURE_SECRET_ID.parse().unwrap();
+        assert!(store.record(&secret_id).unwrap().is_some());
     }
 
     #[test]

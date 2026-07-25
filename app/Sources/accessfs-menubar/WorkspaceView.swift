@@ -733,6 +733,8 @@ private struct SurfaceInspector: View {
     let addDirectEnvFile: () -> Void
     let addLinesFile: () -> Void
     @State private var showingManageSurface = false
+    @State private var confirmingRemoval = false
+    @State private var errorMessage: String?
 
     var body: some View {
         Group {
@@ -776,6 +778,27 @@ private struct SurfaceInspector: View {
                             }
                             .buttonStyle(.borderless)
                             .help("Add output surface")
+                            Menu {
+                                Button("Edit Output…", systemImage: "pencil") {
+                                    showingManageSurface = true
+                                }
+                                Button("Open in Finder", systemImage: "folder") {
+                                    revealSurface(surface)
+                                }
+                                Divider()
+                                Button(
+                                    "Delete Output…", systemImage: "trash",
+                                    role: .destructive
+                                ) {
+                                    confirmingRemoval = true
+                                }
+                            } label: {
+                                Image(systemName: "ellipsis")
+                                    .frame(width: 22, height: 22)
+                            }
+                            .menuStyle(.borderlessButton)
+                            .fixedSize()
+                            .accessibilityLabel("Output actions")
                             SurfaceStatusBadge(status: surface.status)
                         }
                         Text(surface.path)
@@ -839,6 +862,31 @@ private struct SurfaceInspector: View {
             if let surface = store.selectedSurface {
                 ManageSurfaceSheet(store: store, surface: surface)
             }
+        }
+        .alert("Delete output?", isPresented: $confirmingRemoval) {
+            Button("Cancel", role: .cancel) { }
+            Button("Delete Output", role: .destructive) {
+                guard let surface = store.selectedSurface else { return }
+                Task {
+                    do {
+                        try await store.deleteSurface(surface.id)
+                    } catch {
+                        errorMessage = error.localizedDescription
+                    }
+                }
+            }
+        } message: {
+            Text("Its resources and project bindings are kept. Floria removes only its managed link.")
+        }
+        .alert(
+            "Could not delete output",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } })
+        ) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
         }
     }
 
@@ -1139,6 +1187,15 @@ private struct ManageSurfaceSheet: View {
     @State private var confirmingRemoval = false
     @State private var errorMessage: String?
     @State private var selectedBindingIDs: Set<WorkspaceBinding.ID> = []
+    @State private var fileName: String
+    @State private var selectedKind: WorkspaceSurfaceKind
+
+    init(store: WorkspaceStore, surface: WorkspaceSurface) {
+        self.store = store
+        self.surface = surface
+        _fileName = State(initialValue: surface.name)
+        _selectedKind = State(initialValue: surface.kind)
+    }
 
     private var isFileSurface: Bool {
         surface.kind == .dotenvFile || surface.kind == .direnvFile || surface.kind == .iniFile
@@ -1147,12 +1204,11 @@ private struct ManageSurfaceSheet: View {
     }
 
     private var isComposedSurface: Bool {
-        surface.kind == .dotenvFile || surface.kind == .direnvFile || surface.kind == .iniFile
-            || surface.kind == .linesFile
+        selectedKind.isComposed
     }
 
     private var bindingCandidates: [WorkspaceBinding] {
-        store.compatibleBindings(for: surface.kind)
+        store.compatibleBindings(for: selectedKind)
     }
 
     private var expectedTarget: String {
@@ -1174,14 +1230,35 @@ private struct ManageSurfaceSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Manage \(surface.name)").font(.title2.bold())
+                Text("Edit Output").font(.title2.bold())
                 Text(linkSummary)
                     .font(.callout)
                     .foregroundStyle(actualTarget == expectedTarget ? Color.green : Color.orange)
             }
 
+            if isFileSurface {
+                InspectorSection(title: "Output") {
+                    TextField("File name", text: $fileName)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.body.monospaced())
+                    if surface.kind.isComposed {
+                        Picker("Format", selection: $selectedKind) {
+                            ForEach(WorkspaceSurfaceKind.composedCases, id: \.self) { kind in
+                                Label(kind.title, systemImage: kind.systemImage).tag(kind)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                    } else {
+                        LabeledContent("Format", value: surface.kind.title)
+                    }
+                }
+            }
+
             InspectorSection(title: "Project path") {
-                Text(surface.path)
+                Text(
+                    ((surface.path as NSString).deletingLastPathComponent as NSString)
+                        .appendingPathComponent(fileName)
+                )
                     .font(.callout.monospaced())
                     .textSelection(.enabled)
             }
@@ -1199,9 +1276,6 @@ private struct ManageSurfaceSheet: View {
                         Text("No compatible bindings")
                             .foregroundStyle(.secondary)
                     }
-                    Button("Save Members", action: saveMembers)
-                        .buttonStyle(.borderedProminent)
-                        .disabled(isWorking)
                 }
             }
 
@@ -1228,10 +1302,19 @@ private struct ManageSurfaceSheet: View {
                     NSWorkspace.shared.activateFileViewerSelecting(
                         [URL(fileURLWithPath: surface.path)])
                 }
-                Spacer()
                 if isFileSurface {
                     Button("Repair Link", systemImage: "wrench.and.screwdriver", action: repairLink)
                         .disabled(isWorking)
+                }
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                if isFileSurface {
+                    Button("Save Changes", action: saveChanges)
+                        .buttonStyle(.borderedProminent)
+                        .disabled(
+                            isWorking
+                                || fileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                 }
             }
 
@@ -1251,6 +1334,10 @@ private struct ManageSurfaceSheet: View {
         .frame(width: 620)
         .onAppear {
             selectedBindingIDs = Set(surface.bindingIDs)
+        }
+        .onChange(of: selectedKind) { _, kind in
+            let allowed = Set(store.compatibleBindings(for: kind).map(\.id))
+            selectedBindingIDs.formIntersection(allowed)
         }
         .alert("Remove output?", isPresented: $confirmingRemoval) {
             Button("Cancel", role: .cancel) { }
@@ -1282,13 +1369,16 @@ private struct ManageSurfaceSheet: View {
         }
     }
 
-    private func saveMembers() {
+    private func saveChanges() {
         Task {
             isWorking = true
             defer { isWorking = false }
             do {
                 let ordered = bindingCandidates.map(\.id).filter(selectedBindingIDs.contains)
-                try await store.updateSurfaceBindings(surface.id, bindingIDs: ordered)
+                try await store.updateSurface(
+                    surface.id, fileName: fileName, kind: selectedKind,
+                    bindingIDs: ordered)
+                dismiss()
             } catch {
                 errorMessage = error.localizedDescription
             }
@@ -1309,7 +1399,7 @@ private struct ManageSurfaceSheet: View {
             isWorking = true
             defer { isWorking = false }
             do {
-                try await store.removeSurface(surface.id)
+                try await store.deleteSurface(surface.id)
                 dismiss()
             } catch {
                 errorMessage = error.localizedDescription
@@ -1667,6 +1757,8 @@ private struct ResourceCatalogView: View {
     let search: String
     let addResourceTitle: String
     let addResource: (() -> Void)?
+    @State private var editingSharedSecret: WorkspaceResource?
+    @State private var deletingSharedSecret: WorkspaceResource?
 
     private var filtered: [WorkspaceResource] {
         store.resources.filter { resource in
@@ -1708,6 +1800,24 @@ private struct ResourceCatalogView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
+                    if resource.kind == .sharedSecret {
+                        Menu {
+                            Button("Edit Secret…", systemImage: "pencil") {
+                                editingSharedSecret = resource
+                            }
+                            Divider()
+                            Button("Delete Secret…", systemImage: "trash", role: .destructive) {
+                                deletingSharedSecret = resource
+                            }
+                        } label: {
+                            Image(systemName: "ellipsis")
+                                .frame(width: 28, height: 28)
+                                .contentShape(Rectangle())
+                        }
+                        .menuStyle(.borderlessButton)
+                        .fixedSize()
+                        .accessibilityLabel("More actions for \(resource.name)")
+                    }
                 }
                 .padding(.vertical, 5)
             }
@@ -1724,6 +1834,148 @@ private struct ResourceCatalogView: View {
             }
         }
         .navigationTitle(title)
+        .sheet(item: $editingSharedSecret) { resource in
+            EditSharedSecretSheet(store: store, resource: resource)
+        }
+        .alert(
+            deletingSharedSecret?.usageCount == 0
+                ? "Delete Shared Secret?" : "Shared Secret Is In Use",
+            isPresented: Binding(
+                get: { deletingSharedSecret != nil },
+                set: { if !$0 { deletingSharedSecret = nil } })
+        ) {
+            if let resource = deletingSharedSecret, resource.usageCount == 0 {
+                Button("Cancel", role: .cancel) { deletingSharedSecret = nil }
+                Button("Delete Secret", role: .destructive) {
+                    deleteSharedSecret(resource)
+                }
+            } else {
+                Button("OK") { deletingSharedSecret = nil }
+            }
+        } message: {
+            if let resource = deletingSharedSecret {
+                if resource.usageCount == 0 {
+                    Text("This permanently removes its encrypted value and version history.")
+                } else {
+                    Text(
+                        "Remove \(resource.name) from its \(resource.usageCount) project binding\(resource.usageCount == 1 ? "" : "s") first."
+                    )
+                }
+            }
+        }
+    }
+
+    private func deleteSharedSecret(_ resource: WorkspaceResource) {
+        deletingSharedSecret = nil
+        Task {
+            do {
+                try await store.deleteSharedSecret(resource.id)
+            } catch {
+                store.lastError = error.localizedDescription
+            }
+        }
+    }
+}
+
+private struct EditSharedSecretSheet: View {
+    @Bindable var store: WorkspaceStore
+    let resource: WorkspaceResource
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var name: String
+    @State private var defaultKey: String
+    @State private var newValue = ""
+    @State private var isSaving = false
+    @State private var errorMessage: String?
+
+    init(store: WorkspaceStore, resource: WorkspaceResource) {
+        self.store = store
+        self.resource = resource
+        _name = State(initialValue: resource.name)
+        _defaultKey = State(initialValue: resource.defaultEnvKey ?? "")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Edit Shared Secret").font(.title2.bold())
+                Text("Change its metadata or rotate the encrypted value.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Name").font(.callout.weight(.medium))
+                TextField("Cloudflare API Token", text: $name)
+                    .textFieldStyle(.roundedBorder)
+            }
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Default environment key (optional)")
+                    .font(.callout.weight(.medium))
+                TextField("CLOUDFLARE_API_TOKEN", text: $defaultKey)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.body.monospaced())
+                Text("Leave empty for a keyless value used by Lines outputs.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            VStack(alignment: .leading, spacing: 7) {
+                Text("New secret value (optional)")
+                    .font(.callout.weight(.medium))
+                SecureField("Leave blank to keep the current value", text: $newValue)
+                    .textFieldStyle(.roundedBorder)
+                Text("Saving a new value appends an encrypted version; existing history is kept.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            HStack(spacing: 7) {
+                Image(systemName: "exclamationmark.triangle")
+                Text("A key change must remain compatible with every output using this secret.")
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+
+            Divider()
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Save Changes", action: save)
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isSaving || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(width: 500)
+        .alert(
+            "Could not update secret",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } })
+        ) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
+    }
+
+    private func save() {
+        Task {
+            isSaving = true
+            defer { isSaving = false }
+            let submittedValue = newValue
+            newValue = ""
+            do {
+                try await store.updateSharedSecret(
+                    resource.id, name: name, defaultEnvKey: defaultKey.uppercased(),
+                    newValue: submittedValue)
+                dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
     }
 }
 
@@ -2165,6 +2417,8 @@ private struct NewProjectSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
     @State private var path = ""
+    @State private var initialFileName = WorkspaceSurfaceKind.dotenvFile.defaultFileName
+    @State private var initialSurfaceKind = WorkspaceSurfaceKind.dotenvFile
     @State private var isSaving = false
     @State private var errorMessage: String?
 
@@ -2172,7 +2426,7 @@ private struct NewProjectSheet: View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Add Project").font(.title2.bold())
-                Text("Floria creates a Development environment and a read-only .env link.")
+                Text("Floria creates a Development environment and its first read-only output.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -2192,9 +2446,35 @@ private struct NewProjectSheet: View {
                     .textFieldStyle(.roundedBorder)
             }
 
+            VStack(alignment: .leading, spacing: 7) {
+                Text("Initial output").font(.callout.weight(.medium))
+                HStack {
+                    Picker(
+                        "Format",
+                        selection: Binding(
+                            get: { initialSurfaceKind },
+                            set: { newKind in
+                                if initialFileName == initialSurfaceKind.defaultFileName {
+                                    initialFileName = newKind.defaultFileName
+                                }
+                                initialSurfaceKind = newKind
+                            })
+                    ) {
+                        ForEach(WorkspaceSurfaceKind.composedCases, id: \.self) { kind in
+                            Text(kind.title).tag(kind)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 180)
+                    TextField("File name", text: $initialFileName)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.body.monospaced())
+                }
+            }
+
             HStack {
                 Image(systemName: "info.circle")
-                Text("An existing .env file or symlink is never replaced.")
+                Text("An existing file or symlink is never replaced.")
             }
             .font(.caption)
             .foregroundStyle(.secondary)
@@ -2207,7 +2487,9 @@ private struct NewProjectSheet: View {
                 Button("Create Project") { createProject() }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(isSaving || name.isEmpty || path.isEmpty)
+                    .disabled(
+                        isSaving || name.isEmpty || path.isEmpty
+                            || initialFileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
         .padding(24)
@@ -2241,7 +2523,9 @@ private struct NewProjectSheet: View {
             isSaving = true
             defer { isSaving = false }
             do {
-                let projectID = try await store.createProject(name: name, path: path)
+                let projectID = try await store.createProject(
+                    name: name, path: path, initialFileName: initialFileName,
+                    initialSurfaceKind: initialSurfaceKind)
                 onCreated(projectID)
                 dismiss()
             } catch {

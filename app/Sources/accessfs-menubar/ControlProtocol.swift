@@ -176,6 +176,10 @@ enum ControlCommand: Sendable {
     case protectedFileRollback(id: String, version: UInt32)
     case fileRestore(String)
     case sharedSecretCreate(resourceID: String, name: String, defaultEnvKey: String?, value: String)
+    case sharedSecretUpdate(
+        resourceID: String, name: String, defaultEnvKey: String?, value: String?
+    )
+    case sharedSecretRemove(resourceID: String)
     case envFileCreate(resourceID: String, name: String, codec: String, value: String)
     case projectCreate(CatalogProject, CatalogEnvironment, CatalogSurface)
     case projectUpsert(CatalogProject)
@@ -196,6 +200,8 @@ enum ControlCommand: Sendable {
         case .protectedFileRollback: "protected_file_rollback"
         case .fileRestore: "file_restore"
         case .sharedSecretCreate: "shared_secret_create"
+        case .sharedSecretUpdate: "shared_secret_update"
+        case .sharedSecretRemove: "shared_secret_remove"
         case .envFileCreate: "env_file_create"
         case .projectCreate: "project_create"
         case .projectUpsert: "project_upsert"
@@ -235,6 +241,18 @@ enum ControlCommand: Sendable {
                     params: SharedSecretCreateParams(
                         resourceID: resourceID, name: name, defaultEnvKey: defaultEnvKey,
                         value: value)))
+        case .sharedSecretUpdate(let resourceID, let name, let defaultEnvKey, let value):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: SharedSecretUpdateParams(
+                        resourceID: resourceID, name: name, defaultEnvKey: defaultEnvKey,
+                        value: value)))
+        case .sharedSecretRemove(let resourceID):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: SharedSecretRemoveParams(resourceID: resourceID)))
         case .envFileCreate(let resourceID, let name, let codec, let value):
             return try encoder.encode(
                 ControlRequest(
@@ -293,6 +311,15 @@ private struct SharedSecretCreateParams: Encodable {
     let defaultEnvKey: String?
     let value: String
 }
+
+private struct SharedSecretUpdateParams: Encodable {
+    let resourceID: String
+    let name: String
+    let defaultEnvKey: String?
+    let value: String?
+}
+
+private struct SharedSecretRemoveParams: Encodable { let resourceID: String }
 
 private struct FileProtectParams: Encodable { let path: String }
 private struct ProtectedFileIDParams: Encodable { let id: String }

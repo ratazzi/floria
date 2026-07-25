@@ -67,6 +67,13 @@ pub enum ControlCommand {
         default_env_key: Option<String>,
         value: SecretValue,
     },
+    SharedSecretUpdate {
+        resource_id: String,
+        name: String,
+        default_env_key: Option<String>,
+        value: Option<SecretValue>,
+    },
+    SharedSecretRemove { resource_id: String },
     SharedSecretRotate { resource_id: String, value: SecretValue },
     EnvFileCreate {
         resource_id: String,

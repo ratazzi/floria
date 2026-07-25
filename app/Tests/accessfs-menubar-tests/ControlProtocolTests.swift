@@ -117,6 +117,32 @@ final class ControlProtocolTests: XCTestCase {
             "fixture-host|5432|fixture-db|fixture-user|fixture-value")
     }
 
+    func testSharedSecretMaintenanceRequestsMatchRustWireShape() throws {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+
+        let update = try ControlCommand.sharedSecretUpdate(
+            resourceID: "fixture-secret", name: "Renamed Secret",
+            defaultEnvKey: "RENAMED_TOKEN", value: "fixture-value-three"
+        ).requestData(requestID: 91, encoder: encoder)
+        let updateValue = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: update) as? [String: Any])
+        let updateParams = try XCTUnwrap(updateValue["params"] as? [String: Any])
+        XCTAssertEqual(updateValue["method"] as? String, "shared_secret_update")
+        XCTAssertEqual(updateParams["resource_id"] as? String, "fixture-secret")
+        XCTAssertEqual(updateParams["name"] as? String, "Renamed Secret")
+        XCTAssertEqual(updateParams["default_env_key"] as? String, "RENAMED_TOKEN")
+        XCTAssertEqual(updateParams["value"] as? String, "fixture-value-three")
+
+        let remove = try ControlCommand.sharedSecretRemove(resourceID: "fixture-secret")
+            .requestData(requestID: 92, encoder: encoder)
+        let removeValue = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: remove) as? [String: Any])
+        let removeParams = try XCTUnwrap(removeValue["params"] as? [String: Any])
+        XCTAssertEqual(removeValue["method"] as? String, "shared_secret_remove")
+        XCTAssertEqual(removeParams["resource_id"] as? String, "fixture-secret")
+    }
+
     func testEnvFileCreateRequestCarriesPlaintextOnlyInTheControlBody() throws {
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase

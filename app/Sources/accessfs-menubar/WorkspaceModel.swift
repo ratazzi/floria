@@ -138,6 +138,7 @@ struct WorkspaceResource: Identifiable, Hashable, Sendable {
     let kind: WorkspaceResourceKind
     let shape: WorkspaceValueShape
     let codec: WorkspaceResourceCodec
+    let defaultEnvKey: String?
     let entries: [WorkspaceEntry]
     let detail: String
     let usageCount: Int
@@ -145,6 +146,7 @@ struct WorkspaceResource: Identifiable, Hashable, Sendable {
     init(
         id: String, name: String, kind: WorkspaceResourceKind, shape: WorkspaceValueShape,
         codec: WorkspaceResourceCodec? = nil,
+        defaultEnvKey: String? = nil,
         exports: [WorkspaceExport], entries: [WorkspaceEntry] = [], detail: String,
         usageCount: Int
     ) {
@@ -153,6 +155,7 @@ struct WorkspaceResource: Identifiable, Hashable, Sendable {
         self.kind = kind
         self.shape = shape
         self.codec = codec ?? (kind == .envFile ? .dotenv : .opaque)
+        self.defaultEnvKey = defaultEnvKey
         self.entries = entries.isEmpty
             ? exports.map {
                 WorkspaceEntry(
@@ -239,7 +242,7 @@ enum WorkspaceBindingTarget: String, CaseIterable, Sendable {
     }
 }
 
-enum WorkspaceSurfaceKind: String, Sendable {
+enum WorkspaceSurfaceKind: String, CaseIterable, Sendable {
     case dotenvFile
     case direnvFile
     case iniFile
@@ -270,6 +273,26 @@ enum WorkspaceSurfaceKind: String, Sendable {
         case .regularFile: "doc"
         case .unixSocket: "point.3.connected.trianglepath.dotted"
         }
+    }
+
+    var isComposed: Bool {
+        self == .dotenvFile || self == .direnvFile || self == .iniFile || self == .linesFile
+    }
+
+    var defaultFileName: String {
+        switch self {
+        case .dotenvFile: ".env"
+        case .direnvFile: ".envrc"
+        case .iniFile: "credentials.ini"
+        case .linesFile: ".secrets"
+        case .envFileDirect: ".env.local"
+        case .regularFile: "output"
+        case .unixSocket: "agent.sock"
+        }
+    }
+
+    static var composedCases: [WorkspaceSurfaceKind] {
+        allCases.filter(\.isComposed)
     }
 }
 
@@ -650,7 +673,10 @@ final class WorkspaceStore {
     }
 
     @discardableResult
-    func createProject(name: String, path: String) async throws -> WorkspaceProject.ID {
+    func createProject(
+        name: String, path: String, initialFileName: String = ".env",
+        initialSurfaceKind: WorkspaceSurfaceKind = .dotenvFile
+    ) async throws -> WorkspaceProject.ID {
         guard let controlClient else {
             throw WorkspaceStoreError.controlUnavailable
         }
@@ -663,28 +689,25 @@ final class WorkspaceStore {
         else {
             throw WorkspaceStoreError.invalid("Choose an existing project directory")
         }
-        let dotenvPath = (path as NSString).appendingPathComponent(".env")
-        var fileInfo = stat()
-        let dotenvStatus = dotenvPath.withCString { lstat($0, &fileInfo) }
-        guard dotenvStatus != 0 else {
-            throw WorkspaceStoreError.invalid(
-                "\(dotenvPath) already exists. Floria will never replace it automatically.")
+        guard initialSurfaceKind.isComposed else {
+            throw WorkspaceStoreError.invalid("Choose a composed output format")
         }
-        guard errno == ENOENT else {
-            throw WorkspaceStoreError.invalid("Floria could not inspect \(dotenvPath)")
-        }
+        let draft = WorkspaceProject(
+            id: "", name: name, path: path, commonBindings: [], environments: [])
+        let output = try newSurfaceOutput(fileName: initialFileName, in: draft)
 
         let projectID = Self.newID("project")
         let environmentID = Self.newID("environment")
-        let surfaceID = Self.newID("dotenv")
+        let surfaceID = Self.newID("surface")
         do {
             try await controlClient.createProject(
                 CatalogProject(id: projectID, name: name, path: path),
                 environment: CatalogEnvironment(
                     id: environmentID, projectID: projectID, name: "Development", position: 0),
                 surface: CatalogSurface(
-                    id: surfaceID, environmentID: environmentID, name: ".env",
-                    kind: "dotenv_file", path: dotenvPath, input: .bindings([]), position: 0))
+                    id: surfaceID, environmentID: environmentID, name: output.name,
+                    kind: initialSurfaceKind.catalogValue, path: output.path,
+                    input: .bindings([]), position: 0))
             apply(try await controlClient.snapshot(), selectingProject: projectID)
             lastError = nil
             return projectID
@@ -717,6 +740,47 @@ final class WorkspaceStore {
         apply(try await controlClient.snapshot())
         lastError = nil
         return resourceID
+    }
+
+    func updateSharedSecret(
+        _ id: WorkspaceResource.ID, name: String, defaultEnvKey: String,
+        newValue: String = ""
+    ) async throws {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        guard resources.contains(where: { $0.id == id && $0.kind == .sharedSecret }) else {
+            throw WorkspaceStoreError.invalid("Choose a Shared Secret first")
+        }
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let enteredKey = defaultEnvKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = enteredKey.isEmpty ? nil : enteredKey
+        guard !name.isEmpty else { throw WorkspaceStoreError.invalid("Secret name is required") }
+        if let key, !Self.isValidEnvKey(key) {
+            throw WorkspaceStoreError.invalid(
+                "The default key must start with A-Z or _, followed by A-Z, 0-9, or _")
+        }
+
+        try await controlClient.updateSharedSecret(
+            resourceID: id, name: name, defaultEnvKey: key,
+            value: newValue.isEmpty ? nil : newValue)
+        apply(try await controlClient.snapshot())
+        lastError = nil
+    }
+
+    func deleteSharedSecret(_ id: WorkspaceResource.ID) async throws {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        guard let resource = resources.first(where: { $0.id == id && $0.kind == .sharedSecret })
+        else {
+            throw WorkspaceStoreError.invalid("Choose a Shared Secret first")
+        }
+        guard resource.usageCount == 0 else {
+            let projectWord = resource.usageCount == 1 ? "project" : "projects"
+            throw WorkspaceStoreError.invalid(
+                "Remove this secret from \(resource.usageCount) \(projectWord) before deleting it")
+        }
+
+        try await controlClient.deleteSharedSecret(resourceID: id)
+        apply(try await controlClient.snapshot())
+        lastError = nil
     }
 
     @discardableResult
@@ -1024,10 +1088,57 @@ final class WorkspaceStore {
         lastError = nil
     }
 
-    func removeSurface(_ id: WorkspaceSurface.ID) async throws {
+    func deleteSurface(_ id: WorkspaceSurface.ID) async throws {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
         try await controlClient.removeSurface(id)
         apply(try await controlClient.snapshot())
+        lastError = nil
+    }
+
+    func removeSurface(_ id: WorkspaceSurface.ID) async throws {
+        try await deleteSurface(id)
+    }
+
+    func updateSurface(
+        _ id: WorkspaceSurface.ID, fileName: String, kind: WorkspaceSurfaceKind,
+        bindingIDs: [WorkspaceBinding.ID]
+    ) async throws {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        guard let project = selectedProject, let environment = selectedEnvironment,
+            let position = environment.surfaces.firstIndex(where: { $0.id == id }),
+            let surface = environment.surfaces.first(where: { $0.id == id })
+        else {
+            throw WorkspaceStoreError.invalid("Select an output first")
+        }
+        let output = try newSurfaceOutput(
+            fileName: fileName, in: project, excludingSurfaceID: id)
+
+        let input: CatalogSurfaceInput
+        switch surface.input {
+        case .bindings:
+            guard kind.isComposed else {
+                throw WorkspaceStoreError.invalid("Choose a composed output format")
+            }
+            let allowed = Set(compatibleBindings(for: kind).map(\.id))
+            guard bindingIDs.allSatisfy(allowed.contains) else {
+                throw WorkspaceStoreError.invalid(
+                    "One or more bindings cannot feed the selected format")
+            }
+            input = .bindings(bindingIDs)
+        case .resource(let resourceID):
+            guard kind == surface.kind else {
+                throw WorkspaceStoreError.invalid("Direct outputs keep their source format")
+            }
+            input = .resource(resourceID)
+        }
+
+        try await controlClient.upsertSurface(
+            CatalogSurface(
+                id: id, environmentID: environment.id, name: output.name,
+                kind: kind.catalogValue, path: output.path, input: input,
+                position: Int64(position)))
+        apply(try await controlClient.snapshot())
+        selectedSurfaceID = id
         lastError = nil
     }
 
@@ -1089,7 +1200,8 @@ final class WorkspaceStore {
     }
 
     private func newSurfaceOutput(
-        fileName: String, in project: WorkspaceProject
+        fileName: String, in project: WorkspaceProject,
+        excludingSurfaceID: WorkspaceSurface.ID? = nil
     ) throws -> (name: String, path: String) {
         let name = fileName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty, name != ".", name != "..",
@@ -1098,8 +1210,15 @@ final class WorkspaceStore {
             throw WorkspaceStoreError.invalid("Output name must be one file name")
         }
         let path = (project.path as NSString).appendingPathComponent(name)
-        guard !project.environments.flatMap(\.surfaces).contains(where: { $0.path == path }) else {
+        guard !project.environments.flatMap(\.surfaces).contains(where: {
+            $0.id != excludingSurfaceID && $0.path == path
+        }) else {
             throw WorkspaceStoreError.invalid("\(path) is already used by another output")
+        }
+        if let existing = project.environments.flatMap(\.surfaces).first(where: {
+            $0.id == excludingSurfaceID
+        }), existing.path == path {
+            return (name, path)
         }
         var fileInfo = stat()
         let status = path.withCString { lstat($0, &fileInfo) }
@@ -1186,6 +1305,7 @@ final class WorkspaceStore {
             }
             return WorkspaceResource(
                 id: resource.id, name: resource.name, kind: kind, shape: shape, codec: codec,
+                defaultEnvKey: resource.defaultEnvKey,
                 exports: [],
                 entries: entries,
                 detail: resource.detail ?? resource.defaultEnvKey ?? kind.title,
