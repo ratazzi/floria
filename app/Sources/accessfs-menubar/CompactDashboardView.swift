@@ -1504,7 +1504,7 @@ private struct DiscoveryReviewSheet: View {
         let missingCount = plan.summary.missingReferenceEntries
         if missingCount > 0 {
             notes.append(
-                "\(missingCount) declared key\(missingCount == 1 ? "" : "s") have no discovered value."
+                "\(missingCount) declared key\(missingCount == 1 ? " has" : "s have") no discovered value."
             )
         }
         let base = notes.joined(separator: " ")
