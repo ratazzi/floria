@@ -405,7 +405,7 @@ struct AdvancedWorkspaceView: View {
                     }
                 }
                 Divider()
-                Button("Refresh Workspace", systemImage: "arrow.clockwise") {
+                Button("Refresh Library", systemImage: "arrow.clockwise") {
                     Task {
                         await state.workspace.reload(reportErrors: true)
                         await state.reloadPolicyMode()
@@ -454,7 +454,7 @@ struct AdvancedWorkspaceView: View {
                     .padding(.top, 55)
                     .padding(.bottom, 24)
 
-                    sidebarSectionTitle("Workspace")
+                    sidebarSectionTitle("Library")
                     VStack(spacing: 3) {
                         sidebarRow("Projects", systemImage: "folder", tag: .projects)
                         sidebarRow(

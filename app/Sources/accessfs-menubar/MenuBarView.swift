@@ -557,7 +557,7 @@ private struct MenuBarFooter: View {
             .padding(.horizontal, 10)
             .padding(.top, 2)
             .padding(.bottom, 4)
-            MenuItemButton(title: "Open Workspace", icon: "rectangle.grid.2x2", shortcut: "D") {
+            MenuItemButton(title: "Open Library", icon: "rectangle.grid.2x2", shortcut: "D") {
                 DockVisibilityController.shared.prepareToShowDashboard()
                 openWindow(id: "dashboard")
                 // Changing an accessory app back to regular doesn't make it frontmost.

@@ -229,7 +229,7 @@ struct DashboardView: View {
                 Button("Discover Project…", systemImage: "sparkle.magnifyingglass") {
                     chooseDiscoverySource()
                 }
-                Button("Open Workspace", systemImage: "rectangle.3.group") {
+                Button("Open Library", systemImage: "rectangle.3.group") {
                     openWorkspace()
                 }
                 Button("Open Access Log", systemImage: "clock") {
@@ -585,7 +585,7 @@ struct DashboardView: View {
         if let error = state.workspace.lastError {
             result.append(
                 DashboardIssue(
-                    id: "workspace-error", title: "Workspace could not refresh",
+                    id: "workspace-error", title: "Library could not refresh",
                     detail: error, actionTitle: "Retry", action: .reload))
         }
 
