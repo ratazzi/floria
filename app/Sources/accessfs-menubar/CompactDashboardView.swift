@@ -2,6 +2,17 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+struct AppSearchFocusKey: FocusedValueKey {
+    typealias Value = () -> Void
+}
+
+extension FocusedValues {
+    var focusAppSearch: AppSearchFocusKey.Value? {
+        get { self[AppSearchFocusKey.self] }
+        set { self[AppSearchFocusKey.self] = newValue }
+    }
+}
+
 private struct DiscoveryPresentation: Identifiable {
     let id = UUID()
     let plan: DiscoveryPlan
@@ -38,6 +49,7 @@ struct DashboardView: View {
     @State private var showingAccessLog = false
     @State private var pendingAuditWindow: AuditOnlyWindow?
     @State private var showingAuditConfirmation = false
+    @FocusState private var searchIsFocused: Bool
 
     var body: some View {
         ZStack {
@@ -78,6 +90,9 @@ struct DashboardView: View {
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .focusedSceneValue(\.focusAppSearch) {
+            searchIsFocused = true
+        }
         .dropDestination(for: URL.self) { urls, _ in
             guard let url = urls.first else { return false }
             beginDiscovery(at: url.path)
@@ -140,6 +155,14 @@ struct DashboardView: View {
                     .foregroundStyle(.tertiary)
                 TextField("Search", text: $search)
                     .textFieldStyle(.plain)
+                    .focused($searchIsFocused)
+                    .onExitCommand {
+                        if search.isEmpty {
+                            searchIsFocused = false
+                        } else {
+                            search = ""
+                        }
+                    }
                 if !search.isEmpty {
                     Button {
                         search = ""

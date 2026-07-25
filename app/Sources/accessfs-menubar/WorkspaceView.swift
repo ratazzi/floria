@@ -246,6 +246,7 @@ struct AdvancedWorkspaceView: View {
     @State private var showingConnectExternalAgent = false
     @State private var pendingAuditWindow: AuditOnlyWindow?
     @State private var showingAuditConfirmation = false
+    @FocusState private var searchIsFocused: Bool
 
     init(
         state: AppState,
@@ -269,6 +270,9 @@ struct AdvancedWorkspaceView: View {
             }
         }
         .ignoresSafeArea(.container, edges: .top)
+        .focusedSceneValue(\.focusAppSearch) {
+            searchIsFocused = true
+        }
         .onAppear {
             guard case .project(let projectID) = initialSelection else { return }
             state.workspace.selectProject(projectID)
@@ -330,8 +334,16 @@ struct AdvancedWorkspaceView: View {
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass")
                     .foregroundStyle(.secondary)
-                TextField("Search projects and secrets", text: $search)
+                TextField("Search current view", text: $search)
                     .textFieldStyle(.plain)
+                    .focused($searchIsFocused)
+                    .onExitCommand {
+                        if search.isEmpty {
+                            searchIsFocused = false
+                        } else {
+                            search = ""
+                        }
+                    }
             }
             .padding(.horizontal, 12)
             .frame(maxWidth: 430)
@@ -366,6 +378,7 @@ struct AdvancedWorkspaceView: View {
                     .frame(width: 30, height: 30)
             }
             .buttonStyle(.bordered)
+            .accessibilityLabel("Add workspace item")
 
             Spacer(minLength: 16)
 
@@ -416,6 +429,10 @@ struct AdvancedWorkspaceView: View {
                 .frame(height: 30)
             }
             .buttonStyle(.bordered)
+            .accessibilityLabel(
+                state.policyMode.isAuditOnly()
+                    ? "Audit Only policy"
+                    : (state.connected ? "Protected policy" : "Daemon offline"))
         }
         .padding(.horizontal, 18)
         .frame(height: 90)
@@ -432,9 +449,9 @@ struct AdvancedWorkspaceView: View {
                         Text("Floria")
                             .font(.title2.bold())
                     }
-                        .padding(.horizontal, 18)
-                        .padding(.top, 55)
-                        .padding(.bottom, 24)
+                    .padding(.horizontal, 18)
+                    .padding(.top, 55)
+                    .padding(.bottom, 24)
 
                     sidebarSectionTitle("Workspace")
                     VStack(spacing: 3) {

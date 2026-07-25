@@ -21,6 +21,20 @@ enum FloriaImages {
     }
 }
 
+private struct DashboardCommands: Commands {
+    @FocusedValue(\.focusAppSearch) private var focusSearch
+
+    var body: some Commands {
+        CommandGroup(after: .pasteboard) {
+            Button("Search") {
+                focusSearch?()
+            }
+            .keyboardShortcut("f", modifiers: .command)
+            .disabled(focusSearch == nil)
+        }
+    }
+}
+
 /// Dock-and-menubar app: a full workspace window, a compact status dropdown,
 /// and modal authorization prompts driven by the daemon.
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -72,5 +86,8 @@ struct FloriaMenuBarApp: App {
         .defaultSize(width: 880, height: 720)
         .windowStyle(.hiddenTitleBar)
         .defaultLaunchBehavior(.presented)
+        .commands {
+            DashboardCommands()
+        }
     }
 }
