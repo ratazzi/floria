@@ -14,7 +14,8 @@ use accessfs_core::audit::{read_recent_access, AuditAccessRecord};
 use accessfs_core::authz::{Enforcement, PolicyMode, PolicyModeStatus};
 use accessfs_discover::{
     discover, discover_git_checkouts, DiscoveredContent, DiscoveredFileAction, DiscoveredFileKind,
-    ExistingEnvironment, ExistingProject, ExistingSecret, ExistingSurface, GitCheckoutMonitor,
+    ExistingEnvironment, ExistingProject, ExistingSecret, ExistingSurface, GitCheckoutDiscovery,
+    GitCheckoutMonitor, MonitoredGitCheckout,
 };
 use accessfs_platform::SocketPeerVerifier;
 use accessfs_ssh::ManagedKeyError;
@@ -26,8 +27,8 @@ use crate::protocol::{
     AccessHistorySsh, ActiveGrant, ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest,
     ControlResponse, ControlResult, DiscoveryAppliedFile, DiscoveryApplyOutcome,
     DiscoveryApplyResult, DiscoveryReferenceResolution, DiscoveryReferenceSource,
-    ProjectCheckoutCandidate, ProjectCheckoutDiscovery, ProtectedFile, ProtectedFileVersion,
-    SecretValue, SshConfigStatus, SshIdentity,
+    ProjectCheckoutCandidate, ProjectCheckoutDiscovery, ProjectCheckoutInventory, ProtectedFile,
+    ProtectedFileVersion, SecretValue, SshConfigStatus, SshIdentity,
 };
 
 pub struct ControlServer {
@@ -227,7 +228,7 @@ fn accept_loop(
                 continue;
             }
         };
-        tracing::info!(
+        tracing::debug!(
             pid = peer.identity.pid,
             executable = ?peer.identity.exe_path,
             bundle_id = ?peer.identity.bundle_id,
@@ -523,8 +524,11 @@ fn dispatch(
                 source,
             )
         }
+        ControlCommand::ProjectCheckoutInventory => {
+            project_checkout_inventory(catalog, checkout_monitor)
+        }
         ControlCommand::ProjectCheckoutDiscover { project_id } => {
-            discover_project_checkouts(catalog, &project_id, checkout_monitor)
+            discover_project_checkouts(catalog, &project_id)
         }
         ControlCommand::ProjectCheckoutUpsert { checkout } => {
             catalog.upsert_checkout(&checkout)?;
@@ -1324,7 +1328,6 @@ impl Drop for DiscoveryMutationGuard<'_> {
 fn discover_project_checkouts(
     catalog: &Catalog,
     project_id: &str,
-    monitor: Option<&GitCheckoutMonitor>,
 ) -> Result<ControlResult, DispatchError> {
     let snapshot = catalog.snapshot()?;
     let project = snapshot
@@ -1332,12 +1335,55 @@ fn discover_project_checkouts(
         .iter()
         .find(|project| project.id == project_id)
         .ok_or_else(|| CatalogError::NotFound(format!("project {project_id}")))?;
-    let discovered = match monitor.and_then(|monitor| monitor.discovery(project_id)) {
-        Some(Ok(discovery)) => discovery,
-        Some(Err(error)) => return Err(DispatchError::Validation(error)),
-        None => discover_git_checkouts(&project.path)
-            .map_err(|error| DispatchError::Validation(error.to_string()))?,
+    let discovered = discover_git_checkouts(&project.path)
+        .map_err(|error| DispatchError::Validation(error.to_string()))?;
+    Ok(ControlResult::ProjectCheckoutDiscovery(
+        checkout_discovery(&snapshot, project_id, discovered),
+    ))
+}
+
+fn project_checkout_inventory(
+    catalog: &Catalog,
+    monitor: Option<&GitCheckoutMonitor>,
+) -> Result<ControlResult, DispatchError> {
+    let snapshot = catalog.snapshot()?;
+    let (revision, projects) = if let Some(monitor) = monitor {
+        let inventory = monitor.inventory();
+        let projects = snapshot
+            .projects
+            .iter()
+            .filter_map(|project| match inventory.projects.get(&project.id) {
+                Some(MonitoredGitCheckout::Ready(discovered)) => Some(checkout_discovery(
+                    &snapshot,
+                    &project.id,
+                    discovered.clone(),
+                )),
+                Some(MonitoredGitCheckout::Unavailable(_)) | None => None,
+            })
+            .collect();
+        (inventory.revision, projects)
+    } else {
+        let projects = snapshot
+            .projects
+            .iter()
+            .filter_map(|project| {
+                discover_git_checkouts(&project.path)
+                    .ok()
+                    .map(|discovered| checkout_discovery(&snapshot, &project.id, discovered))
+            })
+            .collect();
+        (0, projects)
     };
+    Ok(ControlResult::ProjectCheckoutInventory(
+        ProjectCheckoutInventory { revision, projects },
+    ))
+}
+
+fn checkout_discovery(
+    snapshot: &CatalogSnapshot,
+    project_id: &str,
+    discovered: GitCheckoutDiscovery,
+) -> ProjectCheckoutDiscovery {
     let checkouts = discovered
         .checkouts
         .into_iter()
@@ -1353,13 +1399,11 @@ fn discover_project_checkouts(
             git_primary: candidate.git_primary,
         })
         .collect();
-    Ok(ControlResult::ProjectCheckoutDiscovery(
-        ProjectCheckoutDiscovery {
-            project_id: project_id.to_string(),
-            common_dir: discovered.common_dir,
-            checkouts,
-        },
-    ))
+    ProjectCheckoutDiscovery {
+        project_id: project_id.to_string(),
+        common_dir: discovered.common_dir,
+        checkouts,
+    }
 }
 
 fn ensure_discovered_project(
@@ -2854,6 +2898,18 @@ mod tests {
                 .managed_checkout_id,
             None
         );
+
+        let result = dispatch(
+            &catalog,
+            DispatchServices::default(),
+            ControlCommand::ProjectCheckoutInventory,
+        )
+        .unwrap();
+        let ControlResult::ProjectCheckoutInventory(inventory) = result else {
+            panic!("unexpected checkout inventory result")
+        };
+        assert_eq!(inventory.revision, 0);
+        assert_eq!(inventory.projects, vec![discovery.clone()]);
 
         let checkout = accessfs_catalog::ProjectCheckout {
             id: "fixture-worktree".to_string(),

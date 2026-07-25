@@ -73,6 +73,7 @@ pub enum ControlCommand {
         key: String,
         source: DiscoveryReferenceSource,
     },
+    ProjectCheckoutInventory,
     ProjectCheckoutDiscover { project_id: String },
     ProjectCheckoutUpsert { checkout: ProjectCheckout },
     ProjectCheckoutRemove { id: String },
@@ -171,6 +172,7 @@ pub enum ControlResult {
     Discovery(DiscoveryPlan),
     DiscoveryApplied(DiscoveryApplyResult),
     DiscoveryReferenceResolved(DiscoveryReferenceResolution),
+    ProjectCheckoutInventory(ProjectCheckoutInventory),
     ProjectCheckoutDiscovery(ProjectCheckoutDiscovery),
     SshAgentIdentities(Vec<SshIdentity>),
     SshIdentityCreated { resource: Resource },
@@ -186,6 +188,12 @@ pub enum ControlResult {
     SharedSecretRotated { resource_id: String, version: u32 },
     EnvFileCreated { resource: Resource, version: u32 },
     Empty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectCheckoutInventory {
+    pub revision: u64,
+    pub projects: Vec<ProjectCheckoutDiscovery>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -536,6 +544,14 @@ mod tests {
 
     #[test]
     fn project_checkout_commands_have_stable_wire_shapes() {
+        let inventory = serde_json::to_value(ControlRequest {
+            request_id: 30,
+            command: ControlCommand::ProjectCheckoutInventory,
+        })
+        .unwrap();
+        assert_eq!(inventory["method"], "project_checkout_inventory");
+        assert!(inventory.get("params").is_none());
+
         let discover = serde_json::to_value(ControlRequest {
             request_id: 31,
             command: ControlCommand::ProjectCheckoutDiscover {
@@ -594,6 +610,16 @@ mod tests {
             result["value"]["checkouts"][0]["path"],
             "/workspace/fixture-worktree"
         );
+
+        let inventory = serde_json::to_value(ControlResult::ProjectCheckoutInventory(
+            ProjectCheckoutInventory {
+                revision: 4,
+                projects: vec![],
+            },
+        ))
+        .unwrap();
+        assert_eq!(inventory["type"], "project_checkout_inventory");
+        assert_eq!(inventory["value"]["revision"], 4);
     }
 
     #[test]

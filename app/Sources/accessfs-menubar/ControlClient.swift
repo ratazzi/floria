@@ -124,6 +124,17 @@ final class ControlClient: @unchecked Sendable {
         return result
     }
 
+    func projectCheckoutInventory() async throws -> ProjectCheckoutInventory {
+        guard let result: ProjectCheckoutInventory = try await request(
+            .projectCheckoutInventory,
+            expecting: "project_checkout_inventory",
+            as: ProjectCheckoutInventory.self)
+        else {
+            throw ControlClientError.missingResult("project_checkout_inventory")
+        }
+        return result
+    }
+
     func upsertProjectCheckout(_ checkout: CatalogProjectCheckout) async throws {
         try await requestEmpty(.projectCheckoutUpsert(checkout))
     }

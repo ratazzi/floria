@@ -547,6 +547,13 @@ final class ControlProtocolTests: XCTestCase {
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
 
+        let inventory = try ControlCommand.projectCheckoutInventory
+            .requestData(requestID: 30, encoder: encoder)
+        let inventoryValue = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: inventory) as? [String: Any])
+        XCTAssertEqual(inventoryValue["method"] as? String, "project_checkout_inventory")
+        XCTAssertNil(inventoryValue["params"])
+
         let discover = try ControlCommand.projectCheckoutDiscover(projectID: "fixture-project")
             .requestData(requestID: 31, encoder: encoder)
         let discoverValue = try XCTUnwrap(
@@ -578,6 +585,14 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(result.projectID, "fixture-project")
         XCTAssertTrue(result.checkouts.first?.gitPrimary == true)
         XCTAssertNil(result.checkouts.last?.managedCheckoutID)
+
+        let inventoryResponse = Data(
+            #"{"request_id":30,"status":"ok","result":{"type":"project_checkout_inventory","value":{"revision":4,"projects":[{"project_id":"fixture-project","common_dir":"/tmp/fixture/.git","checkouts":[]}]}}}"#.utf8)
+        let decodedInventory = try JSONDecoder().decode(
+            ControlResponseEnvelope<ProjectCheckoutInventory>.self, from: inventoryResponse)
+        let inventoryResult = try XCTUnwrap(decodedInventory.result?.value)
+        XCTAssertEqual(inventoryResult.revision, 4)
+        XCTAssertEqual(inventoryResult.projects.first?.projectID, "fixture-project")
 
         let remove = try ControlCommand.projectCheckoutRemove(id: "fixture-worktree")
             .requestData(requestID: 33, encoder: encoder)

@@ -784,6 +784,9 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
         ControlResult::DiscoveryReferenceResolved(result) => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
+        ControlResult::ProjectCheckoutInventory(result) => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
         ControlResult::ProjectCheckoutDiscovery(result) => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }

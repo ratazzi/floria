@@ -328,6 +328,11 @@ struct ProjectCheckoutDiscovery: Codable, Hashable, Sendable {
     }
 }
 
+struct ProjectCheckoutInventory: Codable, Hashable, Sendable {
+    let revision: UInt64
+    let projects: [ProjectCheckoutDiscovery]
+}
+
 struct ProjectCheckoutCandidate: Codable, Hashable, Identifiable, Sendable {
     let path: String
     let gitPrimary: Bool
@@ -578,6 +583,7 @@ enum ControlCommand: Sendable {
         path: String, files: [String], separateEntries: [DiscoverySeparateEntry])
     case discoverReferenceResolve(
         surfaceID: String, key: String, source: DiscoveryReferenceSource)
+    case projectCheckoutInventory
     case projectCheckoutDiscover(projectID: String)
     case projectCheckoutUpsert(CatalogProjectCheckout)
     case projectCheckoutRemove(id: String)
@@ -633,6 +639,7 @@ enum ControlCommand: Sendable {
         case .discover: "discover"
         case .discoverApply: "discover_apply"
         case .discoverReferenceResolve: "discover_reference_resolve"
+        case .projectCheckoutInventory: "project_checkout_inventory"
         case .projectCheckoutDiscover: "project_checkout_discover"
         case .projectCheckoutUpsert: "project_checkout_upsert"
         case .projectCheckoutRemove: "project_checkout_remove"
@@ -669,8 +676,8 @@ enum ControlCommand: Sendable {
 
     func requestData(requestID: UInt64, encoder: JSONEncoder) throws -> Data {
         switch self {
-        case .policyModeGet, .grantList, .grantClear, .snapshot, .sshConfigStatus,
-            .sshConfigInstall, .sshConfigRemove, .protectedFiles:
+        case .policyModeGet, .grantList, .grantClear, .snapshot, .projectCheckoutInventory,
+            .sshConfigStatus, .sshConfigInstall, .sshConfigRemove, .protectedFiles:
             return try encoder.encode(ControlRequestWithoutParams(requestID: requestID, method: method))
         case .policyModeSet(let mode, let durationSecs):
             return try encoder.encode(

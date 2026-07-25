@@ -841,16 +841,17 @@ final class WorkspaceStore {
 
     func refreshProjectCheckoutDiscoveries() async {
         guard let controlClient else { return }
+        guard let inventory = try? await controlClient.projectCheckoutInventory() else { return }
         let projectIDs = Set(projects.map(\.id))
-        var next = checkoutDiscoveries.filter { projectIDs.contains($0.key) }
-        for project in projects {
-            guard
-                let discovery = try? await controlClient.discoverProjectCheckouts(
-                    projectID: project.id)
-            else { continue }
-            next[project.id] = discovery
+        let next = Dictionary(
+            uniqueKeysWithValues: inventory.projects.compactMap { discovery in
+                projectIDs.contains(discovery.projectID)
+                    ? (discovery.projectID, discovery)
+                    : nil
+            })
+        if checkoutDiscoveries != next {
+            checkoutDiscoveries = next
         }
-        checkoutDiscoveries = next
     }
 
     func provisionProjectCheckout(
