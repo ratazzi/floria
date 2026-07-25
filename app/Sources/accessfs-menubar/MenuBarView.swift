@@ -5,6 +5,7 @@ struct MenuBarView: View {
     @Bindable var state: AppState
     @State private var searchText = ""
     @State private var listContentHeight: CGFloat = 0
+    @State private var pendingConfirmation: MenuBarConfirmation?
 
     /// The list grows with its content and only scrolls past ~60% of the screen —
     /// menubar dropdowns are expected to run tall rather than scroll early.
@@ -27,7 +28,9 @@ struct MenuBarView: View {
     var body: some View {
         VStack(spacing: 0) {
             MenuBarHeader(searchText: $searchText, count: filtered.count)
-            PolicyModeControl(state: state)
+            PolicyModeControl(state: state) { window in
+                pendingConfirmation = .auditOnly(window)
+            }
             Divider()
             if filtered.isEmpty {
                 emptyState
@@ -35,10 +38,24 @@ struct MenuBarView: View {
                 accessList
             }
             Divider()
-            MenuBarFooter(state: state)
+            MenuBarFooter(state: state) {
+                pendingConfirmation = .clearRecent(count: state.recents.count)
+            }
         }
         .frame(width: 360)
         .task { await state.reloadPolicyMode() }
+        .overlay {
+            if let pendingConfirmation {
+                MenuBarConfirmationOverlay(
+                    confirmation: pendingConfirmation,
+                    cancel: { self.pendingConfirmation = nil },
+                    confirm: { confirm(pendingConfirmation) })
+                    .transition(.opacity.combined(with: .scale(scale: 0.98)))
+            }
+        }
+        .onDisappear {
+            pendingConfirmation = nil
+        }
     }
 
     // Plain VStack, not LazyVStack: the MenuBarExtra window sizes itself to the content's
@@ -86,6 +103,18 @@ struct MenuBarView: View {
         .frame(maxWidth: .infinity)
         .padding(.vertical, 28)
     }
+
+    private func confirm(_ confirmation: MenuBarConfirmation) {
+        pendingConfirmation = nil
+        switch confirmation {
+        case .clearRecent:
+            state.clearRecents()
+        case .auditOnly(let window):
+            Task {
+                await state.setPolicyMode(.auditOnly, durationSecs: window.durationSecs)
+            }
+        }
+    }
 }
 
 enum AuditOnlyWindow: String, Identifiable {
@@ -112,11 +141,100 @@ enum AuditOnlyWindow: String, Identifiable {
     }
 }
 
+private enum MenuBarConfirmation: Equatable {
+    case clearRecent(count: Int)
+    case auditOnly(AuditOnlyWindow)
+
+    var title: String {
+        switch self {
+        case .clearRecent: "Clear recent activity?"
+        case .auditOnly: "Enable Audit Only?"
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .clearRecent:
+            "This clears only the activity shown in Floria. The daemon audit log on disk is not deleted."
+        case .auditOnly:
+            "Ask and Touch ID items will be allowed without interaction. Every access will still be audited, and explicit deny rules remain blocked."
+        }
+    }
+
+    var confirmTitle: String {
+        switch self {
+        case .clearRecent(let count): "Clear \(count) Events"
+        case .auditOnly(let window): "Enable for \(window.title)"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .clearRecent: "trash.fill"
+        case .auditOnly: "eye.circle.fill"
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .clearRecent: .red
+        case .auditOnly: .orange
+        }
+    }
+}
+
+private struct MenuBarConfirmationOverlay: View {
+    let confirmation: MenuBarConfirmation
+    let cancel: () -> Void
+    let confirm: () -> Void
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.16)
+                .contentShape(Rectangle())
+
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 9) {
+                    Image(systemName: confirmation.systemImage)
+                        .font(.title3)
+                        .foregroundStyle(confirmation.tint)
+                    Text(confirmation.title)
+                        .font(.headline)
+                    Spacer()
+                }
+                Text(confirmation.message)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    Button("Cancel", action: cancel)
+                        .keyboardShortcut(.cancelAction)
+                        .frame(maxWidth: .infinity)
+                    Button(confirmation.confirmTitle, action: confirm)
+                        .keyboardShortcut(.defaultAction)
+                        .buttonStyle(.borderedProminent)
+                        .tint(confirmation.tint)
+                        .frame(maxWidth: .infinity)
+                }
+            }
+            .padding(16)
+            .frame(width: 314)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
+            .overlay {
+                RoundedRectangle(cornerRadius: 14)
+                    .stroke(Color.secondary.opacity(0.20), lineWidth: 1)
+            }
+            .shadow(color: .black.opacity(0.18), radius: 18, y: 8)
+            .padding(18)
+        }
+        .accessibilityElement(children: .contain)
+    }
+}
+
 /// The daemon remains authoritative; this control only chooses and displays its runtime mode.
 private struct PolicyModeControl: View {
     @Bindable var state: AppState
-    @State private var pendingWindow: AuditOnlyWindow?
-    @State private var showsConfirmation = false
+    let requestConfirmation: (AuditOnlyWindow) -> Void
 
     var body: some View {
         let auditOnly = state.policyMode.isAuditOnly()
@@ -130,7 +248,7 @@ private struct PolicyModeControl: View {
                     ForEach(
                         [AuditOnlyWindow.oneHour, .eightHours, .untilChanged]
                     ) { window in
-                        Button(window.title) { request(window) }
+                        Button(window.title) { requestConfirmation(window) }
                     }
                 }
             }
@@ -158,21 +276,6 @@ private struct PolicyModeControl: View {
         .menuStyle(.borderlessButton)
         .padding(.horizontal, 10)
         .padding(.bottom, state.policyModeError == nil ? 8 : 3)
-        .confirmationDialog(
-            "Enable Audit Only?", isPresented: $showsConfirmation,
-            presenting: pendingWindow
-        ) { window in
-            Button("Enable for \(window.title)", role: .destructive) {
-                Task {
-                    await state.setPolicyMode(.auditOnly, durationSecs: window.durationSecs)
-                }
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: { _ in
-            Text(
-                "Ask and Touch ID items will be allowed without interaction. Every access will still be audited, and explicit deny rules remain blocked."
-            )
-        }
         if let error = state.policyModeError {
             Text(error)
                 .font(.caption2)
@@ -181,11 +284,6 @@ private struct PolicyModeControl: View {
                 .padding(.horizontal, 10)
                 .padding(.bottom, 6)
         }
-    }
-
-    private func request(_ window: AuditOnlyWindow) {
-        pendingWindow = window
-        showsConfirmation = true
     }
 
     private func statusDetail(at date: Date) -> String {
@@ -339,7 +437,7 @@ private struct AccessRow: View {
 private struct MenuBarFooter: View {
     @Bindable var state: AppState
     @Environment(\.openWindow) private var openWindow
-    @State private var showingClearConfirmation = false
+    let requestClearConfirmation: () -> Void
 
     var body: some View {
         VStack(spacing: 1) {
@@ -363,7 +461,7 @@ private struct MenuBarFooter: View {
             }
             .keyboardShortcut("d")
             MenuItemButton(title: "Clear Recent…", icon: "trash", shortcut: "K") {
-                showingClearConfirmation = true
+                requestClearConfirmation()
             }
             .keyboardShortcut("k")
             .disabled(state.recents.isEmpty)
@@ -373,17 +471,6 @@ private struct MenuBarFooter: View {
             .keyboardShortcut("q")
         }
         .padding(6)
-        .confirmationDialog(
-            "Clear recent activity?",
-            isPresented: $showingClearConfirmation
-        ) {
-            Button("Clear \(state.recents.count) Events", role: .destructive) {
-                state.clearRecents()
-            }
-            Button("Cancel", role: .cancel) {}
-        } message: {
-            Text("This clears only the activity shown in Floria. The daemon audit log on disk is not deleted.")
-        }
     }
 }
 
