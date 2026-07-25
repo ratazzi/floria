@@ -6,6 +6,7 @@ use accessfs_catalog::{
     ItemMetadata, ResourceCodec, ResourceUsage, Surface,
 };
 use accessfs_core::authz::{Enforcement, PolicyMode, PolicyModeStatus};
+use accessfs_discover::DiscoveryPlan;
 use accessfs_store::StoreError;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -57,6 +58,8 @@ pub enum ControlCommand {
     PolicyModeGet,
     PolicyModeSet { mode: PolicyMode, duration_secs: Option<u64> },
     Snapshot,
+    Discover { path: PathBuf },
+    DiscoverApply { path: PathBuf },
     SshAgentDiscover { endpoint: PathBuf },
     SshIdentityImport {
         resource_id: String,
@@ -147,6 +150,8 @@ pub enum ControlResult {
     Pong { schema_version: i64 },
     PolicyMode(PolicyModeStatus),
     Snapshot(CatalogSnapshot),
+    Discovery(DiscoveryPlan),
+    DiscoveryApplied(DiscoveryApplyResult),
     SshAgentIdentities(Vec<SshIdentity>),
     SshIdentityCreated { resource: Resource },
     SshConfig(SshConfigStatus),
@@ -161,6 +166,31 @@ pub enum ControlResult {
     SharedSecretRotated { resource_id: String, version: u32 },
     EnvFileCreated { resource: Resource, version: u32 },
     Empty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveryApplyResult {
+    pub project_id: Option<String>,
+    pub created_resources: usize,
+    pub reused_resources: usize,
+    pub protected_files: usize,
+    pub imported_ssh_identities: usize,
+    pub files: Vec<DiscoveryAppliedFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveryAppliedFile {
+    pub path: PathBuf,
+    pub outcome: DiscoveryApplyOutcome,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryApplyOutcome {
+    Imported,
+    Protected,
+    Skipped,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -301,6 +331,35 @@ mod tests {
         assert_eq!(value["method"], "policy_mode_set");
         assert_eq!(value["params"]["mode"], "audit_only");
         assert_eq!(value["params"]["duration_secs"], 3600);
+    }
+
+    #[test]
+    fn discover_carries_only_the_review_path() {
+        let request = ControlRequest {
+            request_id: 12,
+            command: ControlCommand::Discover {
+                path: PathBuf::from("/fixture/project"),
+            },
+        };
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["method"], "discover");
+        assert_eq!(value["params"]["path"], "/fixture/project");
+        assert_eq!(value["params"].as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn discover_apply_is_an_explicit_separate_mutation() {
+        let request = ControlRequest {
+            request_id: 13,
+            command: ControlCommand::DiscoverApply {
+                path: PathBuf::from("/fixture/project"),
+            },
+        };
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["method"], "discover_apply");
+        assert_eq!(value["params"]["path"], "/fixture/project");
     }
 
     #[test]

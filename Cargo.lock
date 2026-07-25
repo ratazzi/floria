@@ -63,6 +63,7 @@ version = "0.1.0"
 dependencies = [
  "accessfs-catalog",
  "accessfs-core",
+ "accessfs-discover",
  "accessfs-ssh",
  "accessfs-store",
  "accessfs-surface",
@@ -92,6 +93,19 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "wait-timeout",
+ "zeroize",
+]
+
+[[package]]
+name = "accessfs-discover"
+version = "0.1.0"
+dependencies = [
+ "accessfs-catalog",
+ "accessfs-surface",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml 0.8.23",
  "zeroize",
 ]
 

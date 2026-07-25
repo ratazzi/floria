@@ -6,17 +6,22 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use accessfs_catalog::{
-    Catalog, CatalogError, CatalogSnapshot, EntrySpec, ItemMetadata, Resource, ResourceCodec,
-    ResourceKind, ResourceSource, ValueShape,
+    Binding, BindingScope, Catalog, CatalogError, CatalogSnapshot, EntrySelection, EntrySpec,
+    Environment, ItemMetadata, Project, Resource, ResourceCodec, ResourceKind, ResourceSource,
+    Surface, SurfaceInput, SurfaceKind, ValueShape,
 };
 use accessfs_core::authz::{Enforcement, PolicyMode, PolicyModeStatus};
+use accessfs_discover::{
+    discover, DiscoveredContent, DiscoveredFileAction, DiscoveredFileKind, ExistingSecret,
+};
 use accessfs_ssh::ManagedKeyError;
 use accessfs_store::{NewSecret, SecretId, SecretOrigin, SecretRecord, SecretStore, StoreError};
-use accessfs_surface::{decode_source, validate_secret_bytes};
+use accessfs_surface::{decode_source, ensure_file_surface_link, validate_secret_bytes};
 
 use crate::protocol::{
     read_msg, write_msg, ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest,
-    ControlResponse, ControlResult, ProtectedFile, ProtectedFileVersion, SshConfigStatus,
+    ControlResponse, ControlResult, DiscoveryAppliedFile, DiscoveryApplyOutcome,
+    DiscoveryApplyResult, ProtectedFile, ProtectedFileVersion, SecretValue, SshConfigStatus,
     SshIdentity,
 };
 
@@ -273,6 +278,7 @@ fn changes_runtime(command: &ControlCommand) -> bool {
             | ControlCommand::FileProtect { .. }
             | ControlCommand::ProtectedFileMetadataUpdate { .. }
             | ControlCommand::FileRestore { .. }
+            | ControlCommand::DiscoverApply { .. }
     )
 }
 
@@ -392,6 +398,19 @@ fn dispatch(
                 .map_err(DispatchError::Policy)
         }
         ControlCommand::Snapshot => Ok(ControlResult::Snapshot(catalog.snapshot()?)),
+        ControlCommand::Discover { path } => {
+            let store = store.ok_or(DispatchError::StoreUnavailable)?;
+            let discovery =
+                discover(&path).map_err(|error| DispatchError::Validation(error.to_string()))?;
+            let existing = existing_discovery_secrets(catalog, store)?;
+            Ok(ControlResult::Discovery(discovery.plan(&existing)))
+        }
+        ControlCommand::DiscoverApply { path } => apply_discovery(
+            catalog,
+            store.ok_or(DispatchError::StoreUnavailable)?,
+            mount_path.ok_or(DispatchError::StoreUnavailable)?,
+            &path,
+        ),
         ControlCommand::SshAgentDiscover { endpoint } => {
             if !endpoint.is_absolute() {
                 return Err(DispatchError::Validation(
@@ -618,6 +637,472 @@ fn dispatch(
             Ok(ControlResult::Empty)
         }
     }
+}
+
+fn apply_discovery(
+    catalog: &Catalog,
+    store: &dyn SecretStore,
+    mount_path: &Path,
+    path: &Path,
+) -> Result<ControlResult, DispatchError> {
+    let discovery =
+        discover(path).map_err(|error| DispatchError::Validation(error.to_string()))?;
+    let mut existing = existing_discovery_secrets(catalog, store)?;
+    let plan = discovery.plan(&existing);
+    let contents = discovery.into_contents();
+    let needs_project = contents
+        .iter()
+        .any(|file| file.action == DiscoveredFileAction::Compose);
+    let project_id = if needs_project {
+        Some(ensure_discovered_project(catalog, &plan.project)?)
+    } else {
+        None
+    };
+    let mut result = DiscoveryApplyResult {
+        project_id: project_id.clone(),
+        created_resources: 0,
+        reused_resources: 0,
+        protected_files: 0,
+        imported_ssh_identities: 0,
+        files: Vec::new(),
+    };
+
+    for file in contents {
+        if file.action == DiscoveredFileAction::Compose && !file.warnings.is_empty() {
+            result.files.push(DiscoveryAppliedFile {
+                path: file.path,
+                outcome: DiscoveryApplyOutcome::Skipped,
+                detail: "Skipped because the file contains unsupported or invalid content"
+                    .to_string(),
+            });
+            continue;
+        }
+
+        match file.action {
+            DiscoveredFileAction::Protect => {
+                let applied = protect_file(catalog, store, mount_path, &file.path)?;
+                if !matches!(applied, ControlResult::FileProtected { .. }) {
+                    return Err(DispatchError::Validation(
+                        "protecting a discovered file returned an unexpected result".to_string(),
+                    ));
+                }
+                result.protected_files += 1;
+                result.files.push(DiscoveryAppliedFile {
+                    path: file.path,
+                    outcome: DiscoveryApplyOutcome::Protected,
+                    detail: "Protected as a read-only audited file".to_string(),
+                });
+            }
+            DiscoveredFileAction::ImportSshIdentity => {
+                let resource_id = generated_id("ssh-identity");
+                let name = file
+                    .path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("SSH identity")
+                    .to_string();
+                import_ssh_identity(
+                    catalog,
+                    store,
+                    resource_id,
+                    name,
+                    &file.path,
+                    None,
+                    ManagedItemSettings {
+                        enforcement: Enforcement::Prompt,
+                        metadata: discovered_metadata(&file),
+                    },
+                )?;
+                result.imported_ssh_identities += 1;
+                result.files.push(DiscoveryAppliedFile {
+                    path: file.path,
+                    outcome: DiscoveryApplyOutcome::Imported,
+                    detail: "Imported as a managed SSH identity".to_string(),
+                });
+            }
+            DiscoveredFileAction::Compose => {
+                let Some(project_id) = project_id.as_deref() else {
+                    return Err(DispatchError::Validation(
+                        "discovery composition requires a project".to_string(),
+                    ));
+                };
+                apply_composed_discovery(
+                    catalog,
+                    store,
+                    mount_path,
+                    project_id,
+                    &mut existing,
+                    &mut result,
+                    file,
+                )?;
+            }
+        }
+    }
+
+    Ok(ControlResult::DiscoveryApplied(result))
+}
+
+fn apply_composed_discovery(
+    catalog: &Catalog,
+    store: &dyn SecretStore,
+    mount_path: &Path,
+    project_id: &str,
+    existing: &mut Vec<ExistingSecret>,
+    result: &mut DiscoveryApplyResult,
+    file: DiscoveredContent,
+) -> Result<(), DispatchError> {
+    if file.entries.is_empty() {
+        result.files.push(DiscoveryAppliedFile {
+            path: file.path,
+            outcome: DiscoveryApplyOutcome::Skipped,
+            detail: "No statically importable values were found".to_string(),
+        });
+        return Ok(());
+    }
+
+    let environment_name = file.environment.as_deref().unwrap_or("development");
+    let environment_id = ensure_discovered_environment(catalog, project_id, environment_name)?;
+    let mut binding_ids = Vec::new();
+    let mut mutation = DiscoveryMutationGuard::new(catalog, store);
+
+    match file.kind {
+        DiscoveredFileKind::Dotenv | DiscoveredFileKind::Direnv => {
+            for (position, entry) in file.entries.iter().enumerate() {
+                let resource_id = if let Some(candidate) = existing.iter().find(|candidate| {
+                    candidate.key == entry.key
+                        && candidate.value.as_slice() == entry.value.as_bytes()
+                }) {
+                    result.reused_resources += 1;
+                    candidate.resource_id.clone()
+                } else {
+                    let resource_id = generated_id("secret");
+                    create_shared_secret(
+                        catalog,
+                        store,
+                        resource_id.clone(),
+                        entry.key.clone(),
+                        Some(entry.key.clone()),
+                        SecretValue::new(entry.value.as_str().to_string()),
+                        ManagedItemSettings {
+                            enforcement: Enforcement::Prompt,
+                            metadata: discovered_metadata(&file),
+                        },
+                    )?;
+                    mutation.created_resources.push(resource_id.clone());
+                    existing.push(ExistingSecret {
+                        resource_id: resource_id.clone(),
+                        key: entry.key.clone(),
+                        value: zeroize::Zeroizing::new(entry.value.as_bytes().to_vec()),
+                    });
+                    result.created_resources += 1;
+                    resource_id
+                };
+                let binding_id = generated_id("binding");
+                catalog.upsert_binding(&Binding {
+                    id: binding_id.clone(),
+                    project_id: project_id.to_string(),
+                    scope: BindingScope::Environment {
+                        environment_id: environment_id.clone(),
+                    },
+                    resource_id,
+                    selection: EntrySelection::All,
+                    key_override: None,
+                    enabled: true,
+                    allow_override: false,
+                    position: position as i64,
+                })?;
+                mutation.created_bindings.push(binding_id.clone());
+                binding_ids.push(binding_id);
+            }
+        }
+        DiscoveredFileKind::AwsCredentials => {
+            let bytes = zeroize::Zeroizing::new(std::fs::read(&file.path).map_err(|source| {
+                DispatchError::Io { path: file.path.clone(), source }
+            })?);
+            let text = std::str::from_utf8(&bytes).map_err(|_| {
+                DispatchError::Validation(format!(
+                    "{} is not valid UTF-8",
+                    file.path.display()
+                ))
+            })?;
+            let resource_id = generated_id("env-file");
+            create_env_file(
+                catalog,
+                store,
+                resource_id.clone(),
+                file.path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("AWS credentials")
+                    .to_string(),
+                ResourceCodec::Ini,
+                SecretValue::new(text.to_string()),
+                ManagedItemSettings {
+                    enforcement: Enforcement::Prompt,
+                    metadata: discovered_metadata(&file),
+                },
+            )?;
+            mutation.created_resources.push(resource_id.clone());
+            result.created_resources += 1;
+            let binding_id = generated_id("binding");
+            catalog.upsert_binding(&Binding {
+                id: binding_id.clone(),
+                project_id: project_id.to_string(),
+                scope: BindingScope::Environment {
+                    environment_id: environment_id.clone(),
+                },
+                resource_id,
+                selection: EntrySelection::All,
+                key_override: None,
+                enabled: true,
+                allow_override: false,
+                position: 0,
+            })?;
+            mutation.created_bindings.push(binding_id.clone());
+            binding_ids.push(binding_id);
+        }
+        _ => {
+            result.files.push(DiscoveryAppliedFile {
+                path: file.path,
+                outcome: DiscoveryApplyOutcome::Skipped,
+                detail: "This discovered format is not composable yet".to_string(),
+            });
+            return Ok(());
+        }
+    }
+
+    let surface_kind = match file.kind {
+        DiscoveredFileKind::Dotenv => SurfaceKind::DotenvFile,
+        DiscoveredFileKind::Direnv => SurfaceKind::DirenvFile,
+        DiscoveredFileKind::AwsCredentials => SurfaceKind::IniFile,
+        _ => unreachable!("non-composable kinds returned above"),
+    };
+    let surface = Surface {
+        id: generated_id("surface"),
+        environment_id,
+        name: file
+            .path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("environment")
+            .to_string(),
+        kind: surface_kind,
+        path: file.path.clone(),
+        input: SurfaceInput::Bindings { binding_ids },
+        enforcement: Enforcement::Prompt,
+        position: 0,
+    };
+    replace_discovered_file_with_surface(catalog, mount_path, &surface)?;
+    mutation.committed = true;
+    result.files.push(DiscoveryAppliedFile {
+        path: file.path,
+        outcome: DiscoveryApplyOutcome::Imported,
+        detail: match file.kind {
+            DiscoveredFileKind::AwsCredentials => {
+                "Imported as a section-aware INI environment file".to_string()
+            }
+            _ => "Imported as reusable secrets and a composed output".to_string(),
+        },
+    });
+    Ok(())
+}
+
+struct DiscoveryMutationGuard<'a> {
+    catalog: &'a Catalog,
+    store: &'a dyn SecretStore,
+    created_resources: Vec<String>,
+    created_bindings: Vec<String>,
+    committed: bool,
+}
+
+impl<'a> DiscoveryMutationGuard<'a> {
+    fn new(catalog: &'a Catalog, store: &'a dyn SecretStore) -> Self {
+        DiscoveryMutationGuard {
+            catalog,
+            store,
+            created_resources: Vec::new(),
+            created_bindings: Vec::new(),
+            committed: false,
+        }
+    }
+}
+
+impl Drop for DiscoveryMutationGuard<'_> {
+    fn drop(&mut self) {
+        if self.committed {
+            return;
+        }
+        for binding_id in self.created_bindings.iter().rev() {
+            if let Err(error) = self.catalog.remove_binding(binding_id) {
+                tracing::warn!(%binding_id, %error, "discovery rollback could not remove binding");
+            }
+        }
+        for resource_id in self.created_resources.iter().rev() {
+            let secret_id = self
+                .catalog
+                .resource(resource_id)
+                .ok()
+                .and_then(|resource| match resource.source {
+                    ResourceSource::SecretRef { secret_id } => secret_id.parse::<SecretId>().ok(),
+                    ResourceSource::Literal { .. }
+                    | ResourceSource::Command { .. }
+                    | ResourceSource::Socket { .. } => None,
+                });
+            if let Err(error) = self.catalog.remove_resource(resource_id) {
+                tracing::warn!(%resource_id, %error, "discovery rollback could not remove resource");
+                continue;
+            }
+            if let Some(secret_id) = secret_id {
+                if let Err(error) = self.store.delete(&secret_id) {
+                    tracing::warn!(
+                        %resource_id,
+                        %error,
+                        "discovery rollback could not remove stored secret"
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn ensure_discovered_project(
+    catalog: &Catalog,
+    project: &accessfs_discover::DiscoveredProject,
+) -> Result<String, DispatchError> {
+    if let Some(existing) = catalog
+        .snapshot()?
+        .projects
+        .into_iter()
+        .find(|candidate| candidate.path == project.path)
+    {
+        return Ok(existing.id);
+    }
+    let id = generated_id("project");
+    catalog.upsert_project(&Project {
+        id: id.clone(),
+        name: project.name.clone(),
+        path: project.path.clone(),
+    })?;
+    Ok(id)
+}
+
+fn ensure_discovered_environment(
+    catalog: &Catalog,
+    project_id: &str,
+    name: &str,
+) -> Result<String, DispatchError> {
+    let snapshot = catalog.snapshot()?;
+    if let Some(existing) = snapshot.environments.iter().find(|candidate| {
+        candidate.project_id == project_id && candidate.name.eq_ignore_ascii_case(name)
+    }) {
+        return Ok(existing.id.clone());
+    }
+    let id = generated_id("environment");
+    let display_name = name
+        .split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            chars
+                .next()
+                .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    catalog.upsert_environment(&Environment {
+        id: id.clone(),
+        project_id: project_id.to_string(),
+        name: display_name,
+        position: snapshot.environments.len() as i64,
+    })?;
+    Ok(id)
+}
+
+fn replace_discovered_file_with_surface(
+    catalog: &Catalog,
+    mount_path: &Path,
+    surface: &Surface,
+) -> Result<(), DispatchError> {
+    let file_name = surface
+        .path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("environment");
+    let backup = surface.path.with_file_name(format!(
+        ".{file_name}.floria-import-{}",
+        SecretId::generate()
+    ));
+    std::fs::rename(&surface.path, &backup).map_err(|source| DispatchError::Io {
+        path: surface.path.clone(),
+        source,
+    })?;
+    if let Err(error) = catalog.upsert_surface(surface) {
+        let _ = std::fs::rename(&backup, &surface.path);
+        return Err(DispatchError::Catalog(error));
+    }
+    if let Err(error) = ensure_file_surface_link(surface, mount_path) {
+        let _ = catalog.remove_surface(&surface.id);
+        let _ = std::fs::rename(&backup, &surface.path);
+        return Err(DispatchError::Validation(error.to_string()));
+    }
+    if let Err(source) = std::fs::remove_file(&backup) {
+        let _ = std::fs::remove_file(&surface.path);
+        let _ = catalog.remove_surface(&surface.id);
+        let _ = std::fs::rename(&backup, &surface.path);
+        return Err(DispatchError::Io { path: backup, source });
+    }
+    Ok(())
+}
+
+fn discovered_metadata(file: &DiscoveredContent) -> ItemMetadata {
+    ItemMetadata {
+        note: Some(format!("Discovered from {}", file.relative_path.display())),
+        links: Vec::new(),
+    }
+}
+
+fn generated_id(prefix: &str) -> String {
+    format!("{prefix}-{}", SecretId::generate())
+}
+
+fn existing_discovery_secrets(
+    catalog: &Catalog,
+    store: &dyn SecretStore,
+) -> Result<Vec<ExistingSecret>, DispatchError> {
+    let snapshot = catalog.snapshot()?;
+    let mut existing = Vec::new();
+    for resource in snapshot.resources {
+        if resource.kind != ResourceKind::SharedSecret || resource.shape != ValueShape::Scalar {
+            continue;
+        }
+        let Some(key) = resource.default_env_key else { continue };
+        let ResourceSource::SecretRef { secret_id } = resource.source else { continue };
+        let id = match secret_id.parse::<SecretId>() {
+            Ok(id) => id,
+            Err(error) => {
+                tracing::warn!(
+                    resource_id = %resource.id,
+                    %error,
+                    "ignoring invalid shared-secret reference during discovery"
+                );
+                continue;
+            }
+        };
+        let value = match store.get(&id) {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(
+                    resource_id = %resource.id,
+                    %error,
+                    "shared secret was unavailable for discovery matching"
+                );
+                continue;
+            }
+        };
+        existing.push(ExistingSecret { resource_id: resource.id, key, value });
+    }
+    Ok(existing)
 }
 
 fn create_project_workspace(
@@ -1503,6 +1988,8 @@ mod tests {
                         | "Fixture Env File"
                         | "Fixture INI File"
                         | "Fixture SSH Identity"
+                        | "DISCOVERED_TOKEN"
+                        | "credentials"
                 ));
             }
             let id: SecretId = FIXTURE_SECRET_ID.parse().unwrap();
@@ -1711,6 +2198,178 @@ mod tests {
                 expires_at: Some(1_800_003_600),
             })
         );
+    }
+
+    #[test]
+    fn discovery_reuses_only_an_exact_shared_secret_without_returning_plaintext() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("fixture-project");
+        std::fs::create_dir(&project_path).unwrap();
+        std::fs::write(
+            project_path.join(".env"),
+            "API_TOKEN=fixture-shared-value\nOTHER=fixture-other-value\n",
+        )
+        .unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let store = FixtureStore::new();
+
+        dispatch(
+            &catalog,
+            Some(&store),
+            None,
+            None,
+            None,
+            None,
+            ControlCommand::SharedSecretCreate {
+                resource_id: "fixture-shared-api-token".to_string(),
+                name: "Fixture Shared Secret".to_string(),
+                default_env_key: Some("API_TOKEN".to_string()),
+                value: crate::protocol::SecretValue::new("fixture-shared-value"),
+                enforcement: Enforcement::Prompt,
+                metadata: ItemMetadata::default(),
+            },
+        )
+        .unwrap();
+
+        let result = dispatch(
+            &catalog,
+            Some(&store),
+            None,
+            None,
+            None,
+            None,
+            ControlCommand::Discover { path: project_path },
+        )
+        .unwrap();
+        let serialized = serde_json::to_string(&result).unwrap();
+        assert!(!serialized.contains("fixture-shared-value"));
+        assert!(!serialized.contains("fixture-other-value"));
+
+        let ControlResult::Discovery(plan) = result else {
+            panic!("expected discovery result");
+        };
+        assert_eq!(plan.summary.reused_secrets, 1);
+        assert_eq!(plan.summary.new_secrets, 1);
+        assert!(matches!(
+            plan.files[0].entries[0].action,
+            accessfs_discover::DiscoveredEntryAction::ReuseSharedSecret { ref resource_id }
+                if resource_id == "fixture-shared-api-token"
+        ));
+    }
+
+    #[test]
+    fn discovery_apply_replaces_dotenv_with_a_composed_surface() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("fixture-project");
+        let source_path = project_path.join(".env");
+        let mount_path = dir.path().join("mount");
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
+        std::fs::create_dir_all(mount_path.join(accessfs_core::config::SURFACES_DIR)).unwrap();
+        std::fs::write(
+            &source_path,
+            "DISCOVERED_TOKEN=fixture-discovered-value\n",
+        )
+        .unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let store = FixtureStore::new();
+
+        let applied = dispatch(
+            &catalog,
+            Some(&store),
+            Some(&mount_path),
+            None,
+            None,
+            None,
+            ControlCommand::DiscoverApply {
+                path: project_path.clone(),
+            },
+        )
+        .unwrap();
+
+        let ControlResult::DiscoveryApplied(result) = applied else {
+            panic!("expected discovery apply result");
+        };
+        assert_eq!(result.created_resources, 1);
+        assert_eq!(result.reused_resources, 0);
+        assert_eq!(result.files[0].outcome, DiscoveryApplyOutcome::Imported);
+        let snapshot = catalog.snapshot().unwrap();
+        assert_eq!(snapshot.projects.len(), 1);
+        assert_eq!(snapshot.environments.len(), 1);
+        assert_eq!(snapshot.resources.len(), 1);
+        assert_eq!(snapshot.bindings.len(), 1);
+        assert_eq!(snapshot.surfaces.len(), 1);
+        assert_eq!(
+            std::fs::read_link(&source_path).unwrap(),
+            mount_path
+                .join(accessfs_core::config::SURFACES_DIR)
+                .join(&snapshot.surfaces[0].id)
+        );
+        assert!(!project_path
+            .read_dir()
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains("floria-import")));
+        let secret_id: SecretId = FIXTURE_SECRET_ID.parse().unwrap();
+        assert_eq!(
+            store.get(&secret_id).unwrap().as_slice(),
+            b"fixture-discovered-value"
+        );
+    }
+
+    #[test]
+    fn discovery_apply_keeps_aws_credentials_section_aware() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("fixture-project");
+        let source_path = project_path.join(".aws/credentials");
+        let mount_path = dir.path().join("mount");
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
+        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(mount_path.join(accessfs_core::config::SURFACES_DIR)).unwrap();
+        std::fs::write(
+            &source_path,
+            "[default]\naws_access_key_id=fixture-access-id\n\
+             aws_secret_access_key=fixture-secret-value\n\
+             [staging]\naws_access_key_id=fixture-staging-id\n",
+        )
+        .unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let store = FixtureStore::new();
+
+        let applied = dispatch(
+            &catalog,
+            Some(&store),
+            Some(&mount_path),
+            None,
+            None,
+            None,
+            ControlCommand::DiscoverApply {
+                path: project_path,
+            },
+        )
+        .unwrap();
+
+        let ControlResult::DiscoveryApplied(result) = applied else {
+            panic!("expected discovery apply result");
+        };
+        assert_eq!(result.created_resources, 1);
+        assert_eq!(result.files[0].outcome, DiscoveryApplyOutcome::Imported);
+        let snapshot = catalog.snapshot().unwrap();
+        assert_eq!(snapshot.resources.len(), 1);
+        assert_eq!(snapshot.resources[0].kind, ResourceKind::EnvFile);
+        assert_eq!(snapshot.resources[0].codec, ResourceCodec::Ini);
+        assert!(snapshot.resources[0]
+            .entries
+            .iter()
+            .any(|entry| entry.address.contains("default")));
+        assert!(snapshot.resources[0]
+            .entries
+            .iter()
+            .any(|entry| entry.address.contains("staging")));
+        assert_eq!(snapshot.surfaces[0].kind, SurfaceKind::IniFile);
+        assert!(std::fs::symlink_metadata(source_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 
     #[test]

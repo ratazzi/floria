@@ -128,6 +128,12 @@ enum ControlCmd {
     },
     /// Print the complete metadata catalog as JSON (never secret plaintext).
     Snapshot,
+    /// Discover supported project configuration. Add --apply only after reviewing the plan.
+    Discover {
+        path: PathBuf,
+        #[arg(long)]
+        apply: bool,
+    },
     /// Resolve environment keys and provenance without decrypting values.
     Resolve {
         project_id: String,
@@ -658,6 +664,15 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
             ControlCommand::PolicyModeSet { mode: mode.into(), duration_secs }
         }
         ControlCmd::Snapshot => ControlCommand::Snapshot,
+        ControlCmd::Discover { path, apply } => {
+            let path = std::fs::canonicalize(&path)
+                .with_context(|| format!("resolving discovery path {}", path.display()))?;
+            if apply {
+                ControlCommand::DiscoverApply { path }
+            } else {
+                ControlCommand::Discover { path }
+            }
+        }
         ControlCmd::Resolve { project_id, environment_id } => {
             ControlCommand::ResolveEnvironment { project_id, environment_id }
         }
@@ -673,6 +688,12 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
         }
         ControlResult::Snapshot(snapshot) => {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        }
+        ControlResult::Discovery(plan) => {
+            println!("{}", serde_json::to_string_pretty(&plan)?);
+        }
+        ControlResult::DiscoveryApplied(result) => {
+            println!("{}", serde_json::to_string_pretty(&result)?);
         }
         ControlResult::SshAgentIdentities(identities) => {
             println!("{}", serde_json::to_string_pretty(&identities)?);
