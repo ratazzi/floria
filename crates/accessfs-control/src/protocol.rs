@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use accessfs_catalog::{
     Binding, CatalogError, CatalogSnapshot, Environment, Project, ResolvedEnvironment, Resource,
-    ItemMetadata, ResourceCodec, ResourceUsage, Surface,
+    ItemMetadata, ProjectCheckout, ResourceCodec, ResourceUsage, Surface,
 };
 use accessfs_core::authz::{Enforcement, PolicyEvaluation, PolicyMode, PolicyModeStatus};
 use accessfs_discover::DiscoveryPlan;
@@ -73,6 +73,9 @@ pub enum ControlCommand {
         key: String,
         source: DiscoveryReferenceSource,
     },
+    ProjectCheckoutDiscover { project_id: String },
+    ProjectCheckoutUpsert { checkout: ProjectCheckout },
+    ProjectCheckoutRemove { id: String },
     SshAgentDiscover { endpoint: PathBuf },
     SshIdentityImport {
         resource_id: String,
@@ -168,6 +171,7 @@ pub enum ControlResult {
     Discovery(DiscoveryPlan),
     DiscoveryApplied(DiscoveryApplyResult),
     DiscoveryReferenceResolved(DiscoveryReferenceResolution),
+    ProjectCheckoutDiscovery(ProjectCheckoutDiscovery),
     SshAgentIdentities(Vec<SshIdentity>),
     SshIdentityCreated { resource: Resource },
     SshConfig(SshConfigStatus),
@@ -182,6 +186,20 @@ pub enum ControlResult {
     SharedSecretRotated { resource_id: String, version: u32 },
     EnvFileCreated { resource: Resource, version: u32 },
     Empty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectCheckoutDiscovery {
+    pub project_id: String,
+    pub common_dir: PathBuf,
+    pub checkouts: Vec<ProjectCheckoutCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectCheckoutCandidate {
+    pub path: PathBuf,
+    pub git_primary: bool,
+    pub managed_checkout_id: Option<String>,
 }
 
 /// Metadata-only view of one non-expired authorization grant. Matching continues to use the
@@ -514,6 +532,68 @@ mod tests {
         assert_eq!(value["method"], "discover");
         assert_eq!(value["params"]["path"], "/fixture/project");
         assert_eq!(value["params"].as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn project_checkout_commands_have_stable_wire_shapes() {
+        let discover = serde_json::to_value(ControlRequest {
+            request_id: 31,
+            command: ControlCommand::ProjectCheckoutDiscover {
+                project_id: "fixture-project".to_string(),
+            },
+        })
+        .unwrap();
+        assert_eq!(discover["method"], "project_checkout_discover");
+        assert_eq!(discover["params"]["project_id"], "fixture-project");
+
+        let upsert = serde_json::to_value(ControlRequest {
+            request_id: 32,
+            command: ControlCommand::ProjectCheckoutUpsert {
+                checkout: ProjectCheckout {
+                    id: "fixture-worktree".to_string(),
+                    project_id: "fixture-project".to_string(),
+                    path: PathBuf::from("/workspace/fixture-worktree"),
+                    environment_id: Some("fixture-development".to_string()),
+                    kind: accessfs_catalog::ProjectCheckoutKind::Worktree,
+                    git_common_dir: Some(PathBuf::from("/workspace/fixture/.git")),
+                },
+            },
+        })
+        .unwrap();
+        assert_eq!(upsert["method"], "project_checkout_upsert");
+        assert_eq!(
+            upsert["params"]["checkout"]["environment_id"],
+            "fixture-development"
+        );
+        assert_eq!(upsert["params"]["checkout"]["kind"], "worktree");
+
+        let remove = serde_json::to_value(ControlRequest {
+            request_id: 33,
+            command: ControlCommand::ProjectCheckoutRemove {
+                id: "fixture-worktree".to_string(),
+            },
+        })
+        .unwrap();
+        assert_eq!(remove["method"], "project_checkout_remove");
+        assert_eq!(remove["params"]["id"], "fixture-worktree");
+
+        let result = serde_json::to_value(ControlResult::ProjectCheckoutDiscovery(
+            ProjectCheckoutDiscovery {
+                project_id: "fixture-project".to_string(),
+                common_dir: PathBuf::from("/workspace/fixture/.git"),
+                checkouts: vec![ProjectCheckoutCandidate {
+                    path: PathBuf::from("/workspace/fixture-worktree"),
+                    git_primary: false,
+                    managed_checkout_id: None,
+                }],
+            },
+        ))
+        .unwrap();
+        assert_eq!(result["type"], "project_checkout_discovery");
+        assert_eq!(
+            result["value"]["checkouts"][0]["path"],
+            "/workspace/fixture-worktree"
+        );
     }
 
     #[test]

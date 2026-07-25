@@ -13,6 +13,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+mod git;
+
+pub use git::{
+    discover_git_checkouts, DiscoveredGitCheckout, GitCheckoutDiscovery, GitCheckoutError,
+};
+
 const MAX_DEPTH: usize = 6;
 const MAX_CANDIDATES: usize = 1_000;
 const MAX_FILE_SIZE: u64 = 1 << 20;

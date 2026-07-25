@@ -13,8 +13,8 @@ use accessfs_catalog::{
 use accessfs_core::audit::{read_recent_access, AuditAccessRecord};
 use accessfs_core::authz::{Enforcement, PolicyMode, PolicyModeStatus};
 use accessfs_discover::{
-    discover, DiscoveredContent, DiscoveredFileAction, DiscoveredFileKind, ExistingEnvironment,
-    ExistingProject, ExistingSecret, ExistingSurface,
+    discover, discover_git_checkouts, DiscoveredContent, DiscoveredFileAction,
+    DiscoveredFileKind, ExistingEnvironment, ExistingProject, ExistingSecret, ExistingSurface,
 };
 use accessfs_platform::SocketPeerVerifier;
 use accessfs_ssh::ManagedKeyError;
@@ -25,8 +25,9 @@ use crate::protocol::{
     read_msg, write_msg, AccessHistoryEvent, AccessHistoryIdentity, AccessHistoryProcess,
     AccessHistorySsh, ActiveGrant, ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest,
     ControlResponse, ControlResult, DiscoveryAppliedFile, DiscoveryApplyOutcome,
-    DiscoveryApplyResult, DiscoveryReferenceResolution, DiscoveryReferenceSource, ProtectedFile,
-    ProtectedFileVersion, SecretValue, SshConfigStatus, SshIdentity,
+    DiscoveryApplyResult, DiscoveryReferenceResolution, DiscoveryReferenceSource,
+    ProjectCheckoutCandidate, ProjectCheckoutDiscovery, ProtectedFile, ProtectedFileVersion,
+    SecretValue, SshConfigStatus, SshIdentity,
 };
 
 pub struct ControlServer {
@@ -311,6 +312,8 @@ fn changes_runtime(command: &ControlCommand) -> bool {
             | ControlCommand::FileRestore { .. }
             | ControlCommand::DiscoverApply { .. }
             | ControlCommand::DiscoverReferenceResolve { .. }
+            | ControlCommand::ProjectCheckoutUpsert { .. }
+            | ControlCommand::ProjectCheckoutRemove { .. }
     )
 }
 
@@ -513,6 +516,17 @@ fn dispatch(
                 &key,
                 source,
             )
+        }
+        ControlCommand::ProjectCheckoutDiscover { project_id } => {
+            discover_project_checkouts(catalog, &project_id)
+        }
+        ControlCommand::ProjectCheckoutUpsert { checkout } => {
+            catalog.upsert_checkout(&checkout)?;
+            Ok(ControlResult::Empty)
+        }
+        ControlCommand::ProjectCheckoutRemove { id } => {
+            catalog.remove_checkout(&id)?;
+            Ok(ControlResult::Empty)
         }
         ControlCommand::SshAgentDiscover { endpoint } => {
             if !endpoint.is_absolute() {
@@ -1299,6 +1313,42 @@ impl Drop for DiscoveryMutationGuard<'_> {
             }
         }
     }
+}
+
+fn discover_project_checkouts(
+    catalog: &Catalog,
+    project_id: &str,
+) -> Result<ControlResult, DispatchError> {
+    let snapshot = catalog.snapshot()?;
+    let project = snapshot
+        .projects
+        .iter()
+        .find(|project| project.id == project_id)
+        .ok_or_else(|| CatalogError::NotFound(format!("project {project_id}")))?;
+    let discovered = discover_git_checkouts(&project.path)
+        .map_err(|error| DispatchError::Validation(error.to_string()))?;
+    let checkouts = discovered
+        .checkouts
+        .into_iter()
+        .map(|candidate| ProjectCheckoutCandidate {
+            managed_checkout_id: snapshot
+                .checkouts
+                .iter()
+                .find(|checkout| {
+                    checkout.project_id == project_id && checkout.path == candidate.path
+                })
+                .map(|checkout| checkout.id.clone()),
+            path: candidate.path,
+            git_primary: candidate.git_primary,
+        })
+        .collect();
+    Ok(ControlResult::ProjectCheckoutDiscovery(
+        ProjectCheckoutDiscovery {
+            project_id: project_id.to_string(),
+            common_dir: discovered.common_dir,
+            checkouts,
+        },
+    ))
 }
 
 fn ensure_discovered_project(
@@ -2735,6 +2785,94 @@ mod tests {
     }
 
     #[test]
+    fn project_checkout_discovery_and_lifecycle_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("main");
+        let worktree = dir.path().join("feature");
+        let worktree_git = primary.join(".git/worktrees/feature");
+        std::fs::create_dir_all(&worktree_git).unwrap();
+        std::fs::create_dir(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", worktree_git.display()),
+        )
+        .unwrap();
+        std::fs::write(worktree_git.join("commondir"), "../..\n").unwrap();
+        std::fs::write(
+            worktree_git.join("gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .unwrap();
+        let primary = std::fs::canonicalize(primary).unwrap();
+        let worktree = std::fs::canonicalize(worktree).unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        catalog
+            .upsert_project(&Project {
+                id: "fixture-project".to_string(),
+                name: "Fixture".to_string(),
+                path: primary.clone(),
+            })
+            .unwrap();
+        catalog
+            .upsert_environment(&Environment {
+                id: "fixture-development".to_string(),
+                project_id: "fixture-project".to_string(),
+                name: "Development".to_string(),
+                position: 0,
+            })
+            .unwrap();
+
+        let result = dispatch(
+            &catalog,
+            DispatchServices::default(),
+            ControlCommand::ProjectCheckoutDiscover {
+                project_id: "fixture-project".to_string(),
+            },
+        )
+        .unwrap();
+        let ControlResult::ProjectCheckoutDiscovery(discovery) = result else {
+            panic!("unexpected checkout discovery result")
+        };
+        assert_eq!(discovery.checkouts.len(), 2);
+        assert_eq!(
+            discovery
+                .checkouts
+                .iter()
+                .find(|candidate| candidate.path == worktree)
+                .unwrap()
+                .managed_checkout_id,
+            None
+        );
+
+        let checkout = accessfs_catalog::ProjectCheckout {
+            id: "fixture-worktree".to_string(),
+            project_id: "fixture-project".to_string(),
+            path: worktree.clone(),
+            environment_id: Some("fixture-development".to_string()),
+            kind: accessfs_catalog::ProjectCheckoutKind::Worktree,
+            git_common_dir: Some(discovery.common_dir),
+        };
+        dispatch(
+            &catalog,
+            DispatchServices::default(),
+            ControlCommand::ProjectCheckoutUpsert {
+                checkout: checkout.clone(),
+            },
+        )
+        .unwrap();
+        assert!(catalog.snapshot().unwrap().checkouts.contains(&checkout));
+        dispatch(
+            &catalog,
+            DispatchServices::default(),
+            ControlCommand::ProjectCheckoutRemove {
+                id: checkout.id.clone(),
+            },
+        )
+        .unwrap();
+        assert!(!catalog.snapshot().unwrap().checkouts.contains(&checkout));
+    }
+
+    #[test]
     fn policy_mode_roundtrips_through_the_control_seam() {
         let dir = tempfile::tempdir().unwrap();
         let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
@@ -3634,7 +3772,7 @@ mod tests {
         let mut client = ControlClient::connect(&socket).unwrap();
         assert_eq!(
             client.request(ControlCommand::Ping).unwrap(),
-            ControlResult::Pong { schema_version: 7 }
+            ControlResult::Pong { schema_version: 8 }
         );
         client
             .request(ControlCommand::ProjectUpsert {
