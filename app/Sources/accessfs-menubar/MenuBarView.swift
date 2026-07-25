@@ -1,5 +1,103 @@
 import SwiftUI
 
+struct MenuBarAccessGroup: Identifiable {
+    struct ID: Hashable {
+        let path: String
+        let shownPath: String
+        let operation: String
+        let decision: String
+        let exePath: String?
+        let chain: String
+        let ruleID: String?
+        let policyMode: String?
+        let policyConfiguredEnforcement: String?
+        let policyEffectiveEnforcement: String?
+        let sshFingerprint: String?
+    }
+
+    let id: ID
+    let latest: RecentAccess
+    var count: Int
+}
+
+struct MenuBarAccessFeed {
+    static let recentWindow: TimeInterval = 60 * 60
+    static let maximumGroups = 30
+
+    let groups: [MenuBarAccessGroup]
+    let totalGroupCount: Int
+    let isSearching: Bool
+
+    var countLabel: String {
+        let count = totalGroupCount > groups.count ? "\(groups.count)+" : "\(totalGroupCount)"
+        return isSearching ? count : "1h · \(count)"
+    }
+
+    static func make(
+        recents: [RecentAccess],
+        searchText: String,
+        now: Date = Date()
+    ) -> MenuBarAccessFeed {
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let isSearching = !query.isEmpty
+        let cutoff = now.addingTimeInterval(-recentWindow)
+        let candidates = recents
+            .filter { recent in
+                if isSearching {
+                    return recent.matchesMenuBarSearch(query)
+                }
+                guard let date = recent.date else { return false }
+                return date >= cutoff
+            }
+            .sorted {
+                ($0.date ?? .distantPast) > ($1.date ?? .distantPast)
+            }
+
+        var groupIndexes: [MenuBarAccessGroup.ID: Int] = [:]
+        var groups: [MenuBarAccessGroup] = []
+        for recent in candidates {
+            let id = MenuBarAccessGroup.ID(recent)
+            if let index = groupIndexes[id] {
+                groups[index].count += 1
+            } else {
+                groupIndexes[id] = groups.count
+                groups.append(MenuBarAccessGroup(id: id, latest: recent, count: 1))
+            }
+        }
+
+        return MenuBarAccessFeed(
+            groups: Array(groups.prefix(maximumGroups)),
+            totalGroupCount: groups.count,
+            isSearching: isSearching)
+    }
+}
+
+private extension MenuBarAccessGroup.ID {
+    init(_ recent: RecentAccess) {
+        path = recent.path
+        shownPath = recent.shownPath
+        operation = recent.operation
+        decision = recent.decision
+        exePath = recent.exePath
+        chain = recent.chain
+        ruleID = recent.ruleId
+        policyMode = recent.policy?.mode
+        policyConfiguredEnforcement = recent.policy?.configured_enforcement
+        policyEffectiveEnforcement = recent.policy?.effective_enforcement
+        sshFingerprint = recent.ssh?.key_fingerprint
+    }
+}
+
+private extension RecentAccess {
+    func matchesMenuBarSearch(_ query: String) -> Bool {
+        shownPath.localizedCaseInsensitiveContains(query)
+            || path.localizedCaseInsensitiveContains(query)
+            || exe.localizedCaseInsensitiveContains(query)
+            || operation.localizedCaseInsensitiveContains(query)
+            || decision.localizedCaseInsensitiveContains(query)
+    }
+}
+
 /// The window-style dropdown: search header, recent-access list, footer actions.
 struct MenuBarView: View {
     @Bindable var state: AppState
@@ -13,26 +111,18 @@ struct MenuBarView: View {
         (NSScreen.main?.visibleFrame.height ?? 900) * 0.6
     }
 
-    private var filtered: [RecentAccess] {
-        guard !searchText.isEmpty else { return state.recents }
-        let q = searchText
-        return state.recents.filter {
-            $0.shownPath.localizedCaseInsensitiveContains(q)
-                || $0.path.localizedCaseInsensitiveContains(q)
-                || $0.exe.localizedCaseInsensitiveContains(q)
-                || $0.operation.localizedCaseInsensitiveContains(q)
-                || $0.decision.localizedCaseInsensitiveContains(q)
-        }
+    private var accessFeed: MenuBarAccessFeed {
+        MenuBarAccessFeed.make(recents: state.recents, searchText: searchText)
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            MenuBarHeader(searchText: $searchText, count: filtered.count)
+            MenuBarHeader(searchText: $searchText, countLabel: accessFeed.countLabel)
             PolicyModeControl(state: state) { window in
                 pendingConfirmation = .auditOnly(window)
             }
             Divider()
-            if filtered.isEmpty {
+            if accessFeed.groups.isEmpty {
                 emptyState
             } else {
                 accessList
@@ -60,15 +150,15 @@ struct MenuBarView: View {
 
     // Plain VStack, not LazyVStack: the MenuBarExtra window sizes itself to the content's
     // ideal height, and lazy content measures as zero before it has a viewport — the whole
-    // list collapses to nothing. The list is capped at 50 rows, eager layout is cheap.
+    // list collapses to nothing. The list is capped at 30 groups, eager layout is cheap.
     // A ScrollView's own ideal height is unrelated to its content's, so the viewport is
     // pinned to the measured content height (scrolling only past the cap).
     private var accessList: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 1) {
                 SectionLabel(icon: "clock", title: "Recent Access")
-                ForEach(filtered) { ev in
-                    AccessRow(ev: ev)
+                ForEach(accessFeed.groups) { group in
+                    AccessRow(group: group)
                 }
             }
             .padding(.horizontal, 6)
@@ -94,7 +184,7 @@ struct MenuBarView: View {
                 searchText.isEmpty
                     ? (state.accessHistoryLoading
                         ? "Loading access history…"
-                        : (state.connected ? "No recent access" : "Agent not connected"))
+                        : (state.connected ? "No access in the last hour" : "Agent not connected"))
                     : "No matches"
             )
             .font(.callout)
@@ -307,7 +397,7 @@ private struct PolicyModeControl: View {
 /// Search field + live count, like the reference design.
 private struct MenuBarHeader: View {
     @Binding var searchText: String
-    let count: Int
+    let countLabel: String
 
     var body: some View {
         HStack(spacing: 8) {
@@ -332,7 +422,7 @@ private struct MenuBarHeader: View {
             .padding(.vertical, 4)
             .background(.quaternary.opacity(0.7))
             .clipShape(RoundedRectangle(cornerRadius: 6))
-            Text("\(count)")
+            Text(countLabel)
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 6)
@@ -363,8 +453,9 @@ private struct SectionLabel: View {
 /// One access event: decision dot, read/write badge, exe + path, timestamp. Hover highlights
 /// and the tooltip carries the full path / rule / process chain.
 private struct AccessRow: View {
-    let ev: RecentAccess
+    let group: MenuBarAccessGroup
     @State private var hovered = false
+    private var ev: RecentAccess { group.latest }
 
     var body: some View {
         HStack(spacing: 8) {
@@ -395,6 +486,15 @@ private struct AccessRow: View {
                     .truncationMode(.middle)
             }
             Spacer(minLength: 4)
+            if group.count > 1 {
+                Text("×\(group.count)")
+                    .font(.caption2.monospacedDigit().weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(.tertiary.opacity(0.18))
+                    .clipShape(Capsule())
+            }
             Text(ev.time)
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.tertiary)
@@ -419,6 +519,9 @@ private struct AccessRow: View {
         if let policy = ev.policy {
             lines.append(
                 "policy: \(policy.configured_enforcement) → \(policy.effective_enforcement) (\(policy.mode))")
+        }
+        if group.count > 1 {
+            lines.append("accesses: \(group.count)")
         }
         lines.append("chain: \(ev.chain)")
         return lines.joined(separator: "\n")
