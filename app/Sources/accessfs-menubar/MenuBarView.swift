@@ -558,8 +558,9 @@ private struct MenuBarFooter: View {
             .padding(.top, 2)
             .padding(.bottom, 4)
             MenuItemButton(title: "Open Workspace", icon: "rectangle.grid.2x2", shortcut: "D") {
+                DockVisibilityController.shared.prepareToShowDashboard()
                 openWindow(id: "dashboard")
-                // An accessory app doesn't come frontmost on openWindow by itself.
+                // Changing an accessory app back to regular doesn't make it frontmost.
                 NSApp.activate(ignoringOtherApps: true)
             }
             .keyboardShortcut("d")

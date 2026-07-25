@@ -35,14 +35,14 @@ private struct DashboardCommands: Commands {
     }
 }
 
-/// Dock-and-menubar app: a full workspace window, a compact status dropdown,
-/// and modal authorization prompts driven by the daemon.
+/// Menubar app with a full workspace window and modal authorization prompts.
+/// The Dock icon follows the workspace window rather than the background app lifetime.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let icon = FloriaImages.applicationIcon {
             NSApp.applicationIconImage = icon
         }
-        NSApp.setActivationPolicy(.regular)
+        DockVisibilityController.shared.prepareToShowDashboard()
     }
 }
 
@@ -82,6 +82,12 @@ struct FloriaMenuBarApp: App {
         // after the window is closed.
         Window("floria", id: "dashboard") {
             DashboardView(state: state)
+                .background(
+                    DashboardWindowTracker(
+                        dockVisibilityController: DockVisibilityController.shared))
+                .onDisappear {
+                    DockVisibilityController.shared.dashboardDidClose()
+                }
         }
         .defaultSize(width: 880, height: 720)
         .windowStyle(.hiddenTitleBar)
