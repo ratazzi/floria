@@ -6,7 +6,7 @@
 //! as an access event.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
@@ -19,6 +19,9 @@ use accessfs_core::rules::{repo_root, RuleObject, RuleRequest, RuleSet};
 use accessfs_platform::SocketPeerVerifier;
 
 use crate::grant_cache::{ActiveGrant, GrantCache, GrantKey, GrantMetadata};
+use crate::managed_rules::{
+    managed_rules, normalize_managed_policy, ManagedPolicyItem,
+};
 use crate::protocol::{DaemonMsg, IdentityView, SshSignView};
 use crate::policy_mode::PolicyModeState;
 use crate::socket::{PromptResult, SocketServer};
@@ -42,11 +45,13 @@ const PERSISTENT_TTL: Duration = Duration::from_secs(24 * 3600);
 
 pub struct SocketAgent {
     server: Arc<SocketServer>,
-    /// Policy rules, evaluated first-match by priority.
-    rules: RuleSet,
-    /// Per-managed-path defaults supplied by the live catalog/store snapshot. Explicit process
-    /// rules still win; these values replace only the built-in secrets/surfaces defaults.
-    managed_enforcement: RwLock<HashMap<String, Enforcement>>,
+    /// Immutable config rules, used as the base whenever live managed rules are rebuilt.
+    base_rules: RuleSet,
+    /// Config and managed rules, evaluated together by first-match priority.
+    rules: RwLock<RuleSet>,
+    /// `None` until the initial catalog snapshot is installed. Later semantic changes invalidate
+    /// grants; equivalent normalized snapshots are ignored.
+    managed_items: RwLock<Option<Vec<ManagedPolicyItem>>>,
     /// Daemon-wide runtime override, persisted independently from per-item catalog settings.
     policy_mode: PolicyModeState,
     /// Persistent `(grant_key, object, operation) -> expiry` cache. The object is the path for file
@@ -59,8 +64,6 @@ pub struct SocketAgent {
     /// Incremented whenever runtime or managed policy changes. An answer to a prompt created under
     /// an older generation may resolve that access but must not install a grant afterward.
     grant_generation: AtomicU64,
-    /// The first catalog snapshot is startup initialization, not a policy mutation.
-    managed_policy_initialized: AtomicBool,
 }
 
 type PromptFlightKey = (GrantKey, u64);
@@ -104,17 +107,18 @@ impl SocketAgent {
             rules = cfg.rules.len(),
             "agent socket listening"
         );
+        let base_rules = cfg.rules.clone();
         Ok(Arc::new(SocketAgent {
             server,
-            rules: cfg.rules.clone(),
-            managed_enforcement: RwLock::new(HashMap::new()),
+            rules: RwLock::new(base_rules.clone()),
+            base_rules,
+            managed_items: RwLock::new(None),
             policy_mode: PolicyModeState::open(
                 cfg.agent_socket.with_file_name("policy-mode.json"),
             ),
             grants: GrantCache::open(cfg.agent_socket.with_file_name("grants.json")),
             prompt_flights: Mutex::new(HashMap::new()),
             grant_generation: AtomicU64::new(0),
-            managed_policy_initialized: AtomicBool::new(false),
         }))
     }
 
@@ -150,36 +154,27 @@ impl SocketAgent {
         self.grants.clear()
     }
 
-    /// Atomically replace the default enforcement for managed secret and surface paths.
-    pub fn replace_managed_enforcement(&self, values: HashMap<String, Enforcement>) {
-        match self.managed_enforcement.write() {
-            Ok(mut current) => *current = values,
-            Err(poisoned) => *poisoned.into_inner() = values,
-        }
-        if !self.managed_policy_initialized.swap(true, Ordering::AcqRel) {
+    /// Replace catalog/store policy as ordinary rules. Normalization makes refresh order
+    /// irrelevant and merges duplicate objects using the strictest enforcement.
+    pub fn replace_managed_policy(&self, items: Vec<ManagedPolicyItem>) {
+        let items = normalize_managed_policy(items);
+        let mut current = self
+            .managed_items
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if current.as_ref() == Some(&items) {
             return;
         }
-        self.grant_generation.fetch_add(1, Ordering::AcqRel);
-        if let Err(error) = self.grants.clear() {
-            tracing::warn!(%error, "clearing grants after managed policy change failed");
-        }
-    }
-
-    fn managed_enforcement(&self, path: &str) -> Option<Enforcement> {
-        match self.managed_enforcement.read() {
-            Ok(values) => values.get(path).copied(),
-            Err(poisoned) => poisoned.into_inner().get(path).copied(),
-        }
-    }
-
-    fn request_enforcement(&self, request: &AuthRequest<'_>) -> Option<Enforcement> {
-        if let Some(accessfs_core::authz::AccessContext::SshSign(context)) = request.context {
-            let resource_path = format!("resources/{}", context.resource_id);
-            if let Some(enforcement) = self.managed_enforcement(&resource_path) {
-                return Some(enforcement);
+        let initial_install = current.is_none();
+        let replacement = self.base_rules.with_additional(managed_rules(&items));
+        *self.rules.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = replacement;
+        *current = Some(items);
+        if !initial_install {
+            self.grant_generation.fetch_add(1, Ordering::AcqRel);
+            if let Err(error) = self.grants.clear() {
+                tracing::warn!(%error, "clearing grants after managed policy change failed");
             }
         }
-        self.managed_enforcement(request.path)
     }
 
     fn handle_prompt(
@@ -339,14 +334,11 @@ impl Authorizer for SocketAgent {
             operation: req.operation,
             object,
         };
-        let (mut enforcement, mut rule_id) =
-            self.rules.decide(&rule_request);
-        if matches!(rule_id.as_deref(), Some("secrets-default" | "surfaces-default")) {
-            if let Some(level) = self.request_enforcement(req) {
-                enforcement = level;
-                rule_id = Some(format!("security-level:{}", level.as_str()));
-            }
-        }
+        let (enforcement, rule_id) = self
+            .rules
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .decide(&rule_request);
 
         let policy = self.policy_mode.evaluate(enforcement);
         let decision = match policy.effective_enforcement {
@@ -430,9 +422,12 @@ fn grant_ttl(d: &crate::protocol::ClientDecision) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::managed_rules::ManagedObject;
     use crate::protocol::{read_msg, write_msg};
     use accessfs_core::authz::{AccessContext, Operation, SshSignContext};
-    use accessfs_core::rules::{any_path_glob, ObjectMatch, Rule, RuleOps, SubjectMatch};
+    use accessfs_core::rules::{
+        any_path_glob, ObjectMatch, Rule, RuleOps, SubjectMatch, BUILTIN_DEFAULT_PRIORITY,
+    };
     use accessfs_platform::SameUserPeerVerifier;
     use serde_json::{json, Value};
     use std::os::unix::net::UnixStream;
@@ -451,15 +446,23 @@ mod tests {
     fn agent_with_rules(dir: &std::path::Path, rules: Vec<Rule>) -> SocketAgent {
         let server =
             SocketServer::start(&dir.join("agent.sock"), Arc::new(SameUserPeerVerifier)).unwrap();
+        let base_rules = RuleSet::new(rules);
         SocketAgent {
             server,
-            rules: RuleSet::new(rules),
-            managed_enforcement: RwLock::new(HashMap::new()),
+            rules: RwLock::new(base_rules.clone()),
+            base_rules,
+            managed_items: RwLock::new(None),
             policy_mode: PolicyModeState::open(dir.join("policy-mode.json")),
             grants: GrantCache::open(dir.join("grants.json")),
             prompt_flights: Mutex::new(HashMap::new()),
             grant_generation: AtomicU64::new(0),
-            managed_policy_initialized: AtomicBool::new(false),
+        }
+    }
+
+    fn managed_secret(secret_id: &str, enforcement: Enforcement) -> ManagedPolicyItem {
+        ManagedPolicyItem {
+            object: ManagedObject::Secret { secret_id: secret_id.to_string() },
+            enforcement,
         }
     }
 
@@ -841,7 +844,7 @@ mod tests {
             tmp.path(),
             vec![Rule {
                 id: "secrets-default".into(),
-                priority: 0,
+                priority: BUILTIN_DEFAULT_PRIORITY,
                 subject: SubjectMatch::default(),
                 object: ObjectMatch::default(),
                 path_glob: any_path_glob(),
@@ -850,15 +853,12 @@ mod tests {
                 enabled: true,
             }],
         );
-        agent.replace_managed_enforcement(HashMap::from([(
-            "secrets/test-id".to_string(),
-            Enforcement::Allow,
-        )]));
+        agent.replace_managed_policy(vec![managed_secret("test-id", Enforcement::Allow)]);
 
         let id = ProcessIdentity::bare(1234, 501, 20);
         let decision = agent.authorize(&req(&id, Operation::Read));
         assert!(decision.is_allowed());
-        assert_eq!(decision.rule_id.as_deref(), Some("security-level:allow"));
+        assert_eq!(decision.rule_id.as_deref(), Some("managed:secret:test-id"));
     }
 
     #[test]
@@ -897,7 +897,7 @@ mod tests {
             tmp.path(),
             vec![Rule {
                 id: "surfaces-default".into(),
-                priority: 0,
+                priority: BUILTIN_DEFAULT_PRIORITY,
                 subject: SubjectMatch::default(),
                 object: ObjectMatch::default(),
                 path_glob: any_path_glob(),
@@ -906,10 +906,20 @@ mod tests {
                 enabled: true,
             }],
         );
-        agent.replace_managed_enforcement(HashMap::from([
-            ("surfaces/fixture-agent".to_string(), Enforcement::TouchId),
-            ("resources/fixture-managed-key".to_string(), Enforcement::Allow),
-        ]));
+        agent.replace_managed_policy(vec![
+            ManagedPolicyItem {
+                object: ManagedObject::Surface {
+                    surface_id: "fixture-agent".to_string(),
+                },
+                enforcement: Enforcement::TouchId,
+            },
+            ManagedPolicyItem {
+                object: ManagedObject::SshResource {
+                    resource_id: "fixture-managed-key".to_string(),
+                },
+                enforcement: Enforcement::Allow,
+            },
+        ]);
         let identity = ProcessIdentity::bare(1234, 501, 20);
         let context = SshSignContext {
             surface_id: "fixture-agent",
@@ -931,7 +941,10 @@ mod tests {
         });
 
         assert!(decision.is_allowed());
-        assert_eq!(decision.rule_id.as_deref(), Some("security-level:allow"));
+        assert_eq!(
+            decision.rule_id.as_deref(),
+            Some("managed:ssh-resource:fixture-managed-key")
+        );
     }
 
     #[test]
@@ -962,10 +975,7 @@ mod tests {
                 },
             ],
         );
-        agent.replace_managed_enforcement(HashMap::from([(
-            "secrets/test-id".to_string(),
-            Enforcement::Allow,
-        )]));
+        agent.replace_managed_policy(vec![managed_secret("test-id", Enforcement::Allow)]);
 
         let id = ProcessIdentity::bare(1234, 501, 20);
         let decision = agent.authorize(&req(&id, Operation::Read));
@@ -1092,17 +1102,28 @@ mod tests {
             .insert(key.clone(), Duration::from_secs(600), fixture_grant_metadata())
             .unwrap();
 
-        agent.replace_managed_enforcement(HashMap::from([(
-            "secrets/test-id".to_string(),
-            Enforcement::Prompt,
-        )]));
+        let surface = ManagedPolicyItem {
+            object: ManagedObject::Surface { surface_id: "fixture".to_string() },
+            enforcement: Enforcement::Allow,
+        };
+        agent.replace_managed_policy(vec![
+            managed_secret("test-id", Enforcement::Prompt),
+            surface.clone(),
+        ]);
         assert!(agent.grants.is_valid(&key));
+        assert_eq!(agent.grant_generation.load(Ordering::Acquire), 0);
 
-        agent.replace_managed_enforcement(HashMap::from([(
-            "secrets/test-id".to_string(),
-            Enforcement::TouchId,
-        )]));
+        // Refresh order is not policy. The normalized items compare equal and preserve grants.
+        agent.replace_managed_policy(vec![
+            surface,
+            managed_secret("test-id", Enforcement::Prompt),
+        ]);
+        assert!(agent.grants.is_valid(&key));
+        assert_eq!(agent.grant_generation.load(Ordering::Acquire), 0);
+
+        agent.replace_managed_policy(vec![managed_secret("test-id", Enforcement::TouchId)]);
         assert!(agent.grants.is_empty());
+        assert_eq!(agent.grant_generation.load(Ordering::Acquire), 1);
         assert!(GrantCache::open(tmp.path().join("grants.json")).is_empty());
     }
 }

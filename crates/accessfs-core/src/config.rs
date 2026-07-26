@@ -10,7 +10,7 @@ use crate::error::{CoreError, Result};
 use crate::handler::ContentHandler;
 use crate::rules::{
     any_path_glob, compile_glob, exact_path_glob, ObjectMatch, Rule, RuleOps, RuleSet,
-    SubjectMatch,
+    SubjectMatch, BUILTIN_DEFAULT_PRIORITY, CATCH_ALL_PRIORITY, MANAGED_RESOURCE_PRIORITY,
 };
 
 /// Virtual directory under the mount where store-backed secrets are surfaced (`secrets/<id>`).
@@ -260,7 +260,7 @@ fn build_ruleset(rule_cfgs: Vec<RuleCfg>, files: &[FileEntry]) -> Result<RuleSet
     // one writable namespace, and both directions must be gated. Tighten with an explicit `[[rule]]`.
     rules.push(Rule {
         id: "secrets-default".to_string(),
-        priority: i32::MIN + 1,
+        priority: BUILTIN_DEFAULT_PRIORITY,
         subject: SubjectMatch::default(),
         object: ObjectMatch::default(),
         path_glob: compile_glob(&format!("{SECRETS_DIR}/**"))
@@ -274,7 +274,7 @@ fn build_ruleset(rule_cfgs: Vec<RuleCfg>, files: &[FileEntry]) -> Result<RuleSet
     // capability gate still rejects writes to composed surfaces before authorization.
     rules.push(Rule {
         id: "surfaces-default".to_string(),
-        priority: i32::MIN + 1,
+        priority: BUILTIN_DEFAULT_PRIORITY,
         subject: SubjectMatch::default(),
         object: ObjectMatch::default(),
         path_glob: compile_glob(&format!("{SURFACES_DIR}/**"))
@@ -288,7 +288,7 @@ fn build_ruleset(rule_cfgs: Vec<RuleCfg>, files: &[FileEntry]) -> Result<RuleSet
     // match it — either capability falling past every rule hits the fail-closed default instead.
     rules.push(Rule {
         id: "default".to_string(),
-        priority: i32::MIN,
+        priority: CATCH_ALL_PRIORITY,
         subject: SubjectMatch::default(),
         object: ObjectMatch::default(),
         path_glob: any_path_glob(),
@@ -302,6 +302,12 @@ fn build_ruleset(rule_cfgs: Vec<RuleCfg>, files: &[FileEntry]) -> Result<RuleSet
 
 fn resolve_rule(rc: RuleCfg, idx: usize) -> Result<Rule> {
     let id = rc.id.unwrap_or_else(|| format!("rule-{idx}"));
+    let priority = rc.priority.unwrap_or(0);
+    if priority <= MANAGED_RESOURCE_PRIORITY {
+        return Err(CoreError::config(format!(
+            "rule {id}: priority must be greater than {MANAGED_RESOURCE_PRIORITY}"
+        )));
+    }
     let enforcement = Enforcement::parse(&rc.enforcement)
         .ok_or_else(|| CoreError::config(format!("rule {id}: invalid enforcement {:?}", rc.enforcement)))?;
     let path_glob = compile_glob(rc.path.as_deref().unwrap_or("**"))
@@ -327,7 +333,7 @@ fn resolve_rule(rc: RuleCfg, idx: usize) -> Result<Rule> {
     };
     Ok(Rule {
         id,
-        priority: rc.priority.unwrap_or(0),
+        priority,
         subject,
         object: ObjectMatch::default(),
         path_glob,
@@ -735,6 +741,17 @@ mod tests {
         let mut bad = rule_cfg("bad", "**", "allow");
         bad.operation = Some("readwrite-ish".to_string());
         assert!(build_ruleset(vec![bad], &[]).is_err());
+    }
+
+    #[test]
+    fn explicit_rule_priority_must_stay_above_managed_policy() {
+        let mut reserved = rule_cfg("reserved", "**", "allow");
+        reserved.priority = Some(MANAGED_RESOURCE_PRIORITY);
+        assert!(build_ruleset(vec![reserved], &[]).is_err());
+
+        let mut explicit = rule_cfg("explicit", "**", "allow");
+        explicit.priority = Some(MANAGED_RESOURCE_PRIORITY + 1);
+        assert!(build_ruleset(vec![explicit], &[]).is_ok());
     }
 
     #[test]

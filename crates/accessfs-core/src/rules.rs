@@ -10,12 +10,18 @@
 //! their helper processes); interpreters (`node`, `python`, ...) share their distributor's
 //! `team_id`, so they must be identified by `repo` (the git checkout they run from) instead.
 
+use std::cmp::Reverse;
 use std::path::Path;
 
 use globset::{Glob, GlobMatcher};
 
 use crate::authz::{Enforcement, Operation};
 use crate::identity::ProcessIdentity;
+
+pub const MANAGED_RESOURCE_PRIORITY: i32 = i32::MIN + 3;
+pub const MANAGED_ITEM_PRIORITY: i32 = i32::MIN + 2;
+pub const BUILTIN_DEFAULT_PRIORITY: i32 = i32::MIN + 1;
+pub const CATCH_ALL_PRIORITY: i32 = i32::MIN;
 
 /// Which operations a rule matches. Rules predate the writable mount and mean
 /// "who may *read* what"; keeping unstated rules read-only preserves exactly that — a
@@ -160,7 +166,7 @@ impl RuleSet {
     /// Build a rule set. Rules are stably sorted by descending priority; equal priority keeps
     /// insertion order, so callers can insert more-authoritative rules first to win ties.
     pub fn new(mut rules: Vec<Rule>) -> Self {
-        rules.sort_by(|a, b| b.priority.cmp(&a.priority));
+        rules.sort_by_key(|rule| Reverse(rule.priority));
         RuleSet { rules }
     }
 
@@ -188,6 +194,13 @@ impl RuleSet {
 
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
+    }
+
+    /// Build a fresh ordered set from these base rules plus runtime-synthesized rules.
+    pub fn with_additional(&self, additional: Vec<Rule>) -> Self {
+        let mut rules = self.rules.clone();
+        rules.extend(additional);
+        RuleSet::new(rules)
     }
 }
 

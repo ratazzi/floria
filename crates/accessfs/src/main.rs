@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -11,14 +10,15 @@ use std::sync::{Arc, Mutex};
 use accessfs_catalog::{
     Catalog, CatalogSnapshot, ResourceKind, ResourceSource, Surface,
 };
+use accessfs_agent::{ManagedObject, ManagedPolicyItem};
 use accessfs_control::{
     ActiveGrant as ControlActiveGrant, CatalogObserver, ControlClient, ControlCommand,
     ControlResult, ControlRuntimeServices, ControlServer, ManagedSshConfig,
     RuntimePolicyController, SshConfigManager, SshIdentity, SshIdentityDiscovery,
 };
 use accessfs_core::audit::AuditLog;
-use accessfs_core::authz::{Authorizer, Enforcement, PolicyMode, PolicyModeStatus};
-use accessfs_core::config::{Config, ResolvedConfig, StoreKeySource, SECRETS_DIR, SURFACES_DIR};
+use accessfs_core::authz::{Authorizer, PolicyMode, PolicyModeStatus};
+use accessfs_core::config::{Config, ResolvedConfig, StoreKeySource};
 use accessfs_discover::{GitCheckoutMonitor, MonitoredGitProject};
 use accessfs_platform::{CodeSignedPeerVerifier, SocketPeerVerifier};
 use accessfs_store::{
@@ -515,7 +515,7 @@ fn cmd_mount(config: &Path) -> Result<()> {
     let store: Arc<dyn SecretStore> = Arc::new(open_store(&cfg)?);
     let agent = accessfs_agent::SocketAgent::start(&cfg, agent_peer_verifier)
         .context("starting agent socket")?;
-    agent.replace_managed_enforcement(managed_enforcement(&snapshot, &store.list()?));
+    agent.replace_managed_policy(managed_policy_items(&snapshot, &store.list()?));
     let audit = Arc::new(AuditLog::open(&cfg.audit_log).context("opening shared audit log")?);
     let ssh_authorizer: Arc<dyn Authorizer> = agent.clone();
     let managed_keys: Arc<dyn accessfs_agent::ManagedKeyReader> =
@@ -693,7 +693,7 @@ impl CatalogObserver for RuntimeCatalogObserver {
         match self.store.list() {
             Ok(records) => self
                 .agent
-                .replace_managed_enforcement(managed_enforcement(snapshot, &records)),
+                .replace_managed_policy(managed_policy_items(snapshot, &records)),
             Err(error) => tracing::warn!(%error, "refreshing managed security levels failed"),
         }
     }
@@ -710,50 +710,43 @@ fn monitored_git_projects(snapshot: &CatalogSnapshot) -> Vec<MonitoredGitProject
         .collect()
 }
 
-fn managed_enforcement(
+fn managed_policy_items(
     snapshot: &CatalogSnapshot,
     records: &[SecretRecord],
-) -> HashMap<String, Enforcement> {
-    let mut paths = HashMap::new();
+) -> Vec<ManagedPolicyItem> {
+    let mut items = Vec::new();
 
     // File-origin secrets are independently managed items. Managed-origin secrets inherit from
-    // their Resource below so lowering a Resource to audit-only is not masked by the store default.
+    // their Resource below. Duplicate secret objects are merged by the agent using strictest wins.
     for record in records.iter().filter(|record| record.source_path().is_some()) {
-        paths.insert(
-            format!("{SECRETS_DIR}/{}", record.id),
-            record.enforcement,
-        );
+        items.push(ManagedPolicyItem {
+            object: ManagedObject::Secret { secret_id: record.id.to_string() },
+            enforcement: record.enforcement,
+        });
     }
 
     for resource in &snapshot.resources {
         if matches!(resource.kind, ResourceKind::SshIdentity | ResourceKind::SshAgent) {
-            paths.insert(format!("resources/{}", resource.id), resource.enforcement);
+            items.push(ManagedPolicyItem {
+                object: ManagedObject::SshResource { resource_id: resource.id.clone() },
+                enforcement: resource.enforcement,
+            });
         }
         let ResourceSource::SecretRef { secret_id } = &resource.source else { continue };
-        let path = format!("{SECRETS_DIR}/{secret_id}");
-        paths
-            .entry(path)
-            .and_modify(|current| *current = stricter(*current, resource.enforcement))
-            .or_insert(resource.enforcement);
+        items.push(ManagedPolicyItem {
+            object: ManagedObject::Secret { secret_id: secret_id.clone() },
+            enforcement: resource.enforcement,
+        });
     }
 
     for surface in &snapshot.surfaces {
-        paths.insert(format!("{SURFACES_DIR}/{}", surface.id), surface.enforcement);
+        items.push(ManagedPolicyItem {
+            object: ManagedObject::Surface { surface_id: surface.id.clone() },
+            enforcement: surface.enforcement,
+        });
     }
 
-    paths
-}
-
-fn stricter(left: Enforcement, right: Enforcement) -> Enforcement {
-    fn rank(value: Enforcement) -> u8 {
-        match value {
-            Enforcement::Allow => 0,
-            Enforcement::Prompt => 1,
-            Enforcement::TouchId => 2,
-            Enforcement::Deny => 3,
-        }
-    }
-    if rank(left) >= rank(right) { left } else { right }
+    items
 }
 
 fn cleanup_removed_file_links(
@@ -1265,6 +1258,7 @@ mod tests {
         Binding, BindingScope, EntrySelection, EntrySpec, FileBacking, Resource, ResourceCodec,
         ResourceKind, SurfaceFormat, SurfaceInput, SurfaceKind, ValueShape,
     };
+    use accessfs_core::authz::Enforcement;
     use accessfs_store::SecretOrigin;
 
     fn resource(id: &str, secret_id: &str, enforcement: Enforcement) -> Resource {
@@ -1347,7 +1341,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_enforcement_keeps_surface_and_resource_levels_independent() {
+    fn managed_policy_keeps_surface_and_resource_levels_independent() {
         let audit_id = "00000000-0000-0000-0000-000000000201";
         let biometric_id = "00000000-0000-0000-0000-000000000202";
         let protected_id = "00000000-0000-0000-0000-000000000203";
@@ -1397,20 +1391,28 @@ mod tests {
             metadata: Default::default(),
         }];
 
-        let levels = managed_enforcement(&snapshot, &records);
-        assert_eq!(levels[&format!("{SECRETS_DIR}/{audit_id}")], Enforcement::Allow);
-        assert_eq!(
-            levels[&format!("{SECRETS_DIR}/{biometric_id}")],
-            Enforcement::TouchId
-        );
-        assert_eq!(
-            levels[&format!("{SECRETS_DIR}/{protected_id}")],
-            Enforcement::Allow
-        );
-        assert_eq!(
-            levels[&format!("{SURFACES_DIR}/combined")],
-            Enforcement::Allow
-        );
-        assert_eq!(levels["resources/managed-ssh"], Enforcement::Prompt);
+        let items = managed_policy_items(&snapshot, &records);
+        assert!(items.contains(&ManagedPolicyItem {
+            object: ManagedObject::Secret { secret_id: audit_id.to_string() },
+            enforcement: Enforcement::Allow,
+        }));
+        assert!(items.contains(&ManagedPolicyItem {
+            object: ManagedObject::Secret { secret_id: biometric_id.to_string() },
+            enforcement: Enforcement::TouchId,
+        }));
+        assert!(items.contains(&ManagedPolicyItem {
+            object: ManagedObject::Secret { secret_id: protected_id.to_string() },
+            enforcement: Enforcement::Allow,
+        }));
+        assert!(items.contains(&ManagedPolicyItem {
+            object: ManagedObject::Surface { surface_id: "combined".to_string() },
+            enforcement: Enforcement::Allow,
+        }));
+        assert!(items.contains(&ManagedPolicyItem {
+            object: ManagedObject::SshResource {
+                resource_id: "managed-ssh".to_string(),
+            },
+            enforcement: Enforcement::Prompt,
+        }));
     }
 }
