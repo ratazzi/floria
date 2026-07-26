@@ -49,17 +49,50 @@ use tree::{NodeKind, Tree};
 /// event loop and the fast callbacks never wait on them.
 const AUTH_POOL_THREADS: usize = 32;
 
+/// Lazily allocated, mount-stable inode registry for one dynamic namespace.
+struct InoMap {
+    dir_ino: u64,
+    id_to_ino: DashMap<String, u64>,
+    ino_to_id: DashMap<u64, String>,
+    next_ino: Arc<AtomicU64>,
+}
+
+impl InoMap {
+    fn new(dir_ino: u64, next_ino: Arc<AtomicU64>) -> Self {
+        InoMap {
+            dir_ino,
+            id_to_ino: DashMap::new(),
+            ino_to_id: DashMap::new(),
+            next_ino,
+        }
+    }
+
+    fn ino_for(&self, id: &str) -> u64 {
+        use dashmap::mapref::entry::Entry;
+        // The entry lock serializes concurrent allocations for the same id, so no double-assign.
+        match self.id_to_ino.entry(id.to_string()) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
+                self.ino_to_id.insert(ino, id.to_string());
+                entry.insert(ino);
+                ino
+            }
+        }
+    }
+
+    fn id_for_ino(&self, ino: u64) -> Option<String> {
+        self.ino_to_id.get(&ino).map(|id| id.clone())
+    }
+}
+
 /// The dynamic `secrets/<id>` namespace: a live view over the store, resolved on every
 /// lookup/readdir/open so a freshly `protect`ed file appears without remounting. inodes are
 /// allocated lazily per secret id and stay stable for the mount's lifetime.
 struct SecretsNs {
     store: Arc<dyn SecretStore>,
     catalog: Option<Catalog>,
-    /// Inode of the `secrets/` directory whose children this namespace owns.
-    dir_ino: u64,
-    id_to_ino: DashMap<String, u64>,
-    ino_to_id: DashMap<u64, String>,
-    next_ino: Arc<AtomicU64>,
+    inos: InoMap,
 }
 
 impl SecretsNs {
@@ -72,30 +105,16 @@ impl SecretsNs {
         SecretsNs {
             store,
             catalog,
-            dir_ino,
-            id_to_ino: DashMap::new(),
-            ino_to_id: DashMap::new(),
-            next_ino,
+            inos: InoMap::new(dir_ino, next_ino),
         }
     }
 
-    /// Get or allocate the stable inode for a secret id.
     fn ino_for(&self, id: &str) -> u64 {
-        use dashmap::mapref::entry::Entry;
-        // The entry lock serializes concurrent allocations for the same id, so no double-assign.
-        match self.id_to_ino.entry(id.to_string()) {
-            Entry::Occupied(e) => *e.get(),
-            Entry::Vacant(e) => {
-                let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
-                self.ino_to_id.insert(ino, id.to_string());
-                e.insert(ino);
-                ino
-            }
-        }
+        self.inos.ino_for(id)
     }
 
     fn id_for_ino(&self, ino: u64) -> Option<String> {
-        self.ino_to_id.get(&ino).map(|s| s.clone())
+        self.inos.id_for_ino(ino)
     }
 }
 
@@ -104,10 +123,7 @@ impl SecretsNs {
 struct SurfaceNs {
     registry: Arc<SurfaceRegistry>,
     resolver: SurfaceResolver,
-    dir_ino: u64,
-    id_to_ino: DashMap<String, u64>,
-    ino_to_id: DashMap<u64, String>,
-    next_ino: Arc<AtomicU64>,
+    inos: InoMap,
 }
 
 impl SurfaceNs {
@@ -120,24 +136,12 @@ impl SurfaceNs {
         SurfaceNs {
             registry,
             resolver,
-            dir_ino,
-            id_to_ino: DashMap::new(),
-            ino_to_id: DashMap::new(),
-            next_ino,
+            inos: InoMap::new(dir_ino, next_ino),
         }
     }
 
     fn ino_for(&self, id: &str) -> u64 {
-        use dashmap::mapref::entry::Entry;
-        match self.id_to_ino.entry(id.to_string()) {
-            Entry::Occupied(entry) => *entry.get(),
-            Entry::Vacant(entry) => {
-                let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
-                self.ino_to_id.insert(ino, id.to_string());
-                entry.insert(ino);
-                ino
-            }
-        }
+        self.inos.ino_for(id)
     }
 
     fn surface_for_ino(&self, ino: u64) -> Option<RegisteredSurface> {
@@ -145,7 +149,7 @@ impl SurfaceNs {
     }
 
     fn id_for_ino(&self, ino: u64) -> Option<String> {
-        self.ino_to_id.get(&ino).map(|id| id.clone())
+        self.inos.id_for_ino(ino)
     }
 }
 
@@ -931,7 +935,7 @@ impl fuser::Filesystem for AccessFs {
         };
         // Surface children resolve from the control-plane-maintained in-memory registry.
         if let Some(ns) = &self.inner.surfaces {
-            if parent.0 == ns.dir_ino {
+            if parent.0 == ns.inos.dir_ino {
                 match ns.registry.get(name) {
                     Some(registered) => {
                         let ino = ns.ino_for(name);
@@ -947,7 +951,7 @@ impl fuser::Filesystem for AccessFs {
         }
         // Children of the secrets directory resolve dynamically against the store.
         if let Some(ns) = &self.inner.secrets {
-            if parent.0 == ns.dir_ino {
+            if parent.0 == ns.inos.dir_ino {
                 match name
                     .parse::<SecretId>()
                     .ok()
@@ -1056,7 +1060,7 @@ impl fuser::Filesystem for AccessFs {
         }
 
         if let Some(ns) = &self.inner.surfaces {
-            if ino.0 == ns.dir_ino {
+            if ino.0 == ns.inos.dir_ino {
                 let mut entries: Vec<(u64, FileType, String)> = vec![
                     (ino.0, FileType::Directory, ".".to_string()),
                     (node.parent, FileType::Directory, "..".to_string()),
@@ -1079,7 +1083,7 @@ impl fuser::Filesystem for AccessFs {
 
         // The secrets directory lists the store's current contents dynamically.
         if let Some(ns) = &self.inner.secrets {
-            if ino.0 == ns.dir_ino {
+            if ino.0 == ns.inos.dir_ino {
                 let mut entries: Vec<(u64, FileType, String)> = vec![
                     (ino.0, FileType::Directory, ".".to_string()),
                     (node.parent, FileType::Directory, "..".to_string()),
