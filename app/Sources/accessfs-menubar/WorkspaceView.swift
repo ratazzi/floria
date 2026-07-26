@@ -1163,9 +1163,6 @@ private struct SurfaceInspector: View {
                         SocketSurfacePreview(
                             store: store, copyPath: { copyToPasteboard(surface.path) },
                             manageSocket: { showingManageSurface = true })
-                    case .regularFile:
-                        ContentUnavailableView("No preview", systemImage: "doc")
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
                     }
                 }
                 .background(Color.primary.opacity(0.018))
@@ -3583,7 +3580,7 @@ private struct AddBindingSheet: View {
             return resource.entries
                 .filter { selected.contains($0.address) && current.contains($0.address) }
                 .map(\.label)
-        case .linesFile, .envFileDirect, .regularFile, .unixSocket:
+        case .linesFile, .envFileDirect, .unixSocket:
             return []
         }
     }

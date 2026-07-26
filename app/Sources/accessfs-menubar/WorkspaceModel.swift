@@ -335,7 +335,6 @@ enum WorkspaceSurfaceKind: String, CaseIterable, Sendable {
     case iniFile
     case envFileDirect
     case linesFile
-    case regularFile
     case unixSocket
 
     var title: String {
@@ -345,7 +344,6 @@ enum WorkspaceSurfaceKind: String, CaseIterable, Sendable {
         case .iniFile: "INI File"
         case .envFileDirect: "Direct Env File"
         case .linesFile: "Lines File"
-        case .regularFile: "File"
         case .unixSocket: "Unix Socket"
         }
     }
@@ -357,9 +355,12 @@ enum WorkspaceSurfaceKind: String, CaseIterable, Sendable {
         case .iniFile: "list.bullet.rectangle"
         case .envFileDirect: "doc.text.fill"
         case .linesFile: "text.line.first.and.arrowtriangle.forward"
-        case .regularFile: "doc"
         case .unixSocket: "point.3.connected.trianglepath.dotted"
         }
+    }
+
+    var isFile: Bool {
+        self != .unixSocket
     }
 
     var isComposed: Bool {
@@ -373,7 +374,6 @@ enum WorkspaceSurfaceKind: String, CaseIterable, Sendable {
         case .iniFile: "credentials.ini"
         case .linesFile: ".secrets"
         case .envFileDirect: ".env.local"
-        case .regularFile: "output"
         case .unixSocket: "agent.sock"
         }
     }
@@ -765,7 +765,7 @@ final class WorkspaceStore {
             return isIdentityProvider
                 && resource.codec == .opaque && binding.keyOverride == nil
                 && !entries.isEmpty && entries.allSatisfy { $0.key == nil && !$0.sensitive }
-        case .envFileDirect, .regularFile:
+        case .envFileDirect:
             return false
         }
     }
@@ -1268,7 +1268,7 @@ final class WorkspaceStore {
             try await controlClient.upsertSurface(
                 CatalogSurface(
                     id: surfaceID, environmentID: environmentID, name: output.name,
-                    kind: "dotenv_file", path: output.path,
+                    kind: WorkspaceSurfaceKind.dotenvFile.catalogValue, path: output.path,
                     input: .bindings(commonBindingIDs), position: 0))
         } catch {
             try? await controlClient.removeEnvironment(environmentID)
@@ -1297,7 +1297,8 @@ final class WorkspaceStore {
         try await controlClient.upsertSurface(
             CatalogSurface(
                 id: surfaceID, environmentID: environment.id, name: output.name,
-                kind: "dotenv_file", path: output.path, input: .bindings(bindingIDs),
+                kind: WorkspaceSurfaceKind.dotenvFile.catalogValue,
+                path: output.path, input: .bindings(bindingIDs),
                 position: Int64(environment.surfaces.count)))
         apply(try await controlClient.snapshot())
         selectedSurfaceID = surfaceID
@@ -1320,7 +1321,8 @@ final class WorkspaceStore {
         try await controlClient.upsertSurface(
             CatalogSurface(
                 id: surfaceID, environmentID: environment.id, name: output.name,
-                kind: "direnv_file", path: output.path, input: .bindings(bindingIDs),
+                kind: WorkspaceSurfaceKind.direnvFile.catalogValue,
+                path: output.path, input: .bindings(bindingIDs),
                 position: Int64(environment.surfaces.count)))
         apply(try await controlClient.snapshot())
         selectedSurfaceID = surfaceID
@@ -1343,7 +1345,8 @@ final class WorkspaceStore {
         try await controlClient.upsertSurface(
             CatalogSurface(
                 id: surfaceID, environmentID: environment.id, name: output.name,
-                kind: "ini_file", path: output.path, input: .bindings(bindingIDs),
+                kind: WorkspaceSurfaceKind.iniFile.catalogValue,
+                path: output.path, input: .bindings(bindingIDs),
                 position: Int64(environment.surfaces.count)))
         apply(try await controlClient.snapshot())
         selectedSurfaceID = surfaceID
@@ -1366,7 +1369,8 @@ final class WorkspaceStore {
         try await controlClient.upsertSurface(
             CatalogSurface(
                 id: surfaceID, environmentID: environment.id, name: output.name,
-                kind: "lines_file", path: output.path, input: .bindings(bindingIDs),
+                kind: WorkspaceSurfaceKind.linesFile.catalogValue,
+                path: output.path, input: .bindings(bindingIDs),
                 position: Int64(environment.surfaces.count)))
         apply(try await controlClient.snapshot())
         selectedSurfaceID = surfaceID
@@ -1393,7 +1397,8 @@ final class WorkspaceStore {
         try await controlClient.upsertSurface(
             CatalogSurface(
                 id: surfaceID, environmentID: environment.id, name: output.name,
-                kind: "env_file_direct", path: output.path, input: .resource(resourceID),
+                kind: WorkspaceSurfaceKind.envFileDirect.catalogValue,
+                path: output.path, input: .resource(resourceID),
                 position: Int64(environment.surfaces.count)))
         apply(try await controlClient.snapshot())
         selectedSurfaceID = surfaceID
@@ -1436,7 +1441,7 @@ final class WorkspaceStore {
             try await controlClient.upsertSurface(
                 CatalogSurface(
                     id: surfaceID, environmentID: environment.id, name: output.name,
-                    kind: "unix_socket", path: output.path,
+                    kind: WorkspaceSurfaceKind.unixSocket.catalogValue, path: output.path,
                     input: .sshAgent([bindingID], route: route?.catalogValue),
                     enforcement: securityLevel.rawValue,
                     position: Int64(surfacePosition)))
@@ -2052,7 +2057,6 @@ private extension WorkspaceSurfaceKind {
         case .iniFile: "ini_file"
         case .envFileDirect: "env_file_direct"
         case .linesFile: "lines_file"
-        case .regularFile: "regular_file"
         case .unixSocket: "unix_socket"
         }
     }
@@ -2064,7 +2068,6 @@ private extension WorkspaceSurfaceKind {
         case "ini_file": self = .iniFile
         case "env_file_direct": self = .envFileDirect
         case "lines_file": self = .linesFile
-        case "regular_file": self = .regularFile
         case "unix_socket": self = .unixSocket
         default: return nil
         }
