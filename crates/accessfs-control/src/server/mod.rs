@@ -26,8 +26,9 @@ use accessfs_surface::{decode_source, ensure_file_surface_link, validate_secret_
 use crate::protocol::{
     read_msg, write_msg, AccessHistoryEvent, AccessHistoryIdentity, AccessHistoryProcess,
     AccessHistorySsh, ActiveGrant, ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest,
-    ControlResponse, ControlResult, DiscoveryAppliedFile, DiscoveryApplyOutcome,
-    DiscoveryApplyResult, DiscoveryReferenceResolution, DiscoveryReferenceSource,
+    ControlResponse, ControlResult, DiscoveryAppliedFile, DiscoveryApplyOutcome, DiscoveryApplyResult,
+    DiscoveryImport, DiscoveryImportDestination, DiscoveryReferenceResolution,
+    DiscoveryReferenceSource, DiscoverySourceDisposition,
     ProjectCheckoutCandidate, ProjectCheckoutDiscovery, ProjectCheckoutInventory, ProtectedFile,
     ProtectedFileVersion, SecretValue, SshConfigStatus, SshIdentity,
 };

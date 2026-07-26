@@ -109,11 +109,9 @@ struct DashboardView: View {
                     $0.kind == .sharedSecret && $0.shape == .scalar
                 },
                 apply: {
-                    files, projectAssignments, separateEntries, promoteEntries,
-                    demoteEntries in
+                    imports, separateEntries, promoteEntries, demoteEntries in
                     try await state.workspace.applyDiscovery(
-                        at: presentation.plan.paths, files: files,
-                        projectAssignments: projectAssignments,
+                        at: presentation.plan.paths, imports: imports,
                         separateEntries: separateEntries,
                         promoteEntries: promoteEntries,
                         demoteEntries: demoteEntries)
@@ -1704,12 +1702,18 @@ private struct DiscoveryProjectHeader: View {
     private var detail: String {
         guard let project = group.project else {
             return group.needsReview
-                ? "Choose the project that should own each file."
+                ? "Choose where each file should be imported."
                 : "No project is required for these files."
         }
         let ecosystems = project.ecosystems.joined(separator: " · ")
         return ecosystems.isEmpty ? project.path : "\(project.path) · \(ecosystems)"
     }
+}
+
+private enum DiscoveryDestinationChoice: Equatable {
+    case project(String)
+    case library(protectOriginal: Bool)
+    case projects(Set<String>, protectOriginal: Bool)
 }
 
 private struct DiscoveryReviewSheet: View {
@@ -1718,8 +1722,8 @@ private struct DiscoveryReviewSheet: View {
     let sharedSecrets: [WorkspaceResource]
     let apply:
         (
-            [String], [DiscoveryProjectAssignment], [DiscoverySeparateEntry],
-            [DiscoverySeparateEntry], [DiscoverySeparateEntry]
+            [DiscoveryImport], [DiscoverySeparateEntry], [DiscoverySeparateEntry],
+            [DiscoverySeparateEntry]
         ) async throws -> DiscoveryApplyResult
     let resolveReference:
         (String, String, DiscoveryReferenceSource) async throws
@@ -1729,7 +1733,7 @@ private struct DiscoveryReviewSheet: View {
     @State private var appliedResult: DiscoveryApplyResult?
     @State private var applyError: String?
     @State private var selectedFilePaths: Set<String>
-    @State private var assignedProjectPaths: [String: String]
+    @State private var destinations: [String: DiscoveryDestinationChoice]
     @State private var separateEntryIDs: Set<String> = []
     @State private var promotedEntryIDs: Set<String> = []
     @State private var demotedEntryIDs: Set<String> = []
@@ -1740,8 +1744,7 @@ private struct DiscoveryReviewSheet: View {
         plan: DiscoveryPlan,
         sharedSecrets: [WorkspaceResource],
         apply: @escaping (
-            [String], [DiscoveryProjectAssignment], [DiscoverySeparateEntry],
-            [DiscoverySeparateEntry],
+            [DiscoveryImport], [DiscoverySeparateEntry], [DiscoverySeparateEntry],
             [DiscoverySeparateEntry]
         ) async throws -> DiscoveryApplyResult,
         resolveReference: @escaping
@@ -1756,10 +1759,24 @@ private struct DiscoveryReviewSheet: View {
         self.openProject = openProject
         _selectedFilePaths = State(
             initialValue: Set(plan.files.filter(\.canApplyDiscovery).map(\.path)))
-        _assignedProjectPaths = State(
+        _destinations = State(
             initialValue: Dictionary(
                 uniqueKeysWithValues: plan.files.compactMap { file in
-                    file.assignment.projectPath.map { (file.path, $0) }
+                    guard file.canApplyDiscovery else { return nil }
+                    let destination: DiscoveryDestinationChoice?
+                    switch file.action {
+                    case .compose:
+                        destination = file.assignment.projectPath.map {
+                            .project($0)
+                        }
+                    case .protect:
+                        destination = .library(protectOriginal: true)
+                    case .importSshIdentity:
+                        destination = .library(protectOriginal: false)
+                    case .reference, .review:
+                        destination = nil
+                    }
+                    return destination.map { (file.path, $0) }
                 }))
     }
 
@@ -1796,7 +1813,7 @@ private struct DiscoveryReviewSheet: View {
         plan.files.filter {
             selectedFilePaths.contains($0.path)
                 && $0.action == .compose
-                && assignedProjectPaths[$0.path] == nil
+                && !destinationIsResolved(for: $0)
         }.count
     }
 
@@ -1854,9 +1871,9 @@ private struct DiscoveryReviewSheet: View {
                                 DiscoveryFileCard(
                                     file: file,
                                     projects: plan.projects,
-                                    projectPath: Binding(
-                                        get: { assignedProjectPaths[file.path] },
-                                        set: { assignedProjectPaths[file.path] = $0 }),
+                                    destination: Binding(
+                                        get: { destinations[file.path] },
+                                        set: { destinations[file.path] = $0 }),
                                     selected: Binding(
                                         get: { selectedFilePaths.contains(file.path) },
                                         set: { selected in
@@ -1987,7 +2004,7 @@ private struct DiscoveryReviewSheet: View {
         var notes = ["Static scan only; project code was not executed."]
         if hasUnresolvedAssignments {
             notes.append(
-                "\(needsReviewCount) selected file\(needsReviewCount == 1 ? "" : "s") need a project."
+                "\(needsReviewCount) selected file\(needsReviewCount == 1 ? "" : "s") need an import destination."
             )
         }
         let referenceCount = plan.files.filter { $0.action == .reference }.count
@@ -2018,6 +2035,79 @@ private struct DiscoveryReviewSheet: View {
         plan.projects.allSatisfy { $0.managedProjectID == nil } ? "items" : "changes"
     }
 
+    private func destinationIsResolved(for file: DiscoveredFile) -> Bool {
+        guard let destination = destinations[file.path] else { return false }
+        if case .projects(let projectPaths, _) = destination {
+            return !projectPaths.isEmpty
+        }
+        return true
+    }
+
+    private func discoveryImport(for file: DiscoveredFile) -> DiscoveryImport? {
+        switch file.action {
+        case .protect:
+            return DiscoveryImport(
+                path: file.path,
+                destination: .library,
+                sourceDisposition: .protectInPlace)
+        case .importSshIdentity:
+            let protectOriginal =
+                if case .library(let protectOriginal) = destinations[file.path] {
+                    protectOriginal
+                } else {
+                    false
+                }
+            return DiscoveryImport(
+                path: file.path,
+                destination: .library,
+                sourceDisposition: protectOriginal ? .protectInPlace : .leaveUnchanged)
+        case .compose:
+            guard let destination = destinations[file.path] else { return nil }
+            switch destination {
+            case .project(let projectPath):
+                return DiscoveryImport(
+                    path: file.path,
+                    destination: .projectOutput(
+                        projectPath: projectPath, outputPath: file.path),
+                    sourceDisposition: .replaceWithSurface)
+            case .library(let protectOriginal):
+                return DiscoveryImport(
+                    path: file.path,
+                    destination: .library,
+                    sourceDisposition: protectOriginal ? .protectInPlace : .leaveUnchanged)
+            case .projects(let projectPaths, let protectOriginal):
+                let outputs = projectPaths.sorted().map { projectPath in
+                    DiscoveryProjectOutput(
+                        projectPath: projectPath,
+                        outputPath: projectOutputPath(for: file, projectPath: projectPath))
+                }
+                guard !outputs.isEmpty else { return nil }
+                let replacesSource = outputs.contains {
+                    ($0.outputPath as NSString).standardizingPath
+                        == (file.path as NSString).standardizingPath
+                }
+                return DiscoveryImport(
+                    path: file.path,
+                    destination: .projectOutputs(outputs: outputs),
+                    sourceDisposition: replacesSource
+                        ? .replaceWithSurface
+                        : (protectOriginal ? .protectInPlace : .leaveUnchanged))
+            }
+        case .reference, .review:
+            return nil
+        }
+    }
+
+    private func projectOutputPath(
+        for file: DiscoveredFile, projectPath: String
+    ) -> String {
+        let relativePath =
+            file.kind == .awsCredentials
+                ? ".aws/credentials"
+                : (file.path as NSString).lastPathComponent
+        return (projectPath as NSString).appendingPathComponent(relativePath)
+    }
+
     private func applyDiscovery() {
         guard !isApplying else { return }
         isApplying = true
@@ -2036,14 +2126,9 @@ private struct DiscoveryReviewSheet: View {
                         }
                     }
                 }
-                let projectAssignments = selectedFiles.compactMap { file in
-                    assignedProjectPaths[file.path].map {
-                        DiscoveryProjectAssignment(path: file.path, projectPath: $0)
-                    }
-                }
+                let imports = selectedFiles.compactMap(discoveryImport)
                 appliedResult = try await apply(
-                    selectedFilePaths.sorted(),
-                    projectAssignments,
+                    imports,
                     entriesMatching(separateEntryIDs),
                     entriesMatching(promotedEntryIDs),
                     entriesMatching(demotedEntryIDs))
@@ -2367,7 +2452,7 @@ private struct SummaryMetric: View {
 private struct DiscoveryFileCard: View {
     let file: DiscoveredFile
     let projects: [DiscoveredProject]
-    @Binding var projectPath: String?
+    @Binding var destination: DiscoveryDestinationChoice?
     @Binding var selected: Bool
     let result: DiscoveryAppliedFile?
     let locked: Bool
@@ -2402,28 +2487,74 @@ private struct DiscoveryFileCard: View {
                 Spacer()
                 if file.action == .compose {
                     Menu {
-                        ForEach(projectChoices, id: \.path) { project in
+                        Section("Project Output") {
+                            ForEach(projectChoices, id: \.path) { project in
+                                Button {
+                                    destination = .project(project.path)
+                                } label: {
+                                    if assignedProject?.path == project.path {
+                                        Label(project.name, systemImage: "checkmark")
+                                    } else {
+                                        Text(project.name)
+                                    }
+                                }
+                            }
+                        }
+                        Divider()
+                        Button {
+                            destination = .library(protectOriginal: true)
+                        } label: {
+                            if case .library = destination {
+                                Label("Library", systemImage: "checkmark")
+                            } else {
+                                Text("Library")
+                            }
+                        }
+                        Menu("Share with Projects") {
+                            ForEach(projects, id: \.path) { project in
+                                Button {
+                                    toggleSharedProject(project.path)
+                                } label: {
+                                    if sharedProjectPaths.contains(project.path) {
+                                        Label(project.name, systemImage: "checkmark")
+                                    } else {
+                                        Text(project.name)
+                                    }
+                                }
+                            }
+                        }
+                        if canChooseOriginalDisposition {
+                            Divider()
                             Button {
-                                projectPath = project.path
+                                setProtectOriginal(true)
                             } label: {
-                                if projectPath == project.path {
-                                    Label(project.name, systemImage: "checkmark")
+                                if protectsOriginal {
+                                    Label("Protect Original", systemImage: "checkmark")
                                 } else {
-                                    Text(project.name)
+                                    Text("Protect Original")
+                                }
+                            }
+                            Button {
+                                setProtectOriginal(false)
+                            } label: {
+                                if !protectsOriginal {
+                                    Label("Leave Original Unchanged", systemImage: "checkmark")
+                                } else {
+                                    Text("Leave Original Unchanged")
                                 }
                             }
                         }
                     } label: {
                         Label(
-                            assignedProject?.name ?? "Choose Project",
-                            systemImage: "folder")
+                            destinationTitle,
+                            systemImage: destinationIcon)
                             .font(.caption.weight(.medium))
                             .foregroundStyle(
-                                assignedProject == nil ? Color.orange : Color.secondary)
+                                destination == nil ? Color.orange : Color.secondary)
                     }
                     .menuStyle(.borderlessButton)
                     .fixedSize()
-                    .disabled(locked || projectChoices.isEmpty)
+                    .disabled(locked)
                 }
                 Text(statusTitle)
                     .font(.caption.weight(.medium))
@@ -2466,8 +2597,90 @@ private struct DiscoveryFileCard: View {
     }
 
     private var assignedProject: DiscoveredProject? {
-        guard let projectPath else { return nil }
+        guard case .project(let projectPath) = destination else { return nil }
         return projects.first { $0.path == projectPath }
+    }
+
+    private var sharedProjectPaths: Set<String> {
+        guard case .projects(let paths, _) = destination else { return [] }
+        return paths
+    }
+
+    private var destinationTitle: String {
+        switch destination {
+        case .project(let path):
+            return projects.first { $0.path == path }?.name ?? "Project Output"
+        case .library:
+            return "Library"
+        case .projects(let paths, _):
+            return paths.isEmpty
+                ? "Choose Projects"
+                : "Share with \(paths.count) Project\(paths.count == 1 ? "" : "s")"
+        case nil:
+            return "Choose Destination"
+        }
+    }
+
+    private var destinationIcon: String {
+        switch destination {
+        case .library: "books.vertical"
+        case .projects: "folder.badge.plus"
+        case .project, nil: "folder"
+        }
+    }
+
+    private var protectsOriginal: Bool {
+        switch destination {
+        case .library(let protectOriginal), .projects(_, let protectOriginal):
+            protectOriginal
+        case .project, nil:
+            false
+        }
+    }
+
+    private var canChooseOriginalDisposition: Bool {
+        switch destination {
+        case .library:
+            true
+        case .projects(let paths, _):
+            !paths.contains { projectOutputPath(for: $0) == standardizedSourcePath }
+        case .project, nil:
+            false
+        }
+    }
+
+    private var standardizedSourcePath: String {
+        (file.path as NSString).standardizingPath
+    }
+
+    private func projectOutputPath(for projectPath: String) -> String {
+        let relativePath =
+            file.kind == .awsCredentials
+                ? ".aws/credentials"
+                : (file.path as NSString).lastPathComponent
+        return ((projectPath as NSString).appendingPathComponent(relativePath) as NSString)
+            .standardizingPath
+    }
+
+    private func toggleSharedProject(_ projectPath: String) {
+        var paths = sharedProjectPaths
+        if paths.contains(projectPath) {
+            paths.remove(projectPath)
+        } else {
+            paths.insert(projectPath)
+        }
+        destination = .projects(paths, protectOriginal: protectsOriginal || paths.count == 1)
+    }
+
+    private func setProtectOriginal(_ protectOriginal: Bool) {
+        switch destination {
+        case .library:
+            destination = .library(protectOriginal: protectOriginal)
+        case .projects(let paths, _):
+            destination = .projects(paths, protectOriginal: protectOriginal)
+        case .project, nil:
+            break
+        }
     }
 
     private var detail: String {
@@ -2535,8 +2748,8 @@ private struct DiscoveryFileCard: View {
         if file.action == .compose && file.entries.isEmpty {
             return "No statically importable values were found."
         }
-        if file.action == .compose && assignedProject == nil {
-            return "Choose which discovered project should own this output."
+        if file.action == .compose && destination == nil {
+            return "Choose a project output, Library, or multiple projects."
         }
         return selected ? "Include in this import" : "Leave this file unchanged"
     }

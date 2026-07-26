@@ -581,14 +581,80 @@ struct DiscoverySeparateEntry: Codable, Hashable, Sendable {
     let address: String
 }
 
-struct DiscoveryProjectAssignment: Codable, Hashable, Sendable {
+struct DiscoveryImport: Codable, Hashable, Sendable {
     let path: String
-    let projectPath: String
+    let destination: DiscoveryImportDestination
+    let sourceDisposition: DiscoverySourceDisposition
 
     enum CodingKeys: String, CodingKey {
-        case path
-        case projectPath = "project_path"
+        case path, destination
+        case sourceDisposition = "source_disposition"
     }
+}
+
+struct DiscoveryProjectOutput: Codable, Hashable, Sendable {
+    let projectPath: String
+    let outputPath: String
+
+    enum CodingKeys: String, CodingKey {
+        case projectPath = "project_path"
+        case outputPath = "output_path"
+    }
+}
+
+enum DiscoveryImportDestination: Codable, Hashable, Sendable {
+    case projectOutput(projectPath: String, outputPath: String)
+    case library
+    case projectOutputs(outputs: [DiscoveryProjectOutput])
+
+    private enum CodingKeys: String, CodingKey {
+        case type
+        case projectPath = "project_path"
+        case outputPath = "output_path"
+        case outputs
+    }
+
+    private enum Kind: String, Codable {
+        case projectOutput = "project_output"
+        case library
+        case projectOutputs = "project_outputs"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(Kind.self, forKey: .type) {
+        case .projectOutput:
+            self = .projectOutput(
+                projectPath: try container.decode(String.self, forKey: .projectPath),
+                outputPath: try container.decode(String.self, forKey: .outputPath))
+        case .library:
+            self = .library
+        case .projectOutputs:
+            self = .projectOutputs(
+                outputs: try container.decode([DiscoveryProjectOutput].self, forKey: .outputs))
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .projectOutput(let projectPath, let outputPath):
+            try container.encode(Kind.projectOutput, forKey: .type)
+            try container.encode(projectPath, forKey: .projectPath)
+            try container.encode(outputPath, forKey: .outputPath)
+        case .library:
+            try container.encode(Kind.library, forKey: .type)
+        case .projectOutputs(let outputs):
+            try container.encode(Kind.projectOutputs, forKey: .type)
+            try container.encode(outputs, forKey: .outputs)
+        }
+    }
+}
+
+enum DiscoverySourceDisposition: String, Codable, Hashable, Sendable {
+    case replaceWithSurface = "replace_with_surface"
+    case protectInPlace = "protect_in_place"
+    case leaveUnchanged = "leave_unchanged"
 }
 
 struct DiscoveredSshIdentity: Codable, Hashable, Sendable {
@@ -654,8 +720,7 @@ enum ControlCommand: Sendable {
     case snapshot
     case discover(paths: [String])
     case discoverApply(
-        paths: [String], files: [String],
-        projectAssignments: [DiscoveryProjectAssignment],
+        paths: [String], imports: [DiscoveryImport],
         separateEntries: [DiscoverySeparateEntry],
         promoteEntries: [DiscoverySeparateEntry], demoteEntries: [DiscoverySeparateEntry])
     case discoverReferenceResolve(
@@ -777,13 +842,13 @@ enum ControlCommand: Sendable {
                     requestID: requestID, method: method,
                     params: DiscoverParams(paths: paths)))
         case .discoverApply(
-            let paths, let files, let projectAssignments, let separateEntries,
+            let paths, let imports, let separateEntries,
             let promoteEntries, let demoteEntries):
             return try encoder.encode(
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: DiscoverApplyParams(
-                        paths: paths, files: files, projectAssignments: projectAssignments,
+                        paths: paths, imports: imports,
                         separateEntries: separateEntries,
                         promoteEntries: promoteEntries, demoteEntries: demoteEntries)))
         case .discoverReferenceResolve(let surfaceID, let key, let source):
@@ -932,14 +997,12 @@ private struct AccessHistoryParams: Encodable { let limit: Int }
 private struct DiscoverParams: Encodable { let paths: [String] }
 private struct DiscoverApplyParams: Encodable {
     let paths: [String]
-    let files: [String]
-    let projectAssignments: [DiscoveryProjectAssignment]
+    let imports: [DiscoveryImport]
     let separateEntries: [DiscoverySeparateEntry]
     let promoteEntries: [DiscoverySeparateEntry]
     let demoteEntries: [DiscoverySeparateEntry]
     enum CodingKeys: String, CodingKey {
-        case paths, files
-        case projectAssignments = "project_assignments"
+        case paths, imports
         case separateEntries = "separate_entries"
         case promoteEntries = "promote_entries"
         case demoteEntries = "demote_entries"

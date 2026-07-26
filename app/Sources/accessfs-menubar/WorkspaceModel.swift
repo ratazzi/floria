@@ -817,8 +817,7 @@ final class WorkspaceStore {
     }
 
     func applyDiscovery(
-        at paths: [String], files: [String],
-        projectAssignments: [DiscoveryProjectAssignment],
+        at paths: [String], imports: [DiscoveryImport],
         separateEntries: [DiscoverySeparateEntry],
         promoteEntries: [DiscoverySeparateEntry] = [],
         demoteEntries: [DiscoverySeparateEntry] = []
@@ -831,14 +830,31 @@ final class WorkspaceStore {
                     address: $0.address)
             }
         }
+        let standardizedImports = imports.map { item in
+            let destination: DiscoveryImportDestination
+            switch item.destination {
+            case .projectOutput(let projectPath, let outputPath):
+                destination = .projectOutput(
+                    projectPath: (projectPath as NSString).standardizingPath,
+                    outputPath: (outputPath as NSString).standardizingPath)
+            case .library:
+                destination = .library
+            case .projectOutputs(let outputs):
+                destination = .projectOutputs(
+                    outputs: outputs.map {
+                        DiscoveryProjectOutput(
+                            projectPath: ($0.projectPath as NSString).standardizingPath,
+                            outputPath: ($0.outputPath as NSString).standardizingPath)
+                    })
+            }
+            return DiscoveryImport(
+                path: (item.path as NSString).standardizingPath,
+                destination: destination,
+                sourceDisposition: item.sourceDisposition)
+        }
         let result = try await controlClient.applyDiscovery(
             paths: paths.map { ($0 as NSString).standardizingPath },
-            files: files.map { ($0 as NSString).standardizingPath },
-            projectAssignments: projectAssignments.map {
-                DiscoveryProjectAssignment(
-                    path: ($0.path as NSString).standardizingPath,
-                    projectPath: ($0.projectPath as NSString).standardizingPath)
-            },
+            imports: standardizedImports,
             separateEntries: standardized(separateEntries),
             promoteEntries: standardized(promoteEntries),
             demoteEntries: standardized(demoteEntries))

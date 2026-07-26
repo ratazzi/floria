@@ -73,14 +73,25 @@ final class ControlProtocolTests: XCTestCase {
         encoder.keyEncodingStrategy = .convertToSnakeCase
         let data = try ControlCommand.discoverApply(
             paths: ["/fixture/project"],
-            files: ["/fixture/project/.env", "/fixture/project/.env.production"],
-            projectAssignments: [
-                DiscoveryProjectAssignment(
+            imports: [
+                DiscoveryImport(
                     path: "/fixture/project/.env",
-                    projectPath: "/fixture/project"),
-                DiscoveryProjectAssignment(
+                    destination: .projectOutput(
+                        projectPath: "/fixture/project",
+                        outputPath: "/fixture/project/.env"),
+                    sourceDisposition: .replaceWithSurface),
+                DiscoveryImport(
                     path: "/fixture/project/.env.production",
-                    projectPath: "/fixture/project"),
+                    destination: .projectOutputs(
+                        outputs: [
+                            DiscoveryProjectOutput(
+                                projectPath: "/fixture/project",
+                                outputPath: "/fixture/project/.env.production"),
+                            DiscoveryProjectOutput(
+                                projectPath: "/fixture/worker",
+                                outputPath: "/fixture/worker/.env.production"),
+                        ]),
+                    sourceDisposition: .replaceWithSurface),
             ],
             separateEntries: [
                 DiscoverySeparateEntry(
@@ -96,9 +107,16 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(
             (request["params"] as? [String: Any])?["paths"] as? [String],
             ["/fixture/project"])
+        let imports = try XCTUnwrap(
+            (request["params"] as? [String: Any])?["imports"] as? [[String: Any]])
+        XCTAssertEqual(imports.count, 2)
         XCTAssertEqual(
-            (request["params"] as? [String: Any])?["files"] as? [String],
-            ["/fixture/project/.env", "/fixture/project/.env.production"])
+            (imports[0]["destination"] as? [String: Any])?["type"] as? String,
+            "project_output")
+        XCTAssertEqual(imports[0]["source_disposition"] as? String, "replace_with_surface")
+        XCTAssertEqual(
+            (imports[1]["destination"] as? [String: Any])?["type"] as? String,
+            "project_outputs")
         let separateEntries = try XCTUnwrap(
             (request["params"] as? [String: Any])?["separate_entries"]
                 as? [[String: String]])

@@ -65,9 +65,7 @@ pub enum ControlCommand {
     Discover { paths: Vec<PathBuf> },
     DiscoverApply {
         paths: Vec<PathBuf>,
-        files: Option<Vec<PathBuf>>,
-        #[serde(default)]
-        project_assignments: Vec<DiscoveryProjectAssignment>,
+        imports: Option<Vec<DiscoveryImport>>,
         separate_entries: Vec<DiscoveryEntryRef>,
         /// Review overrides: import these plain-classified entries as secrets.
         #[serde(default)]
@@ -297,10 +295,38 @@ pub struct DiscoveryApplyResult {
     pub files: Vec<DiscoveryAppliedFile>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct DiscoveryProjectAssignment {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveryImport {
     pub path: PathBuf,
+    pub destination: DiscoveryImportDestination,
+    pub source_disposition: DiscoverySourceDisposition,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DiscoveryImportDestination {
+    ProjectOutput {
+        project_path: PathBuf,
+        output_path: PathBuf,
+    },
+    Library,
+    ProjectOutputs {
+        outputs: Vec<DiscoveryProjectOutput>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DiscoveryProjectOutput {
     pub project_path: PathBuf,
+    pub output_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoverySourceDisposition {
+    ReplaceWithSurface,
+    ProtectInPlace,
+    LeaveUnchanged,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -651,11 +677,14 @@ mod tests {
             request_id: 13,
             command: ControlCommand::DiscoverApply {
                 paths: vec![PathBuf::from("/fixture/project")],
-                files: Some(vec![PathBuf::from("/fixture/project/.env")]),
-                project_assignments: vec![DiscoveryProjectAssignment {
+                imports: Some(vec![DiscoveryImport {
                     path: PathBuf::from("/fixture/project/.env"),
-                    project_path: PathBuf::from("/fixture/project"),
-                }],
+                    destination: DiscoveryImportDestination::ProjectOutput {
+                        project_path: PathBuf::from("/fixture/project"),
+                        output_path: PathBuf::from("/fixture/project/.env"),
+                    },
+                    source_disposition: DiscoverySourceDisposition::ReplaceWithSurface,
+                }]),
                 separate_entries: vec![DiscoveryEntryRef {
                     path: PathBuf::from("/fixture/project/.env"),
                     address: "keys/API_TOKEN".to_string(),
@@ -672,8 +701,16 @@ mod tests {
             serde_json::json!(["/fixture/project"])
         );
         assert_eq!(
-            value["params"]["files"],
-            serde_json::json!(["/fixture/project/.env"])
+            value["params"]["imports"],
+            serde_json::json!([{
+                "path": "/fixture/project/.env",
+                "destination": {
+                    "type": "project_output",
+                    "project_path": "/fixture/project",
+                    "output_path": "/fixture/project/.env"
+                },
+                "source_disposition": "replace_with_surface"
+            }])
         );
         assert_eq!(
             value["params"]["separate_entries"],

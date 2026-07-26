@@ -12,7 +12,7 @@
     use accessfs_store::{
         SecretOrigin, SecretRecord, StoreResult, VersionRecord,
     };
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -52,6 +52,48 @@
                 heads: Mutex::new(HashMap::new()),
                 get_calls: AtomicUsize::new(0),
             }
+        }
+    }
+
+    fn project_output_import(path: &Path, project_path: &Path) -> DiscoveryImport {
+        DiscoveryImport {
+            path: path.to_path_buf(),
+            destination: DiscoveryImportDestination::ProjectOutput {
+                project_path: project_path.to_path_buf(),
+                output_path: path.to_path_buf(),
+            },
+            source_disposition: DiscoverySourceDisposition::ReplaceWithSurface,
+        }
+    }
+
+    fn library_import(
+        path: &Path,
+        source_disposition: DiscoverySourceDisposition,
+    ) -> DiscoveryImport {
+        DiscoveryImport {
+            path: path.to_path_buf(),
+            destination: DiscoveryImportDestination::Library,
+            source_disposition,
+        }
+    }
+
+    fn project_outputs_import(
+        path: &Path,
+        outputs: Vec<(&Path, &Path)>,
+        source_disposition: DiscoverySourceDisposition,
+    ) -> DiscoveryImport {
+        DiscoveryImport {
+            path: path.to_path_buf(),
+            destination: DiscoveryImportDestination::ProjectOutputs {
+                outputs: outputs
+                    .into_iter()
+                    .map(|(project_path, output_path)| crate::protocol::DiscoveryProjectOutput {
+                        project_path: project_path.to_path_buf(),
+                        output_path: output_path.to_path_buf(),
+                    })
+                    .collect(),
+            },
+            source_disposition,
         }
     }
 
@@ -641,8 +683,7 @@
             },
             ControlCommand::DiscoverApply {
                 paths: vec![project_path.clone()],
-                files: Some(vec![source_path.clone()]),
-                project_assignments: Vec::new(),
+                imports: Some(vec![project_output_import(&source_path, &project_path)]),
                 separate_entries: Vec::new(),
                 promote_entries: Vec::new(),
                 demote_entries: Vec::new(),
@@ -702,8 +743,10 @@
             },
             ControlCommand::DiscoverApply {
                 paths: vec![project_path],
-                files: Some(vec![source_path.clone()]),
-                project_assignments: Vec::new(),
+                imports: Some(vec![library_import(
+                    &source_path,
+                    DiscoverySourceDisposition::ProtectInPlace,
+                )]),
                 separate_entries: Vec::new(),
                 promote_entries: Vec::new(),
                 demote_entries: Vec::new(),
@@ -768,15 +811,11 @@
             },
             ControlCommand::DiscoverApply {
                 paths: vec![workspace_path.clone()],
-                files: Some(vec![
-                    first_source_path.clone(),
-                    second_source_path.clone(),
-                    shared_source_path.clone(),
+                imports: Some(vec![
+                    project_output_import(&first_source_path, &first_project_path),
+                    project_output_import(&second_source_path, &second_project_path),
+                    project_output_import(&shared_source_path, &workspace_path),
                 ]),
-                project_assignments: vec![crate::protocol::DiscoveryProjectAssignment {
-                    path: shared_source_path.clone(),
-                    project_path: workspace_path.clone(),
-                }],
                 separate_entries: Vec::new(),
                 promote_entries: Vec::new(),
                 demote_entries: Vec::new(),
@@ -809,6 +848,127 @@
     }
 
     #[test]
+    fn discovery_apply_imports_composable_content_into_the_library_without_a_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("fixture-project");
+        let source_path = project_path.join(".env");
+        let mount_path = dir.path().join("mount");
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
+        std::fs::create_dir_all(&mount_path).unwrap();
+        std::fs::write(&source_path, "DISCOVERED_TOKEN=fixture-library-value\n").unwrap();
+        let source_bytes = std::fs::read(&source_path).unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let store = FixtureStore::new();
+
+        let applied = dispatch(
+            &catalog,
+            DispatchServices {
+                store: Some(&store),
+                mount_path: Some(&mount_path),
+                ..DispatchServices::default()
+            },
+            ControlCommand::DiscoverApply {
+                paths: vec![project_path],
+                imports: Some(vec![library_import(
+                    &source_path,
+                    DiscoverySourceDisposition::LeaveUnchanged,
+                )]),
+                separate_entries: Vec::new(),
+                promote_entries: Vec::new(),
+                demote_entries: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let ControlResult::DiscoveryApplied(result) = applied else {
+            panic!("expected discovery apply result");
+        };
+        assert!(result.project_ids.is_empty());
+        assert_eq!(result.created_resources, 1);
+        assert_eq!(result.files[0].outcome, DiscoveryApplyOutcome::Imported);
+        assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
+        let snapshot = catalog.snapshot().unwrap();
+        assert!(snapshot.projects.is_empty());
+        assert!(snapshot.environments.is_empty());
+        assert_eq!(snapshot.resources.len(), 1);
+        assert!(snapshot.bindings.is_empty());
+        assert!(snapshot.surfaces.is_empty());
+        assert_eq!(snapshot.resources[0].kind, ResourceKind::SharedSecret);
+        assert_eq!(snapshot.resources[0].origin.sources[0].project_id, None);
+    }
+
+    #[test]
+    fn discovery_apply_materializes_once_and_shares_outputs_across_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_path = dir.path().join("workspace");
+        let first_project_path = workspace_path.join("first-project");
+        let second_project_path = workspace_path.join("second-project");
+        let source_path = workspace_path.join(".env.shared");
+        let first_output_path = first_project_path.join(".env.shared");
+        let second_output_path = second_project_path.join(".env.shared");
+        let mount_path = dir.path().join("mount");
+        std::fs::create_dir_all(first_project_path.join(".git")).unwrap();
+        std::fs::create_dir_all(second_project_path.join(".git")).unwrap();
+        std::fs::create_dir_all(mount_path.join(accessfs_core::config::SURFACES_DIR)).unwrap();
+        std::fs::write(&source_path, "DISCOVERED_TOKEN=fixture-shared-value\n").unwrap();
+        let source_bytes = std::fs::read(&source_path).unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let store = FixtureStore::new();
+
+        let applied = dispatch(
+            &catalog,
+            DispatchServices {
+                store: Some(&store),
+                mount_path: Some(&mount_path),
+                ..DispatchServices::default()
+            },
+            ControlCommand::DiscoverApply {
+                paths: vec![workspace_path],
+                imports: Some(vec![project_outputs_import(
+                    &source_path,
+                    vec![
+                        (&first_project_path, &first_output_path),
+                        (&second_project_path, &second_output_path),
+                    ],
+                    DiscoverySourceDisposition::LeaveUnchanged,
+                )]),
+                separate_entries: Vec::new(),
+                promote_entries: Vec::new(),
+                demote_entries: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let ControlResult::DiscoveryApplied(result) = applied else {
+            panic!("expected discovery apply result");
+        };
+        assert_eq!(result.project_ids.len(), 2);
+        assert_eq!(result.created_resources, 1);
+        assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes);
+        for output_path in [&first_output_path, &second_output_path] {
+            assert!(std::fs::symlink_metadata(output_path)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+        let snapshot = catalog.snapshot().unwrap();
+        assert_eq!(snapshot.projects.len(), 2);
+        assert_eq!(snapshot.environments.len(), 2);
+        assert_eq!(snapshot.resources.len(), 1);
+        assert_eq!(snapshot.bindings.len(), 2);
+        assert_eq!(snapshot.surfaces.len(), 2);
+        assert_eq!(
+            snapshot
+                .bindings
+                .iter()
+                .map(|binding| binding.resource_id.as_str())
+                .collect::<HashSet<_>>()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn discovery_apply_splits_plain_values_into_an_env_file_with_origins() {
         let dir = tempfile::tempdir().unwrap();
         let project_path = dir.path().join("fixture-project");
@@ -832,9 +992,8 @@
                 ..DispatchServices::default()
             },
             ControlCommand::DiscoverApply {
-                paths: vec![project_path],
-                files: Some(vec![source_path.clone()]),
-                project_assignments: Vec::new(),
+                paths: vec![project_path.clone()],
+                imports: Some(vec![project_output_import(&source_path, &project_path)]),
                 separate_entries: Vec::new(),
                 promote_entries: Vec::new(),
                 demote_entries: Vec::new(),
@@ -904,9 +1063,8 @@
                 ..DispatchServices::default()
             },
             ControlCommand::DiscoverApply {
-                paths: vec![project_path],
-                files: Some(vec![source_path.clone()]),
-                project_assignments: Vec::new(),
+                paths: vec![project_path.clone()],
+                imports: Some(vec![project_output_import(&source_path, &project_path)]),
                 separate_entries: Vec::new(),
                 promote_entries: vec![crate::protocol::DiscoveryEntryRef {
                     path: source_path.clone(),
@@ -977,9 +1135,8 @@
                 ..DispatchServices::default()
             },
             ControlCommand::DiscoverApply {
-                paths: vec![project_path],
-                files: Some(vec![source_path.clone()]),
-                project_assignments: Vec::new(),
+                paths: vec![project_path.clone()],
+                imports: Some(vec![project_output_import(&source_path, &project_path)]),
                 separate_entries: Vec::new(),
                 promote_entries: Vec::new(),
                 demote_entries: Vec::new(),
@@ -1015,9 +1172,8 @@
                 ..DispatchServices::default()
             },
             ControlCommand::DiscoverApply {
-                paths: vec![project_path],
-                files: Some(vec![production_path.clone()]),
-                project_assignments: Vec::new(),
+                paths: vec![project_path.clone()],
+                imports: Some(vec![project_output_import(&production_path, &project_path)]),
                 separate_entries: Vec::new(),
                 promote_entries: Vec::new(),
                 demote_entries: Vec::new(),
@@ -1066,8 +1222,7 @@
             },
             ControlCommand::DiscoverApply {
                 paths: vec![project_path.clone()],
-                files: None,
-                project_assignments: Vec::new(),
+                imports: None,
                 separate_entries: Vec::new(),
                 promote_entries: Vec::new(),
                 demote_entries: Vec::new(),
@@ -1084,9 +1239,7 @@
             .is_symlink());
         assert!(std::fs::symlink_metadata(&reference_path).unwrap().is_file());
         assert_eq!(std::fs::read(&reference_path).unwrap(), reference_bytes);
-        assert!(result.files.iter().any(|file| {
-            file.path == reference_path && file.outcome == DiscoveryApplyOutcome::Skipped
-        }));
+        assert!(!result.files.iter().any(|file| file.path == reference_path));
         let snapshot = catalog.snapshot().unwrap();
         assert_eq!(snapshot.resources.len(), 1);
         assert_eq!(snapshot.surfaces.len(), 1);
@@ -1231,9 +1384,11 @@
                 ..DispatchServices::default()
             },
             ControlCommand::DiscoverApply {
-                paths: vec![project_path],
-                files: Some(vec![development_path, production_path]),
-                project_assignments: Vec::new(),
+                paths: vec![project_path.clone()],
+                imports: Some(vec![
+                    project_output_import(&development_path, &project_path),
+                    project_output_import(&production_path, &project_path),
+                ]),
                 separate_entries: Vec::new(),
                 promote_entries: Vec::new(),
                 demote_entries: Vec::new(),
@@ -1282,9 +1437,11 @@
                 ..DispatchServices::default()
             },
             ControlCommand::DiscoverApply {
-                paths: vec![project_path],
-                files: Some(vec![development_path, production_path.clone()]),
-                project_assignments: Vec::new(),
+                paths: vec![project_path.clone()],
+                imports: Some(vec![
+                    project_output_import(&development_path, &project_path),
+                    project_output_import(&production_path, &project_path),
+                ]),
                 separate_entries: vec![crate::protocol::DiscoveryEntryRef {
                     path: production_path,
                     address: "keys/DISCOVERED_TOKEN".to_string(),
@@ -1327,8 +1484,10 @@
             },
             ControlCommand::DiscoverApply {
                 paths: vec![project_path.clone()],
-                files: Some(vec![project_path.join(".env.not-reviewed")]),
-                project_assignments: Vec::new(),
+                imports: Some(vec![project_output_import(
+                    &project_path.join(".env.not-reviewed"),
+                    &project_path,
+                )]),
                 separate_entries: Vec::new(),
                 promote_entries: Vec::new(),
                 demote_entries: Vec::new(),
@@ -1374,9 +1533,11 @@
                 ..DispatchServices::default()
             },
             ControlCommand::DiscoverApply {
-                paths: vec![project_path],
-                files: Some(vec![dotenv_path.clone(), ssh_path.clone()]),
-                project_assignments: Vec::new(),
+                paths: vec![project_path.clone()],
+                imports: Some(vec![
+                    project_output_import(&dotenv_path, &project_path),
+                    library_import(&ssh_path, DiscoverySourceDisposition::LeaveUnchanged),
+                ]),
                 separate_entries: Vec::new(),
                 promote_entries: Vec::new(),
                 demote_entries: Vec::new(),
@@ -1431,9 +1592,8 @@
                 ..DispatchServices::default()
             },
             ControlCommand::DiscoverApply {
-                paths: vec![project_path],
-                files: Some(vec![source_path.clone()]),
-                project_assignments: Vec::new(),
+                paths: vec![project_path.clone()],
+                imports: Some(vec![project_output_import(&source_path, &project_path)]),
                 separate_entries: Vec::new(),
                 promote_entries: Vec::new(),
                 demote_entries: Vec::new(),

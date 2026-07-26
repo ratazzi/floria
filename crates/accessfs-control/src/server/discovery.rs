@@ -6,8 +6,7 @@ pub(super) fn apply_discovery(
     store: &dyn SecretStore,
     mount_path: &Path,
     paths: &[PathBuf],
-    selected_files: Option<&[PathBuf]>,
-    project_assignments: &[crate::protocol::DiscoveryProjectAssignment],
+    reviewed_imports: Option<&[DiscoveryImport]>,
     separate_entries: &[crate::protocol::DiscoveryEntryRef],
     promote_entries: &[crate::protocol::DiscoveryEntryRef],
     demote_entries: &[crate::protocol::DiscoveryEntryRef],
@@ -18,25 +17,7 @@ pub(super) fn apply_discovery(
     let mut existing = existing_discovery_secrets(catalog, store, &candidate_keys)?;
     let plan = discovery.plan(&existing);
     let mut contents = discovery.into_contents();
-    if let Some(selected_files) = selected_files {
-        if selected_files.is_empty() {
-            return Err(DispatchError::Validation(
-                "select at least one discovered file to import".to_string(),
-            ));
-        }
-        let mut selected = selected_files.iter().cloned().collect::<HashSet<_>>();
-        contents.retain(|file| selected.remove(&file.path));
-        if !selected.is_empty() {
-            return Err(DispatchError::Validation(format!(
-                "selected file was not part of the reviewed discovery: {}",
-                selected
-                    .iter()
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )));
-        }
-    }
+    let imports = resolve_discovery_imports(&contents, reviewed_imports)?;
     let valid_project_paths = plan
         .projects
         .iter()
@@ -44,44 +25,27 @@ pub(super) fn apply_discovery(
         .collect::<HashSet<_>>();
     let valid_file_paths =
         contents.iter().map(|file| file.path.clone()).collect::<HashSet<_>>();
-    let mut explicit_assignments = HashMap::<PathBuf, PathBuf>::new();
-    for assignment in project_assignments {
-        if !valid_file_paths.contains(&assignment.path) {
+    let mut imports_by_path = HashMap::<PathBuf, DiscoveryImport>::new();
+    for import in imports {
+        if !valid_file_paths.contains(&import.path) {
             return Err(DispatchError::Validation(format!(
-                "project assignment file was not part of the reviewed discovery: {}",
-                assignment.path.display()
+                "import file was not part of the reviewed discovery: {}",
+                import.path.display()
             )));
         }
-        if !valid_project_paths.contains(&assignment.project_path) {
+        let file = contents
+            .iter()
+            .find(|file| file.path == import.path)
+            .expect("validated discovered file");
+        validate_discovery_import(file, &import, &valid_project_paths)?;
+        if imports_by_path.insert(import.path.clone(), import).is_some() {
             return Err(DispatchError::Validation(format!(
-                "project assignment target was not part of the reviewed discovery: {}",
-                assignment.project_path.display()
-            )));
-        }
-        if explicit_assignments
-            .insert(assignment.path.clone(), assignment.project_path.clone())
-            .is_some()
-        {
-            return Err(DispatchError::Validation(format!(
-                "project assignment was provided more than once: {}",
-                assignment.path.display()
-            )));
-        }
-    }
-    for file in &mut contents {
-        if let Some(project_path) = explicit_assignments.get(&file.path) {
-            file.assignment.project_path = Some(project_path.clone());
-            file.assignment.state = accessfs_discover::ProjectAssignmentState::Assigned;
-        }
-        if file.action == DiscoveredFileAction::Compose
-            && file.assignment.project_path.is_none()
-        {
-            return Err(DispatchError::Validation(format!(
-                "choose a project for {} before importing it",
+                "import destination was provided more than once: {}",
                 file.path.display()
             )));
         }
     }
+    contents.retain(|file| imports_by_path.contains_key(&file.path));
     let valid_override_entries = contents
         .iter()
         .filter(|file| {
@@ -120,10 +84,10 @@ pub(super) fn apply_discovery(
             )));
         }
     }
-    let required_project_paths = contents
-        .iter()
-        .filter(|file| file.action == DiscoveredFileAction::Compose)
-        .filter_map(|file| file.assignment.project_path.clone())
+    let required_project_paths = imports_by_path
+        .values()
+        .flat_map(|import| import_project_paths(&import.destination))
+        .cloned()
         .collect::<HashSet<_>>();
     let mut project_states = HashMap::<PathBuf, (String, bool)>::new();
     for project_path in &required_project_paths {
@@ -158,6 +122,9 @@ pub(super) fn apply_discovery(
     let mut composed_success = HashSet::<PathBuf>::new();
 
     for file in contents {
+        let import = imports_by_path
+            .remove(&file.path)
+            .expect("selected discovery import");
         if file.action == DiscoveredFileAction::Compose && !file.warnings.is_empty() {
             result.files.push(DiscoveryAppliedFile {
                 path: file.path,
@@ -169,13 +136,8 @@ pub(super) fn apply_discovery(
         }
 
         let file_path = file.path.clone();
-        let assigned_project_path = file.assignment.project_path.clone();
-        let assigned_project_id = assigned_project_path
-            .as_ref()
-            .and_then(|path| project_states.get(path))
-            .map(|(id, _)| id.clone());
         let existing_len = existing.len();
-        let applied = (|| -> Result<bool, DispatchError> {
+        let applied = (|| -> Result<Vec<PathBuf>, DispatchError> {
             match file.action {
                 DiscoveredFileAction::Protect => {
                     let protected = protect_file(catalog, store, mount_path, &file.path)?;
@@ -190,7 +152,7 @@ pub(super) fn apply_discovery(
                             outcome: DiscoveryApplyOutcome::Protected,
                             detail: "Protected as a read-only audited file".to_string(),
                         });
-                        Ok(false)
+                        Ok(Vec::new())
                     }
                 }
                 DiscoveredFileAction::ImportSshIdentity => {
@@ -216,67 +178,101 @@ pub(super) fn apply_discovery(
                             kind: OriginKind::Discovered,
                             sources: vec![OriginSource {
                                 path: file.path.clone(),
-                                project_id: assigned_project_id.clone(),
+                                project_id: None,
                                 environment: None,
                                 imported_at: now_rfc3339(),
                             }],
                         },
                     )?;
                     result.imported_ssh_identities += 1;
+                    if import.source_disposition == DiscoverySourceDisposition::ProtectInPlace {
+                        protect_file(catalog, store, mount_path, &file.path)?;
+                        result.protected_files += 1;
+                    }
                     result.files.push(DiscoveryAppliedFile {
                         path: file.path,
                         outcome: DiscoveryApplyOutcome::Imported,
                         detail: "Imported as a managed SSH identity".to_string(),
                     });
-                    Ok(false)
+                    Ok(Vec::new())
                 }
-                DiscoveredFileAction::Compose => {
-                    let Some(project_id) = assigned_project_id.as_deref() else {
-                        return Err(DispatchError::Validation(
-                            "discovery composition requires a project".to_string(),
-                        ));
-                    };
-                    apply_composed_discovery(
-                        catalog,
-                        store,
-                        mount_path,
-                        project_id,
-                        DiscoveryReuseState {
-                            existing: &mut existing,
-                            separate_entries: &separate_entries,
-                            promote_entries: &promote_entries,
-                            demote_entries: &demote_entries,
-                        },
-                        &mut result,
-                        file,
-                    )
-                }
-                DiscoveredFileAction::Review => {
-                    result.files.push(DiscoveryAppliedFile {
-                        path: file.path,
-                        outcome: DiscoveryApplyOutcome::Skipped,
-                        detail: "Detected for review; automatic import is not supported yet"
-                            .to_string(),
-                    });
-                    Ok(false)
-                }
-                DiscoveredFileAction::Reference => {
-                    result.files.push(DiscoveryAppliedFile {
-                        path: file.path,
-                        outcome: DiscoveryApplyOutcome::Skipped,
-                        detail: "Reference configuration left unchanged".to_string(),
-                    });
-                    Ok(false)
+                DiscoveredFileAction::Compose => match import.destination {
+                    DiscoveryImportDestination::ProjectOutput {
+                        project_path,
+                        output_path,
+                    } => {
+                        let project_id = &project_states[&project_path].0;
+                        let imported = apply_project_output_discovery(
+                            catalog,
+                            store,
+                            mount_path,
+                            project_id,
+                            &output_path,
+                            DiscoveryReuseState {
+                                existing: &mut existing,
+                                separate_entries: &separate_entries,
+                                promote_entries: &promote_entries,
+                                demote_entries: &demote_entries,
+                            },
+                            &mut result,
+                            file,
+                        )?;
+                        Ok(imported.then_some(project_path).into_iter().collect())
+                    }
+                    DiscoveryImportDestination::Library => {
+                        apply_library_discovery(
+                            catalog,
+                            store,
+                            mount_path,
+                            import.source_disposition,
+                            DiscoveryReuseState {
+                                existing: &mut existing,
+                                separate_entries: &separate_entries,
+                                promote_entries: &promote_entries,
+                                demote_entries: &demote_entries,
+                            },
+                            &mut result,
+                            file,
+                        )?;
+                        Ok(Vec::new())
+                    }
+                    DiscoveryImportDestination::ProjectOutputs { outputs } => {
+                        let resolved = outputs
+                            .iter()
+                            .map(|output| ResolvedProjectOutput {
+                                project_id: project_states[&output.project_path].0.clone(),
+                                output_path: output.output_path.clone(),
+                            })
+                            .collect::<Vec<_>>();
+                        let imported = apply_project_outputs_discovery(
+                            catalog,
+                            store,
+                            mount_path,
+                            &resolved,
+                            import.source_disposition,
+                            DiscoveryReuseState {
+                                existing: &mut existing,
+                                separate_entries: &separate_entries,
+                                promote_entries: &promote_entries,
+                                demote_entries: &demote_entries,
+                            },
+                            &mut result,
+                            file,
+                        )?;
+                        Ok(if imported {
+                            outputs.into_iter().map(|output| output.project_path).collect()
+                        } else {
+                            Vec::new()
+                        })
+                    }
+                },
+                DiscoveredFileAction::Review | DiscoveredFileAction::Reference => {
+                    unreachable!("review-only files cannot have an Import Destination")
                 }
             }
         })();
         match applied {
-            Ok(true) => {
-                if let Some(project_path) = assigned_project_path {
-                    composed_success.insert(project_path);
-                }
-            }
-            Ok(false) => {}
+            Ok(project_paths) => composed_success.extend(project_paths),
             Err(error) => {
                 existing.truncate(existing_len);
                 result.files.push(DiscoveryAppliedFile {
@@ -305,6 +301,223 @@ pub(super) fn apply_discovery(
     Ok(ControlResult::DiscoveryApplied(result))
 }
 
+fn resolve_discovery_imports(
+    contents: &[DiscoveredContent],
+    reviewed: Option<&[DiscoveryImport]>,
+) -> Result<Vec<DiscoveryImport>, DispatchError> {
+    if let Some(reviewed) = reviewed {
+        if reviewed.is_empty() {
+            return Err(DispatchError::Validation(
+                "select at least one discovered file to import".to_string(),
+            ));
+        }
+        return Ok(reviewed.to_vec());
+    }
+
+    contents
+        .iter()
+        .filter_map(|file| {
+            let import = match file.action {
+                DiscoveredFileAction::Compose => {
+                    let Some(project_path) = file.assignment.project_path.clone() else {
+                        return Some(Err(DispatchError::Validation(format!(
+                            "choose an import destination for {} before importing it",
+                            file.path.display()
+                        ))));
+                    };
+                    DiscoveryImport {
+                        path: file.path.clone(),
+                        destination: DiscoveryImportDestination::ProjectOutput {
+                            project_path,
+                            output_path: file.path.clone(),
+                        },
+                        source_disposition: DiscoverySourceDisposition::ReplaceWithSurface,
+                    }
+                }
+                DiscoveredFileAction::Protect => DiscoveryImport {
+                    path: file.path.clone(),
+                    destination: DiscoveryImportDestination::Library,
+                    source_disposition: DiscoverySourceDisposition::ProtectInPlace,
+                },
+                DiscoveredFileAction::ImportSshIdentity => DiscoveryImport {
+                    path: file.path.clone(),
+                    destination: DiscoveryImportDestination::Library,
+                    source_disposition: DiscoverySourceDisposition::LeaveUnchanged,
+                },
+                DiscoveredFileAction::Review | DiscoveredFileAction::Reference => return None,
+            };
+            Some(Ok(import))
+        })
+        .collect()
+}
+
+fn import_project_paths(
+    destination: &DiscoveryImportDestination,
+) -> Vec<&PathBuf> {
+    match destination {
+        DiscoveryImportDestination::ProjectOutput { project_path, .. } => vec![project_path],
+        DiscoveryImportDestination::Library => Vec::new(),
+        DiscoveryImportDestination::ProjectOutputs { outputs } => {
+            outputs.iter().map(|output| &output.project_path).collect()
+        }
+    }
+}
+
+fn validate_discovery_import(
+    file: &DiscoveredContent,
+    import: &DiscoveryImport,
+    valid_project_paths: &HashSet<PathBuf>,
+) -> Result<(), DispatchError> {
+    let invalid = |message: String| DispatchError::Validation(format!(
+        "{}: {message}",
+        file.path.display()
+    ));
+    match (&import.destination, import.source_disposition) {
+        (
+            DiscoveryImportDestination::ProjectOutput {
+                project_path,
+                output_path,
+            },
+            DiscoverySourceDisposition::ReplaceWithSurface,
+        ) if file.action == DiscoveredFileAction::Compose => {
+            validate_project_output(project_path, output_path, valid_project_paths)?;
+            if output_path != &file.path {
+                return Err(invalid(
+                    "a single Project Output must replace the discovered source path".to_string(),
+                ));
+            }
+        }
+        (
+            DiscoveryImportDestination::Library,
+            DiscoverySourceDisposition::ProtectInPlace
+            | DiscoverySourceDisposition::LeaveUnchanged,
+        ) if matches!(
+            file.action,
+            DiscoveredFileAction::Compose | DiscoveredFileAction::ImportSshIdentity
+        ) => {}
+        (
+            DiscoveryImportDestination::Library,
+            DiscoverySourceDisposition::ProtectInPlace,
+        ) if file.action == DiscoveredFileAction::Protect => {}
+        (
+            DiscoveryImportDestination::ProjectOutputs { outputs },
+            source_disposition,
+        ) if file.action == DiscoveredFileAction::Compose => {
+            if outputs.is_empty() {
+                return Err(invalid("choose at least one Project Output".to_string()));
+            }
+            let mut project_paths = HashSet::new();
+            let mut output_paths = HashSet::new();
+            for output in outputs {
+                validate_project_output(
+                    &output.project_path,
+                    &output.output_path,
+                    valid_project_paths,
+                )?;
+                if !project_paths.insert(&output.project_path) {
+                    return Err(invalid(format!(
+                        "project output was selected more than once: {}",
+                        output.project_path.display()
+                    )));
+                }
+                if !output_paths.insert(&output.output_path) {
+                    return Err(invalid(format!(
+                        "output path was selected more than once: {}",
+                        output.output_path.display()
+                    )));
+                }
+            }
+            let replaces_source =
+                outputs.iter().filter(|output| output.output_path == file.path).count();
+            match source_disposition {
+                DiscoverySourceDisposition::ReplaceWithSurface if replaces_source == 1 => {}
+                DiscoverySourceDisposition::ReplaceWithSurface => {
+                    return Err(invalid(
+                        "replace-with-surface requires exactly one output at the source path"
+                            .to_string(),
+                    ));
+                }
+                DiscoverySourceDisposition::ProtectInPlace
+                | DiscoverySourceDisposition::LeaveUnchanged
+                    if replaces_source == 0 => {}
+                DiscoverySourceDisposition::ProtectInPlace
+                | DiscoverySourceDisposition::LeaveUnchanged => {
+                    return Err(invalid(
+                        "the source path cannot also be a Project Output when it is protected or left unchanged"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        _ => {
+            return Err(invalid(
+                "the selected Import Destination and Source Disposition are incompatible"
+                    .to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_project_output(
+    project_path: &Path,
+    output_path: &Path,
+    valid_project_paths: &HashSet<PathBuf>,
+) -> Result<(), DispatchError> {
+    if !valid_project_paths.contains(project_path) {
+        return Err(DispatchError::Validation(format!(
+            "project output target was not part of discovery: {}",
+            project_path.display()
+        )));
+    }
+    if !output_path.is_absolute()
+        || output_path
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+        || !output_path.starts_with(project_path)
+    {
+        return Err(DispatchError::Validation(format!(
+            "project output must be an absolute path inside {}: {}",
+            project_path.display(),
+            output_path.display()
+        )));
+    }
+    let canonical_project =
+        std::fs::canonicalize(project_path).map_err(|source| DispatchError::Io {
+            path: project_path.to_path_buf(),
+            source,
+        })?;
+    let mut existing_parent = output_path.parent();
+    let canonical_parent = loop {
+        let parent = existing_parent.ok_or_else(|| {
+            DispatchError::Validation(format!(
+                "project output has no existing parent: {}",
+                output_path.display()
+            ))
+        })?;
+        match std::fs::canonicalize(parent) {
+            Ok(path) => break path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                existing_parent = parent.parent();
+            }
+            Err(source) => {
+                return Err(DispatchError::Io {
+                    path: parent.to_path_buf(),
+                    source,
+                });
+            }
+        }
+    };
+    if !canonical_parent.starts_with(&canonical_project) {
+        return Err(DispatchError::Validation(format!(
+            "project output resolves outside {}: {}",
+            project_path.display(),
+            output_path.display()
+        )));
+    }
+    Ok(())
+}
+
 struct DiscoveryReuseState<'a> {
     existing: &'a mut Vec<ExistingSecret>,
     separate_entries: &'a HashSet<(PathBuf, String)>,
@@ -312,36 +525,205 @@ struct DiscoveryReuseState<'a> {
     demote_entries: &'a HashSet<(PathBuf, String)>,
 }
 
-fn apply_composed_discovery(
+#[derive(Clone)]
+struct MaterializedResource {
+    resource_id: String,
+    position: i64,
+}
+
+struct ResolvedProjectOutput {
+    project_id: String,
+    output_path: PathBuf,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_project_output_discovery(
     catalog: &Catalog,
     store: &dyn SecretStore,
     mount_path: &Path,
     project_id: &str,
+    output_path: &Path,
     reuse: DiscoveryReuseState<'_>,
     result: &mut DiscoveryApplyResult,
     file: DiscoveredContent,
 ) -> Result<bool, DispatchError> {
-    if file.entries.is_empty() {
-        result.files.push(DiscoveryAppliedFile {
-            path: file.path,
-            outcome: DiscoveryApplyOutcome::Skipped,
-            detail: "No statically importable values were found".to_string(),
-        });
+    if !discovery_file_has_importable_content(&file, result) {
         return Ok(false);
     }
 
     let environment_name = file.environment.as_deref().unwrap_or("development");
-    let mut binding_ids = Vec::new();
     let mut mutation = DiscoveryMutationGuard::new(catalog, store);
     let (environment_id, environment_created) =
         ensure_discovered_environment(catalog, project_id, environment_name)?;
     if environment_created {
         mutation.track_environment(environment_id.clone());
     }
+    let source = discovered_source(&file, Some(project_id), Some(environment_name));
+    let resources = materialize_discovered_resources(
+        catalog,
+        store,
+        reuse,
+        result,
+        &file,
+        source,
+        &mut mutation,
+    )?;
+    let binding_ids = bind_materialized_resources(
+        catalog,
+        project_id,
+        &environment_id,
+        &resources,
+        &mut mutation,
+    )?;
+    let surface = discovered_surface(&file, environment_id, output_path, binding_ids)?;
+    replace_discovered_file_with_surface(catalog, mount_path, &surface)?;
+    mutation.commit();
+    result.files.push(DiscoveryAppliedFile {
+        path: file.path,
+        outcome: DiscoveryApplyOutcome::Imported,
+        detail: project_output_detail(file.kind),
+    });
+    Ok(true)
+}
 
+fn apply_library_discovery(
+    catalog: &Catalog,
+    store: &dyn SecretStore,
+    mount_path: &Path,
+    source_disposition: DiscoverySourceDisposition,
+    reuse: DiscoveryReuseState<'_>,
+    result: &mut DiscoveryApplyResult,
+    file: DiscoveredContent,
+) -> Result<bool, DispatchError> {
+    if !discovery_file_has_importable_content(&file, result) {
+        return Ok(false);
+    }
+
+    let mut mutation = DiscoveryMutationGuard::new(catalog, store);
+    let source = discovered_source(&file, None, None);
+    materialize_discovered_resources(
+        catalog,
+        store,
+        reuse,
+        result,
+        &file,
+        source,
+        &mut mutation,
+    )?;
+    apply_source_disposition(
+        catalog,
+        store,
+        mount_path,
+        source_disposition,
+        &file.path,
+        result,
+    )?;
+    mutation.commit();
+    result.files.push(DiscoveryAppliedFile {
+        path: file.path,
+        outcome: DiscoveryApplyOutcome::Imported,
+        detail: match source_disposition {
+            DiscoverySourceDisposition::ProtectInPlace => {
+                "Imported into Library and protected the original file".to_string()
+            }
+            DiscoverySourceDisposition::LeaveUnchanged => {
+                "Imported into Library and left the original file unchanged".to_string()
+            }
+            DiscoverySourceDisposition::ReplaceWithSurface => {
+                unreachable!("validated Library source disposition")
+            }
+        },
+    });
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_project_outputs_discovery(
+    catalog: &Catalog,
+    store: &dyn SecretStore,
+    mount_path: &Path,
+    outputs: &[ResolvedProjectOutput],
+    source_disposition: DiscoverySourceDisposition,
+    reuse: DiscoveryReuseState<'_>,
+    result: &mut DiscoveryApplyResult,
+    file: DiscoveredContent,
+) -> Result<bool, DispatchError> {
+    if !discovery_file_has_importable_content(&file, result) {
+        return Ok(false);
+    }
+
+    let environment_name = file.environment.as_deref().unwrap_or("development");
+    let mut mutation = DiscoveryMutationGuard::new(catalog, store);
+    let source = discovered_source(&file, None, None);
+    let resources = materialize_discovered_resources(
+        catalog,
+        store,
+        reuse,
+        result,
+        &file,
+        source,
+        &mut mutation,
+    )?;
+    let mut source_surface = None;
+    for output in outputs {
+        let (environment_id, environment_created) =
+            ensure_discovered_environment(catalog, &output.project_id, environment_name)?;
+        if environment_created {
+            mutation.track_environment(environment_id.clone());
+        }
+        let binding_ids = bind_materialized_resources(
+            catalog,
+            &output.project_id,
+            &environment_id,
+            &resources,
+            &mut mutation,
+        )?;
+        let surface =
+            discovered_surface(&file, environment_id, &output.output_path, binding_ids)?;
+        if output.output_path == file.path {
+            source_surface = Some(surface);
+        } else {
+            create_discovered_surface(catalog, mount_path, &surface)?;
+            mutation.track_surface(surface.id.clone(), surface.path.clone());
+        }
+    }
+    if let Some(surface) = source_surface {
+        replace_discovered_file_with_surface(catalog, mount_path, &surface)?;
+    } else {
+        apply_source_disposition(
+            catalog,
+            store,
+            mount_path,
+            source_disposition,
+            &file.path,
+            result,
+        )?;
+    }
+    mutation.commit();
+    result.files.push(DiscoveryAppliedFile {
+        path: file.path,
+        outcome: DiscoveryApplyOutcome::Imported,
+        detail: format!(
+            "Imported once and created {} Project Output{}",
+            outputs.len(),
+            if outputs.len() == 1 { "" } else { "s" }
+        ),
+    });
+    Ok(true)
+}
+
+fn materialize_discovered_resources(
+    catalog: &Catalog,
+    store: &dyn SecretStore,
+    reuse: DiscoveryReuseState<'_>,
+    result: &mut DiscoveryApplyResult,
+    file: &DiscoveredContent,
+    source: OriginSource,
+    mutation: &mut DiscoveryMutationGuard<'_>,
+) -> Result<Vec<MaterializedResource>, DispatchError> {
+    let mut resources = Vec::new();
     match file.kind {
         DiscoveredFileKind::Dotenv | DiscoveredFileKind::Direnv => {
-            let source = discovered_source(&file, project_id, environment_name);
             let mut plain_entries: Vec<(usize, &accessfs_discover::DiscoveredValue)> = Vec::new();
             for (position, entry) in file.entries.iter().enumerate() {
                 let entry_ref = (file.path.clone(), entry.address.clone());
@@ -395,22 +777,10 @@ fn apply_composed_discovery(
                     result.created_resources += 1;
                     resource_id
                 };
-                let binding_id = generated_id("binding");
-                catalog.upsert_binding(&Binding {
-                    id: binding_id.clone(),
-                    project_id: project_id.to_string(),
-                    scope: BindingScope::Environment {
-                        environment_id: environment_id.clone(),
-                    },
+                resources.push(MaterializedResource {
                     resource_id,
-                    selection: EntrySelection::All,
-                    key_override: None,
-                    enabled: true,
-                    allow_override: false,
                     position: position as i64,
-                })?;
-                mutation.track_binding(binding_id.clone());
-                binding_ids.push(binding_id);
+                });
             }
             if !plain_entries.is_empty() {
                 let values = plain_entries
@@ -444,22 +814,10 @@ fn apply_composed_discovery(
                 )?;
                 mutation.track_resource(resource_id.clone());
                 result.created_resources += 1;
-                let binding_id = generated_id("binding");
-                catalog.upsert_binding(&Binding {
-                    id: binding_id.clone(),
-                    project_id: project_id.to_string(),
-                    scope: BindingScope::Environment {
-                        environment_id: environment_id.clone(),
-                    },
+                resources.push(MaterializedResource {
                     resource_id,
-                    selection: EntrySelection::All,
-                    key_override: None,
-                    enabled: true,
-                    allow_override: false,
                     position: plain_entries[0].0 as i64,
-                })?;
-                mutation.track_binding(binding_id.clone());
-                binding_ids.push(binding_id);
+                });
             }
         }
         DiscoveredFileKind::AwsCredentials => {
@@ -490,72 +848,174 @@ fn apply_composed_discovery(
                 },
                 ResourceOrigin {
                     kind: OriginKind::Discovered,
-                    sources: vec![discovered_source(&file, project_id, environment_name)],
+                    sources: vec![source],
                 },
             )?;
             mutation.track_resource(resource_id.clone());
             result.created_resources += 1;
-            let binding_id = generated_id("binding");
-            catalog.upsert_binding(&Binding {
-                id: binding_id.clone(),
-                project_id: project_id.to_string(),
-                scope: BindingScope::Environment {
-                    environment_id: environment_id.clone(),
-                },
+            resources.push(MaterializedResource {
                 resource_id,
-                selection: EntrySelection::All,
-                key_override: None,
-                enabled: true,
-                allow_override: false,
                 position: 0,
-            })?;
-            mutation.track_binding(binding_id.clone());
-            binding_ids.push(binding_id);
+            });
+        }
+        _ => unreachable!("validated composable discovery kind"),
+    }
+    resources.sort_by_key(|resource| resource.position);
+    Ok(resources)
+}
+
+fn bind_materialized_resources(
+    catalog: &Catalog,
+    project_id: &str,
+    environment_id: &str,
+    resources: &[MaterializedResource],
+    mutation: &mut DiscoveryMutationGuard<'_>,
+) -> Result<Vec<String>, DispatchError> {
+    let mut binding_ids = Vec::with_capacity(resources.len());
+    for resource in resources {
+        let binding_id = generated_id("binding");
+        catalog.upsert_binding(&Binding {
+            id: binding_id.clone(),
+            project_id: project_id.to_string(),
+            scope: BindingScope::Environment {
+                environment_id: environment_id.to_string(),
+            },
+            resource_id: resource.resource_id.clone(),
+            selection: EntrySelection::All,
+            key_override: None,
+            enabled: true,
+            allow_override: false,
+            position: resource.position,
+        })?;
+        mutation.track_binding(binding_id.clone());
+        binding_ids.push(binding_id);
+    }
+    Ok(binding_ids)
+}
+
+fn discovered_surface(
+    file: &DiscoveredContent,
+    environment_id: String,
+    output_path: &Path,
+    binding_ids: Vec<String>,
+) -> Result<Surface, DispatchError> {
+    let kind = match file.kind {
+        DiscoveredFileKind::Dotenv => {
+            SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv))
+        }
+        DiscoveredFileKind::Direnv => {
+            SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Direnv))
+        }
+        DiscoveredFileKind::AwsCredentials => {
+            SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Ini))
         }
         _ => {
-            result.files.push(DiscoveryAppliedFile {
-                path: file.path,
-                outcome: DiscoveryApplyOutcome::Skipped,
-                detail: "This discovered format is not composable yet".to_string(),
-            });
-            return Ok(false);
+            return Err(DispatchError::Validation(format!(
+                "{} is not a composable discovery format",
+                file.path.display()
+            )));
         }
-    }
-
-    let surface_kind = match file.kind {
-        DiscoveredFileKind::Dotenv => SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
-        DiscoveredFileKind::Direnv => SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Direnv)),
-        DiscoveredFileKind::AwsCredentials => SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Ini)),
-        _ => unreachable!("non-composable kinds returned above"),
     };
-    let surface = Surface {
+    Ok(Surface {
         id: generated_id("surface"),
         environment_id,
-        name: file
-            .path
+        name: output_path
             .file_name()
             .and_then(|value| value.to_str())
             .unwrap_or("environment")
             .to_string(),
-        kind: surface_kind,
-        path: file.path.clone(),
+        kind,
+        path: output_path.to_path_buf(),
         input: SurfaceInput::Bindings { binding_ids },
         enforcement: Enforcement::Prompt,
         position: 0,
-    };
-    replace_discovered_file_with_surface(catalog, mount_path, &surface)?;
-    mutation.commit();
-    result.files.push(DiscoveryAppliedFile {
-        path: file.path,
-        outcome: DiscoveryApplyOutcome::Imported,
-        detail: match file.kind {
-            DiscoveredFileKind::AwsCredentials => {
-                "Imported as a section-aware INI environment file".to_string()
+    })
+}
+
+fn discovery_file_has_importable_content(
+    file: &DiscoveredContent,
+    result: &mut DiscoveryApplyResult,
+) -> bool {
+    if file.entries.is_empty() {
+        result.files.push(DiscoveryAppliedFile {
+            path: file.path.clone(),
+            outcome: DiscoveryApplyOutcome::Skipped,
+            detail: "No statically importable values were found".to_string(),
+        });
+        return false;
+    }
+    matches!(
+        file.kind,
+        DiscoveredFileKind::Dotenv
+            | DiscoveredFileKind::Direnv
+            | DiscoveredFileKind::AwsCredentials
+    )
+}
+
+fn project_output_detail(kind: DiscoveredFileKind) -> String {
+    match kind {
+        DiscoveredFileKind::AwsCredentials => {
+            "Imported as a section-aware INI environment file".to_string()
+        }
+        _ => "Imported as reusable secrets and a composed output".to_string(),
+    }
+}
+
+fn apply_source_disposition(
+    catalog: &Catalog,
+    store: &dyn SecretStore,
+    mount_path: &Path,
+    disposition: DiscoverySourceDisposition,
+    source_path: &Path,
+    result: &mut DiscoveryApplyResult,
+) -> Result<(), DispatchError> {
+    match disposition {
+        DiscoverySourceDisposition::ProtectInPlace => {
+            let protected = protect_file(catalog, store, mount_path, source_path)?;
+            if !matches!(protected, ControlResult::FileProtected { .. }) {
+                return Err(DispatchError::Validation(
+                    "protecting a discovered source returned an unexpected result".to_string(),
+                ));
             }
-            _ => "Imported as reusable secrets and a composed output".to_string(),
-        },
-    });
-    Ok(true)
+            result.protected_files += 1;
+        }
+        DiscoverySourceDisposition::LeaveUnchanged => {}
+        DiscoverySourceDisposition::ReplaceWithSurface => {
+            return Err(DispatchError::Validation(
+                "replace-with-surface requires a Project Output at the source path".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn create_discovered_surface(
+    catalog: &Catalog,
+    mount_path: &Path,
+    surface: &Surface,
+) -> Result<(), DispatchError> {
+    match std::fs::symlink_metadata(&surface.path) {
+        Ok(_) => {
+            return Err(DispatchError::Validation(format!(
+                "project output already exists: {}",
+                surface.path.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(DispatchError::Io {
+                path: surface.path.clone(),
+                source,
+            });
+        }
+    }
+    catalog.upsert_surface(surface)?;
+    if let Err(error) = ensure_file_surface_link(surface, mount_path) {
+        let _ = catalog.remove_surface(&surface.id);
+        let _ = std::fs::remove_file(&surface.path);
+        return Err(DispatchError::Validation(error.to_string()));
+    }
+    Ok(())
 }
 
 pub(super) struct DiscoveryMutationGuard<'a> {
@@ -564,6 +1024,7 @@ pub(super) struct DiscoveryMutationGuard<'a> {
     created_resources: Vec<String>,
     created_bindings: Vec<String>,
     created_environments: Vec<String>,
+    created_surfaces: Vec<(String, PathBuf)>,
     committed: bool,
 }
 
@@ -575,6 +1036,7 @@ impl<'a> DiscoveryMutationGuard<'a> {
             created_resources: Vec::new(),
             created_bindings: Vec::new(),
             created_environments: Vec::new(),
+            created_surfaces: Vec::new(),
             committed: false,
         }
     }
@@ -591,6 +1053,10 @@ impl<'a> DiscoveryMutationGuard<'a> {
         self.created_environments.push(environment_id);
     }
 
+    fn track_surface(&mut self, surface_id: String, path: PathBuf) {
+        self.created_surfaces.push((surface_id, path));
+    }
+
     pub(super) fn commit(&mut self) {
         self.committed = true;
     }
@@ -600,6 +1066,26 @@ impl Drop for DiscoveryMutationGuard<'_> {
     fn drop(&mut self) {
         if self.committed {
             return;
+        }
+        for (surface_id, path) in self.created_surfaces.iter().rev() {
+            if let Err(error) = self.catalog.remove_surface(surface_id) {
+                tracing::warn!(
+                    %surface_id,
+                    %error,
+                    "discovery rollback could not remove surface"
+                );
+            }
+            if std::fs::symlink_metadata(path)
+                .is_ok_and(|metadata| metadata.file_type().is_symlink())
+            {
+                if let Err(error) = std::fs::remove_file(path) {
+                    tracing::warn!(
+                        path = %path.display(),
+                        %error,
+                        "discovery rollback could not remove surface link"
+                    );
+                }
+            }
         }
         for binding_id in self.created_bindings.iter().rev() {
             if let Err(error) = self.catalog.remove_binding(binding_id) {
@@ -739,13 +1225,13 @@ pub(super) fn now_rfc3339() -> String {
 
 pub(super) fn discovered_source(
     file: &DiscoveredContent,
-    project_id: &str,
-    environment: &str,
+    project_id: Option<&str>,
+    environment: Option<&str>,
 ) -> OriginSource {
     OriginSource {
         path: file.path.clone(),
-        project_id: Some(project_id.to_string()),
-        environment: Some(environment.to_string()),
+        project_id: project_id.map(str::to_string),
+        environment: environment.map(str::to_string),
         imported_at: now_rfc3339(),
     }
 }

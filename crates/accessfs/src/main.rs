@@ -827,8 +827,7 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
             if apply {
                 ControlCommand::DiscoverApply {
                     paths: vec![path],
-                    files: None,
-                    project_assignments: Vec::new(),
+                    imports: None,
                     separate_entries: Vec::new(),
                     promote_entries: Vec::new(),
                     demote_entries: Vec::new(),

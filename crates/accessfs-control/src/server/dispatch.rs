@@ -94,8 +94,7 @@ pub(super) fn dispatch(
         }
         ControlCommand::DiscoverApply {
             paths,
-            files,
-            project_assignments,
+            imports,
             separate_entries,
             promote_entries,
             demote_entries,
@@ -104,8 +103,7 @@ pub(super) fn dispatch(
             store.ok_or(DispatchError::StoreUnavailable)?,
             mount_path.ok_or(DispatchError::StoreUnavailable)?,
             &paths,
-            files.as_deref(),
-            &project_assignments,
+            imports.as_deref(),
             &separate_entries,
             &promote_entries,
             &demote_entries,
