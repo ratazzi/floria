@@ -386,6 +386,95 @@ struct DiscoveryPlan: Codable, Hashable, Sendable {
     let projects: [DiscoveredProject]
     let files: [DiscoveredFile]
     let summary: DiscoverySummary
+    let managedItems: [DiscoveryManagedItem]
+
+    enum CodingKeys: String, CodingKey {
+        case paths, projects, files, summary
+        case managedItems = "managed_items"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        paths = try container.decode([String].self, forKey: .paths)
+        projects = try container.decode([DiscoveredProject].self, forKey: .projects)
+        files = try container.decode([DiscoveredFile].self, forKey: .files)
+        summary = try container.decode(DiscoverySummary.self, forKey: .summary)
+        managedItems =
+            try container.decodeIfPresent([DiscoveryManagedItem].self, forKey: .managedItems) ?? []
+    }
+}
+
+struct DiscoveryJobStatus: Codable, Hashable, Identifiable, Sendable {
+    let id: String
+    let state: DiscoveryJobState
+    let progress: DiscoveryJobProgress
+    let plan: DiscoveryPlan?
+    let error: String?
+}
+
+enum DiscoveryJobState: String, Codable, Hashable, Sendable {
+    case queued
+    case running
+    case cancelling
+    case completed
+    case cancelled
+    case failed
+
+    var isTerminal: Bool {
+        self == .completed || self == .cancelled || self == .failed
+    }
+}
+
+enum DiscoveryJobPhase: String, Codable, Hashable, Sendable {
+    case starting
+    case projectCandidates = "project_candidates"
+    case candidateFiles = "candidate_files"
+    case parsingFiles = "parsing_files"
+    case reconciling
+    case complete
+}
+
+struct DiscoveryJobProgress: Codable, Hashable, Sendable {
+    let phase: DiscoveryJobPhase
+    let directoriesScanned: Int
+    let candidateFiles: Int
+    let projectCandidates: Int
+    let filesParsed: Int
+
+    enum CodingKeys: String, CodingKey {
+        case phase
+        case directoriesScanned = "directories_scanned"
+        case candidateFiles = "candidate_files"
+        case projectCandidates = "project_candidates"
+        case filesParsed = "files_parsed"
+    }
+}
+
+struct DiscoveryManagedItem: Codable, Hashable, Identifiable, Sendable {
+    let id: String
+    let path: String
+    let relativePath: String
+    let projectPath: String?
+    let environment: String?
+    let kind: DiscoveryManagedItemKind
+    let status: DiscoveryManagedItemStatus
+
+    enum CodingKeys: String, CodingKey {
+        case id, path, environment, kind, status
+        case relativePath = "relative_path"
+        case projectPath = "project_path"
+    }
+}
+
+enum DiscoveryManagedItemKind: String, Codable, Hashable, Sendable {
+    case surface
+    case protectedFile = "protected_file"
+}
+
+enum DiscoveryManagedItemStatus: String, Codable, Hashable, Sendable {
+    case linked
+    case missing
+    case replaced
 }
 
 struct DiscoveredProject: Codable, Hashable, Sendable {
@@ -719,6 +808,9 @@ enum ControlCommand: Sendable {
     case accessHistory(limit: Int)
     case snapshot
     case discover(paths: [String])
+    case discoverStart(paths: [String])
+    case discoverStatus(id: String)
+    case discoverCancel(id: String)
     case discoverApply(
         paths: [String], imports: [DiscoveryImport],
         separateEntries: [DiscoverySeparateEntry],
@@ -779,6 +871,9 @@ enum ControlCommand: Sendable {
         case .accessHistory: "access_history"
         case .snapshot: "snapshot"
         case .discover: "discover"
+        case .discoverStart: "discover_start"
+        case .discoverStatus: "discover_status"
+        case .discoverCancel: "discover_cancel"
         case .discoverApply: "discover_apply"
         case .discoverReferenceResolve: "discover_reference_resolve"
         case .projectCheckoutInventory: "project_checkout_inventory"
@@ -841,6 +936,16 @@ enum ControlCommand: Sendable {
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: DiscoverParams(paths: paths)))
+        case .discoverStart(let paths):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: DiscoverParams(paths: paths)))
+        case .discoverStatus(let id), .discoverCancel(let id):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: DiscoveryJobIDParams(id: id)))
         case .discoverApply(
             let paths, let imports, let separateEntries,
             let promoteEntries, let demoteEntries):
@@ -995,6 +1100,7 @@ private struct PolicyModeSetParams: Encodable {
 private struct GrantIDParams: Encodable { let id: String }
 private struct AccessHistoryParams: Encodable { let limit: Int }
 private struct DiscoverParams: Encodable { let paths: [String] }
+private struct DiscoveryJobIDParams: Encodable { let id: String }
 private struct DiscoverApplyParams: Encodable {
     let paths: [String]
     let imports: [DiscoveryImport]

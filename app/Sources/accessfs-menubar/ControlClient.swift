@@ -90,6 +90,39 @@ final class ControlClient: @unchecked Sendable {
         return plan
     }
 
+    func startDiscovery(paths: [String]) async throws -> DiscoveryJobStatus {
+        guard let status: DiscoveryJobStatus = try await request(
+            .discoverStart(paths: paths),
+            expecting: "discovery_job",
+            as: DiscoveryJobStatus.self)
+        else {
+            throw ControlClientError.missingResult("discovery_job")
+        }
+        return status
+    }
+
+    func discoveryStatus(id: String) async throws -> DiscoveryJobStatus {
+        guard let status: DiscoveryJobStatus = try await request(
+            .discoverStatus(id: id),
+            expecting: "discovery_job",
+            as: DiscoveryJobStatus.self)
+        else {
+            throw ControlClientError.missingResult("discovery_job")
+        }
+        return status
+    }
+
+    func cancelDiscovery(id: String) async throws -> DiscoveryJobStatus {
+        guard let status: DiscoveryJobStatus = try await request(
+            .discoverCancel(id: id),
+            expecting: "discovery_job",
+            as: DiscoveryJobStatus.self)
+        else {
+            throw ControlClientError.missingResult("discovery_job")
+        }
+        return status
+    }
+
     func applyDiscovery(
         paths: [String], imports: [DiscoveryImport],
         separateEntries: [DiscoverySeparateEntry],

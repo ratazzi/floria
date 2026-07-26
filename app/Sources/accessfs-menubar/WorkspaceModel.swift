@@ -816,6 +816,24 @@ final class WorkspaceStore {
         return plan
     }
 
+    func startDiscovery(at paths: [String]) async throws -> DiscoveryJobStatus {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        let standardized = paths.map { ($0 as NSString).standardizingPath }
+        let status = try await controlClient.startDiscovery(paths: standardized)
+        lastError = nil
+        return status
+    }
+
+    func discoveryStatus(id: String) async throws -> DiscoveryJobStatus {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        return try await controlClient.discoveryStatus(id: id)
+    }
+
+    func cancelDiscovery(id: String) async throws -> DiscoveryJobStatus {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        return try await controlClient.cancelDiscovery(id: id)
+    }
+
     func applyDiscovery(
         at paths: [String], imports: [DiscoveryImport],
         separateEntries: [DiscoverySeparateEntry],

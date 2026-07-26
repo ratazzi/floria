@@ -15,7 +15,7 @@ extension FocusedValues {
 
 private struct DiscoveryPresentation: Identifiable {
     let id = UUID()
-    let plan: DiscoveryPlan
+    let paths: [String]
 }
 
 private struct WorkspacePresentation: Identifiable {
@@ -44,7 +44,6 @@ struct DashboardView: View {
     @State private var isDropTargeted = false
     @State private var isDiscovering = false
     @State private var discovery: DiscoveryPresentation?
-    @State private var discoveryError: String?
     @State private var workspacePresentation: WorkspacePresentation?
     @State private var showingAccessLog = false
     @State private var pendingAuditWindow: AuditOnlyWindow?
@@ -102,23 +101,14 @@ struct DashboardView: View {
             beginDiscovery(at: paths)
             return true
         } isTargeted: { isDropTargeted = $0 }
-        .sheet(item: $discovery) { presentation in
-            DiscoveryReviewSheet(
-                plan: presentation.plan,
+        .sheet(item: $discovery, onDismiss: {
+            isDiscovering = false
+        }) { presentation in
+            DiscoveryWorkflowSheet(
+                paths: presentation.paths,
+                store: state.workspace,
                 sharedSecrets: state.workspace.resources.filter {
                     $0.kind == .sharedSecret && $0.shape == .scalar
-                },
-                apply: {
-                    imports, separateEntries, promoteEntries, demoteEntries in
-                    try await state.workspace.applyDiscovery(
-                        at: presentation.plan.paths, imports: imports,
-                        separateEntries: separateEntries,
-                        promoteEntries: promoteEntries,
-                        demoteEntries: demoteEntries)
-                },
-                resolveReference: { surfaceID, key, source in
-                    try await state.workspace.resolveDiscoveryReference(
-                        surfaceID: surfaceID, key: key, source: source)
                 },
                 openProject: { projectID in
                     selectedProjectID = projectID
@@ -132,16 +122,6 @@ struct DashboardView: View {
         .sheet(isPresented: $showingAccessLog) {
             AccessLogView(state: state)
                 .frame(minWidth: 920, minHeight: 620)
-        }
-        .alert(
-            "Discovery could not finish",
-            isPresented: Binding(
-                get: { discoveryError != nil },
-                set: { if !$0 { discoveryError = nil } })
-        ) {
-            Button("OK") { discoveryError = nil }
-        } message: {
-            Text(discoveryError ?? "Unknown error")
         }
         .confirmationDialog(
             "Enable Audit Only?", isPresented: $showingAuditConfirmation,
@@ -743,15 +723,7 @@ struct DashboardView: View {
     private func beginDiscovery(at paths: [String]) {
         guard !isDiscovering else { return }
         isDiscovering = true
-        Task {
-            defer { isDiscovering = false }
-            do {
-                let plan = try await state.workspace.discover(at: paths)
-                discovery = DiscoveryPresentation(plan: plan)
-            } catch {
-                discoveryError = error.localizedDescription
-            }
-        }
+        discovery = DiscoveryPresentation(paths: paths)
     }
 
 }
@@ -1672,6 +1644,7 @@ private struct DiscoveryProjectGroup: Identifiable {
     let id: String
     let project: DiscoveredProject?
     let files: [DiscoveredFile]
+    let managedItems: [DiscoveryManagedItem]
     let needsReview: Bool
 }
 
@@ -1683,7 +1656,7 @@ private struct DiscoveryProjectHeader: View {
             Image(systemName: group.needsReview ? "questionmark.folder" : "folder")
                 .foregroundStyle(group.needsReview ? Color.orange : Color.blue)
             VStack(alignment: .leading, spacing: 1) {
-                Text(group.project?.name ?? (group.needsReview ? "Needs Review" : "Unassigned"))
+                Text(group.project?.name ?? (group.needsReview ? "Needs Review" : "Other Files"))
                     .font(.callout.weight(.semibold))
                 Text(detail)
                     .font(.caption)
@@ -1692,7 +1665,8 @@ private struct DiscoveryProjectHeader: View {
                     .truncationMode(.middle)
             }
             Spacer()
-            Text("\(group.files.count) file\(group.files.count == 1 ? "" : "s")")
+            let itemCount = group.files.count + group.managedItems.count
+            Text("\(itemCount) item\(itemCount == 1 ? "" : "s")")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -1703,10 +1677,329 @@ private struct DiscoveryProjectHeader: View {
         guard let project = group.project else {
             return group.needsReview
                 ? "Choose where each file should be imported."
-                : "No project is required for these files."
+                : "Using the selected import destinations."
         }
         let ecosystems = project.ecosystems.joined(separator: " · ")
         return ecosystems.isEmpty ? project.path : "\(project.path) · \(ecosystems)"
+    }
+}
+
+private struct DiscoveryImportPreviewBanner: View {
+    let preview: DiscoveryImportPreview
+    let unresolvedAssignments: Int
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            Label {
+                Text(
+                    preview.hasConflicts
+                        ? "\(preview.conflicts.count) output conflict\(preview.conflicts.count == 1 ? "" : "s")"
+                        : (unresolvedAssignments > 0
+                            ? "Choose \(unresolvedAssignments) destination\(unresolvedAssignments == 1 ? "" : "s")"
+                            : "Ready to import"))
+                    .font(.callout.weight(.semibold))
+            } icon: {
+                Image(
+                    systemName: preview.hasConflicts
+                        ? "exclamationmark.triangle.fill"
+                        : (unresolvedAssignments > 0
+                            ? "questionmark.folder.fill"
+                            : "checkmark.circle.fill"))
+            }
+            .foregroundStyle(needsAttention ? Color.orange : Color.green)
+
+            Text(preview.actionSummary)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Text("Secret reuse is finalized during import using an exact key and value match.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            if preview.hasConflicts {
+                ForEach(preview.conflicts.prefix(3)) { conflict in
+                    Text(conflict.message)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                if preview.conflicts.count > 3 {
+                    Text("And \(preview.conflicts.count - 3) more…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Text(
+                    "Choose Library, remove the conflicting project, or move the existing output before importing."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            } else if unresolvedAssignments > 0 {
+                Text("Assign every selected file before Floria can validate the complete plan.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            (needsAttention ? Color.orange : Color.green).opacity(0.07),
+            in: RoundedRectangle(cornerRadius: 10))
+    }
+
+    private var needsAttention: Bool {
+        preview.hasConflicts || unresolvedAssignments > 0
+    }
+}
+
+private struct DiscoveryWorkflowSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let paths: [String]
+    @Bindable var store: WorkspaceStore
+    let sharedSecrets: [WorkspaceResource]
+    let openProject: (String) -> Void
+    @State private var job: DiscoveryJobStatus?
+    @State private var errorMessage: String?
+    @State private var isCancelling = false
+
+    var body: some View {
+        Group {
+            if let plan = job?.plan {
+                DiscoveryReviewSheet(
+                    plan: plan,
+                    sharedSecrets: sharedSecrets,
+                    apply: {
+                        imports, separateEntries, promoteEntries, demoteEntries in
+                        try await store.applyDiscovery(
+                            at: plan.paths,
+                            imports: imports,
+                            separateEntries: separateEntries,
+                            promoteEntries: promoteEntries,
+                            demoteEntries: demoteEntries)
+                    },
+                    resolveReference: { surfaceID, key, source in
+                        try await store.resolveDiscoveryReference(
+                            surfaceID: surfaceID, key: key, source: source)
+                    },
+                    openProject: openProject)
+            } else {
+                progressView
+            }
+        }
+        .task {
+            await runDiscovery()
+        }
+        .interactiveDismissDisabled(isActive)
+        .onDisappear {
+            guard let job, !job.state.isTerminal else { return }
+            Task {
+                _ = try? await store.cancelDiscovery(id: job.id)
+            }
+        }
+    }
+
+    private var progressView: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 13) {
+                Image(systemName: "sparkle.magnifyingglass")
+                    .font(.title2)
+                    .foregroundStyle(.blue)
+                    .frame(width: 42, height: 42)
+                    .background(Color.blue.opacity(0.10), in: RoundedRectangle(cornerRadius: 11))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Discovering Workspace")
+                        .font(.title2.bold())
+                    Text(scopeTitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                Spacer()
+            }
+            .padding(22)
+            Divider()
+
+            VStack(alignment: .leading, spacing: 20) {
+                if let errorMessage {
+                    Label {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Discovery could not finish")
+                                .font(.headline)
+                            Text(errorMessage)
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    } icon: {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                    }
+                } else if job?.state == .cancelled {
+                    Label("Discovery cancelled", systemImage: "xmark.circle")
+                        .font(.headline)
+                        .foregroundStyle(.secondary)
+                } else {
+                    HStack(spacing: 12) {
+                        ProgressView()
+                            .controlSize(.small)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(phaseTitle)
+                                .font(.headline)
+                            Text(phaseDetail)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                    }
+                }
+
+                HStack(spacing: 10) {
+                    SummaryMetric(
+                        value: progress.directoriesScanned,
+                        label: "Directory visits")
+                    SummaryMetric(
+                        value: progress.projectCandidates,
+                        label: "Projects")
+                    SummaryMetric(
+                        value: progress.candidateFiles,
+                        label: "Candidates")
+                    SummaryMetric(
+                        value: progress.filesParsed,
+                        label: "Read")
+                }
+
+                Text("Floria reads candidate files as data. It never executes project code.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(22)
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+
+            Divider()
+            HStack {
+                Text(statusNote)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if isActive {
+                    Button(isCancelling ? "Cancelling…" : "Cancel") {
+                        cancelDiscovery()
+                    }
+                    .disabled(job == nil || isCancelling)
+                } else {
+                    Button("Done") { dismiss() }
+                        .keyboardShortcut(.defaultAction)
+                }
+            }
+            .padding(.horizontal, 22)
+            .frame(height: 58)
+        }
+        .frame(width: 640, height: 390)
+    }
+
+    private var progress: DiscoveryJobProgress {
+        job?.progress
+            ?? DiscoveryJobProgress(
+                phase: .starting,
+                directoriesScanned: 0,
+                candidateFiles: 0,
+                projectCandidates: 0,
+                filesParsed: 0)
+    }
+
+    private var isActive: Bool {
+        guard errorMessage == nil else { return false }
+        guard let job else { return true }
+        return !job.state.isTerminal
+    }
+
+    private var scopeTitle: String {
+        if paths.count == 1 {
+            return (paths[0] as NSString).abbreviatingWithTildeInPath
+        }
+        return "\(paths.count) selected locations"
+    }
+
+    private var phaseTitle: String {
+        if isCancelling || job?.state == .cancelling {
+            return "Stopping discovery…"
+        }
+        switch progress.phase {
+        case .starting:
+            return "Preparing discovery…"
+        case .projectCandidates:
+            return "Finding projects…"
+        case .candidateFiles:
+            return "Finding configuration files…"
+        case .parsingFiles:
+            return "Reading candidates…"
+        case .reconciling:
+            return "Comparing with Library…"
+        case .complete:
+            return "Preparing review…"
+        }
+    }
+
+    private var phaseDetail: String {
+        switch progress.phase {
+        case .starting:
+            return "Starting the background scanner."
+        case .projectCandidates:
+            return "\(progress.directoriesScanned) directory visits completed."
+        case .candidateFiles:
+            return "\(progress.candidateFiles) candidate files found."
+        case .parsingFiles:
+            return "\(progress.filesParsed) of \(progress.candidateFiles) candidates read."
+        case .reconciling:
+            return "Checking existing projects, outputs, and protected files."
+        case .complete:
+            return "The review is almost ready."
+        }
+    }
+
+    private var statusNote: String {
+        if errorMessage != nil {
+            return "No changes were made."
+        }
+        if job?.state == .cancelled {
+            return "No changes were made."
+        }
+        return "You can cancel safely before importing."
+    }
+
+    private func runDiscovery() async {
+        do {
+            var current = try await store.startDiscovery(at: paths)
+            job = current
+            while !Task.isCancelled && !current.state.isTerminal {
+                try await Task.sleep(nanoseconds: 500_000_000)
+                current = try await store.discoveryStatus(id: current.id)
+                job = current
+            }
+            if current.state == .failed {
+                errorMessage = current.error ?? "The background discovery job failed."
+            } else if current.state == .completed && current.plan == nil {
+                errorMessage = "Discovery completed without a review plan."
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func cancelDiscovery() {
+        guard let job, !job.state.isTerminal, !isCancelling else { return }
+        isCancelling = true
+        Task {
+            do {
+                self.job = try await store.cancelDiscovery(id: job.id)
+                dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
+                isCancelling = false
+            }
+        }
     }
 }
 
@@ -1757,12 +2050,18 @@ private struct DiscoveryReviewSheet: View {
         self.apply = apply
         self.resolveReference = resolveReference
         self.openProject = openProject
+        let managedPaths = Set(plan.managedItems.map(\.path))
         _selectedFilePaths = State(
-            initialValue: Set(plan.files.filter(\.canApplyDiscovery).map(\.path)))
+            initialValue: Set(
+                plan.files
+                    .filter { $0.canApplyDiscovery && !managedPaths.contains($0.path) }
+                    .map(\.path)))
         _destinations = State(
             initialValue: Dictionary(
                 uniqueKeysWithValues: plan.files.compactMap { file in
-                    guard file.canApplyDiscovery else { return nil }
+                    guard file.canApplyDiscovery, !managedPaths.contains(file.path) else {
+                        return nil
+                    }
                     let destination: DiscoveryDestinationChoice?
                     switch file.action {
                     case .compose:
@@ -1780,6 +2079,14 @@ private struct DiscoveryReviewSheet: View {
                 }))
     }
 
+    private var managedItemPaths: Set<String> {
+        Set(plan.managedItems.map(\.path))
+    }
+
+    private var discoveredFiles: [DiscoveredFile] {
+        plan.files.filter { !managedItemPaths.contains($0.path) }
+    }
+
     private var discoveryScopeTitle: String {
         if plan.paths.count == 1, let path = plan.paths.first {
             return path
@@ -1789,20 +2096,33 @@ private struct DiscoveryReviewSheet: View {
 
     private var discoveryGroups: [DiscoveryProjectGroup] {
         var groups = plan.projects.compactMap { project -> DiscoveryProjectGroup? in
-            let files = plan.files.filter {
+            let files = discoveredFiles.filter {
                 $0.assignment.projectPath == project.path
             }
-            guard !files.isEmpty else { return nil }
+            let managedItems = plan.managedItems.filter {
+                $0.projectPath == project.path
+            }
+            guard !files.isEmpty || !managedItems.isEmpty else { return nil }
             return DiscoveryProjectGroup(
-                id: project.path, project: project, files: files, needsReview: false)
+                id: project.path,
+                project: project,
+                files: files,
+                managedItems: managedItems,
+                needsReview: false)
         }
-        let unassigned = plan.files.filter { $0.assignment.projectPath == nil }
-        if !unassigned.isEmpty {
+        let unassignedFiles = discoveredFiles.filter { $0.assignment.projectPath == nil }
+        let unassignedManagedItems = plan.managedItems.filter { $0.projectPath == nil }
+        if !unassignedFiles.isEmpty || !unassignedManagedItems.isEmpty {
             groups.insert(
                 DiscoveryProjectGroup(
-                    id: "needs-review", project: nil, files: unassigned,
-                    needsReview: unassigned.contains {
-                        $0.assignment.state == .needsReview
+                    id: "needs-review",
+                    project: nil,
+                    files: unassignedFiles,
+                    managedItems: unassignedManagedItems,
+                    needsReview: unassignedFiles.contains {
+                        selectedFilePaths.contains($0.path)
+                            && $0.action == .compose
+                            && !destinationIsResolved(for: $0)
                     }),
                 at: 0)
         }
@@ -1810,11 +2130,19 @@ private struct DiscoveryReviewSheet: View {
     }
 
     private var needsReviewCount: Int {
-        plan.files.filter {
+        discoveredFiles.filter {
             selectedFilePaths.contains($0.path)
                 && $0.action == .compose
                 && !destinationIsResolved(for: $0)
         }.count
+    }
+
+    private var managedAttentionCount: Int {
+        plan.managedItems.filter { $0.status != .linked }.count
+    }
+
+    private var visibleProjectCount: Int {
+        discoveryGroups.filter { $0.project != nil }.count
     }
 
     private var hasUnresolvedAssignments: Bool {
@@ -1822,6 +2150,17 @@ private struct DiscoveryReviewSheet: View {
     }
 
     var body: some View {
+        let preview = importPreview
+        let cachedSharedGroupCounts = sharedGroupCounts
+        let cachedAppliedResults = Dictionary(
+            uniqueKeysWithValues: (appliedResult?.files ?? []).map { ($0.path, $0) })
+        let cachedConflicts = preview.conflicts.reduce(
+            into: [String: [DiscoveryImportPreview.Conflict]]()
+        ) { conflictsByPath, conflict in
+            for path in conflict.sourcePaths {
+                conflictsByPath[path, default: []].append(conflict)
+            }
+        }
         VStack(spacing: 0) {
             HStack(spacing: 13) {
                 Image(systemName: "sparkle.magnifyingglass")
@@ -1847,12 +2186,19 @@ private struct DiscoveryReviewSheet: View {
             Divider()
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
+                LazyVStack(alignment: .leading, spacing: 18) {
                     HStack(spacing: 10) {
-                        SummaryMetric(value: plan.projects.count, label: "Projects")
-                        SummaryMetric(value: plan.summary.files, label: "Files")
-                        SummaryMetric(value: selectedSecretSummary.new, label: "New")
-                        SummaryMetric(value: needsReviewCount, label: "Needs Review")
+                        SummaryMetric(value: visibleProjectCount, label: "Projects")
+                        SummaryMetric(value: discoveredFiles.count, label: "New Files")
+                        SummaryMetric(value: plan.managedItems.count, label: "Managed")
+                        SummaryMetric(
+                            value: needsReviewCount + managedAttentionCount,
+                            label: "Attention")
+                    }
+                    if !selectedFilePaths.isEmpty {
+                        DiscoveryImportPreviewBanner(
+                            preview: preview,
+                            unresolvedAssignments: needsReviewCount)
                     }
                     if let appliedResult {
                         Label(
@@ -1865,8 +2211,11 @@ private struct DiscoveryReviewSheet: View {
                             .background(Color.green.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
                     }
                     ForEach(discoveryGroups) { group in
-                        VStack(alignment: .leading, spacing: 9) {
+                        LazyVStack(alignment: .leading, spacing: 9) {
                             DiscoveryProjectHeader(group: group)
+                            ForEach(group.managedItems) { item in
+                                DiscoveryManagedItemCard(item: item)
+                            }
                             ForEach(group.files) { file in
                                 DiscoveryFileCard(
                                     file: file,
@@ -1883,15 +2232,14 @@ private struct DiscoveryReviewSheet: View {
                                                 selectedFilePaths.remove(file.path)
                                             }
                                         }),
-                                    result: appliedResult?.files.first { $0.path == file.path },
+                                    result: cachedAppliedResults[file.path],
                                     locked: appliedResult != nil,
                                     separateEntryIDs: $separateEntryIDs,
                                     promotedEntryIDs: $promotedEntryIDs,
                                     demotedEntryIDs: $demotedEntryIDs,
-                                    sharedGroupCounts: sharedGroupCounts,
-                                    automaticGroupCounts: automaticGroupCounts,
-                                    automaticGroupPrimaryEntryIDs: automaticGroupPrimaryEntryIDs,
+                                    sharedGroupCounts: cachedSharedGroupCounts,
                                     resolvedReferenceEntryIDs: resolvedReferenceEntryIDs,
+                                    conflicts: cachedConflicts[file.path] ?? [],
                                     resolveReference: { entry in
                                         referenceTarget = ReferenceResolutionTarget(
                                             file: file, entry: entry)
@@ -1899,7 +2247,7 @@ private struct DiscoveryReviewSheet: View {
                             }
                         }
                     }
-                    if plan.files.isEmpty {
+                    if discoveredFiles.isEmpty && plan.managedItems.isEmpty {
                         ContentUnavailableView(
                             "Nothing discovered",
                             systemImage: "doc.text.magnifyingglass",
@@ -1942,13 +2290,14 @@ private struct DiscoveryReviewSheet: View {
                             Text(
                                 appliedResult == nil
                                     ? importButtonTitle
-                                    : (appliedResult?.projectID == nil ? "Done" : "Open Project"))
+                                    : completionButtonTitle)
                         }
                     }
                     .disabled(
                         isApplying
                             || (appliedResult == nil
-                                && (selectedFilePaths.isEmpty || hasUnresolvedAssignments)))
+                                && (selectedFilePaths.isEmpty || hasUnresolvedAssignments
+                                    || preview.hasConflicts)))
                     .keyboardShortcut(.defaultAction)
                 }
             }
@@ -1979,7 +2328,7 @@ private struct DiscoveryReviewSheet: View {
     }
 
     private var importButtonTitle: String {
-        let files = plan.files.filter { selectedFilePaths.contains($0.path) }
+        let files = discoveredFiles.filter { selectedFilePaths.contains($0.path) }
         let count = files.count
         guard count > 0 else { return "Select Items" }
         let suffix = count == 1 ? "" : "s"
@@ -1997,17 +2346,55 @@ private struct DiscoveryReviewSheet: View {
     }
 
     private var hasImportableItems: Bool {
-        plan.files.contains(where: \.canApplyDiscovery)
+        discoveredFiles.contains(where: \.canApplyDiscovery)
+    }
+
+    private var selectedFiles: [DiscoveredFile] {
+        discoveredFiles.filter { selectedFilePaths.contains($0.path) }
+    }
+
+    private var selectedImports: [DiscoveryImport] {
+        selectedFiles.compactMap(discoveryImport)
+    }
+
+    private var importPreview: DiscoveryImportPreview {
+        DiscoveryImportPreview(
+            imports: selectedImports,
+            pathExists: { path in
+                if FileManager.default.fileExists(atPath: path) {
+                    return true
+                }
+                return (try? FileManager.default.destinationOfSymbolicLink(atPath: path)) != nil
+            })
+    }
+
+    private var completionButtonTitle: String {
+        guard let result = appliedResult else { return "Done" }
+        if result.projectIDs.count > 1 {
+            return "View Projects"
+        }
+        return result.projectID == nil ? "Done" : "Open Project"
     }
 
     private var discoveryNote: String {
         var notes = ["Static scan only; project code was not executed."]
+        if !plan.managedItems.isEmpty {
+            if managedAttentionCount == 0 {
+                notes.append(
+                    "\(plan.managedItems.count) managed path\(plan.managedItems.count == 1 ? " is" : "s are") linked correctly."
+                )
+            } else {
+                notes.append(
+                    "\(managedAttentionCount) managed path\(managedAttentionCount == 1 ? " needs" : "s need") attention."
+                )
+            }
+        }
         if hasUnresolvedAssignments {
             notes.append(
                 "\(needsReviewCount) selected file\(needsReviewCount == 1 ? "" : "s") need an import destination."
             )
         }
-        let referenceCount = plan.files.filter { $0.action == .reference }.count
+        let referenceCount = discoveredFiles.filter { $0.action == .reference }.count
         if referenceCount > 0 {
             notes.append(
                 "\(referenceCount) reference file\(referenceCount == 1 ? "" : "s") will remain unchanged."
@@ -2018,6 +2405,12 @@ private struct DiscoveryReviewSheet: View {
         if missingCount > 0 {
             notes.append(
                 "\(missingCount) declared key\(missingCount == 1 ? " has" : "s have") no discovered value."
+            )
+        }
+        let conflictCount = importPreview.conflicts.count
+        if conflictCount > 0 {
+            notes.append(
+                "\(conflictCount) output conflict\(conflictCount == 1 ? "" : "s") must be resolved before import."
             )
         }
         let base = notes.joined(separator: " ")
@@ -2114,9 +2507,6 @@ private struct DiscoveryReviewSheet: View {
         Task {
             defer { isApplying = false }
             do {
-                let selectedFiles = plan.files.filter {
-                    selectedFilePaths.contains($0.path)
-                }
                 let entriesMatching = { (ids: Set<String>) in
                     selectedFiles.flatMap { file in
                         file.entries.compactMap { entry in
@@ -2126,9 +2516,8 @@ private struct DiscoveryReviewSheet: View {
                         }
                     }
                 }
-                let imports = selectedFiles.compactMap(discoveryImport)
                 appliedResult = try await apply(
-                    imports,
+                    selectedImports,
                     entriesMatching(separateEntryIDs),
                     entriesMatching(promotedEntryIDs),
                     entriesMatching(demotedEntryIDs))
@@ -2156,71 +2545,6 @@ private struct DiscoveryReviewSheet: View {
             .compactMap(\.action.groupID)
             .reduce(into: [:]) { counts, groupID in counts[groupID, default: 0] += 1 }
     }
-
-    private var automaticGroupMembership: [String: [String]] {
-        var membership: [String: [String]] = [:]
-        for file in plan.files where selectedFilePaths.contains(file.path) {
-            for entry in file.entries {
-                let selectionID = entrySelectionID(file: file, entry: entry)
-                guard
-                    !separateEntryIDs.contains(selectionID),
-                    !demotedEntryIDs.contains(selectionID),
-                    let groupID = entry.action.groupID
-                else { continue }
-                membership[groupID, default: []].append(selectionID)
-            }
-        }
-        return membership
-    }
-
-    private var automaticGroupCounts: [String: Int] {
-        automaticGroupMembership.mapValues(\.count)
-    }
-
-    private var automaticGroupPrimaryEntryIDs: Set<String> {
-        Set(automaticGroupMembership.values.compactMap(\.first))
-    }
-
-    private var selectedSecretSummary: (new: Int, reused: Int) {
-        var new = 0
-        var reused = 0
-        var seenGroups = Set<String>()
-        for file in plan.files where selectedFilePaths.contains(file.path) {
-            for entry in file.entries {
-                let selectionID = entrySelectionID(file: file, entry: entry)
-                if demotedEntryIDs.contains(selectionID) {
-                    continue
-                }
-                if entry.action.type == "create_env_file_entry" {
-                    if promotedEntryIDs.contains(selectionID) {
-                        new += 1
-                    }
-                    continue
-                }
-                if separateEntryIDs.contains(selectionID) {
-                    new += 1
-                    continue
-                }
-                switch entry.action.type {
-                case "reuse_shared_secret":
-                    reused += 1
-                case "create_shared_secret", "reuse_discovered_secret":
-                    guard let groupID = entry.action.groupID else {
-                        new += 1
-                        continue
-                    }
-                    if seenGroups.insert(groupID).inserted {
-                        new += 1
-                    } else {
-                        reused += 1
-                    }
-                default:
-                    break
-                }
-            }
-        }
-        return (new, reused)
-    }
 }
 
 private struct ReferenceResolutionTarget: Identifiable {
@@ -2240,8 +2564,8 @@ private enum ReferenceValueSourceMode: String, Identifiable {
 
     var title: String {
         switch self {
-        case .new: "New Secret"
-        case .existing: "Use Existing"
+        case .new: "Enter Value"
+        case .existing: "Use Shared"
         }
     }
 }
@@ -2449,6 +2773,90 @@ private struct SummaryMetric: View {
     }
 }
 
+private struct DiscoveryManagedItemCard: View {
+    let item: DiscoveryManagedItem
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: icon)
+                .foregroundStyle(color)
+                .frame(width: 28, height: 28)
+                .background(color.opacity(0.10), in: RoundedRectangle(cornerRadius: 7))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(item.relativePath)
+                    .font(.body.weight(.medium))
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Label(statusTitle, systemImage: statusIcon)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(statusColor)
+        }
+        .padding(14)
+        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+        .overlay {
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(statusColor.opacity(item.status == .linked ? 0.15 : 0.35), lineWidth: 1)
+        }
+        .help(statusHelp)
+    }
+
+    private var detail: String {
+        var parts = [
+            item.kind == .surface ? "Managed output" : "Protected file"
+        ]
+        if let environment = item.environment {
+            parts.append(environment)
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private var icon: String {
+        item.kind == .surface ? "doc.badge.gearshape" : "doc.badge.lock"
+    }
+
+    private var color: Color {
+        item.kind == .surface ? .blue : .orange
+    }
+
+    private var statusTitle: String {
+        switch item.status {
+        case .linked: "Managed"
+        case .missing: "Link missing"
+        case .replaced: "Path replaced"
+        }
+    }
+
+    private var statusIcon: String {
+        switch item.status {
+        case .linked: "checkmark.circle.fill"
+        case .missing: "exclamationmark.triangle.fill"
+        case .replaced: "xmark.circle.fill"
+        }
+    }
+
+    private var statusColor: Color {
+        switch item.status {
+        case .linked: .green
+        case .missing: .orange
+        case .replaced: .red
+        }
+    }
+
+    private var statusHelp: String {
+        switch item.status {
+        case .linked:
+            "This path still points to its Floria-managed content."
+        case .missing:
+            "The managed path no longer exists. Its catalog and encrypted content are unchanged."
+        case .replaced:
+            "Another file or symbolic link now occupies this managed path. Floria did not replace it."
+        }
+    }
+}
+
 private struct DiscoveryFileCard: View {
     let file: DiscoveredFile
     let projects: [DiscoveredProject]
@@ -2460,9 +2868,8 @@ private struct DiscoveryFileCard: View {
     @Binding var promotedEntryIDs: Set<String>
     @Binding var demotedEntryIDs: Set<String>
     let sharedGroupCounts: [String: Int]
-    let automaticGroupCounts: [String: Int]
-    let automaticGroupPrimaryEntryIDs: Set<String>
     let resolvedReferenceEntryIDs: Set<String>
+    let conflicts: [DiscoveryImportPreview.Conflict]
     let resolveReference: (DiscoveredEntry) -> Void
 
     var body: some View {
@@ -2581,6 +2988,14 @@ private struct DiscoveryFileCard: View {
                     .foregroundStyle(.orange)
                     .padding(.leading, 60)
             }
+            ForEach(conflicts) { conflict in
+                Label(conflict.message, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+                    .padding(.leading, 60)
+            }
             if let result, result.outcome == "failed" {
                 Label(result.detail, systemImage: "xmark.circle.fill")
                     .font(.caption)
@@ -2695,20 +3110,9 @@ private struct DiscoveryFileCard: View {
 
     private var actionTitle: String {
         switch file.action {
-        case .compose:
-            let secrets = file.entries.filter { $0.action.type != "create_env_file_entry" }.count
-            let values = file.entries.count - secrets
-            if secrets > 0 && values > 0 {
-                return "\(secrets) secret\(secrets == 1 ? "" : "s") · \(values) value\(values == 1 ? "" : "s")"
-            }
-            if secrets > 0 && (file.kind == .dotenv || file.kind == .direnv) {
-                return "\(secrets) secret\(secrets == 1 ? "" : "s")"
-            }
-            return "\(file.entries.count) value\(file.entries.count == 1 ? "" : "s")"
-        case .protect: return "Protect in place"
-        case .importSshIdentity: return "Import identity"
-        case .reference: return "Reference only"
-        case .review: return "Review only"
+        case .compose, .importSshIdentity: return "Import"
+        case .protect: return "Protect"
+        case .reference, .review: return "Review"
         }
     }
 
@@ -2756,18 +3160,17 @@ private struct DiscoveryFileCard: View {
 
     private func entryActionTitle(_ type: String) -> String {
         if file.action == .reference {
-            return "Declared key"
+            return "Review"
         }
         if file.action == .review {
-            return "Detected"
+            return "Review"
         }
         return switch type {
         case "reuse_shared_secret": "Reuse"
-        case "create_shared_secret": "New secret"
-        case "create_env_file_entry":
-            file.kind == .dotenv || file.kind == .direnv ? "Env value" : "Keep section"
-        case "keep_in_protected_file": "Protect in place"
-        default: "Include"
+        case "create_shared_secret", "reuse_discovered_secret": "Shared"
+        case "create_env_file_entry": "This file"
+        case "keep_in_protected_file": "Protect"
+        default: "Import"
         }
     }
 
@@ -2777,7 +3180,7 @@ private struct DiscoveryFileCard: View {
         let isSeparate = separateEntryIDs.contains(selectionID)
         if entry.action.type == "reference_entry" {
             if referenceIsCovered(entry) {
-                Text("Covered")
+                Text("Ready")
                     .font(.caption)
                     .foregroundStyle(.green)
             } else if file.managedSurfaceID != nil {
@@ -2788,7 +3191,7 @@ private struct DiscoveryFileCard: View {
                 .buttonStyle(.borderless)
                 .foregroundStyle(.orange)
             } else {
-                Text("Missing value")
+                Text("Needs value")
                     .font(.caption)
                     .foregroundStyle(.orange)
             }
@@ -2799,22 +3202,22 @@ private struct DiscoveryFileCard: View {
                     promotedEntryIDs.remove(selectionID)
                 } label: {
                     if isPromoted {
-                        Text("Keep as env value")
+                        Text("Keep in this file")
                     } else {
-                        Label("Keep as env value", systemImage: "checkmark")
+                        Label("Keep in this file", systemImage: "checkmark")
                     }
                 }
                 Button {
                     promotedEntryIDs.insert(selectionID)
                 } label: {
                     if isPromoted {
-                        Label("Import as secret", systemImage: "checkmark")
+                        Label("Share this value", systemImage: "checkmark")
                     } else {
-                        Text("Import as secret")
+                        Text("Share this value")
                     }
                 }
             } label: {
-                Text(isPromoted ? "New secret" : "Env value")
+                Text(isPromoted ? "Shared" : "This file")
                     .font(.caption)
                     .foregroundStyle(isPromoted ? Color.green : Color.secondary)
             }
@@ -2828,10 +3231,10 @@ private struct DiscoveryFileCard: View {
                     demotedEntryIDs.remove(selectionID)
                 } label: {
                     if isSeparate || isDemoted {
-                        Text(automaticEntryActionTitle(entry, selectionID: selectionID))
+                        Text(automaticEntryActionTitle(entry))
                     } else {
                         Label(
-                            automaticEntryActionTitle(entry, selectionID: selectionID),
+                            automaticEntryActionTitle(entry),
                             systemImage: "checkmark")
                     }
                 }
@@ -2841,9 +3244,9 @@ private struct DiscoveryFileCard: View {
                         demotedEntryIDs.remove(selectionID)
                     } label: {
                         if isSeparate && !isDemoted {
-                            Label("Create separate secret", systemImage: "checkmark")
+                            Label("Keep separate", systemImage: "checkmark")
                         } else {
-                            Text("Create separate secret")
+                            Text("Keep separate")
                         }
                     }
                 }
@@ -2852,18 +3255,18 @@ private struct DiscoveryFileCard: View {
                     separateEntryIDs.remove(selectionID)
                 } label: {
                     if isDemoted {
-                        Label("Keep as env value", systemImage: "checkmark")
+                        Label("Keep in this file", systemImage: "checkmark")
                     } else {
-                        Text("Keep as env value")
+                        Text("Keep in this file")
                     }
                 }
             } label: {
                 Text(
                     isDemoted
-                        ? "Env value"
+                        ? "This file"
                         : (isSeparate
                             ? "Separate"
-                            : automaticEntryActionTitle(entry, selectionID: selectionID)))
+                            : automaticEntryActionTitle(entry)))
                 .font(.caption)
                 .foregroundStyle(
                     isDemoted ? Color.secondary : (isSeparate ? Color.orange : Color.green))
@@ -2874,7 +3277,7 @@ private struct DiscoveryFileCard: View {
             .menuStyle(.borderlessButton)
             .disabled(locked || !selected || !file.canApplyDiscovery)
         } else {
-            Text(automaticEntryActionTitle(entry, selectionID: selectionID))
+            Text(automaticEntryActionTitle(entry))
                 .font(.caption)
                 .foregroundStyle(entryActionColor(entry))
         }
@@ -2908,22 +3311,14 @@ private struct DiscoveryFileCard: View {
         }
     }
 
-    private func automaticEntryActionTitle(
-        _ entry: DiscoveredEntry, selectionID: String
-    ) -> String {
+    private func automaticEntryActionTitle(_ entry: DiscoveredEntry) -> String {
         switch entry.action.type {
         case "reuse_shared_secret":
             return entry.action.resourceName.map { "Reuse \($0)" } ?? "Reuse existing"
         case "create_shared_secret", "reuse_discovered_secret":
-            guard
-                let groupID = entry.action.groupID,
-                automaticGroupCounts[groupID, default: 0] > 1
-            else { return "New secret" }
-            return automaticGroupPrimaryEntryIDs.contains(selectionID)
-                ? "New shared secret"
-                : "Share in import"
+            return "Shared"
         case "reference_entry":
-            return referenceIsCovered(entry) ? "Covered" : "Missing value"
+            return referenceIsCovered(entry) ? "Ready" : "Needs value"
         default:
             return entryActionTitle(entry.action.type)
         }

@@ -43,6 +43,50 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertFalse(String(decoding: response, as: UTF8.self).contains("secret_value"))
     }
 
+    func testAsynchronousDiscoveryCommandsAndProgressMatchRustWireShape() throws {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+
+        let startData = try ControlCommand.discoverStart(paths: ["/fixture/workspace"])
+            .requestData(requestID: 81, encoder: encoder)
+        let start = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: startData) as? [String: Any])
+        XCTAssertEqual(start["method"] as? String, "discover_start")
+        XCTAssertEqual(
+            (start["params"] as? [String: Any])?["paths"] as? [String],
+            ["/fixture/workspace"])
+
+        for (command, method) in [
+            (ControlCommand.discoverStatus(id: "discover-1"), "discover_status"),
+            (.discoverCancel(id: "discover-1"), "discover_cancel"),
+        ] {
+            let data = try command.requestData(requestID: 82, encoder: encoder)
+            let request = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: data) as? [String: Any])
+            XCTAssertEqual(request["method"] as? String, method)
+            XCTAssertEqual(
+                (request["params"] as? [String: Any])?["id"] as? String,
+                "discover-1")
+        }
+
+        let response = Data(
+            #"{"request_id":82,"status":"ok","result":{"type":"discovery_job","value":{"id":"discover-1","state":"running","progress":{"phase":"candidate_files","directories_scanned":64,"candidate_files":5,"project_candidates":2,"files_parsed":0}}}}"#.utf8)
+        let decoded = try JSONDecoder().decode(
+            ControlResponseEnvelope<DiscoveryJobStatus>.self, from: response)
+        let status = try XCTUnwrap(decoded.result?.value)
+
+        XCTAssertEqual(decoded.result?.type, "discovery_job")
+        XCTAssertEqual(status.id, "discover-1")
+        XCTAssertEqual(status.state, .running)
+        XCTAssertFalse(status.state.isTerminal)
+        XCTAssertEqual(status.progress.phase, .candidateFiles)
+        XCTAssertEqual(status.progress.directoriesScanned, 64)
+        XCTAssertEqual(status.progress.candidateFiles, 5)
+        XCTAssertEqual(status.progress.projectCandidates, 2)
+        XCTAssertNil(status.plan)
+        XCTAssertNil(status.error)
+    }
+
     func testDiscoveryCandidateGroupingMatchesRustWireShape() throws {
         let create = try JSONDecoder().decode(
             DiscoveredEntryAction.self,
@@ -66,6 +110,22 @@ final class ControlProtocolTests: XCTestCase {
                 #"{"name":"project","path":"/fixture/project","markers":[],"ecosystems":[],"managed_project_id":"fixture-project"}"#.utf8))
 
         XCTAssertEqual(project.managedProjectID, "fixture-project")
+    }
+
+    func testManagedDiscoveryItemsMatchRustWireShape() throws {
+        let response = Data(
+            #"{"request_id":8,"status":"ok","result":{"type":"discovery","value":{"paths":["/fixture/project"],"projects":[{"name":"project","path":"/fixture/project","markers":[],"ecosystems":[],"managed_project_id":"fixture-project"}],"files":[],"summary":{"files":0,"entries":0,"new_secrets":0,"reused_secrets":0,"missing_reference_entries":0,"warnings":0},"managed_items":[{"id":"fixture-surface","path":"/fixture/project/.env","relative_path":".env","project_path":"/fixture/project","environment":"Development","kind":"surface","status":"linked"},{"id":"fixture-protected","path":"/fixture/project/client.p12","relative_path":"client.p12","project_path":"/fixture/project","kind":"protected_file","status":"missing"}]}}}"#.utf8)
+
+        let decoded = try JSONDecoder().decode(
+            ControlResponseEnvelope<DiscoveryPlan>.self, from: response)
+        let plan = try XCTUnwrap(decoded.result?.value)
+
+        XCTAssertEqual(plan.managedItems.count, 2)
+        XCTAssertEqual(plan.managedItems[0].kind, .surface)
+        XCTAssertEqual(plan.managedItems[0].status, .linked)
+        XCTAssertEqual(plan.managedItems[0].environment, "Development")
+        XCTAssertEqual(plan.managedItems[1].kind, .protectedFile)
+        XCTAssertEqual(plan.managedItems[1].status, .missing)
     }
 
     func testDiscoverApplyRequestAndResultMatchRustWireShape() throws {
