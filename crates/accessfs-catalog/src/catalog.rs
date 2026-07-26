@@ -960,7 +960,7 @@ fn resolve_exports(
             let current_is_environment = matches!(binding.scope, BindingScope::Environment { .. });
             let resolved = ResolvedExport {
                 key: key.clone(),
-                source_key: entry.address.clone(),
+                address: entry.address.clone(),
                 binding_id: binding.id.clone(),
                 resource_id: resource.id.clone(),
                 resource_name: resource.name.clone(),
@@ -2024,7 +2024,7 @@ mod tests {
         let resolved = catalog.resolve_environment("floria", "development").unwrap();
         assert_eq!(resolved.exports.len(), 1);
         assert_eq!(resolved.exports[0].key, "LOG_LEVEL");
-        assert_eq!(resolved.exports[0].source_key, "keys/LOG_LEVEL");
+        assert_eq!(resolved.exports[0].address, "keys/LOG_LEVEL");
     }
 
     #[test]

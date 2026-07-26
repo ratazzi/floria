@@ -168,15 +168,15 @@ impl SurfaceResolver {
             let value = resource_values
                 .get(&export.resource_id)
                 .and_then(|values| {
-                    values.iter().find(|entry| entry.address == export.source_key)
+                    values.iter().find(|entry| entry.address == export.address)
                 })
                 .ok_or_else(|| SurfaceError::MissingKey {
                     resource_id: export.resource_id.clone(),
-                    key: export.source_key.clone(),
+                    key: export.address.clone(),
                 })?;
             entries.push(ResolvedEnvironmentEntry {
                 export_key: export.key,
-                source_address: export.source_key,
+                source_address: export.address,
                 binding_id: export.binding_id,
                 resource_id: export.resource_id,
                 value: value.value.clone(),

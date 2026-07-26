@@ -479,8 +479,8 @@ pub struct CatalogSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedExport {
     pub key: String,
-    /// The key used inside the resource value before a scalar binding renames it.
-    pub source_key: String,
+    /// Stable catalog address used to locate the decoded resource entry.
+    pub address: String,
     pub binding_id: String,
     pub resource_id: String,
     pub resource_name: String,
