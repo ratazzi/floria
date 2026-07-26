@@ -1541,7 +1541,9 @@
         let rediscovered = dispatch(
             &catalog,
             DispatchServices { store: Some(&store), ..DispatchServices::default() },
-            ControlCommand::Discover { paths: vec![project_path.clone()] },
+            ControlCommand::Discover {
+                paths: vec![project_path.clone(), reference_path.clone()],
+            },
         )
         .unwrap();
         let ControlResult::Discovery(plan) = rediscovered else {
@@ -1639,7 +1641,9 @@
         let rediscovered = dispatch(
             &catalog,
             DispatchServices { store: Some(&store), ..DispatchServices::default() },
-            ControlCommand::Discover { paths: vec![project_path] },
+            ControlCommand::Discover {
+                paths: vec![project_path, reference_path],
+            },
         )
         .unwrap();
         let ControlResult::Discovery(resolved_plan) = rediscovered else {

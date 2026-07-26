@@ -17,7 +17,7 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertTrue(sources.contains(#"sidebarSectionTitle("Library")"#))
     }
 
-    func testDiscoveryReviewDoesNotExposeImplementationVocabulary() throws {
+    func testDiscoveryUsesProtectionStateInsteadOfImplementationActions() throws {
         let source = try source("CompactDashboardView.swift")
 
         for phrase in [
@@ -30,13 +30,18 @@ final class ProductLanguageTests: XCTestCase {
             "Protect in place",
             "Protected in place",
             "Import identity",
+            "Review Discovery",
+            "Review Changes",
+            "Needs value",
+            "Choose Destination",
+            "Import",
+            "Review",
         ] {
             XCTAssertFalse(source.contains(#""\#(phrase)""#), phrase)
         }
-        XCTAssertTrue(source.contains(#""This file""#))
-        XCTAssertTrue(source.contains(#""Shared""#))
-        XCTAssertTrue(source.contains(#""Ready""#))
-        XCTAssertTrue(source.contains(#""Needs value""#))
+        XCTAssertTrue(source.contains(#""Protected""#))
+        XCTAssertTrue(source.contains(#""Will be protected""#))
+        XCTAssertTrue(source.contains(#""Not selected""#))
     }
 
     private func source(_ name: String) throws -> String {

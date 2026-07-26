@@ -1667,14 +1667,15 @@ fn discover_dotenv(root: &Path, path: &Path, bytes: &[u8]) -> InternalFile {
         file.tags.push("reference".to_string());
         file.action = DiscoveredFileAction::Reference;
         file.entry_disposition = EntryDisposition::Reference;
+        return file;
     }
-    file
+    finalize_structured_file(file)
 }
 
 fn discover_ini(root: &Path, path: &Path, bytes: &[u8]) -> InternalFile {
     let mut warnings = Vec::new();
     let entries = decode_entries(ResourceCodec::Ini, path, bytes, &mut warnings);
-    structured_file(
+    finalize_structured_file(structured_file(
         root,
         path,
         DiscoveredFileKind::AwsCredentials,
@@ -1682,7 +1683,7 @@ fn discover_ini(root: &Path, path: &Path, bytes: &[u8]) -> InternalFile {
         None,
         entries,
         warnings,
-    )
+    ))
 }
 
 fn discover_direnv(root: &Path, path: &Path, bytes: &[u8]) -> InternalFile {
@@ -1727,7 +1728,7 @@ fn discover_direnv(root: &Path, path: &Path, bytes: &[u8]) -> InternalFile {
             message: "file is not valid UTF-8".to_string(),
         }),
     }
-    structured_file(
+    finalize_structured_file(structured_file(
         root,
         path,
         DiscoveredFileKind::Direnv,
@@ -1735,7 +1736,7 @@ fn discover_direnv(root: &Path, path: &Path, bytes: &[u8]) -> InternalFile {
         Some("development".to_string()),
         entries,
         warnings,
-    )
+    ))
 }
 
 fn discover_mise(root: &Path, path: &Path, bytes: &[u8]) -> InternalFile {
@@ -1791,8 +1792,12 @@ fn discover_mise(root: &Path, path: &Path, bytes: &[u8]) -> InternalFile {
         entries,
         warnings,
     );
-    file.action = DiscoveredFileAction::Review;
-    file.entry_disposition = EntryDisposition::ProtectedFile;
+    if file.entries.is_empty() {
+        file.action = DiscoveredFileAction::Review;
+        file.entry_disposition = EntryDisposition::ProtectedFile;
+    } else {
+        protect_as_is(&mut file);
+    }
     file
 }
 
@@ -1850,6 +1855,23 @@ fn structured_file(
             _ => EntryDisposition::SharedSecret,
         },
     }
+}
+
+fn finalize_structured_file(mut file: InternalFile) -> InternalFile {
+    if !file.warnings.is_empty() {
+        protect_as_is(&mut file);
+    } else if file.entries.is_empty() {
+        file.action = DiscoveredFileAction::Review;
+        file.entry_disposition = EntryDisposition::ProtectedFile;
+    }
+    file
+}
+
+fn protect_as_is(file: &mut InternalFile) {
+    file.codec = ResourceCodec::Opaque;
+    file.entries.clear();
+    file.action = DiscoveredFileAction::Protect;
+    file.entry_disposition = EntryDisposition::ProtectedFile;
 }
 
 fn opaque_file(
@@ -2091,15 +2113,13 @@ mod tests {
         assert_eq!(plan.projects.len(), 1);
         assert_eq!(plan.projects[0].path, root);
         assert_eq!(plan.summary.files, 5);
-        assert_eq!(plan.summary.entries, 4);
+        assert_eq!(plan.summary.entries, 2);
         assert_eq!(plan.summary.new_secrets, 1);
         assert_eq!(plan.summary.warnings, 2);
         assert!(plan.files.iter().any(|file| {
             file.relative_path == Path::new(".envrc")
-                && file.entries.iter().any(|entry| {
-                    entry.key == "LOCAL_FLAG"
-                        && entry.action == DiscoveredEntryAction::CreateEnvFileEntry
-                })
+                && file.entries.is_empty()
+                && file.action == DiscoveredFileAction::Protect
         }));
         assert_eq!(
             plan.files
@@ -2117,6 +2137,11 @@ mod tests {
                 && file.entries.iter().all(|entry| {
                     entry.action == DiscoveredEntryAction::CreateEnvFileEntry
                 })
+        }));
+        assert!(plan.files.iter().any(|file| {
+            file.kind == DiscoveredFileKind::Mise
+                && file.entries.is_empty()
+                && file.action == DiscoveredFileAction::Protect
         }));
     }
 
@@ -2187,20 +2212,29 @@ mod tests {
 
         let plan = discover(root).unwrap().plan(&[]);
 
-        let keys = plan
+        assert!(plan.files.iter().all(|file| file.entries.is_empty()));
+        assert_eq!(plan.summary.warnings, 2);
+        assert!(plan
             .files
             .iter()
-            .flat_map(|file| file.entries.iter().map(|entry| entry.key.as_str()))
-            .collect::<HashSet<_>>();
-        assert_eq!(keys, HashSet::from(["SAFE"]));
-        assert_eq!(plan.summary.warnings, 2);
-        assert_eq!(
-            plan.files
-                .iter()
-                .find(|file| file.kind == DiscoveredFileKind::Mise)
-                .map(|file| file.action),
-            Some(DiscoveredFileAction::Review)
-        );
+            .all(|file| file.action == DiscoveredFileAction::Protect));
+    }
+
+    #[test]
+    fn static_direnv_content_remains_available_for_structured_sharing() {
+        let directory = tempdir().unwrap();
+        let file = directory.path().join(".envrc");
+        fs::write(
+            &file,
+            "export API_TOKEN=fixture-token\nexport REGION=fixture-region\n",
+        )
+        .unwrap();
+
+        let plan = discover(&file).unwrap().plan(&[]);
+
+        assert_eq!(plan.files[0].action, DiscoveredFileAction::Compose);
+        assert_eq!(plan.files[0].entries.len(), 2);
+        assert!(plan.files[0].warnings.is_empty());
     }
 
     #[test]

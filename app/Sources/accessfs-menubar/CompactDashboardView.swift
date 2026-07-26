@@ -107,9 +107,6 @@ struct DashboardView: View {
             DiscoveryWorkflowSheet(
                 paths: presentation.paths,
                 store: state.workspace,
-                sharedSecrets: state.workspace.resources.filter {
-                    $0.kind == .sharedSecret && $0.shape == .scalar
-                },
                 openProject: { projectID in
                     selectedProjectID = projectID
                     search = ""
@@ -1656,7 +1653,7 @@ private struct DiscoveryProjectHeader: View {
             Image(systemName: group.needsReview ? "questionmark.folder" : "folder")
                 .foregroundStyle(group.needsReview ? Color.orange : Color.blue)
             VStack(alignment: .leading, spacing: 1) {
-                Text(group.project?.name ?? (group.needsReview ? "Needs Review" : "Other Files"))
+                Text(group.project?.name ?? (group.needsReview ? "Choose Project" : "Other Files"))
                     .font(.callout.weight(.semibold))
                 Text(detail)
                     .font(.caption)
@@ -1676,8 +1673,8 @@ private struct DiscoveryProjectHeader: View {
     private var detail: String {
         guard let project = group.project else {
             return group.needsReview
-                ? "Choose where each file should be imported."
-                : "Using the selected import destinations."
+                ? "Choose a project for each selected file."
+                : "Files not assigned to a project."
         }
         let ecosystems = project.ecosystems.joined(separator: " · ")
         return ecosystems.isEmpty ? project.path : "\(project.path) · \(ecosystems)"
@@ -1696,7 +1693,7 @@ private struct DiscoveryImportPreviewBanner: View {
                         ? "\(preview.conflicts.count) output conflict\(preview.conflicts.count == 1 ? "" : "s")"
                         : (unresolvedAssignments > 0
                             ? "Choose \(unresolvedAssignments) destination\(unresolvedAssignments == 1 ? "" : "s")"
-                            : "Ready to import"))
+                            : "Ready to protect"))
                     .font(.callout.weight(.semibold))
             } icon: {
                 Image(
@@ -1707,13 +1704,6 @@ private struct DiscoveryImportPreviewBanner: View {
                             : "checkmark.circle.fill"))
             }
             .foregroundStyle(needsAttention ? Color.orange : Color.green)
-
-            Text(preview.actionSummary)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            Text("Secret reuse is finalized during import using an exact key and value match.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
 
             if preview.hasConflicts {
                 ForEach(preview.conflicts.prefix(3)) { conflict in
@@ -1729,12 +1719,12 @@ private struct DiscoveryImportPreviewBanner: View {
                         .foregroundStyle(.secondary)
                 }
                 Text(
-                    "Choose Library, remove the conflicting project, or move the existing output before importing."
+                    "Choose Library, remove the conflicting project, or move the existing output before protecting."
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
             } else if unresolvedAssignments > 0 {
-                Text("Assign every selected file before Floria can validate the complete plan.")
+                Text("Choose a project for every selected file.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -1755,7 +1745,6 @@ private struct DiscoveryWorkflowSheet: View {
     @Environment(\.dismiss) private var dismiss
     let paths: [String]
     @Bindable var store: WorkspaceStore
-    let sharedSecrets: [WorkspaceResource]
     let openProject: (String) -> Void
     @State private var job: DiscoveryJobStatus?
     @State private var errorMessage: String?
@@ -1766,7 +1755,6 @@ private struct DiscoveryWorkflowSheet: View {
             if let plan = job?.plan {
                 DiscoveryReviewSheet(
                     plan: plan,
-                    sharedSecrets: sharedSecrets,
                     apply: {
                         imports, separateEntries, promoteEntries, demoteEntries in
                         try await store.applyDiscovery(
@@ -1775,10 +1763,6 @@ private struct DiscoveryWorkflowSheet: View {
                             separateEntries: separateEntries,
                             promoteEntries: promoteEntries,
                             demoteEntries: demoteEntries)
-                    },
-                    resolveReference: { surfaceID, key, source in
-                        try await store.resolveDiscoveryReference(
-                            surfaceID: surfaceID, key: key, source: source)
                     },
                     openProject: openProject)
             } else {
@@ -2012,15 +1996,11 @@ private enum DiscoveryDestinationChoice: Equatable {
 private struct DiscoveryReviewSheet: View {
     @Environment(\.dismiss) private var dismiss
     let plan: DiscoveryPlan
-    let sharedSecrets: [WorkspaceResource]
     let apply:
         (
             [DiscoveryImport], [DiscoverySeparateEntry], [DiscoverySeparateEntry],
             [DiscoverySeparateEntry]
         ) async throws -> DiscoveryApplyResult
-    let resolveReference:
-        (String, String, DiscoveryReferenceSource) async throws
-            -> DiscoveryReferenceResolution
     let openProject: (String) -> Void
     @State private var isApplying = false
     @State private var appliedResult: DiscoveryApplyResult?
@@ -2030,25 +2010,17 @@ private struct DiscoveryReviewSheet: View {
     @State private var separateEntryIDs: Set<String> = []
     @State private var promotedEntryIDs: Set<String> = []
     @State private var demotedEntryIDs: Set<String> = []
-    @State private var resolvedReferenceEntryIDs: Set<String> = []
-    @State private var referenceTarget: ReferenceResolutionTarget?
 
     init(
         plan: DiscoveryPlan,
-        sharedSecrets: [WorkspaceResource],
         apply: @escaping (
             [DiscoveryImport], [DiscoverySeparateEntry], [DiscoverySeparateEntry],
             [DiscoverySeparateEntry]
         ) async throws -> DiscoveryApplyResult,
-        resolveReference: @escaping
-            (String, String, DiscoveryReferenceSource) async throws
-                -> DiscoveryReferenceResolution,
         openProject: @escaping (String) -> Void
     ) {
         self.plan = plan
-        self.sharedSecrets = sharedSecrets
         self.apply = apply
-        self.resolveReference = resolveReference
         self.openProject = openProject
         let managedPaths = Set(plan.managedItems.map(\.path))
         _selectedFilePaths = State(
@@ -2084,7 +2056,9 @@ private struct DiscoveryReviewSheet: View {
     }
 
     private var discoveredFiles: [DiscoveredFile] {
-        plan.files.filter { !managedItemPaths.contains($0.path) }
+        plan.files.filter {
+            !managedItemPaths.contains($0.path) && $0.canApplyDiscovery
+        }
     }
 
     private var discoveryScopeTitle: String {
@@ -2141,8 +2115,8 @@ private struct DiscoveryReviewSheet: View {
         plan.managedItems.filter { $0.status != .linked }.count
     }
 
-    private var visibleProjectCount: Int {
-        discoveryGroups.filter { $0.project != nil }.count
+    private var protectedCount: Int {
+        plan.managedItems.filter { $0.status == .linked }.count
     }
 
     private var hasUnresolvedAssignments: Bool {
@@ -2171,8 +2145,8 @@ private struct DiscoveryReviewSheet: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(
                         plan.projects.allSatisfy { $0.managedProjectID == nil }
-                            ? "Review Discovery"
-                            : "Review Changes")
+                            ? "Discovery Results"
+                            : "Protection Status")
                         .font(.title2.bold())
                     Text(discoveryScopeTitle)
                         .font(.caption)
@@ -2188,14 +2162,13 @@ private struct DiscoveryReviewSheet: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 18) {
                     HStack(spacing: 10) {
-                        SummaryMetric(value: visibleProjectCount, label: "Projects")
-                        SummaryMetric(value: discoveredFiles.count, label: "New Files")
-                        SummaryMetric(value: plan.managedItems.count, label: "Managed")
+                        SummaryMetric(value: protectedCount, label: "Protected")
+                        SummaryMetric(value: selectedFilePaths.count, label: "Will Be Protected")
                         SummaryMetric(
                             value: needsReviewCount + managedAttentionCount,
                             label: "Attention")
                     }
-                    if !selectedFilePaths.isEmpty {
+                    if preview.hasConflicts || needsReviewCount > 0 {
                         DiscoveryImportPreviewBanner(
                             preview: preview,
                             unresolvedAssignments: needsReviewCount)
@@ -2238,12 +2211,7 @@ private struct DiscoveryReviewSheet: View {
                                     promotedEntryIDs: $promotedEntryIDs,
                                     demotedEntryIDs: $demotedEntryIDs,
                                     sharedGroupCounts: cachedSharedGroupCounts,
-                                    resolvedReferenceEntryIDs: resolvedReferenceEntryIDs,
-                                    conflicts: cachedConflicts[file.path] ?? [],
-                                    resolveReference: { entry in
-                                        referenceTarget = ReferenceResolutionTarget(
-                                            file: file, entry: entry)
-                                    })
+                                    conflicts: cachedConflicts[file.path] ?? [])
                             }
                         }
                     }
@@ -2262,7 +2230,7 @@ private struct DiscoveryReviewSheet: View {
                 Text(
                     appliedResult == nil
                         ? discoveryNote
-                        : "The managed inventory has been refreshed.")
+                        : "Protection status has been refreshed.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -2284,7 +2252,7 @@ private struct DiscoveryReviewSheet: View {
                         if isApplying {
                             HStack(spacing: 7) {
                                 ProgressView().controlSize(.small)
-                                Text("Importing…")
+                                Text("Protecting…")
                             }
                         } else {
                             Text(
@@ -2306,7 +2274,7 @@ private struct DiscoveryReviewSheet: View {
         }
         .frame(width: 720, height: 650)
         .alert(
-            "Import could not finish",
+            "Protection could not finish",
             isPresented: Binding(
                 get: { applyError != nil },
                 set: { if !$0 { applyError = nil } })
@@ -2315,16 +2283,6 @@ private struct DiscoveryReviewSheet: View {
         } message: {
             Text(applyError ?? "Unknown error")
         }
-        .sheet(item: $referenceTarget) { target in
-            ReferenceValueSheet(
-                target: target,
-                sharedSecrets: sharedSecrets,
-                resolve: resolveReference,
-                completed: {
-                    resolvedReferenceEntryIDs.insert(target.id)
-                    referenceTarget = nil
-                })
-        }
     }
 
     private var importButtonTitle: String {
@@ -2332,17 +2290,7 @@ private struct DiscoveryReviewSheet: View {
         let count = files.count
         guard count > 0 else { return "Select Items" }
         let suffix = count == 1 ? "" : "s"
-        let actions = Set(files.map(\.action))
-        if actions == [.protect] {
-            return "Protect \(count) File\(suffix)"
-        }
-        if actions == [.compose] {
-            return "Import \(count) File\(suffix)"
-        }
-        if actions == [.importSshIdentity] {
-            return "Import \(count) Identit\(count == 1 ? "y" : "ies")"
-        }
-        return "Protect & Import \(count) Item\(suffix)"
+        return "Protect \(count) File\(suffix)"
     }
 
     private var hasImportableItems: Bool {
@@ -2381,51 +2329,37 @@ private struct DiscoveryReviewSheet: View {
         if !plan.managedItems.isEmpty {
             if managedAttentionCount == 0 {
                 notes.append(
-                    "\(plan.managedItems.count) managed path\(plan.managedItems.count == 1 ? " is" : "s are") linked correctly."
+                    "\(protectedCount) path\(protectedCount == 1 ? " is" : "s are") protected."
                 )
             } else {
                 notes.append(
-                    "\(managedAttentionCount) managed path\(managedAttentionCount == 1 ? " needs" : "s need") attention."
+                    "\(managedAttentionCount) previously protected path\(managedAttentionCount == 1 ? " is" : "s are") no longer protected."
                 )
             }
         }
         if hasUnresolvedAssignments {
             notes.append(
-                "\(needsReviewCount) selected file\(needsReviewCount == 1 ? "" : "s") need an import destination."
-            )
-        }
-        let referenceCount = discoveredFiles.filter { $0.action == .reference }.count
-        if referenceCount > 0 {
-            notes.append(
-                "\(referenceCount) reference file\(referenceCount == 1 ? "" : "s") will remain unchanged."
-            )
-        }
-        let missingCount = max(
-            0, plan.summary.missingReferenceEntries - resolvedReferenceEntryIDs.count)
-        if missingCount > 0 {
-            notes.append(
-                "\(missingCount) declared key\(missingCount == 1 ? " has" : "s have") no discovered value."
+                "\(needsReviewCount) selected file\(needsReviewCount == 1 ? "" : "s") need a project."
             )
         }
         let conflictCount = importPreview.conflicts.count
         if conflictCount > 0 {
             notes.append(
-                "\(conflictCount) output conflict\(conflictCount == 1 ? "" : "s") must be resolved before import."
+                "\(conflictCount) output conflict\(conflictCount == 1 ? "" : "s") must be resolved before protection."
             )
         }
         let base = notes.joined(separator: " ")
         if selectedFilePaths.isEmpty {
             return hasImportableItems
-                ? "\(base) Select at least one importable item."
-                : "\(base) No importable \(emptyResultKind) were found."
+                ? "\(base) Select at least one file."
+                : "\(base) No files need protection."
         }
-        guard plan.summary.warnings > 0 else { return base }
-        let suffix = plan.summary.warnings == 1 ? "" : "s"
-        return "\(selectedFilePaths.count) selected. \(plan.summary.warnings) warning\(suffix) require review."
-    }
-
-    private var emptyResultKind: String {
-        plan.projects.allSatisfy { $0.managedProjectID == nil } ? "items" : "changes"
+        let dynamicFiles = selectedFiles.filter {
+            $0.action == .protect && !$0.warnings.isEmpty
+        }.count
+        guard dynamicFiles > 0 else { return base }
+        let suffix = dynamicFiles == 1 ? "" : "s"
+        return "\(selectedFilePaths.count) selected. \(dynamicFiles) dynamic file\(suffix) will be protected unchanged."
     }
 
     private func destinationIsResolved(for file: DiscoveredFile) -> Bool {
@@ -2547,216 +2481,6 @@ private struct DiscoveryReviewSheet: View {
     }
 }
 
-private struct ReferenceResolutionTarget: Identifiable {
-    let file: DiscoveredFile
-    let entry: DiscoveredEntry
-
-    var id: String {
-        entrySelectionID(file: file, entry: entry)
-    }
-}
-
-private enum ReferenceValueSourceMode: String, Identifiable {
-    case new
-    case existing
-
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .new: "Enter Value"
-        case .existing: "Use Shared"
-        }
-    }
-}
-
-private struct ReferenceValueSheet: View {
-    @Environment(\.dismiss) private var dismiss
-    let target: ReferenceResolutionTarget
-    let sharedSecrets: [WorkspaceResource]
-    let resolve:
-        (String, String, DiscoveryReferenceSource) async throws
-            -> DiscoveryReferenceResolution
-    let completed: () -> Void
-
-    @State private var sourceMode: ReferenceValueSourceMode = .new
-    @State private var name: String
-    @State private var value = ""
-    @State private var securityLevel = WorkspaceSecurityLevel.confirmation
-    @State private var selectedResourceID: String
-    @State private var isSaving = false
-    @State private var errorMessage: String?
-
-    init(
-        target: ReferenceResolutionTarget,
-        sharedSecrets: [WorkspaceResource],
-        resolve: @escaping
-            (String, String, DiscoveryReferenceSource) async throws
-                -> DiscoveryReferenceResolution,
-        completed: @escaping () -> Void
-    ) {
-        self.target = target
-        self.sharedSecrets = sharedSecrets.sorted { left, right in
-            let leftMatches = left.defaultEnvKey == target.entry.key
-            let rightMatches = right.defaultEnvKey == target.entry.key
-            if leftMatches != rightMatches { return leftMatches }
-            return left.name.localizedStandardCompare(right.name) == .orderedAscending
-        }
-        self.resolve = resolve
-        self.completed = completed
-        _name = State(initialValue: target.entry.key)
-        _selectedResourceID = State(
-            initialValue: self.sharedSecrets.first?.id ?? "")
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 12) {
-                Image(systemName: "key.fill")
-                    .font(.title3)
-                    .foregroundStyle(.blue)
-                    .frame(width: 38, height: 38)
-                    .background(Color.blue.opacity(0.10), in: RoundedRectangle(cornerRadius: 10))
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Add \(target.entry.key)")
-                        .font(.title3.bold())
-                    Text("Declared by \(target.file.relativePath)")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-            }
-            .padding(20)
-            Divider()
-
-            Form {
-                Picker("Source", selection: $sourceMode) {
-                    Text(ReferenceValueSourceMode.new.title)
-                        .tag(ReferenceValueSourceMode.new)
-                    if !sharedSecrets.isEmpty {
-                        Text(ReferenceValueSourceMode.existing.title)
-                            .tag(ReferenceValueSourceMode.existing)
-                    }
-                }
-                .pickerStyle(.segmented)
-
-                if sourceMode == .new {
-                    TextField("Name", text: $name)
-                    SecureField("Value", text: $value)
-                    Picker("Security", selection: $securityLevel) {
-                        ForEach(WorkspaceSecurityLevel.allCases, id: \.self) { level in
-                            Label(level.title, systemImage: level.systemImage)
-                                .tag(level)
-                        }
-                    }
-                } else {
-                    Picker("Shared Secret", selection: $selectedResourceID) {
-                        ForEach(sharedSecrets) { resource in
-                            VStack(alignment: .leading) {
-                                Text(resource.name)
-                                if let key = resource.defaultEnvKey {
-                                    Text(key)
-                                }
-                            }
-                            .tag(resource.id)
-                        }
-                    }
-                    Text(existingSecretNote)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .formStyle(.grouped)
-            .scrollDisabled(true)
-
-            Divider()
-            HStack {
-                Text("Adds this key only to the matching managed output.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button("Cancel") { dismiss() }
-                    .disabled(isSaving)
-                Button(action: save) {
-                    if isSaving {
-                        ProgressView()
-                            .controlSize(.small)
-                    } else {
-                        Text("Add Value")
-                    }
-                }
-                .keyboardShortcut(.defaultAction)
-                .disabled(!canSave || isSaving)
-            }
-            .padding(.horizontal, 20)
-            .frame(height: 58)
-        }
-        .frame(width: 460, height: 390)
-        .alert(
-            "Value could not be added",
-            isPresented: Binding(
-                get: { errorMessage != nil },
-                set: { if !$0 { errorMessage = nil } })
-        ) {
-            Button("OK") { errorMessage = nil }
-        } message: {
-            Text(errorMessage ?? "Unknown error")
-        }
-    }
-
-    private var selectedResource: WorkspaceResource? {
-        sharedSecrets.first { $0.id == selectedResourceID }
-    }
-
-    private var existingSecretNote: String {
-        guard let selectedResource else { return "Choose a Shared Secret." }
-        if selectedResource.defaultEnvKey == target.entry.key {
-            return "The existing default key already matches this declaration."
-        }
-        return "This binding will export the secret as \(target.entry.key)."
-    }
-
-    private var canSave: Bool {
-        guard target.file.managedSurfaceID != nil else { return false }
-        switch sourceMode {
-        case .new:
-            return !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                && !value.isEmpty
-        case .existing:
-            return selectedResource != nil
-        }
-    }
-
-    private func save() {
-        guard let surfaceID = target.file.managedSurfaceID, canSave else { return }
-        let source: DiscoveryReferenceSource
-        switch sourceMode {
-        case .new:
-            source = .newSharedSecret(
-                name: name.trimmingCharacters(in: .whitespacesAndNewlines),
-                value: value,
-                enforcement: securityLevel.rawValue,
-                metadata: ItemMetadata(
-                    note: "Added from \(target.file.relativePath)",
-                    links: []))
-        case .existing:
-            guard let selectedResource else { return }
-            source = .existingSharedSecret(resourceID: selectedResource.id)
-        }
-        isSaving = true
-        Task {
-            defer { isSaving = false }
-            do {
-                _ = try await resolve(surfaceID, target.entry.key, source)
-                completed()
-                dismiss()
-            } catch {
-                errorMessage = error.localizedDescription
-            }
-        }
-    }
-}
-
 private struct SummaryMetric: View {
     let value: Int
     let label: String
@@ -2805,7 +2529,7 @@ private struct DiscoveryManagedItemCard: View {
 
     private var detail: String {
         var parts = [
-            item.kind == .surface ? "Managed output" : "Protected file"
+            item.kind == .surface ? "Protected output" : "Protected file"
         ]
         if let environment = item.environment {
             parts.append(environment)
@@ -2823,9 +2547,8 @@ private struct DiscoveryManagedItemCard: View {
 
     private var statusTitle: String {
         switch item.status {
-        case .linked: "Managed"
-        case .missing: "Link missing"
-        case .replaced: "Path replaced"
+        case .linked: "Protected"
+        case .missing, .replaced: "Not protected"
         }
     }
 
@@ -2868,9 +2591,8 @@ private struct DiscoveryFileCard: View {
     @Binding var promotedEntryIDs: Set<String>
     @Binding var demotedEntryIDs: Set<String>
     let sharedGroupCounts: [String: Int]
-    let resolvedReferenceEntryIDs: Set<String>
     let conflicts: [DiscoveryImportPreview.Conflict]
-    let resolveReference: (DiscoveredEntry) -> Void
+    @State private var showsValues = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 11) {
@@ -2952,41 +2674,67 @@ private struct DiscoveryFileCard: View {
                             }
                         }
                     } label: {
-                        Label(
-                            destinationTitle,
-                            systemImage: destinationIcon)
-                            .font(.caption.weight(.medium))
-                            .foregroundStyle(
-                                destination == nil ? Color.orange : Color.secondary)
+                        if destination == nil {
+                            Label("Choose Project", systemImage: "folder")
+                        } else {
+                            Image(systemName: "ellipsis")
+                        }
                     }
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(destination == nil ? Color.orange : Color.secondary)
                     .menuStyle(.borderlessButton)
                     .fixedSize()
                     .disabled(locked)
                 }
-                Text(statusTitle)
-                    .font(.caption.weight(.medium))
+                Label(statusTitle, systemImage: statusIcon)
+                            .font(.caption.weight(.medium))
                     .foregroundStyle(statusColor)
             }
             if !file.entries.isEmpty {
-                VStack(spacing: 6) {
-                    ForEach(file.entries) { entry in
-                        HStack {
-                            Text(entry.section.map { "[\($0)] \(entry.key)" } ?? entry.key)
-                                .font(.caption.monospaced())
-                            Spacer()
-                            entryAction(entry)
+                Button {
+                    showsValues.toggle()
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: showsValues ? "chevron.down" : "chevron.right")
+                            .font(.caption2.weight(.semibold))
+                        Text(valueSummary)
+                            .font(.caption)
+                        Spacer()
+                    }
+                    .foregroundStyle(.secondary)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .padding(.leading, 38)
+
+                if showsValues {
+                    VStack(spacing: 6) {
+                        ForEach(file.entries) { entry in
+                            HStack {
+                                Text(entry.section.map { "[\($0)] \(entry.key)" } ?? entry.key)
+                                    .font(.caption.monospaced())
+                                Spacer()
+                                entryAction(entry)
+                            }
                         }
                     }
+                    .padding(.leading, 38)
                 }
-                .padding(.leading, 38)
             }
-            ForEach(file.warnings) { warning in
-                Label(
-                    warning.line.map { "Line \($0): \(warning.message)" } ?? warning.message,
-                    systemImage: "exclamationmark.triangle.fill")
+            if file.action == .protect && !file.warnings.isEmpty {
+                Label(dynamicContentNote, systemImage: "shield.fill")
                     .font(.caption)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(.secondary)
                     .padding(.leading, 60)
+            } else {
+                ForEach(file.warnings) { warning in
+                    Label(
+                        warning.line.map { "Line \($0): \(warning.message)" } ?? warning.message,
+                        systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .padding(.leading, 60)
+                }
             }
             ForEach(conflicts) { conflict in
                 Label(conflict.message, systemImage: "exclamationmark.triangle.fill")
@@ -3019,29 +2767,6 @@ private struct DiscoveryFileCard: View {
     private var sharedProjectPaths: Set<String> {
         guard case .projects(let paths, _) = destination else { return [] }
         return paths
-    }
-
-    private var destinationTitle: String {
-        switch destination {
-        case .project(let path):
-            return projects.first { $0.path == path }?.name ?? "Project Output"
-        case .library:
-            return "Library"
-        case .projects(let paths, _):
-            return paths.isEmpty
-                ? "Choose Projects"
-                : "Share with \(paths.count) Project\(paths.count == 1 ? "" : "s")"
-        case nil:
-            return "Choose Destination"
-        }
-    }
-
-    private var destinationIcon: String {
-        switch destination {
-        case .library: "books.vertical"
-        case .projects: "folder.badge.plus"
-        case .project, nil: "folder"
-        }
     }
 
     private var protectsOriginal: Bool {
@@ -3108,29 +2833,31 @@ private struct DiscoveryFileCard: View {
         return parts.joined(separator: " · ")
     }
 
-    private var actionTitle: String {
-        switch file.action {
-        case .compose, .importSshIdentity: return "Import"
-        case .protect: return "Protect"
-        case .reference, .review: return "Review"
-        }
-    }
-
     private var statusTitle: String {
         guard let result else {
-            return locked && !selected ? "Not selected" : actionTitle
+            return selected ? "Will be protected" : "Not selected"
         }
         return switch result.outcome {
-        case "imported": "Imported"
-        case "protected": "Protected"
+        case "imported", "protected": "Protected"
         case "failed": "Failed"
         default: "Skipped"
         }
     }
 
+    private var statusIcon: String {
+        guard let result else {
+            return selected ? "shield.lefthalf.filled" : "circle"
+        }
+        return switch result.outcome {
+        case "imported", "protected": "checkmark.shield.fill"
+        case "failed": "xmark.circle.fill"
+        default: "minus.circle"
+        }
+    }
+
     private var statusColor: Color {
         guard let result else {
-            return file.action == .review || file.action == .reference ? .secondary : color
+            return selected ? .blue : .secondary
         }
         return switch result.outcome {
         case "imported", "protected": .green
@@ -3140,37 +2867,44 @@ private struct DiscoveryFileCard: View {
     }
 
     private var selectionHelp: String {
-        if file.action == .reference {
-            return "Reference configuration is used for review and remains unchanged."
-        }
-        if file.action == .review {
-            return "Detected for review; automatic import is not supported yet."
-        }
-        if file.action == .compose && !file.warnings.isEmpty {
-            return "Resolve unsupported content before importing this file."
-        }
-        if file.action == .compose && file.entries.isEmpty {
-            return "No statically importable values were found."
-        }
         if file.action == .compose && destination == nil {
-            return "Choose a project output, Library, or multiple projects."
+            return "Choose a project before protecting this file."
         }
-        return selected ? "Include in this import" : "Leave this file unchanged"
+        return selected ? "This file will be protected." : "This file will remain unchanged."
+    }
+
+    private var valueSummary: String {
+        let count = file.entries.count
+        let shared = file.entries.filter(isSharedAfterOverrides).count
+        let values = "\(count) value\(count == 1 ? "" : "s")"
+        guard selected, shared > 0 else { return values }
+        return "\(values) · \(shared) shared automatically"
+    }
+
+    private var dynamicContentNote: String {
+        selected
+            ? "Dynamic content will be protected unchanged."
+            : "Contains dynamic content."
+    }
+
+    private func isSharedAfterOverrides(_ entry: DiscoveredEntry) -> Bool {
+        let selectionID = entrySelectionID(file: file, entry: entry)
+        if demotedEntryIDs.contains(selectionID) {
+            return false
+        }
+        if promotedEntryIDs.contains(selectionID) {
+            return true
+        }
+        return isSecretActionEntry(entry)
     }
 
     private func entryActionTitle(_ type: String) -> String {
-        if file.action == .reference {
-            return "Review"
-        }
-        if file.action == .review {
-            return "Review"
-        }
         return switch type {
         case "reuse_shared_secret": "Reuse"
         case "create_shared_secret", "reuse_discovered_secret": "Shared"
         case "create_env_file_entry": "This file"
         case "keep_in_protected_file": "Protect"
-        default: "Import"
+        default: "Unavailable"
         }
     }
 
@@ -3178,24 +2912,7 @@ private struct DiscoveryFileCard: View {
     private func entryAction(_ entry: DiscoveredEntry) -> some View {
         let selectionID = entrySelectionID(file: file, entry: entry)
         let isSeparate = separateEntryIDs.contains(selectionID)
-        if entry.action.type == "reference_entry" {
-            if referenceIsCovered(entry) {
-                Text("Ready")
-                    .font(.caption)
-                    .foregroundStyle(.green)
-            } else if file.managedSurfaceID != nil {
-                Button("Add value…") {
-                    resolveReference(entry)
-                }
-                .font(.caption)
-                .buttonStyle(.borderless)
-                .foregroundStyle(.orange)
-            } else {
-                Text("Needs value")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-            }
-        } else if isPlainEnvEntry(entry) {
+        if isPlainEnvEntry(entry) {
             let isPromoted = promotedEntryIDs.contains(selectionID)
             Menu {
                 Button {
@@ -3279,7 +2996,7 @@ private struct DiscoveryFileCard: View {
         } else {
             Text(automaticEntryActionTitle(entry))
                 .font(.caption)
-                .foregroundStyle(entryActionColor(entry))
+                .foregroundStyle(.secondary)
         }
     }
 
@@ -3317,21 +3034,9 @@ private struct DiscoveryFileCard: View {
             return entry.action.resourceName.map { "Reuse \($0)" } ?? "Reuse existing"
         case "create_shared_secret", "reuse_discovered_secret":
             return "Shared"
-        case "reference_entry":
-            return referenceIsCovered(entry) ? "Ready" : "Needs value"
         default:
             return entryActionTitle(entry.action.type)
         }
-    }
-
-    private func entryActionColor(_ entry: DiscoveredEntry) -> Color {
-        guard entry.action.type == "reference_entry" else { return .secondary }
-        return referenceIsCovered(entry) ? .green : .orange
-    }
-
-    private func referenceIsCovered(_ entry: DiscoveredEntry) -> Bool {
-        entry.action.matched == true
-            || resolvedReferenceEntryIDs.contains(entrySelectionID(file: file, entry: entry))
     }
 
     private var icon: String {
