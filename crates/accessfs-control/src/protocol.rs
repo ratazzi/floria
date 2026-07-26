@@ -1,4 +1,5 @@
 use std::io::{self, Read, Write};
+use std::ops::{Deref, DerefMut};
 use std::path::PathBuf;
 
 use accessfs_catalog::{
@@ -63,6 +64,9 @@ pub enum ControlCommand {
     AccessHistory { limit: usize },
     Snapshot,
     Discover { paths: Vec<PathBuf> },
+    DiscoverStart { paths: Vec<PathBuf> },
+    DiscoverStatus { id: String },
+    DiscoverCancel { id: String },
     DiscoverApply {
         paths: Vec<PathBuf>,
         imports: Option<Vec<DiscoveryImport>>,
@@ -179,7 +183,8 @@ pub enum ControlResult {
     ActiveGrants(Vec<ActiveGrant>),
     AccessHistory(Vec<AccessHistoryEvent>),
     Snapshot(CatalogSnapshot),
-    Discovery(DiscoveryPlan),
+    Discovery(DiscoveryReviewPlan),
+    DiscoveryJob(DiscoveryJobStatus),
     DiscoveryApplied(DiscoveryApplyResult),
     DiscoveryReferenceResolved(DiscoveryReferenceResolution),
     ProjectCheckoutInventory(ProjectCheckoutInventory),
@@ -293,6 +298,113 @@ pub struct DiscoveryApplyResult {
     pub protected_files: usize,
     pub imported_ssh_identities: usize,
     pub files: Vec<DiscoveryAppliedFile>,
+}
+
+/// Control-plane discovery result enriched with the state of paths Floria already manages.
+///
+/// Static discovery remains catalog-agnostic. The control server reconciles its result with the
+/// catalog, encrypted store, and mount layout before crossing the IPC seam.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveryReviewPlan {
+    #[serde(flatten)]
+    pub discovery: DiscoveryPlan,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub managed_items: Vec<DiscoveryManagedItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveryJobStatus {
+    pub id: String,
+    pub state: DiscoveryJobState,
+    pub progress: DiscoveryJobProgress,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<DiscoveryReviewPlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+impl DiscoveryJobStatus {
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self.state,
+            DiscoveryJobState::Completed
+                | DiscoveryJobState::Cancelled
+                | DiscoveryJobState::Failed
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryJobState {
+    Queued,
+    Running,
+    Cancelling,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryJobPhase {
+    Starting,
+    ProjectCandidates,
+    CandidateFiles,
+    ParsingFiles,
+    Reconciling,
+    Complete,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveryJobProgress {
+    pub phase: DiscoveryJobPhase,
+    pub directories_scanned: usize,
+    pub candidate_files: usize,
+    pub project_candidates: usize,
+    pub files_parsed: usize,
+}
+
+impl Deref for DiscoveryReviewPlan {
+    type Target = DiscoveryPlan;
+
+    fn deref(&self) -> &Self::Target {
+        &self.discovery
+    }
+}
+
+impl DerefMut for DiscoveryReviewPlan {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.discovery
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveryManagedItem {
+    pub id: String,
+    pub path: PathBuf,
+    pub relative_path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
+    pub kind: DiscoveryManagedItemKind,
+    pub status: DiscoveryManagedItemStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryManagedItemKind {
+    Surface,
+    ProtectedFile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryManagedItemStatus {
+    Linked,
+    Missing,
+    Replaced,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -589,6 +701,38 @@ mod tests {
             serde_json::json!(["/fixture/project"])
         );
         assert_eq!(value["params"].as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn asynchronous_discovery_commands_have_stable_wire_shapes() {
+        let start = serde_json::to_value(ControlRequest {
+            request_id: 13,
+            command: ControlCommand::DiscoverStart {
+                paths: vec![PathBuf::from("/fixture/workspace")],
+            },
+        })
+        .unwrap();
+        assert_eq!(start["method"], "discover_start");
+        assert_eq!(
+            start["params"]["paths"],
+            serde_json::json!(["/fixture/workspace"])
+        );
+
+        let status = serde_json::to_value(ControlRequest {
+            request_id: 14,
+            command: ControlCommand::DiscoverStatus { id: "discover-1".to_string() },
+        })
+        .unwrap();
+        assert_eq!(status["method"], "discover_status");
+        assert_eq!(status["params"]["id"], "discover-1");
+
+        let cancel = serde_json::to_value(ControlRequest {
+            request_id: 15,
+            command: ControlCommand::DiscoverCancel { id: "discover-1".to_string() },
+        })
+        .unwrap();
+        assert_eq!(cancel["method"], "discover_cancel");
+        assert_eq!(cancel["params"]["id"], "discover-1");
     }
 
     #[test]

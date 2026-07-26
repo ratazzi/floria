@@ -1295,6 +1295,176 @@ pub(super) fn existing_discovery_projects(
     Ok(existing)
 }
 
+pub(super) fn discovery_review_plan(
+    catalog: &Catalog,
+    store: &dyn SecretStore,
+    mount_path: Option<&Path>,
+    discovery: DiscoveryPlan,
+) -> Result<DiscoveryReviewPlan, DispatchError> {
+    let snapshot = catalog.snapshot()?;
+    let mut managed_items = Vec::new();
+
+    for surface in snapshot.surfaces.iter().filter(|surface| surface.kind.is_file()) {
+        if !discovery_path_is_in_scope(&surface.path, &discovery.paths) {
+            continue;
+        }
+        let Some(environment) = snapshot
+            .environments
+            .iter()
+            .find(|environment| environment.id == surface.environment_id)
+        else {
+            continue;
+        };
+        let project_path = snapshot
+            .projects
+            .iter()
+            .find(|project| project.id == environment.project_id)
+            .map(|project| project.path.clone());
+        let expected_target = mount_path.map(|mount_path| {
+            mount_path
+                .join(accessfs_core::config::SURFACES_DIR)
+                .join(&surface.id)
+        });
+        managed_items.push(DiscoveryManagedItem {
+            id: surface.id.clone(),
+            path: surface.path.clone(),
+            relative_path: discovery_relative_path(
+                &surface.path,
+                project_path.as_deref(),
+                &discovery.paths,
+            ),
+            project_path,
+            environment: Some(environment.name.clone()),
+            kind: DiscoveryManagedItemKind::Surface,
+            status: discovery_managed_path_status(&surface.path, expected_target.as_deref()),
+        });
+    }
+
+    for record in store.list()? {
+        let SecretOrigin::File { source_path } = record.origin else { continue };
+        if !discovery_path_is_in_scope(&source_path, &discovery.paths) {
+            continue;
+        }
+        let normalized_source_path = discovery_normalized_path(&source_path);
+        let project_path = snapshot
+            .projects
+            .iter()
+            .filter(|project| {
+                normalized_source_path.starts_with(discovery_normalized_path(&project.path))
+            })
+            .max_by_key(|project| project.path.components().count())
+            .map(|project| project.path.clone());
+        let expected_target = mount_path.map(|mount_path| {
+            mount_path
+                .join(accessfs_core::config::SECRETS_DIR)
+                .join(record.id.to_string())
+        });
+        let status =
+            discovery_managed_path_status(&source_path, expected_target.as_deref());
+        managed_items.push(DiscoveryManagedItem {
+            id: record.id.to_string(),
+            relative_path: discovery_relative_path(
+                &source_path,
+                project_path.as_deref(),
+                &discovery.paths,
+            ),
+            path: source_path,
+            project_path,
+            environment: None,
+            kind: DiscoveryManagedItemKind::ProtectedFile,
+            status,
+        });
+    }
+
+    managed_items.sort_by(|left, right| {
+        left.project_path
+            .cmp(&right.project_path)
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(DiscoveryReviewPlan { discovery, managed_items })
+}
+
+fn discovery_path_is_in_scope(path: &Path, inputs: &[PathBuf]) -> bool {
+    let normalized_path = discovery_normalized_path(path);
+    inputs.iter().any(|input| {
+        if path == input {
+            return true;
+        }
+        std::fs::symlink_metadata(input).is_ok_and(|metadata| {
+            metadata.is_dir()
+                && normalized_path.starts_with(discovery_normalized_path(input))
+        })
+    })
+}
+
+fn discovery_relative_path(
+    path: &Path,
+    project_path: Option<&Path>,
+    inputs: &[PathBuf],
+) -> PathBuf {
+    let normalized_path = discovery_normalized_path(path);
+    project_path
+        .map(discovery_normalized_path)
+        .and_then(|project_path| {
+            normalized_path
+                .strip_prefix(project_path)
+                .ok()
+                .map(Path::to_path_buf)
+        })
+        .or_else(|| {
+            inputs
+                .iter()
+                .map(|input| discovery_normalized_path(input))
+                .filter(|input| normalized_path.starts_with(input))
+                .max_by_key(|input| input.components().count())
+                .and_then(|input| {
+                    normalized_path
+                        .strip_prefix(input)
+                        .ok()
+                        .map(Path::to_path_buf)
+                })
+        })
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .unwrap_or_else(|| {
+            path.file_name()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| path.to_path_buf())
+        })
+}
+
+fn discovery_normalized_path(path: &Path) -> PathBuf {
+    if std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()) {
+        return std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    }
+    let Some(parent) = path.parent() else { return path.to_path_buf() };
+    let Some(name) = path.file_name() else { return path.to_path_buf() };
+    std::fs::canonicalize(parent)
+        .unwrap_or_else(|_| parent.to_path_buf())
+        .join(name)
+}
+
+fn discovery_managed_path_status(
+    path: &Path,
+    expected_target: Option<&Path>,
+) -> DiscoveryManagedItemStatus {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let target = std::fs::read_link(path).ok();
+            if expected_target.is_none_or(|expected| target.as_deref() == Some(expected)) {
+                DiscoveryManagedItemStatus::Linked
+            } else {
+                DiscoveryManagedItemStatus::Replaced
+            }
+        }
+        Ok(_) => DiscoveryManagedItemStatus::Replaced,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            DiscoveryManagedItemStatus::Missing
+        }
+        Err(_) => DiscoveryManagedItemStatus::Replaced,
+    }
+}
+
 pub(super) fn existing_discovery_secrets(
     catalog: &Catalog,
     store: &dyn SecretStore,
@@ -1304,7 +1474,7 @@ pub(super) fn existing_discovery_secrets(
         return Ok(Vec::new());
     }
     let snapshot = catalog.snapshot()?;
-    let mut existing = Vec::new();
+    let mut candidates = Vec::new();
     for resource in snapshot.resources {
         if resource.kind != ResourceKind::SharedSecret || resource.shape != ValueShape::Scalar {
             continue;
@@ -1325,23 +1495,46 @@ pub(super) fn existing_discovery_secrets(
                 continue;
             }
         };
-        let value = match store.get(&id) {
-            Ok(value) => value,
-            Err(error) => {
-                tracing::warn!(
-                    resource_id = %resource.id,
-                    %error,
-                    "shared secret was unavailable for discovery matching"
-                );
-                continue;
-            }
-        };
-        existing.push(ExistingSecret {
-            resource_id: resource.id,
-            name: resource.name,
-            key,
-            value,
-        });
+        candidates.push((resource.id, resource.name, key, id));
     }
+    let ids = candidates
+        .iter()
+        .map(|(_, _, _, id)| id.clone())
+        .collect::<Vec<_>>();
+    let values = match store.get_many(&ids) {
+        Ok(values) => values.into_iter().map(Some).collect::<Vec<_>>(),
+        Err(batch_error) => {
+            tracing::warn!(
+                %batch_error,
+                count = ids.len(),
+                "batch shared-secret loading failed; retrying individually"
+            );
+            ids.iter()
+                .map(|id| match store.get(id) {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        tracing::warn!(
+                            secret_id = %id,
+                            %error,
+                            "shared secret was unavailable for discovery matching"
+                        );
+                        None
+                    }
+                })
+                .collect()
+        }
+    };
+    let existing = candidates
+        .into_iter()
+        .zip(values)
+        .filter_map(|((resource_id, name, key, _), value)| {
+            value.map(|value| ExistingSecret {
+                resource_id,
+                name,
+                key,
+                value,
+            })
+        })
+        .collect();
     Ok(existing)
 }

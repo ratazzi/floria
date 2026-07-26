@@ -15,8 +15,8 @@ use accessfs_core::audit::{read_recent_access, AuditAccessRecord};
 use accessfs_core::authz::{Enforcement, PolicyMode, PolicyModeStatus};
 use accessfs_discover::{
     classify_key, discover_git_checkouts, discover_many, DiscoveredContent, DiscoveredFileAction,
-    DiscoveredFileKind, ExistingEnvironment, ExistingProject, ExistingSecret, ExistingSurface,
-    GitCheckoutDiscovery, GitCheckoutMonitor, KeyClass, MonitoredGitCheckout,
+    DiscoveredFileKind, DiscoveryPlan, ExistingEnvironment, ExistingProject, ExistingSecret,
+    ExistingSurface, GitCheckoutDiscovery, GitCheckoutMonitor, KeyClass, MonitoredGitCheckout,
 };
 use accessfs_platform::SocketPeerVerifier;
 use accessfs_ssh::ManagedKeyError;
@@ -27,8 +27,10 @@ use crate::protocol::{
     read_msg, write_msg, AccessHistoryEvent, AccessHistoryIdentity, AccessHistoryProcess,
     AccessHistorySsh, ActiveGrant, ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest,
     ControlResponse, ControlResult, DiscoveryAppliedFile, DiscoveryApplyOutcome, DiscoveryApplyResult,
-    DiscoveryImport, DiscoveryImportDestination, DiscoveryReferenceResolution,
-    DiscoveryReferenceSource, DiscoverySourceDisposition,
+    DiscoveryImport, DiscoveryImportDestination, DiscoveryJobPhase, DiscoveryJobProgress,
+    DiscoveryJobState, DiscoveryJobStatus, DiscoveryManagedItem, DiscoveryManagedItemKind,
+    DiscoveryManagedItemStatus, DiscoveryReferenceResolution, DiscoveryReferenceSource,
+    DiscoveryReviewPlan, DiscoverySourceDisposition,
     ProjectCheckoutCandidate, ProjectCheckoutDiscovery, ProjectCheckoutInventory, ProtectedFile,
     ProtectedFileVersion, SecretValue, SshConfigStatus, SshIdentity,
 };
@@ -88,6 +90,7 @@ struct ControlDependencies {
     ssh_discovery: Option<Arc<dyn SshIdentityDiscovery>>,
     ssh_config: Option<Arc<dyn SshConfigManager>>,
     audit_log: Option<PathBuf>,
+    discovery_jobs: Option<Arc<DiscoveryJobManager>>,
 }
 
 impl ControlServer {
@@ -178,6 +181,7 @@ impl ControlServer {
                 ssh_discovery: Some(services.ssh_discovery),
                 ssh_config: Some(services.ssh_config),
                 audit_log: Some(services.audit_log),
+                discovery_jobs: None,
             },
             services.peer_verifier,
         )
@@ -197,6 +201,18 @@ impl ControlServer {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
 
         let catalog = Arc::new(catalog);
+        let discovery_jobs = dependencies
+            .store
+            .as_ref()
+            .zip(dependencies.mount_path.as_ref())
+            .map(|(store, mount_path)| {
+                Arc::new(DiscoveryJobManager::new(
+                    Arc::clone(&catalog),
+                    Arc::clone(store),
+                    mount_path.clone(),
+                ))
+            });
+        let dependencies = ControlDependencies { discovery_jobs, ..dependencies };
         std::thread::Builder::new()
             .name("accessfs-control-accept".to_string())
             .spawn(move || accept_loop(listener, catalog, dependencies, peer_verifier))?;
@@ -273,6 +289,7 @@ fn handle_connection(
             ssh_config: dependencies.ssh_config.as_deref(),
             checkout_monitor: dependencies.checkout_monitor.as_deref(),
             audit_log: dependencies.audit_log.as_deref(),
+            discovery_jobs: dependencies.discovery_jobs.as_deref(),
         };
         let outcome = match dispatch(&catalog, services, request.command) {
             Ok(result) => {
@@ -305,6 +322,9 @@ fn is_read_only(command: &ControlCommand) -> bool {
             | ControlCommand::AccessHistory { .. }
             | ControlCommand::Snapshot
             | ControlCommand::Discover { .. }
+            | ControlCommand::DiscoverStart { .. }
+            | ControlCommand::DiscoverStatus { .. }
+            | ControlCommand::DiscoverCancel { .. }
             | ControlCommand::ProjectCheckoutInventory
             | ControlCommand::ProjectCheckoutDiscover { .. }
             | ControlCommand::SshAgentDiscover { .. }
@@ -350,6 +370,7 @@ struct DispatchServices<'a> {
     ssh_config: Option<&'a dyn SshConfigManager>,
     checkout_monitor: Option<&'a GitCheckoutMonitor>,
     audit_log: Option<&'a Path>,
+    discovery_jobs: Option<&'a DiscoveryJobManager>,
 }
 
 impl DispatchError {
@@ -413,6 +434,7 @@ impl From<ManagedKeyError> for DispatchError {
 
 mod checkouts;
 mod discovery;
+mod discovery_jobs;
 mod discovery_reference;
 mod dispatch;
 mod history;
@@ -423,6 +445,7 @@ mod ssh;
 
 use checkouts::*;
 use discovery::*;
+use discovery_jobs::*;
 use discovery_reference::*;
 use dispatch::*;
 use history::*;

@@ -26,16 +26,92 @@ pub use watch::{
 const MAX_DEPTH: usize = 6;
 const MAX_CANDIDATES: usize = 1_000;
 const MAX_FILE_SIZE: u64 = 1 << 20;
+const PROGRESS_DIRECTORY_INTERVAL: usize = 64;
+const PROGRESS_FILE_INTERVAL: usize = 16;
 const IGNORED_DIRECTORIES: &[&str] = &[
     ".git",
     ".direnv",
     ".build",
-    "build",
-    "dist",
+    ".cache",
+    ".astro",
+    ".docusaurus",
+    ".eggs",
+    ".gradle",
+    ".history",
+    ".hypothesis",
+    ".ipynb_checkpoints",
+    ".kotlin",
+    ".mypy_cache",
+    ".next",
+    ".nox",
+    ".npm",
+    ".nuxt",
+    ".nyc_output",
+    ".parcel-cache",
+    ".pnpm-store",
+    ".pybuilder",
+    ".pyre",
+    ".pytest_cache",
+    ".pytype",
+    ".ruff_cache",
+    ".ruby-lsp",
+    ".svelte-kit",
+    ".terraform",
+    ".tox",
+    ".turbo",
+    ".venv",
+    ".vs",
+    ".vscode-test",
+    ".wrangler",
+    ".zig-cache",
+    "__pycache__",
+    "__pypackages__",
+    "_deps",
+    "bower_components",
+    "cdk.out",
+    "CMakeFiles",
+    "CMakeScripts",
+    "DerivedData",
+    "develop-eggs",
+    "dist-packages",
+    "jspm_packages",
     "node_modules",
-    "target",
-    "vendor",
+    "site-packages",
+    "venv",
+    "vcpkg_installed",
+    "web_modules",
+    "xcuserdata",
+    "zig-cache",
+    "zig-out",
 ];
+
+#[derive(Clone, Copy, Default)]
+struct EcosystemContext(u16);
+
+impl EcosystemContext {
+    const JAVASCRIPT: u16 = 1 << 0;
+    const PYTHON: u16 = 1 << 1;
+    const GO: u16 = 1 << 2;
+    const RUST: u16 = 1 << 3;
+    const RUBY: u16 = 1 << 4;
+    const SWIFT: u16 = 1 << 5;
+    const GRADLE: u16 = 1 << 6;
+    const MAVEN: u16 = 1 << 7;
+    const CMAKE: u16 = 1 << 8;
+    const ZIG: u16 = 1 << 9;
+    const PHP: u16 = 1 << 10;
+    const SERVERLESS: u16 = 1 << 11;
+    const VITE: u16 = 1 << 12;
+    const NUXT: u16 = 1 << 13;
+
+    fn contains_any(self, ecosystems: u16) -> bool {
+        self.0 & ecosystems != 0
+    }
+
+    fn add(&mut self, ecosystem: u16) {
+        self.0 |= ecosystem;
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum DiscoverError {
@@ -43,8 +119,80 @@ pub enum DiscoverError {
     RelativePath(PathBuf),
     #[error("discover path does not exist: {0}")]
     NotFound(PathBuf),
+    #[error("discovery was cancelled")]
+    Cancelled,
     #[error("cannot inspect {path}: {source}")]
     Io { path: PathBuf, source: std::io::Error },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscoveryScanPhase {
+    ProjectCandidates,
+    CandidateFiles,
+    ParsingFiles,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveryProgress {
+    pub phase: DiscoveryScanPhase,
+    pub directories_scanned: usize,
+    pub candidate_files: usize,
+    pub project_candidates: usize,
+    pub files_parsed: usize,
+}
+
+struct ProgressReporter<'a> {
+    callback: &'a mut dyn FnMut(DiscoveryProgress) -> bool,
+    progress: DiscoveryProgress,
+}
+
+impl ProgressReporter<'_> {
+    fn emit(&mut self) -> Result<(), DiscoverError> {
+        if (self.callback)(self.progress) {
+            Ok(())
+        } else {
+            Err(DiscoverError::Cancelled)
+        }
+    }
+
+    fn begin(&mut self, phase: DiscoveryScanPhase) -> Result<(), DiscoverError> {
+        self.progress.phase = phase;
+        self.emit()
+    }
+
+    fn scanned_directory(&mut self) -> Result<(), DiscoverError> {
+        self.progress.directories_scanned += 1;
+        if self
+            .progress
+            .directories_scanned
+            .is_multiple_of(PROGRESS_DIRECTORY_INTERVAL)
+        {
+            self.emit()?;
+        }
+        Ok(())
+    }
+
+    fn found_candidates(&mut self, count: usize) -> Result<(), DiscoverError> {
+        self.progress.candidate_files = count;
+        if count.is_multiple_of(PROGRESS_FILE_INTERVAL) {
+            self.emit()?;
+        }
+        Ok(())
+    }
+
+    fn found_projects(&mut self, count: usize) -> Result<(), DiscoverError> {
+        self.progress.project_candidates = count;
+        self.emit()
+    }
+
+    fn parsed_file(&mut self) -> Result<(), DiscoverError> {
+        self.progress.files_parsed += 1;
+        if self.progress.files_parsed.is_multiple_of(PROGRESS_FILE_INTERVAL) {
+            self.emit()?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -82,6 +230,17 @@ pub enum ProjectMarkerKind {
     GoModule,
     Cargo,
     CargoLock,
+    Ruby,
+    Swift,
+    Gradle,
+    Maven,
+    Cmake,
+    Zig,
+    Composer,
+    Serverless,
+    Wrangler,
+    Vite,
+    Nuxt,
     Compose,
     Dockerfile,
     SelectedFolder,
@@ -343,6 +502,28 @@ pub fn discover(path: &Path) -> Result<Discovery, DiscoverError> {
 
 /// Discover supported files and Project Candidates from files, projects, or Workspace Folders.
 pub fn discover_many(paths: &[PathBuf]) -> Result<Discovery, DiscoverError> {
+    discover_many_with_progress(paths, |_| true)
+}
+
+/// Discover supported files while reporting bounded progress and honoring cancellation.
+///
+/// The callback runs on the scanning thread. Returning `false` stops before any mutation; discovery
+/// itself remains read-only and returns [`DiscoverError::Cancelled`].
+pub fn discover_many_with_progress(
+    paths: &[PathBuf],
+    mut callback: impl FnMut(DiscoveryProgress) -> bool,
+) -> Result<Discovery, DiscoverError> {
+    let mut progress = ProgressReporter {
+        callback: &mut callback,
+        progress: DiscoveryProgress {
+            phase: DiscoveryScanPhase::ProjectCandidates,
+            directories_scanned: 0,
+            candidate_files: 0,
+            project_candidates: 0,
+            files_parsed: 0,
+        },
+    };
+    progress.emit()?;
     let mut requested_paths = Vec::with_capacity(paths.len());
     for path in paths {
         if !path.is_absolute() {
@@ -359,16 +540,21 @@ pub fn discover_many(paths: &[PathBuf]) -> Result<Discovery, DiscoverError> {
         return Err(DiscoverError::NotFound(PathBuf::from("<empty discovery>")));
     }
 
-    let projects = discover_project_candidates(&requested_paths)?;
+    let projects = discover_project_candidates(&requested_paths, &mut progress)?;
+    progress.found_projects(projects.len())?;
+    progress.begin(DiscoveryScanPhase::CandidateFiles)?;
     let mut candidate_paths = Vec::new();
     for path in &requested_paths {
-        for candidate in collect_candidates(path)? {
+        for candidate in collect_candidates(path, &mut progress)? {
             if !candidate_paths.contains(&candidate) {
                 candidate_paths.push(candidate);
+                progress.found_candidates(candidate_paths.len())?;
             }
         }
     }
+    progress.emit()?;
 
+    progress.begin(DiscoveryScanPhase::ParsingFiles)?;
     let mut files = Vec::with_capacity(candidate_paths.len());
     for candidate in candidate_paths {
         let scan_root = containing_input_root(&requested_paths, &candidate)
@@ -389,6 +575,7 @@ pub fn discover_many(paths: &[PathBuf]) -> Result<Discovery, DiscoverError> {
                 files.push(file);
             }
         }
+        progress.parsed_file()?;
     }
     files.sort_by(|left, right| {
         left.assignment
@@ -397,6 +584,7 @@ pub fn discover_many(paths: &[PathBuf]) -> Result<Discovery, DiscoverError> {
             .then_with(|| left.relative_path.cmp(&right.relative_path))
     });
 
+    progress.emit()?;
     Ok(Discovery { requested_paths, projects, files })
 }
 
@@ -593,19 +781,18 @@ impl Discovery {
 
 fn discover_project_candidates(
     inputs: &[PathBuf],
+    progress: &mut ProgressReporter<'_>,
 ) -> Result<Vec<DiscoveredProject>, DiscoverError> {
-    let mut inspected_directories = Vec::new();
+    let mut inspected_directories = HashSet::new();
     for input in inputs {
         let start = if input.is_dir() {
             input.as_path()
         } else {
             input.parent().unwrap_or(input)
         };
-        collect_directories(start, &mut inspected_directories)?;
+        collect_directories(start, &mut inspected_directories, progress)?;
         for ancestor in start.ancestors().skip(1).take(MAX_DEPTH) {
-            if !inspected_directories.iter().any(|path| path == ancestor) {
-                inspected_directories.push(ancestor.to_path_buf());
-            }
+            inspected_directories.insert(ancestor.to_path_buf());
             if ancestor.join(".git").exists() {
                 break;
             }
@@ -674,7 +861,7 @@ fn discover_project_candidates(
             ));
             continue;
         }
-        for candidate in collect_candidates(input)? {
+        for candidate in collect_candidates(input, progress)? {
             if !candidate_likely_needs_project(&candidate)
                 || projects.iter().any(|project| candidate.starts_with(&project.path))
             {
@@ -718,39 +905,243 @@ fn discover_project_candidates(
 
 fn collect_directories(
     root: &Path,
-    directories: &mut Vec<PathBuf>,
+    directories: &mut HashSet<PathBuf>,
+    progress: &mut ProgressReporter<'_>,
 ) -> Result<(), DiscoverError> {
-    let mut stack = vec![(root.to_path_buf(), 0usize)];
-    while let Some((directory, depth)) = stack.pop() {
-        if directories.iter().any(|path| path == &directory) {
+    let mut stack = vec![(root.to_path_buf(), 0usize, EcosystemContext::default())];
+    while let Some((directory, depth, inherited_ecosystems)) = stack.pop() {
+        if !directories.insert(directory.clone()) {
             continue;
         }
-        directories.push(directory.clone());
+        progress.scanned_directory()?;
         if depth >= MAX_DEPTH {
             continue;
         }
-        let entries = fs::read_dir(&directory)
-            .map_err(|source| DiscoverError::Io { path: directory.clone(), source })?;
-        for entry in entries {
+        let entries = directory_entries(&directory)?;
+        if is_python_virtual_environment(&entries)
+            || (depth > 0 && is_cmake_out_of_source_build_tree(&directory, &entries))
+        {
+            continue;
+        }
+        let ecosystems = ecosystems_for_entries(inherited_ecosystems, &entries);
+        for (entry, file_type) in entries {
+            if !file_type.is_dir() || file_type.is_symlink() {
+                continue;
+            }
+            if is_ignored_directory(&entry.path(), ecosystems) {
+                continue;
+            }
+            stack.push((entry.path(), depth + 1, ecosystems));
+        }
+    }
+    Ok(())
+}
+
+fn directory_entries(
+    directory: &Path,
+) -> Result<Vec<(fs::DirEntry, fs::FileType)>, DiscoverError> {
+    fs::read_dir(directory)
+        .map_err(|source| DiscoverError::Io { path: directory.to_path_buf(), source })?
+        .map(|entry| {
             let entry = entry.map_err(|source| DiscoverError::Io {
-                path: directory.clone(),
+                path: directory.to_path_buf(),
                 source,
             })?;
             let file_type = entry.file_type().map_err(|source| DiscoverError::Io {
                 path: entry.path(),
                 source,
             })?;
-            if !file_type.is_dir() || file_type.is_symlink() {
-                continue;
+            Ok((entry, file_type))
+        })
+        .collect()
+}
+
+fn is_python_virtual_environment(entries: &[(fs::DirEntry, fs::FileType)]) -> bool {
+    entries
+        .iter()
+        .any(|(entry, file_type)| file_type.is_file() && entry.file_name() == "pyvenv.cfg")
+}
+
+fn is_cmake_out_of_source_build_tree(
+    directory: &Path,
+    entries: &[(fs::DirEntry, fs::FileType)],
+) -> bool {
+    let Some(cache) = entries
+        .iter()
+        .find_map(|(entry, file_type)| {
+            (file_type.is_file() && entry.file_name() == "CMakeCache.txt")
+                .then(|| entry.path())
+        })
+    else {
+        return false;
+    };
+    let Ok(metadata) = fs::metadata(&cache) else { return false };
+    if metadata.len() > MAX_FILE_SIZE {
+        return false;
+    }
+    let Ok(contents) = fs::read_to_string(cache) else { return false };
+    let Some(source) = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("CMAKE_HOME_DIRECTORY:INTERNAL="))
+    else {
+        return false;
+    };
+    let source = Path::new(source);
+    let source = fs::canonicalize(source).unwrap_or_else(|_| source.to_path_buf());
+    let directory =
+        fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
+    source != directory
+}
+
+fn ecosystems_for_entries(
+    inherited_ecosystems: EcosystemContext,
+    entries: &[(fs::DirEntry, fs::FileType)],
+) -> EcosystemContext {
+    let starts_git_project = entries
+        .iter()
+        .any(|(entry, _)| entry.file_name() == ".git");
+    let mut ecosystems = if starts_git_project {
+        EcosystemContext::default()
+    } else {
+        inherited_ecosystems
+    };
+    for (entry, file_type) in entries {
+        if !file_type.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        match name {
+            "package.json" | "bun.lock" | "bun.lockb" | "package-lock.json"
+            | "pnpm-lock.yaml" | "yarn.lock" => {
+                ecosystems.add(EcosystemContext::JAVASCRIPT)
             }
-            let name = entry.file_name();
-            if IGNORED_DIRECTORIES.iter().any(|ignored| name == *ignored) {
-                continue;
+            "pyproject.toml" | "uv.lock" | "Pipfile" | "poetry.lock" => {
+                ecosystems.add(EcosystemContext::PYTHON)
             }
-            stack.push((entry.path(), depth + 1));
+            "go.mod" | "go.work" => ecosystems.add(EcosystemContext::GO),
+            "Cargo.toml" | "Cargo.lock" => ecosystems.add(EcosystemContext::RUST),
+            "Gemfile" => ecosystems.add(EcosystemContext::RUBY),
+            "Package.swift" => ecosystems.add(EcosystemContext::SWIFT),
+            "build.gradle" | "build.gradle.kts" | "settings.gradle"
+            | "settings.gradle.kts" => ecosystems.add(EcosystemContext::GRADLE),
+            "pom.xml" => ecosystems.add(EcosystemContext::MAVEN),
+            "CMakeLists.txt" => ecosystems.add(EcosystemContext::CMAKE),
+            "build.zig" | "build.zig.zon" => ecosystems.add(EcosystemContext::ZIG),
+            "composer.json" => ecosystems.add(EcosystemContext::PHP),
+            "serverless.yml" | "serverless.yaml" => {
+                ecosystems.add(EcosystemContext::SERVERLESS)
+            }
+            "vite.config.js" | "vite.config.mjs" | "vite.config.cjs"
+            | "vite.config.ts" | "vite.config.mts" | "vite.config.cts" => {
+                ecosystems.add(EcosystemContext::VITE)
+            }
+            "nuxt.config.js" | "nuxt.config.mjs" | "nuxt.config.cjs"
+            | "nuxt.config.ts" | "nuxt.config.mts" | "nuxt.config.cts" => {
+                ecosystems.add(EcosystemContext::NUXT)
+            }
+            _ if name == "requirements.txt"
+                || (name.starts_with("requirements-") && name.ends_with(".txt")) =>
+            {
+                ecosystems.add(EcosystemContext::PYTHON)
+            }
+            _ => {}
         }
     }
-    Ok(())
+    ecosystems
+}
+
+fn is_ignored_directory(path: &Path, ecosystems: EcosystemContext) -> bool {
+    let Some(name) = path.file_name() else { return false };
+    if IGNORED_DIRECTORIES.iter().any(|ignored| name == *ignored) {
+        return true;
+    }
+    let Some(name) = name.to_str() else { return false };
+    match name {
+        "build" => {
+            path_ends_with(path, &[".aws-sam", "build"])
+                || ecosystems.contains_any(
+                    EcosystemContext::PYTHON
+                        | EcosystemContext::GRADLE
+                        | EcosystemContext::CMAKE
+                        | EcosystemContext::ZIG,
+                )
+        }
+        "coverage" => ecosystems
+            .contains_any(EcosystemContext::JAVASCRIPT | EcosystemContext::RUBY),
+        "deps" => ecosystems.contains_any(EcosystemContext::ZIG),
+        "dist" => ecosystems
+            .contains_any(EcosystemContext::JAVASCRIPT | EcosystemContext::PYTHON),
+        "target" => ecosystems.contains_any(
+            EcosystemContext::RUST
+                | EcosystemContext::PYTHON
+                | EcosystemContext::GRADLE
+                | EcosystemContext::MAVEN,
+        ),
+        "vendor" => {
+            ecosystems.contains_any(EcosystemContext::GO | EcosystemContext::PHP)
+        }
+        ".output" => ecosystems.contains_any(EcosystemContext::NUXT),
+        ".vite" => ecosystems.contains_any(EcosystemContext::VITE),
+        ".serverless" => ecosystems.contains_any(EcosystemContext::SERVERLESS),
+        "cython_debug" | "htmlcov" | "wheels" => {
+            ecosystems.contains_any(EcosystemContext::PYTHON)
+        }
+        ".yardoc" | "_yardoc" | "rdoc" => {
+            ecosystems.contains_any(EcosystemContext::RUBY)
+        }
+        "Build"
+            if path_ends_with(path, &["Carthage", "Build"])
+                && ecosystems.contains_any(EcosystemContext::SWIFT) =>
+        {
+            true
+        }
+        "Build" => ecosystems.contains_any(EcosystemContext::CMAKE),
+        "cache"
+            if path_ends_with(path, &[".angular", "cache"])
+                || path_ends_with(path, &[".nx", "cache"]) =>
+        {
+            true
+        }
+        "workspace-data" if path_ends_with(path, &[".nx", "workspace-data"]) => true,
+        "bundle"
+            if path_ends_with(path, &["vendor", "bundle"])
+                && ecosystems.contains_any(EcosystemContext::RUBY) =>
+        {
+            true
+        }
+        "cache" | "unplugged"
+            if path_ends_with(path, &[".yarn", name])
+                && ecosystems.contains_any(EcosystemContext::JAVASCRIPT) =>
+        {
+            true
+        }
+        _ if name.starts_with("cmake-build-")
+            && ecosystems.contains_any(EcosystemContext::CMAKE) =>
+        {
+            true
+        }
+        _ if name.starts_with(".nuxt-")
+            && ecosystems.contains_any(EcosystemContext::NUXT) =>
+        {
+            true
+        }
+        _ if name.starts_with("build-")
+            && ecosystems.contains_any(EcosystemContext::CMAKE | EcosystemContext::ZIG) =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
+fn path_ends_with(path: &Path, suffix: &[&str]) -> bool {
+    let mut components = path.components().rev();
+    suffix.iter().rev().all(|expected| {
+        components
+            .next()
+            .is_some_and(|component| component.as_os_str() == *expected)
+    })
 }
 
 fn project_markers(directory: &Path) -> Vec<ProjectMarker> {
@@ -771,6 +1162,34 @@ fn project_markers(directory: &Path) -> Vec<ProjectMarker> {
         ("go.work", ProjectMarkerKind::GoModule),
         ("Cargo.toml", ProjectMarkerKind::Cargo),
         ("Cargo.lock", ProjectMarkerKind::CargoLock),
+        ("Gemfile", ProjectMarkerKind::Ruby),
+        ("Package.swift", ProjectMarkerKind::Swift),
+        ("build.gradle", ProjectMarkerKind::Gradle),
+        ("build.gradle.kts", ProjectMarkerKind::Gradle),
+        ("settings.gradle", ProjectMarkerKind::Gradle),
+        ("settings.gradle.kts", ProjectMarkerKind::Gradle),
+        ("pom.xml", ProjectMarkerKind::Maven),
+        ("CMakeLists.txt", ProjectMarkerKind::Cmake),
+        ("build.zig", ProjectMarkerKind::Zig),
+        ("build.zig.zon", ProjectMarkerKind::Zig),
+        ("composer.json", ProjectMarkerKind::Composer),
+        ("serverless.yml", ProjectMarkerKind::Serverless),
+        ("serverless.yaml", ProjectMarkerKind::Serverless),
+        ("wrangler.toml", ProjectMarkerKind::Wrangler),
+        ("wrangler.json", ProjectMarkerKind::Wrangler),
+        ("wrangler.jsonc", ProjectMarkerKind::Wrangler),
+        ("vite.config.js", ProjectMarkerKind::Vite),
+        ("vite.config.mjs", ProjectMarkerKind::Vite),
+        ("vite.config.cjs", ProjectMarkerKind::Vite),
+        ("vite.config.ts", ProjectMarkerKind::Vite),
+        ("vite.config.mts", ProjectMarkerKind::Vite),
+        ("vite.config.cts", ProjectMarkerKind::Vite),
+        ("nuxt.config.js", ProjectMarkerKind::Nuxt),
+        ("nuxt.config.mjs", ProjectMarkerKind::Nuxt),
+        ("nuxt.config.cjs", ProjectMarkerKind::Nuxt),
+        ("nuxt.config.ts", ProjectMarkerKind::Nuxt),
+        ("nuxt.config.mts", ProjectMarkerKind::Nuxt),
+        ("nuxt.config.cts", ProjectMarkerKind::Nuxt),
         ("compose.yaml", ProjectMarkerKind::Compose),
         ("compose.yml", ProjectMarkerKind::Compose),
         ("docker-compose.yaml", ProjectMarkerKind::Compose),
@@ -843,6 +1262,17 @@ fn project_ecosystems(markers: &[ProjectMarker]) -> Vec<String> {
             ProjectMarkerKind::Pyproject | ProjectMarkerKind::PythonRequirements => Some("python"),
             ProjectMarkerKind::GoModule => Some("go"),
             ProjectMarkerKind::Cargo | ProjectMarkerKind::CargoLock => Some("rust"),
+            ProjectMarkerKind::Ruby => Some("ruby"),
+            ProjectMarkerKind::Swift => Some("swift"),
+            ProjectMarkerKind::Gradle => Some("gradle"),
+            ProjectMarkerKind::Maven => Some("maven"),
+            ProjectMarkerKind::Cmake => Some("cmake"),
+            ProjectMarkerKind::Zig => Some("zig"),
+            ProjectMarkerKind::Composer => Some("php"),
+            ProjectMarkerKind::Serverless => Some("serverless"),
+            ProjectMarkerKind::Wrangler => Some("cloudflare"),
+            ProjectMarkerKind::Vite => Some("vite"),
+            ProjectMarkerKind::Nuxt => Some("nuxt"),
             ProjectMarkerKind::Compose | ProjectMarkerKind::Dockerfile => Some("docker"),
             ProjectMarkerKind::Git
             | ProjectMarkerKind::SelectedFolder
@@ -933,38 +1363,39 @@ fn path_depth(path: &Path) -> usize {
     path.components().count()
 }
 
-fn collect_candidates(path: &Path) -> Result<Vec<PathBuf>, DiscoverError> {
+fn collect_candidates(
+    path: &Path,
+    progress: &mut ProgressReporter<'_>,
+) -> Result<Vec<PathBuf>, DiscoverError> {
     if path.is_file() {
         return Ok(vec![path.to_path_buf()]);
     }
 
     let mut candidates = Vec::new();
-    let mut stack = vec![(path.to_path_buf(), 0usize)];
-    while let Some((directory, depth)) = stack.pop() {
-        let entries = fs::read_dir(&directory)
-            .map_err(|source| DiscoverError::Io { path: directory.clone(), source })?;
-        for entry in entries {
-            let entry = entry.map_err(|source| DiscoverError::Io {
-                path: directory.clone(),
-                source,
-            })?;
-            let file_type = entry.file_type().map_err(|source| DiscoverError::Io {
-                path: entry.path(),
-                source,
-            })?;
+    let mut stack = vec![(path.to_path_buf(), 0usize, EcosystemContext::default())];
+    while let Some((directory, depth, inherited_ecosystems)) = stack.pop() {
+        progress.scanned_directory()?;
+        let entries = directory_entries(&directory)?;
+        if is_python_virtual_environment(&entries)
+            || (depth > 0 && is_cmake_out_of_source_build_tree(&directory, &entries))
+        {
+            continue;
+        }
+        let ecosystems = ecosystems_for_entries(inherited_ecosystems, &entries);
+        for (entry, file_type) in entries {
             if file_type.is_symlink() {
                 continue;
             }
             let child = entry.path();
             if file_type.is_dir() {
-                let name = entry.file_name();
-                if depth < MAX_DEPTH
-                    && !IGNORED_DIRECTORIES.iter().any(|ignored| name == *ignored)
-                {
-                    stack.push((child, depth + 1));
+                if depth < MAX_DEPTH && !is_ignored_directory(&child, ecosystems) {
+                    stack.push((child, depth + 1, ecosystems));
                 }
             } else if file_type.is_file() {
-                if is_candidate(&child) && !candidates.contains(&child) {
+                if is_candidate(&child)
+                    && dotenv_reference_marker(&child).is_none()
+                    && !candidates.contains(&child)
+                {
                     candidates.push(child.clone());
                     if candidates.len() >= MAX_CANDIDATES {
                         return Ok(candidates);
@@ -1585,6 +2016,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn progress_callback_can_cancel_a_workspace_scan() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        for index in 0..80 {
+            fs::create_dir(root.join(format!("project-{index}"))).unwrap();
+        }
+        let mut observed = Vec::new();
+
+        let result = discover_many_with_progress(&[root.to_path_buf()], |progress| {
+            observed.push(progress);
+            progress.directories_scanned < PROGRESS_DIRECTORY_INTERVAL
+        });
+
+        assert!(matches!(result, Err(DiscoverError::Cancelled)));
+        assert!(observed.iter().any(|progress| {
+            progress.phase == DiscoveryScanPhase::ProjectCandidates
+                && progress.directories_scanned == PROGRESS_DIRECTORY_INTERVAL
+        }));
+    }
+
+    #[test]
+    fn progress_reports_each_discovery_phase() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(root.join(".env"), "FIXTURE_VALUE=plain-value\n").unwrap();
+        let mut observed = Vec::new();
+
+        let discovery = discover_many_with_progress(&[root.to_path_buf()], |progress| {
+            observed.push(progress);
+            true
+        })
+        .unwrap();
+
+        assert_eq!(discovery.plan(&[]).summary.files, 1);
+        assert!(observed.iter().any(|progress| {
+            progress.phase == DiscoveryScanPhase::ProjectCandidates
+                && progress.project_candidates == 1
+        }));
+        assert!(observed.iter().any(|progress| {
+            progress.phase == DiscoveryScanPhase::CandidateFiles
+                && progress.candidate_files == 1
+        }));
+        assert!(observed.iter().any(|progress| {
+            progress.phase == DiscoveryScanPhase::ParsingFiles
+                && progress.files_parsed == 1
+        }));
+    }
+
+    #[test]
     fn discovers_supported_files_and_classifies_environments() {
         let directory = tempdir().unwrap();
         let root = directory.path();
@@ -1727,13 +2208,238 @@ mod tests {
         let directory = tempdir().unwrap();
         let root = directory.path();
         fs::create_dir(root.join("node_modules")).unwrap();
+        fs::create_dir(root.join(".venv")).unwrap();
+        fs::create_dir_all(root.join("deps/openssl")).unwrap();
+        fs::create_dir_all(root.join("python-runtime")).unwrap();
         fs::write(root.join("node_modules/.env"), "IGNORED=fixture\n").unwrap();
+        fs::write(root.join(".venv/cacert.pem"), "IGNORED=fixture\n").unwrap();
+        fs::write(
+            root.join("deps/openssl/cacert.pem"),
+            "IGNORED=fixture\n",
+        )
+        .unwrap();
+        fs::write(root.join("build.zig"), "pub fn build() void {}\n").unwrap();
+        fs::write(root.join("python-runtime/pyvenv.cfg"), "home = /fixture/python\n").unwrap();
+        fs::write(
+            root.join("python-runtime/cacert.pem"),
+            "IGNORED=fixture\n",
+        )
+        .unwrap();
         fs::write(root.join(".env"), "VISIBLE=fixture\n").unwrap();
 
         let plan = discover(root).unwrap().plan(&[]);
 
         assert_eq!(plan.summary.files, 1);
         assert_eq!(plan.files[0].relative_path, Path::new(".env"));
+    }
+
+    #[test]
+    fn ignores_unambiguous_generated_ecosystem_directories() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        for generated in [
+            ".gradle",
+            ".pnpm-store",
+            ".terraform",
+            "__pypackages__",
+            "CMakeFiles",
+            "DerivedData",
+        ] {
+            let generated = root.join(generated);
+            fs::create_dir_all(&generated).unwrap();
+            fs::write(generated.join(".env"), "IGNORED=fixture\n").unwrap();
+        }
+        fs::write(root.join(".env"), "VISIBLE=fixture\n").unwrap();
+
+        let plan = discover(root).unwrap().plan(&[]);
+
+        assert_eq!(plan.summary.files, 1);
+        assert_eq!(plan.files[0].relative_path, Path::new(".env"));
+    }
+
+    #[test]
+    fn ignores_tool_owned_state_and_structurally_identified_build_trees() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        for generated in [".wrangler", "zig-out", ".astro", ".docusaurus", "cdk.out"] {
+            let generated = root.join(generated);
+            fs::create_dir_all(&generated).unwrap();
+            fs::write(generated.join(".env"), "IGNORED=fixture\n").unwrap();
+        }
+        for generated in [
+            ".angular/cache",
+            ".nx/cache",
+            ".nx/workspace-data",
+            ".aws-sam/build",
+        ] {
+            let generated = root.join(generated);
+            fs::create_dir_all(&generated).unwrap();
+            fs::write(generated.join(".env"), "IGNORED=fixture\n").unwrap();
+        }
+        let cmake_build = root.join("arbitrary-cmake-output");
+        fs::create_dir_all(&cmake_build).unwrap();
+        fs::write(
+            cmake_build.join("CMakeCache.txt"),
+            format!(
+                "CMAKE_HOME_DIRECTORY:INTERNAL={}\n",
+                root.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        fs::write(cmake_build.join(".env"), "IGNORED=fixture\n").unwrap();
+        fs::write(root.join(".angular/.env"), "VISIBLE_ANGULAR=fixture\n").unwrap();
+        fs::write(root.join(".nx/.env"), "VISIBLE_NX=fixture\n").unwrap();
+        fs::write(root.join(".aws-sam/.env"), "VISIBLE_SAM=fixture\n").unwrap();
+        fs::write(root.join(".dev.vars"), "VISIBLE=fixture\n").unwrap();
+
+        let plan = discover(root).unwrap().plan(&[]);
+
+        assert_eq!(plan.summary.files, 4);
+        let relative_paths = plan
+            .files
+            .iter()
+            .map(|file| file.relative_path.as_path())
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            relative_paths,
+            HashSet::from([
+                Path::new(".angular/.env"),
+                Path::new(".nx/.env"),
+                Path::new(".aws-sam/.env"),
+                Path::new(".dev.vars"),
+            ])
+        );
+    }
+
+    #[test]
+    fn keeps_a_cmake_source_tree_after_an_in_source_build() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        let project = root.join("cmake-source");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("CMakeLists.txt"), "project(fixture)\n").unwrap();
+        fs::write(
+            project.join("CMakeCache.txt"),
+            format!(
+                "CMAKE_HOME_DIRECTORY:INTERNAL={}\n",
+                project.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        fs::write(project.join(".env"), "VISIBLE=fixture\n").unwrap();
+
+        let plan = discover(root).unwrap().plan(&[]);
+
+        assert_eq!(plan.summary.files, 1);
+        assert_eq!(plan.files[0].path, project.join(".env"));
+    }
+
+    #[test]
+    fn ignores_ambiguous_output_names_only_in_matching_ecosystems() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        let projects = [
+            ("javascript", "package.json", vec!["dist", "coverage", ".yarn/cache"]),
+            ("python", "pyproject.toml", vec!["build", "dist", "htmlcov"]),
+            ("rust", "Cargo.toml", vec!["target"]),
+            ("go", "go.mod", vec!["vendor"]),
+            ("ruby", "Gemfile", vec!["coverage", ".yardoc"]),
+            ("ruby-bundler", "Gemfile", vec!["vendor/bundle"]),
+            ("swift", "Package.swift", vec!["Carthage/Build"]),
+            ("cmake", "CMakeLists.txt", vec!["build", "cmake-build-debug"]),
+            ("cmake-uppercase", "CMakeLists.txt", vec!["Build"]),
+            ("zig", "build.zig", vec!["build-release", "deps"]),
+            ("php", "composer.json", vec!["vendor"]),
+            ("gradle", "build.gradle", vec!["build"]),
+            ("maven", "pom.xml", vec!["target"]),
+            (
+                "serverless",
+                "serverless.yml",
+                vec![".serverless"],
+            ),
+            ("vite", "vite.config.ts", vec![".vite"]),
+            (
+                "nuxt",
+                "nuxt.config.ts",
+                vec![".output", ".nuxt-build"],
+            ),
+        ];
+        for (project_name, marker, outputs) in projects {
+            let project = root.join(project_name);
+            fs::create_dir_all(&project).unwrap();
+            fs::write(project.join(marker), "fixture\n").unwrap();
+            for output in outputs {
+                let output = project.join(output);
+                fs::create_dir_all(&output).unwrap();
+                fs::write(output.join(".env"), "IGNORED=fixture\n").unwrap();
+            }
+        }
+        fs::write(root.join(".env"), "VISIBLE=fixture\n").unwrap();
+
+        let plan = discover(root).unwrap().plan(&[]);
+
+        assert_eq!(plan.summary.files, 1);
+        assert_eq!(plan.files[0].relative_path, Path::new(".env"));
+    }
+
+    #[test]
+    fn keeps_ambiguous_directory_names_without_matching_ecosystem_markers() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        for ordinary in [
+            "build",
+            "coverage",
+            "deps",
+            "dist",
+            "target",
+            "vendor",
+            "cmake-build-debug",
+            ".yarn/cache",
+            "Carthage/Build",
+            ".serverless",
+            ".vite",
+            ".output",
+            ".webpack",
+        ] {
+            let ordinary = root.join(ordinary);
+            fs::create_dir_all(&ordinary).unwrap();
+            fs::write(ordinary.join(".env"), "VISIBLE=fixture\n").unwrap();
+        }
+
+        let plan = discover(root).unwrap().plan(&[]);
+
+        assert_eq!(plan.summary.files, 13);
+    }
+
+    #[test]
+    fn generic_javascript_context_does_not_imply_framework_outputs() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        fs::write(root.join("package.json"), "{}\n").unwrap();
+        for ordinary in [".vite", ".output", ".webpack"] {
+            fs::create_dir_all(root.join(ordinary)).unwrap();
+            fs::write(root.join(ordinary).join(".env"), "VISIBLE=fixture\n").unwrap();
+        }
+
+        let plan = discover(root).unwrap().plan(&[]);
+
+        assert_eq!(plan.summary.files, 3);
+    }
+
+    #[test]
+    fn ecosystem_context_stops_at_a_nested_git_project() {
+        let directory = tempdir().unwrap();
+        let workspace = directory.path();
+        fs::write(workspace.join("CMakeLists.txt"), "project(parent)\n").unwrap();
+        let nested = workspace.join("independent");
+        fs::create_dir_all(nested.join(".git")).unwrap();
+        fs::create_dir_all(nested.join("Build")).unwrap();
+        fs::write(nested.join("Build/.env"), "VISIBLE=fixture\n").unwrap();
+
+        let plan = discover(workspace).unwrap().plan(&[]);
+
+        assert_eq!(plan.summary.files, 1);
+        assert_eq!(plan.files[0].path, nested.join("Build/.env"));
     }
 
     #[test]
@@ -1808,7 +2514,7 @@ mod tests {
     }
 
     #[test]
-    fn classifies_dotenv_examples_as_references_without_secret_candidates() {
+    fn automatic_scan_excludes_dotenv_reference_templates() {
         let directory = tempdir().unwrap();
         let root = directory.path();
         fs::write(root.join(".env"), "API_TOKEN=fixture-real-value\n").unwrap();
@@ -1825,7 +2531,26 @@ mod tests {
 
         let plan = discover(root).unwrap().plan(&[]);
 
+        assert_eq!(plan.summary.files, 1);
         assert_eq!(plan.summary.new_secrets, 1);
+        assert_eq!(plan.files[0].relative_path, Path::new(".env"));
+    }
+
+    #[test]
+    fn an_explicit_dotenv_template_is_available_as_a_reference() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        let example_path = root.join(".env.example");
+        fs::write(
+            &example_path,
+            "API_TOKEN=replace-me\nOPTIONAL_FLAG=false\n",
+        )
+        .unwrap();
+        let target_path = root.join(".env");
+        fs::write(&target_path, "API_TOKEN=fixture-real-value\n").unwrap();
+
+        let plan = discover_many(&[target_path, example_path]).unwrap().plan(&[]);
+
         let example = plan
             .files
             .iter()
@@ -1847,15 +2572,7 @@ mod tests {
                 && entry.action
                     == DiscoveredEntryAction::ReferenceEntry { matched: false }
         }));
-        assert_eq!(plan.summary.missing_reference_entries, 2);
-
-        let production = plan
-            .files
-            .iter()
-            .find(|file| file.relative_path == Path::new(".env.production.sample"))
-            .unwrap();
-        assert_eq!(production.action, DiscoveredFileAction::Reference);
-        assert_eq!(production.environment.as_deref(), Some("production"));
+        assert_eq!(plan.summary.missing_reference_entries, 1);
     }
 
     #[test]
@@ -1880,7 +2597,12 @@ mod tests {
             }],
         };
 
-        let plan = discover(root).unwrap().plan_with_projects(&[], &[managed]);
+        let plan = discover_many(&[
+            root.to_path_buf(),
+            root.join(".env.qa-west.example"),
+        ])
+            .unwrap()
+            .plan_with_projects(&[], &[managed]);
 
         assert_eq!(
             plan.projects[0].managed_project_id.as_deref(),
@@ -1975,28 +2697,38 @@ mod tests {
     fn package_markers_find_mainstream_projects_without_git() {
         let directory = tempdir().unwrap();
         let workspace = directory.path();
-        let javascript = workspace.join("javascript");
-        let python = workspace.join("python");
-        let go = workspace.join("go");
-        let rust = workspace.join("rust");
-        let docker = workspace.join("docker");
-        for path in [&javascript, &python, &go, &rust, &docker] {
-            fs::create_dir(path).unwrap();
+        let projects = [
+            ("javascript", "package.json", "{}\n"),
+            ("python", "requirements.txt", "fixture-package==0.0.0\n"),
+            ("go", "go.mod", "module example.invalid/fixture\n"),
+            (
+                "rust",
+                "Cargo.toml",
+                "[package]\nname='fixture'\nversion='0.0.0'\n",
+            ),
+            ("ruby", "Gemfile", "source 'https://example.invalid'\n"),
+            ("swift", "Package.swift", "// swift-tools-version: 6.0\n"),
+            ("gradle", "build.gradle.kts", "plugins {}\n"),
+            ("maven", "pom.xml", "<project />\n"),
+            ("cmake", "CMakeLists.txt", "project(fixture)\n"),
+            ("zig", "build.zig", "const std = @import(\"std\");\n"),
+            ("php", "composer.json", "{}\n"),
+            ("serverless", "serverless.yml", "service: fixture\n"),
+            ("cloudflare", "wrangler.toml", "name = \"fixture\"\n"),
+            ("vite", "vite.config.ts", "export default {}\n"),
+            ("nuxt", "nuxt.config.ts", "export default {}\n"),
+            ("docker", "compose.yaml", "services: {}\n"),
+        ];
+        for (name, marker, contents) in projects {
+            let path = workspace.join(name);
+            fs::create_dir(&path).unwrap();
             fs::write(path.join(".env"), "FIXTURE_VALUE=not-a-secret\n").unwrap();
+            fs::write(path.join(marker), contents).unwrap();
         }
-        fs::write(javascript.join("package.json"), "{}\n").unwrap();
-        fs::write(python.join("requirements.txt"), "fixture-package==0.0.0\n").unwrap();
-        fs::write(go.join("go.mod"), "module example.invalid/fixture\n").unwrap();
-        fs::write(
-            rust.join("Cargo.toml"),
-            "[package]\nname='fixture'\nversion='0.0.0'\n",
-        )
-        .unwrap();
-        fs::write(docker.join("compose.yaml"), "services: {}\n").unwrap();
 
         let plan = discover(workspace).unwrap().plan(&[]);
 
-        assert_eq!(plan.projects.len(), 5);
+        assert_eq!(plan.projects.len(), 16);
         let ecosystems = plan
             .projects
             .iter()
@@ -2004,7 +2736,24 @@ mod tests {
             .collect::<HashSet<_>>();
         assert_eq!(
             ecosystems,
-            HashSet::from(["javascript", "python", "go", "rust", "docker"])
+            HashSet::from([
+                "javascript",
+                "python",
+                "go",
+                "rust",
+                "ruby",
+                "swift",
+                "gradle",
+                "maven",
+                "cmake",
+                "zig",
+                "php",
+                "serverless",
+                "cloudflare",
+                "vite",
+                "nuxt",
+                "docker",
+            ])
         );
         assert!(plan
             .files

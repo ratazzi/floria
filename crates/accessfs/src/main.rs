@@ -861,6 +861,9 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
         ControlResult::Discovery(plan) => {
             println!("{}", serde_json::to_string_pretty(&plan)?);
         }
+        ControlResult::DiscoveryJob(status) => {
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
         ControlResult::DiscoveryApplied(result) => {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }

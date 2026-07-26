@@ -481,6 +481,84 @@
     }
 
     #[test]
+    fn asynchronous_discovery_returns_immediately_and_completes_through_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        std::fs::write(project.join(".env"), "FIXTURE_TOKEN=plain-value\n").unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let socket = dir.path().join("control.sock");
+        let store = Arc::new(FixtureStore::new());
+        dispatch(
+            &catalog,
+            DispatchServices {
+                store: Some(store.as_ref()),
+                ..DispatchServices::default()
+            },
+            ControlCommand::SharedSecretCreate {
+                resource_id: "fixture-existing-secret".to_string(),
+                name: "Fixture Shared Secret".to_string(),
+                default_env_key: Some("FIXTURE_TOKEN".to_string()),
+                value: crate::protocol::SecretValue::new("plain-value"),
+                enforcement: Enforcement::Prompt,
+                metadata: ItemMetadata::default(),
+            },
+        )
+        .unwrap();
+        let _server = ControlServer::start_inner(
+            &socket,
+            catalog,
+            ControlDependencies {
+                store: Some(Arc::clone(&store) as Arc<dyn SecretStore>),
+                mount_path: Some(dir.path().join("mount")),
+                ..ControlDependencies::default()
+            },
+            test_peer_verifier(),
+        )
+        .unwrap();
+        let mut client = ControlClient::connect(&socket).unwrap();
+
+        let ControlResult::DiscoveryJob(started) = client
+            .request(ControlCommand::DiscoverStart { paths: vec![project.clone()] })
+            .unwrap()
+        else {
+            panic!("expected discovery job")
+        };
+        assert_eq!(started.state, DiscoveryJobState::Queued);
+        assert!(started.plan.is_none());
+
+        let completed = (0..100)
+            .find_map(|_| {
+                let ControlResult::DiscoveryJob(status) = client
+                    .request(ControlCommand::DiscoverStatus { id: started.id.clone() })
+                    .unwrap()
+                else {
+                    panic!("expected discovery job status")
+                };
+                if status.is_terminal() {
+                    Some(status)
+                } else {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    None
+                }
+            })
+            .expect("discovery job did not finish");
+
+        assert_eq!(completed.state, DiscoveryJobState::Completed);
+        assert_eq!(completed.progress.phase, DiscoveryJobPhase::Complete);
+        let plan = completed.plan.expect("completed discovery plan");
+        assert_eq!(plan.discovery.paths, vec![project]);
+        assert_eq!(plan.discovery.summary.files, 1);
+        assert_eq!(plan.discovery.summary.reused_secrets, 0);
+        assert_eq!(plan.discovery.summary.new_secrets, 1);
+        assert_eq!(
+            store.get_calls.load(Ordering::Relaxed),
+            0,
+            "preview must not decrypt existing secrets; apply performs exact reuse matching"
+        );
+    }
+
+    #[test]
     fn access_history_returns_persisted_reader_metadata_with_surface_display_path() {
         let dir = tempfile::tempdir().unwrap();
         let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
@@ -722,31 +800,178 @@
     }
 
     #[test]
+    fn rediscovering_a_managed_project_does_not_reimport_surface_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("fixture-project");
+        let source_path = project_path.join(".env");
+        let mount_path = dir.path().join("mount");
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
+        std::fs::create_dir_all(mount_path.join(accessfs_core::config::SURFACES_DIR)).unwrap();
+        std::fs::write(
+            &source_path,
+            "DISCOVERED_TOKEN=fixture-discovered-value\n",
+        )
+        .unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let store = FixtureStore::new();
+        let services = DispatchServices {
+            store: Some(&store),
+            mount_path: Some(&mount_path),
+            ..DispatchServices::default()
+        };
+        let import = project_output_import(&source_path, &project_path);
+
+        dispatch(
+            &catalog,
+            services,
+            ControlCommand::DiscoverApply {
+                paths: vec![project_path.clone()],
+                imports: Some(vec![import.clone()]),
+                separate_entries: Vec::new(),
+                promote_entries: Vec::new(),
+                demote_entries: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let managed_snapshot = catalog.snapshot().unwrap();
+        let managed_target = std::fs::read_link(&source_path).unwrap();
+        let store_reads_before_rediscovery = store.get_calls.load(Ordering::Relaxed);
+        let rediscovered = dispatch(
+            &catalog,
+            services,
+            ControlCommand::Discover {
+                paths: vec![project_path.clone()],
+            },
+        )
+        .unwrap();
+
+        let ControlResult::Discovery(plan) = rediscovered else {
+            panic!("expected discovery plan");
+        };
+        assert_eq!(
+            plan.projects[0].managed_project_id.as_deref(),
+            Some(managed_snapshot.projects[0].id.as_str())
+        );
+        assert_eq!(plan.summary.new_secrets, 0);
+        assert_eq!(plan.summary.reused_secrets, 0);
+        assert_eq!(
+            store.get_calls.load(Ordering::Relaxed),
+            store_reads_before_rediscovery
+        );
+        assert_eq!(plan.managed_items.len(), 1);
+        assert_eq!(plan.managed_items[0].path, source_path);
+        assert_eq!(plan.managed_items[0].kind, DiscoveryManagedItemKind::Surface);
+        assert_eq!(
+            plan.managed_items[0].status,
+            DiscoveryManagedItemStatus::Linked
+        );
+
+        let repeated_apply = dispatch(
+            &catalog,
+            services,
+            ControlCommand::DiscoverApply {
+                paths: vec![project_path.clone()],
+                imports: Some(vec![import]),
+                separate_entries: Vec::new(),
+                promote_entries: Vec::new(),
+                demote_entries: Vec::new(),
+            },
+        );
+        assert!(matches!(
+            repeated_apply,
+            Err(DispatchError::Validation(message))
+                if message.contains("was not part of the reviewed discovery")
+        ));
+
+        let repeated_snapshot = catalog.snapshot().unwrap();
+        assert_eq!(repeated_snapshot.projects.len(), managed_snapshot.projects.len());
+        assert_eq!(
+            repeated_snapshot.environments.len(),
+            managed_snapshot.environments.len()
+        );
+        assert_eq!(
+            repeated_snapshot.resources.len(),
+            managed_snapshot.resources.len()
+        );
+        assert_eq!(repeated_snapshot.bindings.len(), managed_snapshot.bindings.len());
+        assert_eq!(repeated_snapshot.surfaces.len(), managed_snapshot.surfaces.len());
+        assert_eq!(std::fs::read_link(&source_path).unwrap(), managed_target);
+
+        std::fs::remove_file(&source_path).unwrap();
+        let missing = dispatch(
+            &catalog,
+            services,
+            ControlCommand::Discover {
+                paths: vec![project_path.clone()],
+            },
+        )
+        .unwrap();
+        let ControlResult::Discovery(missing) = missing else {
+            panic!("expected discovery plan");
+        };
+        assert_eq!(
+            missing.managed_items[0].status,
+            DiscoveryManagedItemStatus::Missing
+        );
+
+        std::fs::write(&source_path, "DISCOVERED_TOKEN=fixture-local-replacement\n").unwrap();
+        let replaced = dispatch(
+            &catalog,
+            services,
+            ControlCommand::Discover {
+                paths: vec![project_path],
+            },
+        )
+        .unwrap();
+        let ControlResult::Discovery(replaced) = replaced else {
+            panic!("expected discovery plan");
+        };
+        assert_eq!(
+            replaced.managed_items[0].status,
+            DiscoveryManagedItemStatus::Replaced
+        );
+        assert_eq!(
+            catalog.snapshot().unwrap().resources.len(),
+            managed_snapshot.resources.len()
+        );
+    }
+
+    #[test]
     fn discovery_apply_protects_binary_credentials_without_text_decoding() {
         let dir = tempfile::tempdir().unwrap();
         let project_path = dir.path().join("fixture-project");
         let source_path = project_path.join("client-identity.p12");
         let mount_path = dir.path().join("mount");
         let fixture_bytes = b"\x30\x82\x00\x08\xff\x00fixture-p12";
-        std::fs::create_dir_all(&project_path).unwrap();
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
         std::fs::create_dir_all(&mount_path).unwrap();
         std::fs::write(&source_path, fixture_bytes).unwrap();
         let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
         let store = FixtureStore::new();
+        catalog
+            .upsert_project(&Project {
+                id: "fixture-project".to_string(),
+                name: "Fixture Project".to_string(),
+                path: project_path.clone(),
+            })
+            .unwrap();
+        let import = library_import(
+            &source_path,
+            DiscoverySourceDisposition::ProtectInPlace,
+        );
+        let services = DispatchServices {
+            store: Some(&store),
+            mount_path: Some(&mount_path),
+            ..DispatchServices::default()
+        };
 
         let applied = dispatch(
             &catalog,
-            DispatchServices {
-                store: Some(&store),
-                mount_path: Some(&mount_path),
-                ..DispatchServices::default()
-            },
+            services,
             ControlCommand::DiscoverApply {
-                paths: vec![project_path],
-                imports: Some(vec![library_import(
-                    &source_path,
-                    DiscoverySourceDisposition::ProtectInPlace,
-                )]),
+                paths: vec![project_path.clone()],
+                imports: Some(vec![import.clone()]),
                 separate_entries: Vec::new(),
                 promote_entries: Vec::new(),
                 demote_entries: Vec::new(),
@@ -761,6 +986,75 @@
         assert!(std::fs::symlink_metadata(&source_path).unwrap().file_type().is_symlink());
         let secret_id: SecretId = FIXTURE_SECRET_ID.parse().unwrap();
         assert_eq!(store.get(&secret_id).unwrap().as_slice(), fixture_bytes);
+        let protected_records = store.list().unwrap();
+        let canonical_source_path = canonical_source_path(&source_path).unwrap();
+        assert_eq!(protected_records.len(), 1);
+        assert_eq!(
+            protected_records[0].source_path(),
+            Some(canonical_source_path.as_path())
+        );
+
+        let managed_snapshot = catalog.snapshot().unwrap();
+        let managed_target = std::fs::read_link(&source_path).unwrap();
+        let store_reads_before_rediscovery = store.get_calls.load(Ordering::Relaxed);
+        let rediscovered = dispatch(
+            &catalog,
+            services,
+            ControlCommand::Discover {
+                paths: vec![project_path.clone()],
+            },
+        )
+        .unwrap();
+        let ControlResult::Discovery(plan) = rediscovered else {
+            panic!("expected discovery plan");
+        };
+        assert_eq!(
+            plan.projects[0].managed_project_id.as_deref(),
+            Some("fixture-project")
+        );
+        assert_eq!(plan.summary.new_secrets, 0);
+        assert_eq!(plan.summary.reused_secrets, 0);
+        assert_eq!(
+            store.get_calls.load(Ordering::Relaxed),
+            store_reads_before_rediscovery
+        );
+        assert_eq!(plan.managed_items.len(), 1);
+        assert_eq!(plan.managed_items[0].path, canonical_source_path);
+        assert_eq!(
+            plan.managed_items[0].kind,
+            DiscoveryManagedItemKind::ProtectedFile
+        );
+        assert_eq!(
+            plan.managed_items[0].status,
+            DiscoveryManagedItemStatus::Linked
+        );
+
+        let repeated_apply = dispatch(
+            &catalog,
+            services,
+            ControlCommand::DiscoverApply {
+                paths: vec![project_path],
+                imports: Some(vec![import]),
+                separate_entries: Vec::new(),
+                promote_entries: Vec::new(),
+                demote_entries: Vec::new(),
+            },
+        );
+        assert!(matches!(
+            repeated_apply,
+            Err(DispatchError::Validation(message))
+                if message.contains("was not part of the reviewed discovery")
+        ));
+
+        let repeated_snapshot = catalog.snapshot().unwrap();
+        assert_eq!(
+            repeated_snapshot.resources.len(),
+            managed_snapshot.resources.len()
+        );
+        assert_eq!(
+            std::fs::read_link(&source_path).unwrap(),
+            managed_target
+        );
     }
 
     #[test]

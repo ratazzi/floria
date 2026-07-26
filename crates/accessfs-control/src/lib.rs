@@ -12,6 +12,7 @@ pub use client::ControlClient;
 pub use protocol::{
     AccessHistoryEvent, AccessHistoryIdentity, AccessHistoryProcess, AccessHistorySsh, ActiveGrant,
     ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest, ControlResponse, ControlResult,
+    DiscoveryJobPhase, DiscoveryJobProgress, DiscoveryJobState, DiscoveryJobStatus,
     ProjectCheckoutCandidate, ProjectCheckoutDiscovery, ProjectCheckoutInventory, ProtectedFile,
     ProtectedFileVersion, SecretValue, SshConfigState, SshConfigStatus, SshIdentity,
 };

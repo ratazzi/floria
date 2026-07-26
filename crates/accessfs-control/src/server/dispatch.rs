@@ -13,6 +13,7 @@ pub(super) fn dispatch(
         ssh_config,
         checkout_monitor,
         audit_log,
+        discovery_jobs,
     } = services;
     match command {
         ControlCommand::Ping => {
@@ -88,10 +89,41 @@ pub(super) fn dispatch(
             let existing = existing_discovery_secrets(catalog, store, &candidate_keys)?;
             let managed_projects =
                 existing_discovery_projects(catalog, discovery.projects())?;
-            Ok(ControlResult::Discovery(
+            discovery_review_plan(
+                catalog,
+                store,
+                mount_path,
                 discovery.plan_with_projects(&existing, &managed_projects),
-            ))
+            )
+            .map(ControlResult::Discovery)
         }
+        ControlCommand::DiscoverStart { paths } => discovery_jobs
+            .ok_or_else(|| {
+                DispatchError::Validation(
+                    "asynchronous discovery is unavailable on this control server".to_string(),
+                )
+            })?
+            .start(paths)
+            .map(ControlResult::DiscoveryJob)
+            .map_err(DispatchError::Validation),
+        ControlCommand::DiscoverStatus { id } => discovery_jobs
+            .ok_or_else(|| {
+                DispatchError::Validation(
+                    "asynchronous discovery is unavailable on this control server".to_string(),
+                )
+            })?
+            .status(&id)
+            .map(ControlResult::DiscoveryJob)
+            .map_err(DispatchError::Validation),
+        ControlCommand::DiscoverCancel { id } => discovery_jobs
+            .ok_or_else(|| {
+                DispatchError::Validation(
+                    "asynchronous discovery is unavailable on this control server".to_string(),
+                )
+            })?
+            .cancel(&id)
+            .map(ControlResult::DiscoveryJob)
+            .map_err(DispatchError::Validation),
         ControlCommand::DiscoverApply {
             paths,
             imports,
