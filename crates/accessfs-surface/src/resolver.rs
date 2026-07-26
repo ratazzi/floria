@@ -744,6 +744,8 @@ mod tests {
     const LINE_ONE_ID: &str = "00000000-0000-0000-0000-000000000003";
     const LINE_TWO_ID: &str = "00000000-0000-0000-0000-000000000004";
     const INI_FILE_ID: &str = "00000000-0000-0000-0000-000000000005";
+    const INI_COMMON_ID: &str = "00000000-0000-0000-0000-000000000006";
+    const INI_ROOT_ID: &str = "00000000-0000-0000-0000-000000000007";
 
     struct FixtureStore {
         entries: Mutex<HashMap<String, (u32, Vec<Vec<u8>>)>>,
@@ -776,6 +778,17 @@ mod tests {
                             1,
                             vec![b"[fixture-development]\nREGION=fixture-region-one\nOUTPUT=fixture-json\n[fixture-staging]\nREGION=fixture-region-two\nOUTPUT=fixture-text\n".to_vec()],
                         ),
+                    ),
+                    (
+                        INI_COMMON_ID.to_string(),
+                        (
+                            1,
+                            vec![b"[common]\nCOMMON=common-value\n".to_vec()],
+                        ),
+                    ),
+                    (
+                        INI_ROOT_ID.to_string(),
+                        (1, vec![b"ROOT=root-value\n".to_vec()]),
                     ),
                 ])),
                 requested_versions: Mutex::new(Vec::new()),
@@ -1195,6 +1208,107 @@ mod tests {
     }
 
     #[test]
+    fn render_entrypoints_reject_the_wrong_surface_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = fixture_catalog(&dir.path().join("catalog.sqlite"));
+        let resolver =
+            SurfaceResolver::new(catalog, Arc::new(FixtureStore::new()) as Arc<dyn SecretStore>);
+
+        assert!(matches!(
+            resolver.render_dotenv_surface("fixture-direct-env"),
+            Err(SurfaceError::UnsupportedSurface { .. })
+        ));
+        assert!(matches!(
+            resolver.render_direnv_surface("fixture-dotenv"),
+            Err(SurfaceError::UnsupportedSurface { .. })
+        ));
+        assert!(matches!(
+            resolver.render_ini_surface("fixture-dotenv"),
+            Err(SurfaceError::UnsupportedSurface { .. })
+        ));
+        assert!(matches!(
+            resolver.render_lines_surface("fixture-dotenv"),
+            Err(SurfaceError::UnsupportedSurface { .. })
+        ));
+        assert!(matches!(
+            resolver.read_direct_env_file("fixture-dotenv"),
+            Err(SurfaceError::UnsupportedSurface { .. })
+        ));
+    }
+
+    #[test]
+    fn executable_and_socket_sources_are_not_file_projection_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = fixture_catalog(&dir.path().join("catalog.sqlite"));
+        let resolver =
+            SurfaceResolver::new(catalog, Arc::new(FixtureStore::new()) as Arc<dyn SecretStore>);
+        let resource = |id: &str, source| Resource {
+            id: id.to_string(),
+            name: id.to_string(),
+            kind: ResourceKind::Command,
+            shape: ValueShape::Scalar,
+            codec: ResourceCodec::Opaque,
+            default_env_key: Some("FIXTURE".to_string()),
+            entries: vec![EntrySpec {
+                address: "value".to_string(),
+                label: id.to_string(),
+                key: Some("FIXTURE".to_string()),
+                sensitive: true,
+            }],
+            source,
+            enforcement: Default::default(),
+            metadata: Default::default(),
+            origin: Default::default(),
+        };
+
+        for resource in [
+            resource(
+                "fixture-command",
+                ResourceSource::Command {
+                    argv: vec!["/fixture/command".to_string()],
+                },
+            ),
+            resource(
+                "fixture-socket",
+                ResourceSource::Socket {
+                    endpoint: PathBuf::from("/fixture/agent.sock"),
+                },
+            ),
+        ] {
+            assert!(matches!(
+                resolver.decode_resource(&resource, None),
+                Err(SurfaceError::IncompatibleResource { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn direct_writeback_rejects_codecs_without_raw_roundtrip_support() {
+        for codec in [ResourceCodec::Ini, ResourceCodec::Opaque] {
+            let resource = Resource {
+                id: format!("fixture-{codec:?}"),
+                name: "Fixture non-writeback resource".to_string(),
+                kind: ResourceKind::EnvFile,
+                shape: ValueShape::KeyValueSet,
+                codec,
+                default_env_key: None,
+                entries: Vec::new(),
+                source: ResourceSource::SecretRef {
+                    secret_id: ENV_FILE_ID.to_string(),
+                },
+                enforcement: Default::default(),
+                metadata: Default::default(),
+                origin: Default::default(),
+            };
+
+            assert!(matches!(
+                validate_direct_env_file(&resource, b"KEY=value\n"),
+                Err(SurfaceError::IncompatibleResource { .. })
+            ));
+        }
+    }
+
+    #[test]
     fn direct_env_file_preserves_bytes_and_versions_value_only_edits() {
         let dir = tempfile::tempdir().unwrap();
         let catalog = fixture_catalog(&dir.path().join("catalog.sqlite"));
@@ -1336,6 +1450,384 @@ mod tests {
         assert_eq!(dependencies[0].key, "sections/fixture-staging/keys/REGION");
         assert_eq!(dependencies[0].secret_id.as_deref(), Some(INI_FILE_ID));
         assert_eq!(dependencies[0].version, Some(1));
+    }
+
+    #[test]
+    fn catalog_rejects_incompatible_ini_and_lines_members_before_rendering() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = fixture_catalog(&dir.path().join("catalog.sqlite"));
+
+        let incompatible_ini = Surface {
+            id: "fixture-incompatible-ini".to_string(),
+            environment_id: "fixture-development".to_string(),
+            name: "incompatible.ini".to_string(),
+            kind: SurfaceKind::IniFile,
+            path: PathBuf::from("/fixture/project/incompatible.ini"),
+            input: SurfaceInput::Bindings {
+                binding_ids: vec!["fixture-env-binding".to_string()],
+            },
+            enforcement: Default::default(),
+            position: 2,
+        };
+        assert!(catalog.upsert_surface(&incompatible_ini).is_err());
+
+        let incompatible_lines = Surface {
+            id: "fixture-incompatible-lines".to_string(),
+            environment_id: "fixture-development".to_string(),
+            name: "incompatible.lines".to_string(),
+            kind: SurfaceKind::LinesFile,
+            path: PathBuf::from("/fixture/project/incompatible.lines"),
+            input: SurfaceInput::Bindings {
+                binding_ids: vec!["fixture-token-binding".to_string()],
+            },
+            enforcement: Default::default(),
+            position: 3,
+        };
+        assert!(catalog.upsert_surface(&incompatible_lines).is_err());
+
+        add_resource(
+            &catalog,
+            Resource {
+                id: "fixture-multiline".to_string(),
+                name: "Fixture Multiline".to_string(),
+                kind: ResourceKind::Literal,
+                shape: ValueShape::Scalar,
+                codec: ResourceCodec::Opaque,
+                default_env_key: None,
+                entries: vec![EntrySpec {
+                    address: "value".to_string(),
+                    label: "Fixture Multiline".to_string(),
+                    key: None,
+                    sensitive: true,
+                }],
+                source: ResourceSource::Literal {
+                    value: "first\nsecond".to_string(),
+                },
+                enforcement: Default::default(),
+                metadata: Default::default(),
+                origin: Default::default(),
+            },
+        );
+        let mut binding = Binding {
+            id: "fixture-multiline-binding".to_string(),
+            project_id: "fixture-project".to_string(),
+            scope: BindingScope::Environment {
+                environment_id: "fixture-development".to_string(),
+            },
+            resource_id: "fixture-multiline".to_string(),
+            selection: EntrySelection::All,
+            key_override: Some("MULTILINE".to_string()),
+            enabled: true,
+            allow_override: false,
+            position: 3,
+        };
+        catalog.upsert_binding(&binding).unwrap();
+        let multiline_surface = Surface {
+            id: "fixture-multiline-lines".to_string(),
+            environment_id: "fixture-development".to_string(),
+            name: "multiline.lines".to_string(),
+            kind: SurfaceKind::LinesFile,
+            path: PathBuf::from("/fixture/project/multiline.lines"),
+            input: SurfaceInput::Bindings {
+                binding_ids: vec![binding.id.clone()],
+            },
+            enforcement: Default::default(),
+            position: 4,
+        };
+        assert!(catalog.upsert_surface(&multiline_surface).is_err());
+
+        binding.key_override = None;
+        catalog.upsert_binding(&binding).unwrap();
+        catalog.upsert_surface(&multiline_surface).unwrap();
+        let resolver =
+            SurfaceResolver::new(catalog, Arc::new(FixtureStore::new()) as Arc<dyn SecretStore>);
+        assert!(matches!(
+            resolver.render_lines_surface(&multiline_surface.id),
+            Err(SurfaceError::InvalidLineValue { .. })
+        ));
+    }
+
+    #[test]
+    fn ini_orders_common_bindings_first_and_root_entries_before_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = fixture_catalog(&dir.path().join("catalog.sqlite"));
+        add_resource(
+            &catalog,
+            Resource {
+                id: "fixture-ordered-ini".to_string(),
+                name: "Fixture Ordered INI".to_string(),
+                kind: ResourceKind::EnvFile,
+                shape: ValueShape::KeyValueSet,
+                codec: ResourceCodec::Ini,
+                default_env_key: None,
+                entries: vec![
+                    EntrySpec {
+                        address: "sections/fixture-development/keys/REGION".to_string(),
+                        label: "[fixture-development] REGION".to_string(),
+                        key: Some("REGION".to_string()),
+                        sensitive: true,
+                    },
+                    EntrySpec {
+                        address: "sections/fixture-development/keys/OUTPUT".to_string(),
+                        label: "[fixture-development] OUTPUT".to_string(),
+                        key: Some("OUTPUT".to_string()),
+                        sensitive: true,
+                    },
+                    EntrySpec {
+                        address: "sections/fixture-staging/keys/REGION".to_string(),
+                        label: "[fixture-staging] REGION".to_string(),
+                        key: Some("REGION".to_string()),
+                        sensitive: true,
+                    },
+                    EntrySpec {
+                        address: "sections/fixture-staging/keys/OUTPUT".to_string(),
+                        label: "[fixture-staging] OUTPUT".to_string(),
+                        key: Some("OUTPUT".to_string()),
+                        sensitive: true,
+                    },
+                ],
+                source: ResourceSource::SecretRef {
+                    secret_id: INI_FILE_ID.to_string(),
+                },
+                enforcement: Default::default(),
+                metadata: Default::default(),
+                origin: Default::default(),
+            },
+        );
+        add_resource(
+            &catalog,
+            Resource {
+                id: "fixture-common-ini".to_string(),
+                name: "Fixture Common INI".to_string(),
+                kind: ResourceKind::EnvFile,
+                shape: ValueShape::KeyValueSet,
+                codec: ResourceCodec::Ini,
+                default_env_key: None,
+                entries: vec![EntrySpec {
+                    address: "sections/common/keys/COMMON".to_string(),
+                    label: "[common] COMMON".to_string(),
+                    key: Some("COMMON".to_string()),
+                    sensitive: true,
+                }],
+                source: ResourceSource::SecretRef {
+                    secret_id: INI_COMMON_ID.to_string(),
+                },
+                enforcement: Default::default(),
+                metadata: Default::default(),
+                origin: Default::default(),
+            },
+        );
+        add_resource(
+            &catalog,
+            Resource {
+                id: "fixture-root-ini".to_string(),
+                name: "Fixture Root INI".to_string(),
+                kind: ResourceKind::EnvFile,
+                shape: ValueShape::KeyValueSet,
+                codec: ResourceCodec::Ini,
+                default_env_key: None,
+                entries: vec![EntrySpec {
+                    address: "root/keys/ROOT".to_string(),
+                    label: "ROOT".to_string(),
+                    key: Some("ROOT".to_string()),
+                    sensitive: true,
+                }],
+                source: ResourceSource::SecretRef {
+                    secret_id: INI_ROOT_ID.to_string(),
+                },
+                enforcement: Default::default(),
+                metadata: Default::default(),
+                origin: Default::default(),
+            },
+        );
+        let environment_binding = Binding {
+            id: "fixture-ordered-ini-environment".to_string(),
+            project_id: "fixture-project".to_string(),
+            scope: BindingScope::Environment {
+                environment_id: "fixture-development".to_string(),
+            },
+            resource_id: "fixture-ordered-ini".to_string(),
+            selection: EntrySelection::Entries {
+                addresses: vec![
+                    "sections/fixture-development/keys/REGION".to_string(),
+                ],
+            },
+            key_override: None,
+            enabled: true,
+            allow_override: false,
+            position: 0,
+        };
+        let common_binding = Binding {
+            id: "fixture-ordered-ini-common".to_string(),
+            project_id: "fixture-project".to_string(),
+            scope: BindingScope::Common,
+            resource_id: "fixture-common-ini".to_string(),
+            selection: EntrySelection::All,
+            key_override: None,
+            enabled: true,
+            allow_override: false,
+            position: 99,
+        };
+        let root_binding = Binding {
+            id: "fixture-ordered-ini-root".to_string(),
+            project_id: "fixture-project".to_string(),
+            scope: BindingScope::Environment {
+                environment_id: "fixture-development".to_string(),
+            },
+            resource_id: "fixture-root-ini".to_string(),
+            selection: EntrySelection::All,
+            key_override: None,
+            enabled: true,
+            allow_override: false,
+            position: 1,
+        };
+        for binding in [&environment_binding, &common_binding, &root_binding] {
+            catalog.upsert_binding(binding).unwrap();
+        }
+        catalog
+            .upsert_surface(&Surface {
+                id: "fixture-common-first-ini".to_string(),
+                environment_id: "fixture-development".to_string(),
+                name: "common-first.ini".to_string(),
+                kind: SurfaceKind::IniFile,
+                path: PathBuf::from("/fixture/project/common-first.ini"),
+                input: SurfaceInput::Bindings {
+                    binding_ids: vec![
+                        environment_binding.id.clone(),
+                        common_binding.id.clone(),
+                    ],
+                },
+                enforcement: Default::default(),
+                position: 2,
+            })
+            .unwrap();
+        catalog
+            .upsert_surface(&Surface {
+                id: "fixture-root-first-ini".to_string(),
+                environment_id: "fixture-development".to_string(),
+                name: "root-first.ini".to_string(),
+                kind: SurfaceKind::IniFile,
+                path: PathBuf::from("/fixture/project/root-first.ini"),
+                input: SurfaceInput::Bindings {
+                    binding_ids: vec![
+                        environment_binding.id.clone(),
+                        root_binding.id.clone(),
+                    ],
+                },
+                enforcement: Default::default(),
+                position: 3,
+            })
+            .unwrap();
+
+        let resolver =
+            SurfaceResolver::new(catalog, Arc::new(FixtureStore::new()) as Arc<dyn SecretStore>);
+        let common_first = resolver
+            .render_ini_surface("fixture-common-first-ini")
+            .unwrap();
+        assert_eq!(
+            common_first.bytes,
+            b"[common]\nCOMMON = common-value\n\n[fixture-development]\nREGION = fixture-region-one\n"
+        );
+        assert_eq!(
+            common_first.entries[0].binding_id,
+            common_binding.id
+        );
+
+        let root_first = resolver
+            .render_ini_surface("fixture-root-first-ini")
+            .unwrap();
+        assert_eq!(
+            root_first.bytes,
+            b"ROOT = root-value\n\n[fixture-development]\nREGION = fixture-region-one\n"
+        );
+        assert!(root_first.entries[0].section.is_none());
+        assert_eq!(root_first.entries[1].section.as_deref(), Some("fixture-development"));
+    }
+
+    #[test]
+    fn lines_orders_common_bindings_before_environment_bindings() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = fixture_catalog(&dir.path().join("catalog.sqlite"));
+        for (id, value) in [
+            ("fixture-common-line", "common-line"),
+            ("fixture-environment-line", "environment-line"),
+        ] {
+            add_resource(
+                &catalog,
+                Resource {
+                    id: id.to_string(),
+                    name: id.to_string(),
+                    kind: ResourceKind::Literal,
+                    shape: ValueShape::Scalar,
+                    codec: ResourceCodec::Opaque,
+                    default_env_key: None,
+                    entries: vec![EntrySpec {
+                        address: "value".to_string(),
+                        label: id.to_string(),
+                        key: None,
+                        sensitive: true,
+                    }],
+                    source: ResourceSource::Literal {
+                        value: value.to_string(),
+                    },
+                    enforcement: Default::default(),
+                    metadata: Default::default(),
+                    origin: Default::default(),
+                },
+            );
+        }
+        let environment_binding = Binding {
+            id: "fixture-environment-line-binding".to_string(),
+            project_id: "fixture-project".to_string(),
+            scope: BindingScope::Environment {
+                environment_id: "fixture-development".to_string(),
+            },
+            resource_id: "fixture-environment-line".to_string(),
+            selection: EntrySelection::All,
+            key_override: None,
+            enabled: true,
+            allow_override: false,
+            position: 0,
+        };
+        let common_binding = Binding {
+            id: "fixture-common-line-binding".to_string(),
+            project_id: "fixture-project".to_string(),
+            scope: BindingScope::Common,
+            resource_id: "fixture-common-line".to_string(),
+            selection: EntrySelection::All,
+            key_override: None,
+            enabled: true,
+            allow_override: false,
+            position: 99,
+        };
+        catalog.upsert_binding(&environment_binding).unwrap();
+        catalog.upsert_binding(&common_binding).unwrap();
+        catalog
+            .upsert_surface(&Surface {
+                id: "fixture-common-first-lines".to_string(),
+                environment_id: "fixture-development".to_string(),
+                name: "common-first.lines".to_string(),
+                kind: SurfaceKind::LinesFile,
+                path: PathBuf::from("/fixture/project/common-first.lines"),
+                input: SurfaceInput::Bindings {
+                    binding_ids: vec![
+                        environment_binding.id.clone(),
+                        common_binding.id.clone(),
+                    ],
+                },
+                enforcement: Default::default(),
+                position: 2,
+            })
+            .unwrap();
+
+        let resolver =
+            SurfaceResolver::new(catalog, Arc::new(FixtureStore::new()) as Arc<dyn SecretStore>);
+        let snapshot = resolver
+            .render_lines_surface("fixture-common-first-lines")
+            .unwrap();
+        assert_eq!(snapshot.bytes, b"common-line\nenvironment-line\n");
+        assert_eq!(snapshot.entries[0].binding_id, common_binding.id);
+        assert_eq!(snapshot.entries[1].binding_id, environment_binding.id);
     }
 
     #[test]
