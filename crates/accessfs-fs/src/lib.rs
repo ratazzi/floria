@@ -30,8 +30,8 @@ use accessfs_core::snapshot::content_version_of;
 use accessfs_core::writebuf::{WriteBufTable, WriteErr};
 use accessfs_store::{SecretId, SecretRecord, SecretStore};
 use accessfs_surface::{
-    validate_secret_bytes, RegisteredSurface, SurfaceBacking, SurfaceError, SurfaceRegistry,
-    SurfaceResolver, DIRENV_MAX_SIZE, DOTENV_MAX_SIZE, INI_MAX_SIZE, LINES_MAX_SIZE,
+    renderer_for, validate_secret_bytes, RegisteredSurface, SurfaceBacking, SurfaceError,
+    SurfaceRegistry, SurfaceResolver,
 };
 use dashmap::DashMap;
 use fuser::{
@@ -279,10 +279,11 @@ impl Shared {
 
     fn surface_attr(&self, ino: u64, registered: &RegisteredSurface) -> Option<fuser::FileAttr> {
         let (size, mode) = match &registered.backing {
-            SurfaceBacking::DotenvComposed => (DOTENV_MAX_SIZE as u64, 0o400),
-            SurfaceBacking::DirenvComposed => (DIRENV_MAX_SIZE as u64, 0o400),
-            SurfaceBacking::IniComposed => (INI_MAX_SIZE as u64, 0o400),
-            SurfaceBacking::LinesComposed => (LINES_MAX_SIZE as u64, 0o400),
+            // Composed surfaces are always read-only; only their byte-layout upper bound belongs
+            // to the renderer.
+            SurfaceBacking::Composed { format } => {
+                (renderer_for(*format).max_size() as u64, 0o400)
+            }
             SurfaceBacking::EnvFileDirect { secret_id, .. } => {
                 let ns = self.secrets.as_ref()?;
                 let id: SecretId = secret_id.parse().ok()?;
@@ -306,10 +307,9 @@ impl Shared {
             if let Some(registered) = ns.surface_for_ino(ino) {
                 let surface = registered.surface;
                 let kind = match registered.backing {
-                    SurfaceBacking::DotenvComposed => OpenKind::DotenvSurface(surface.id.clone()),
-                    SurfaceBacking::DirenvComposed => OpenKind::DirenvSurface(surface.id.clone()),
-                    SurfaceBacking::IniComposed => OpenKind::IniSurface(surface.id.clone()),
-                    SurfaceBacking::LinesComposed => OpenKind::LinesSurface(surface.id.clone()),
+                    SurfaceBacking::Composed { .. } => {
+                        OpenKind::ComposedSurface(surface.id.clone())
+                    }
                     SurfaceBacking::EnvFileDirect { .. } => {
                         OpenKind::DirectEnvFileSurface(surface.id.clone())
                     }
@@ -518,55 +518,7 @@ impl Shared {
                     }
                 }
             }
-            OpenKind::DotenvSurface(surface_id) => {
-                let Some(surfaces) = &self.surfaces else {
-                    tracing::warn!(path = %target.virtual_path, "surface resolver is unavailable");
-                    return Err(errno(libc::EIO));
-                };
-                match surfaces.resolver.render_surface(surface_id) {
-                    Ok(snapshot) => {
-                        tracing::debug!(
-                            path = %target.virtual_path,
-                            resources = snapshot.versions.len(),
-                            exports = snapshot.entries.len(),
-                            "dotenv surface resolved"
-                        );
-                        GeneratedRead {
-                            dependencies: Some(snapshot.audit_dependencies()),
-                            bytes: snapshot.bytes,
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), %error, "dotenv surface failed");
-                        return Err(errno(libc::EIO));
-                    }
-                }
-            }
-            OpenKind::DirenvSurface(surface_id) => {
-                let Some(surfaces) = &self.surfaces else {
-                    tracing::warn!(path = %target.virtual_path, "surface resolver is unavailable");
-                    return Err(errno(libc::EIO));
-                };
-                match surfaces.resolver.render_surface(surface_id) {
-                    Ok(snapshot) => {
-                        tracing::debug!(
-                            path = %target.virtual_path,
-                            resources = snapshot.versions.len(),
-                            exports = snapshot.entries.len(),
-                            "direnv surface resolved"
-                        );
-                        GeneratedRead {
-                            dependencies: Some(snapshot.audit_dependencies()),
-                            bytes: snapshot.bytes,
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), %error, "direnv surface failed");
-                        return Err(errno(libc::EIO));
-                    }
-                }
-            }
-            OpenKind::IniSurface(surface_id) => {
+            OpenKind::ComposedSurface(surface_id) => {
                 let Some(surfaces) = &self.surfaces else {
                     tracing::warn!(path = %target.virtual_path, "surface resolver is unavailable");
                     return Err(errno(libc::EIO));
@@ -577,7 +529,7 @@ impl Shared {
                             path = %target.virtual_path,
                             resources = snapshot.versions.len(),
                             entries = snapshot.entries.len(),
-                            "INI surface resolved"
+                            "composed surface resolved"
                         );
                         GeneratedRead {
                             dependencies: Some(snapshot.audit_dependencies()),
@@ -585,31 +537,7 @@ impl Shared {
                         }
                     }
                     Err(error) => {
-                        tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), %error, "INI surface failed");
-                        return Err(errno(libc::EIO));
-                    }
-                }
-            }
-            OpenKind::LinesSurface(surface_id) => {
-                let Some(surfaces) = &self.surfaces else {
-                    tracing::warn!(path = %target.virtual_path, "surface resolver is unavailable");
-                    return Err(errno(libc::EIO));
-                };
-                match surfaces.resolver.render_surface(surface_id) {
-                    Ok(snapshot) => {
-                        tracing::debug!(
-                            path = %target.virtual_path,
-                            resources = snapshot.versions.len(),
-                            entries = snapshot.entries.len(),
-                            "lines surface resolved"
-                        );
-                        GeneratedRead {
-                            dependencies: Some(snapshot.audit_dependencies()),
-                            bytes: snapshot.bytes,
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), %error, "lines surface failed");
+                        tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), %error, "composed surface failed");
                         return Err(errno(libc::EIO));
                     }
                 }
@@ -913,10 +841,7 @@ struct PendingRead {
 enum OpenKind {
     Handler(ContentHandler),
     Secret(String),
-    DotenvSurface(String),
-    DirenvSurface(String),
-    IniSurface(String),
-    LinesSurface(String),
+    ComposedSurface(String),
     DirectEnvFileSurface(String),
 }
 
@@ -1640,6 +1565,7 @@ mod tests {
     use accessfs_store::{
         NewSecret, SecretOrigin, SecretRecord, StoreError, StoreResult, VersionRecord,
     };
+    use accessfs_surface::{DIRENV_MAX_SIZE, DOTENV_MAX_SIZE, INI_MAX_SIZE, LINES_MAX_SIZE};
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
