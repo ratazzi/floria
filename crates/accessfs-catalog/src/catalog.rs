@@ -682,7 +682,7 @@ fn migrate(conn: &mut Connection) -> CatalogResult<()> {
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         CREATE INDEX surfaces_environment_idx ON surfaces(environment_id, position);
-        PRAGMA user_version = 8;",
+        PRAGMA user_version = 9;",
     )?;
     tx.commit()?;
     Ok(())
@@ -1938,6 +1938,24 @@ mod tests {
             error,
             CatalogError::UnsupportedSchema { found: 1, expected: 9 }
         ));
+    }
+
+    #[test]
+    fn fresh_catalog_persists_current_schema_version_and_reopens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.sqlite");
+
+        let catalog = Catalog::open(&path).unwrap();
+        assert_eq!(catalog.schema_version(), 9);
+        drop(catalog);
+
+        let reopened = Catalog::open(&path).unwrap();
+        let persisted: i64 = reopened
+            .connection()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(persisted, 9);
     }
 
     #[test]
