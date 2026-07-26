@@ -1074,6 +1074,10 @@ fn is_candidate(path: &Path) -> bool {
         return false;
     };
     let parent = path.parent().and_then(Path::file_name).and_then(|name| name.to_str());
+    let credential_extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase);
     name == ".env"
         || name.starts_with(".env.")
         || name.ends_with(".env")
@@ -1087,7 +1091,9 @@ fn is_candidate(path: &Path) -> bool {
         || matches!(name, ".npmrc" | ".pypirc" | ".netrc" | "pip.conf")
         || (parent == Some(".cargo") && name == "credentials.toml")
         || (parent == Some(".docker") && name == "config.json")
-        || name.ends_with(".pem")
+        || credential_extension.as_deref().is_some_and(|extension| {
+            matches!(extension, "pem" | "key" | "p12" | "pfx" | "jks" | "keystore")
+        })
 }
 
 fn candidate_likely_needs_project(path: &Path) -> bool {
@@ -2058,6 +2064,26 @@ mod tests {
             plan.files[0].assignment.state,
             ProjectAssignmentState::Unassigned
         );
+    }
+
+    #[test]
+    fn workspace_discovery_includes_binary_pkcs12_credentials() {
+        let directory = tempdir().unwrap();
+        let file = directory.path().join("client-identity.p12");
+        fs::write(&file, b"\x30\x82\x00\x08\xff\x00fixture-p12").unwrap();
+
+        let explicit_plan = discover(&file).unwrap().plan(&[]);
+        assert_eq!(explicit_plan.files.len(), 1);
+        assert_eq!(explicit_plan.files[0].kind, DiscoveredFileKind::ProtectedFile);
+        assert_eq!(explicit_plan.files[0].action, DiscoveredFileAction::Protect);
+
+        let plan = discover(directory.path()).unwrap().plan(&[]);
+
+        assert!(plan.files.iter().any(|candidate| {
+            candidate.path == file
+                && candidate.kind == DiscoveredFileKind::ProtectedFile
+                && candidate.action == DiscoveredFileAction::Protect
+        }));
     }
 
     #[test]

@@ -681,6 +681,46 @@
     }
 
     #[test]
+    fn discovery_apply_protects_binary_credentials_without_text_decoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("fixture-project");
+        let source_path = project_path.join("client-identity.p12");
+        let mount_path = dir.path().join("mount");
+        let fixture_bytes = b"\x30\x82\x00\x08\xff\x00fixture-p12";
+        std::fs::create_dir_all(&project_path).unwrap();
+        std::fs::create_dir_all(&mount_path).unwrap();
+        std::fs::write(&source_path, fixture_bytes).unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let store = FixtureStore::new();
+
+        let applied = dispatch(
+            &catalog,
+            DispatchServices {
+                store: Some(&store),
+                mount_path: Some(&mount_path),
+                ..DispatchServices::default()
+            },
+            ControlCommand::DiscoverApply {
+                paths: vec![project_path],
+                files: Some(vec![source_path.clone()]),
+                project_assignments: Vec::new(),
+                separate_entries: Vec::new(),
+                promote_entries: Vec::new(),
+                demote_entries: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let ControlResult::DiscoveryApplied(result) = applied else {
+            panic!("expected discovery apply result");
+        };
+        assert_eq!(result.protected_files, 1);
+        assert!(std::fs::symlink_metadata(&source_path).unwrap().file_type().is_symlink());
+        let secret_id: SecretId = FIXTURE_SECRET_ID.parse().unwrap();
+        assert_eq!(store.get(&secret_id).unwrap().as_slice(), fixture_bytes);
+    }
+
+    #[test]
     fn discovery_apply_handles_multiple_projects_and_an_explicit_file_assignment() {
         let dir = tempfile::tempdir().unwrap();
         let workspace_path = dir.path().join("workspace");
