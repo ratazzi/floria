@@ -128,6 +128,10 @@ pub trait SecretStore: Send + Sync {
     fn put(&self, meta: NewSecret, plaintext: &[u8]) -> StoreResult<SecretId>;
     /// Decrypt the head version.
     fn get(&self, id: &SecretId) -> StoreResult<Zeroizing<Vec<u8>>>;
+    /// Decrypt several head versions. Implementations may share expensive key-loading work.
+    fn get_many(&self, ids: &[SecretId]) -> StoreResult<Vec<Zeroizing<Vec<u8>>>> {
+        ids.iter().map(|id| self.get(id)).collect()
+    }
     /// Decrypt a specific version.
     fn get_version(&self, id: &SecretId, version: u32) -> StoreResult<Zeroizing<Vec<u8>>>;
     /// Append a new version (immutable) and move the head to it; returns the new version number.
@@ -352,7 +356,11 @@ impl AgeDirStore {
         Ok(out)
     }
 
-    fn decrypt(&self, ciphertext: &[u8]) -> StoreResult<Zeroizing<Vec<u8>>> {
+    fn decrypt_with_identity(
+        &self,
+        ciphertext: &[u8],
+        identity: &dyn age::Identity,
+    ) -> StoreResult<Zeroizing<Vec<u8>>> {
         let decryptor = match age::Decryptor::new(ciphertext)
             .map_err(|e| StoreError::Crypto(format!("open: {e}")))?
         {
@@ -363,15 +371,30 @@ impl AgeDirStore {
                 ))
             }
         };
-        let identity = self.keys.identity()?;
         let mut reader = decryptor
-            .decrypt(std::iter::once(identity.as_ref() as &dyn age::Identity))
+            .decrypt(std::iter::once(identity))
             .map_err(|e| StoreError::Crypto(format!("decrypt: {e}")))?;
         let mut out = Zeroizing::new(Vec::new());
         reader
             .read_to_end(&mut out)
             .map_err(|e| StoreError::Crypto(format!("read: {e}")))?;
         Ok(out)
+    }
+
+    fn decrypt(&self, ciphertext: &[u8]) -> StoreResult<Zeroizing<Vec<u8>>> {
+        let identity = self.keys.identity()?;
+        self.decrypt_with_identity(ciphertext, identity.as_ref())
+    }
+
+    fn read_version_ciphertext(&self, id: &SecretId, version: u32) -> StoreResult<Vec<u8>> {
+        let path = self.version_blob(id, version);
+        std::fs::read(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StoreError::NotFound(format!("{id}@v{version}"))
+            } else {
+                StoreError::io(&path, e)
+            }
+        })
     }
 }
 
@@ -424,15 +447,22 @@ impl SecretStore for AgeDirStore {
         self.get_version(id, head)
     }
 
+    fn get_many(&self, ids: &[SecretId]) -> StoreResult<Vec<Zeroizing<Vec<u8>>>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let identity = self.keys.identity()?;
+        ids.iter()
+            .map(|id| {
+                let head = self.read_meta(id)?.current_version;
+                let ciphertext = self.read_version_ciphertext(id, head)?;
+                self.decrypt_with_identity(&ciphertext, identity.as_ref())
+            })
+            .collect()
+    }
+
     fn get_version(&self, id: &SecretId, version: u32) -> StoreResult<Zeroizing<Vec<u8>>> {
-        let path = self.version_blob(id, version);
-        let ciphertext = std::fs::read(&path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                StoreError::NotFound(format!("{id}@v{version}"))
-            } else {
-                StoreError::io(&path, e)
-            }
-        })?;
+        let ciphertext = self.read_version_ciphertext(id, version)?;
         self.decrypt(&ciphertext)
     }
 
@@ -603,6 +633,7 @@ fn write_private(path: &Path, bytes: &[u8]) -> StoreResult<()> {
 mod tests {
     use super::*;
     use crate::error::StoreResult;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Test key provider backed by a native age x25519 key (no ssh, no external tools).
     struct X25519Keys(age::x25519::Identity);
@@ -612,6 +643,22 @@ mod tests {
         }
         fn identity(&self) -> StoreResult<Box<dyn age::Identity>> {
             Ok(Box::new(self.0.clone()))
+        }
+    }
+
+    struct CountingKeys {
+        identity: age::x25519::Identity,
+        identity_loads: Arc<AtomicUsize>,
+    }
+
+    impl KeyProvider for CountingKeys {
+        fn recipients(&self) -> StoreResult<Vec<Box<dyn age::Recipient + Send>>> {
+            Ok(vec![Box::new(self.identity.to_public())])
+        }
+
+        fn identity(&self) -> StoreResult<Box<dyn age::Identity>> {
+            self.identity_loads.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(self.identity.clone()))
         }
     }
 
@@ -645,6 +692,29 @@ mod tests {
         // ciphertext on disk must not contain the plaintext
         let blob = std::fs::read(s.version_blob(&id, 1)).unwrap();
         assert!(!blob.windows(secret.len()).any(|w| w == secret));
+    }
+
+    #[test]
+    fn get_many_loads_the_identity_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let identity_loads = Arc::new(AtomicUsize::new(0));
+        let keys = Arc::new(CountingKeys {
+            identity: age::x25519::Identity::generate(),
+            identity_loads: Arc::clone(&identity_loads),
+        });
+        let store = AgeDirStore::open(tmp.path().to_path_buf(), keys).unwrap();
+        let first = store
+            .put(NewSecret::managed("fixture-bulk-one"), b"fixture-value-one")
+            .unwrap();
+        let second = store
+            .put(NewSecret::managed("fixture-bulk-two"), b"fixture-value-two")
+            .unwrap();
+
+        let values = store.get_many(&[first, second]).unwrap();
+
+        assert_eq!(identity_loads.load(Ordering::Relaxed), 1);
+        assert_eq!(values[0].as_slice(), b"fixture-value-one");
+        assert_eq!(values[1].as_slice(), b"fixture-value-two");
     }
 
     #[test]
