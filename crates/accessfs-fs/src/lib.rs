@@ -30,7 +30,7 @@ use accessfs_core::snapshot::content_version_of;
 use accessfs_core::writebuf::{WriteBufTable, WriteErr};
 use accessfs_store::{SecretId, SecretRecord, SecretStore};
 use accessfs_surface::{
-    renderer_for, validate_secret_bytes, RegisteredSurface, SurfaceBacking, SurfaceError,
+    commit_secret_version, renderer_for, RegisteredSurface, SurfaceBacking, SurfaceError,
     SurfaceRegistry, SurfaceResolver,
 };
 use dashmap::DashMap;
@@ -412,17 +412,13 @@ impl Shared {
                     let sid: SecretId = id
                         .parse()
                         .map_err(|_| CommitFailure::io(format!("invalid secret id {id}")))?;
-                    if let Some(catalog) = &ns.catalog {
-                        let snapshot = catalog
-                            .snapshot()
-                            .map_err(|error| CommitFailure::io(error.to_string()))?;
-                        validate_secret_bytes(&snapshot, sid.as_str(), &bytes)
-                            .map_err(CommitFailure::surface)?;
-                    }
-                    let version = ns
-                        .store
-                        .append_version(&sid, &bytes)
-                        .map_err(|error| CommitFailure::io(error.to_string()))?;
+                    let version = commit_secret_version(
+                        ns.catalog.as_ref(),
+                        ns.store.as_ref(),
+                        &sid,
+                        &bytes,
+                    )
+                    .map_err(CommitFailure::surface)?;
                     return Ok((format!("{SECRETS_DIR}/{id}"), version));
                 }
             }

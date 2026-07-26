@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 
 use accessfs_catalog::{
-    CatalogSnapshot, FileBacking, Resource, ResourceCodec, ResourceSource, SurfaceFormat,
-    SurfaceInput, SurfaceKind, ValueShape,
+    Catalog, CatalogSnapshot, FileBacking, Resource, ResourceCodec, ResourceSource,
+    SurfaceFormat, SurfaceInput, SurfaceKind, ValueShape,
 };
+use accessfs_store::{SecretId, SecretStore};
 use zeroize::Zeroizing;
 
 use crate::dotenv::parse_dotenv;
@@ -222,6 +223,24 @@ pub fn validate_secret_bytes(
         }
     }
     Ok(())
+}
+
+/// Validate bytes against every catalog consumer, then append one immutable store version.
+///
+/// This is the mutation choke point for filesystem writeback. The store intentionally remains
+/// format-blind; when no catalog is configured, the skipped cross-layer validation is explicit.
+pub fn commit_secret_version(
+    catalog: Option<&Catalog>,
+    store: &dyn SecretStore,
+    id: &SecretId,
+    bytes: &[u8],
+) -> SurfaceResult<u32> {
+    if let Some(catalog) = catalog {
+        validate_secret_bytes(&catalog.snapshot()?, id.as_str(), bytes)?;
+    } else {
+        tracing::debug!(secret_id = %id, "no catalog configured; skipping schema validation");
+    }
+    store.append_version(id, bytes).map_err(Into::into)
 }
 
 fn same_schema(left: &[(String, Option<String>)], right: &[(String, Option<String>)]) -> bool {

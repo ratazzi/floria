@@ -314,8 +314,12 @@ impl SurfaceResolver {
         let snapshot = self.catalog.snapshot()?;
         let target = direct_env_file_target(&snapshot, surface_id)?;
         let id: SecretId = target.secret_id.parse()?;
-        crate::codec::validate_secret_bytes(&snapshot, id.as_str(), bytes)?;
-        let version = self.store.append_version(&id, bytes)?;
+        let version = crate::codec::commit_secret_version(
+            Some(&self.catalog),
+            self.store.as_ref(),
+            &id,
+            bytes,
+        )?;
         Ok(DirectEnvFileCommit {
             resource_id: target.resource.id,
             secret_id: target.secret_id,

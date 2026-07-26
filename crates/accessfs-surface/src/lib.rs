@@ -12,8 +12,8 @@ mod registry;
 mod resolver;
 
 pub use codec::{
-    codec_capabilities, decode_resource, decode_source, validate_secret_bytes, Codec,
-    CodecCapabilities, DecodedEntry,
+    codec_capabilities, commit_secret_version, decode_resource, decode_source,
+    validate_secret_bytes, Codec, CodecCapabilities, DecodedEntry,
 };
 pub use direnv::DIRENV_MAX_SIZE;
 pub use dotenv::{parse_dotenv, render_dotenv, ParsedDotenvEntry, DOTENV_MAX_SIZE};
