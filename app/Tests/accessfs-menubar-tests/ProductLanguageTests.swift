@@ -42,6 +42,9 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertTrue(source.contains(#""Protected""#))
         XCTAssertTrue(source.contains(#""Will be protected""#))
         XCTAssertTrue(source.contains(#""Not selected""#))
+        XCTAssertTrue(source.contains(#""Opaque file · unchanged""#))
+        XCTAssertTrue(source.contains(#"return selected ? .green : .secondary"#))
+        XCTAssertFalse(source.contains(#""doc.badge.lock""#))
     }
 
     private func source(_ name: String) throws -> String {

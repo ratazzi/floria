@@ -2529,7 +2529,7 @@ private struct DiscoveryManagedItemCard: View {
 
     private var detail: String {
         var parts = [
-            item.kind == .surface ? "Protected output" : "Protected file"
+            item.kind == .surface ? "Managed output" : "Opaque file · unchanged"
         ]
         if let environment = item.environment {
             parts.append(environment)
@@ -2538,11 +2538,11 @@ private struct DiscoveryManagedItemCard: View {
     }
 
     private var icon: String {
-        item.kind == .surface ? "doc.badge.gearshape" : "doc.badge.lock"
+        item.kind == .surface ? "doc.text.fill" : "doc.fill"
     }
 
     private var color: Color {
-        item.kind == .surface ? .blue : .orange
+        statusColor
     }
 
     private var statusTitle: String {
@@ -2554,7 +2554,7 @@ private struct DiscoveryManagedItemCard: View {
 
     private var statusIcon: String {
         switch item.status {
-        case .linked: "checkmark.circle.fill"
+        case .linked: "checkmark.shield.fill"
         case .missing: "exclamationmark.triangle.fill"
         case .replaced: "xmark.circle.fill"
         }
@@ -2562,7 +2562,7 @@ private struct DiscoveryManagedItemCard: View {
 
     private var statusColor: Color {
         switch item.status {
-        case .linked: .green
+        case .linked: .blue
         case .missing: .orange
         case .replaced: .red
         }
@@ -2600,6 +2600,7 @@ private struct DiscoveryFileCard: View {
                 Toggle("", isOn: $selected)
                     .labelsHidden()
                     .toggleStyle(.checkbox)
+                    .tint(.green)
                     .disabled(locked || !file.canApplyDiscovery)
                     .help(selectionHelp)
                 Image(systemName: icon)
@@ -2827,7 +2828,8 @@ private struct DiscoveryFileCard: View {
         var parts = [file.kind.displayTitle]
         if let environment = file.environment { parts.append(environment) }
         for tag in file.tags
-        where !parts.contains(where: { $0.localizedCaseInsensitiveCompare(tag) == .orderedSame }) {
+        where tag.localizedCaseInsensitiveCompare("protected") != .orderedSame
+            && !parts.contains(where: { $0.localizedCaseInsensitiveCompare(tag) == .orderedSame }) {
             parts.append(tag)
         }
         return parts.joined(separator: " · ")
@@ -2846,7 +2848,7 @@ private struct DiscoveryFileCard: View {
 
     private var statusIcon: String {
         guard let result else {
-            return selected ? "shield.lefthalf.filled" : "circle"
+            return selected ? "plus.circle.fill" : "circle"
         }
         return switch result.outcome {
         case "imported", "protected": "checkmark.shield.fill"
@@ -2857,10 +2859,10 @@ private struct DiscoveryFileCard: View {
 
     private var statusColor: Color {
         guard let result else {
-            return selected ? .blue : .secondary
+            return selected ? .green : .secondary
         }
         return switch result.outcome {
-        case "imported", "protected": .green
+        case "imported", "protected": .blue
         case "failed": .red
         default: .secondary
         }
@@ -3041,23 +3043,17 @@ private struct DiscoveryFileCard: View {
 
     private var icon: String {
         switch file.kind {
-        case .dotenv: "doc.text"
+        case .dotenv: "doc.text.fill"
         case .direnv, .mise: "terminal"
-        case .awsCredentials: "cloud"
-        case .pgpass: "cylinder"
-        case .sshPrivateKey: "key.horizontal.fill"
-        case .protectedFile: "doc.badge.lock"
+        case .awsCredentials: "cloud.fill"
+        case .pgpass: "cylinder.fill"
+        case .sshPrivateKey: "key.fill"
+        case .protectedFile: "doc.fill"
         }
     }
 
     private var color: Color {
-        switch file.action {
-        case .compose: .blue
-        case .protect: .orange
-        case .importSshIdentity: .green
-        case .reference: .secondary
-        case .review: .secondary
-        }
+        statusColor
     }
 
     private var projectChoices: [DiscoveredProject] {
@@ -3095,7 +3091,7 @@ private extension DiscoveredFileKind {
         case .awsCredentials: "AWS credentials"
         case .pgpass: "PostgreSQL password file"
         case .sshPrivateKey: "SSH private key"
-        case .protectedFile: "Protected file"
+        case .protectedFile: "Opaque file · unchanged"
         }
     }
 }
