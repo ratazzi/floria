@@ -478,6 +478,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn grant_key_normalizes_interpreters_apps_and_fallback_identities() {
+        let mut interpreter = ProcessIdentity::bare(1001, 501, 20);
+        interpreter.exe_path = Some("/opt/homebrew/bin/python3".into());
+        interpreter.team_id = Some("PYTHON-DISTRIBUTOR".to_string());
+        assert_eq!(
+            grant_key(&interpreter, Some("/Users/fixture/workspace/project")),
+            "repo:/Users/fixture/workspace/project"
+        );
+        assert_eq!(
+            grant_key(&interpreter, None),
+            "exe:/opt/homebrew/bin/python3"
+        );
+
+        let mut app = ProcessIdentity::bare(1002, 501, 20);
+        app.exe_path = Some("/Applications/Fixture.app/Contents/MacOS/Fixture".into());
+        app.team_id = Some("FIXTURETEAM".to_string());
+        assert_eq!(grant_key(&app, Some("/ignored/repo")), "team:FIXTURETEAM");
+
+        let mut executable = ProcessIdentity::bare(1003, 501, 20);
+        executable.exe_path = Some("/usr/bin/cat".into());
+        assert_eq!(grant_key(&executable, None), "exe:/usr/bin/cat");
+
+        let bare = ProcessIdentity::bare(1004, 501, 20);
+        assert_eq!(grant_key(&bare, None), "pid:1004");
+    }
+
     fn connect_test_app(agent: &SocketAgent, socket_path: &std::path::Path) -> UnixStream {
         let mut app = UnixStream::connect(socket_path).unwrap();
         app.set_read_timeout(Some(Duration::from_secs(5))).unwrap();

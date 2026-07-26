@@ -407,3 +407,31 @@ pub struct ResourceUsage {
     pub bindings: Vec<ResourceBindingUsage>,
     pub direct_surface_ids: Vec<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::SurfaceKind;
+
+    #[test]
+    fn surface_kind_round_trips_database_and_flat_json_names() {
+        let cases = [
+            (SurfaceKind::DotenvFile, "dotenv_file"),
+            (SurfaceKind::DirenvFile, "direnv_file"),
+            (SurfaceKind::IniFile, "ini_file"),
+            (SurfaceKind::EnvFileDirect, "env_file_direct"),
+            (SurfaceKind::LinesFile, "lines_file"),
+            (SurfaceKind::RegularFile, "regular_file"),
+            (SurfaceKind::UnixSocket, "unix_socket"),
+        ];
+
+        for (kind, name) in cases {
+            assert_eq!(kind.as_str(), name);
+            assert_eq!(SurfaceKind::parse(name), Some(kind));
+
+            let encoded = serde_json::to_string(&kind).unwrap();
+            assert_eq!(encoded, format!("\"{name}\""));
+            assert_eq!(serde_json::from_str::<SurfaceKind>(&encoded).unwrap(), kind);
+        }
+        assert_eq!(SurfaceKind::parse("unknown"), None);
+    }
+}
