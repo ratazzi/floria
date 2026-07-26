@@ -7,11 +7,11 @@ use serde::Deserialize;
 
 use crate::authz::Enforcement;
 use crate::error::{CoreError, Result};
-use crate::handler::ContentHandler;
 use crate::rules::{
     any_path_glob, compile_glob, exact_path_glob, ObjectMatch, Rule, RuleOps, RuleSet,
     SubjectMatch, BUILTIN_DEFAULT_PRIORITY, CATCH_ALL_PRIORITY, MANAGED_RESOURCE_PRIORITY,
 };
+use crate::source::{CommandSource, ContentSource, LiteralSource};
 
 /// Virtual directory under the mount where store-backed secrets are surfaced (`secrets/<id>`).
 pub const SECRETS_DIR: &str = "secrets";
@@ -100,13 +100,13 @@ pub struct FileCfg {
     pub mode: Option<String>,
     /// Cache TTL, e.g. `"5m"`. Defaults to 0 (regenerated on every open).
     pub ttl: Option<String>,
-    /// Declared size (upper bound) for script handlers. Required for scripts, ignored for constant files.
+    /// Declared size (upper bound) for command sources. Required for commands, ignored for literals.
     pub size: Option<u64>,
     /// Enforcement level: `"allow"` (default, monitor), `"deny"`, or `"prompt"`.
     pub enforcement: Option<String>,
     /// Built-in constant content.
     pub content: Option<String>,
-    /// argv for a local script handler.
+    /// argv for a local command source.
     pub read: Option<Vec<String>>,
 }
 
@@ -144,7 +144,7 @@ pub struct FileEntry {
     /// `Some(n)`: declared size upper bound for a script file (reported via direct-io).
     /// `None`: constant file, size determined exactly by its content.
     pub declared_size: Option<u64>,
-    pub handler: ContentHandler,
+    pub source: Arc<dyn ContentSource>,
 }
 
 impl Config {
@@ -369,41 +369,38 @@ fn resolve_file(fc: FileCfg, base_dir: &Path) -> Result<FileEntry> {
         None => Enforcement::default(),
     };
 
-    let (handler, declared_size) = match (fc.content, fc.read) {
-        (Some(_), Some(_)) => {
-            return Err(CoreError::config(format!(
-                "{path}: set exactly one of `content` or `read`, not both"
-            )))
-        }
-        (None, None) => {
-            return Err(CoreError::config(format!(
-                "{path}: must set one of `content` or `read`"
-            )))
-        }
-        (Some(content), None) => {
-            let bytes = Arc::new(content.into_bytes());
-            (ContentHandler::Constant(bytes), None)
-        }
-        (None, Some(argv)) => {
-            if argv.is_empty() {
-                return Err(CoreError::config(format!("{path}: `read` argv is empty")));
+    let (source, declared_size): (Arc<dyn ContentSource>, Option<u64>) =
+        match (fc.content, fc.read) {
+            (Some(_), Some(_)) => {
+                return Err(CoreError::config(format!(
+                    "{path}: set exactly one of `content` or `read`, not both"
+                )))
             }
-            let size = fc.size.ok_or_else(|| {
-                CoreError::config(format!("{path}: script files require `size`"))
-            })?;
-            // Check ownership/permissions of the script executable (relative paths resolved against the config dir).
-            let exe = resolve_script_exe(&argv[0], base_dir);
-            check_secure_perms(&exe)?;
-            let mut resolved_argv = argv;
-            resolved_argv[0] = exe.to_string_lossy().into_owned();
-            (
-                ContentHandler::Script {
-                    argv: resolved_argv,
-                },
-                Some(size),
-            )
-        }
-    };
+            (None, None) => {
+                return Err(CoreError::config(format!(
+                    "{path}: must set one of `content` or `read`"
+                )))
+            }
+            (Some(content), None) => {
+                let bytes = Arc::new(content.into_bytes());
+                (Arc::new(LiteralSource::new(bytes)), None)
+            }
+            (None, Some(argv)) => {
+                if argv.is_empty() {
+                    return Err(CoreError::config(format!("{path}: `read` argv is empty")));
+                }
+                let size = fc.size.ok_or_else(|| {
+                    CoreError::config(format!("{path}: script files require `size`"))
+                })?;
+                // Check ownership/permissions of the command executable (relative paths resolved
+                // against the config directory).
+                let exe = resolve_script_exe(&argv[0], base_dir);
+                check_secure_perms(&exe)?;
+                let mut resolved_argv = argv;
+                resolved_argv[0] = exe.to_string_lossy().into_owned();
+                (Arc::new(CommandSource::new(resolved_argv)), Some(size))
+            }
+        };
 
     Ok(FileEntry {
         path,
@@ -412,7 +409,7 @@ fn resolve_file(fc: FileCfg, base_dir: &Path) -> Result<FileEntry> {
         ttl,
         enforcement,
         declared_size,
-        handler,
+        source,
     })
 }
 

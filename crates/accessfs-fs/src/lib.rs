@@ -23,10 +23,10 @@ use std::time::SystemTime;
 use accessfs_catalog::Catalog;
 use accessfs_core::audit::{AuditDependency, AuditLog};
 use accessfs_core::authz::{AuthRequest, Authorizer, Decision, Operation};
-use accessfs_core::identity::ProcessIdentity;
 use accessfs_core::config::{ResolvedConfig, SECRETS_DIR, SURFACES_DIR};
-use accessfs_core::handler::{ContentHandler, HandlerCtx};
+use accessfs_core::identity::ProcessIdentity;
 use accessfs_core::snapshot::content_version_of;
+use accessfs_core::source::{ContentSource, SourceCtx};
 use accessfs_core::writebuf::{WriteBufTable, WriteErr};
 use accessfs_store::{SecretId, SecretRecord, SecretStore};
 use accessfs_surface::{
@@ -353,7 +353,7 @@ impl Shared {
             virtual_path: file.virtual_path.clone(),
             display: None,
             direct_io: file.direct_io,
-            kind: OpenKind::Handler(file.handler.clone()),
+            kind: OpenKind::Static(Arc::clone(&file.source)),
         })
     }
 
@@ -504,16 +504,23 @@ impl Shared {
                     return Err(errno(libc::EIO));
                 }
             },
-            OpenKind::Handler(handler) => {
-                let ctx = HandlerCtx {
-                    virtual_path: target.virtual_path.clone(),
+            OpenKind::Static(source) => {
+                let ctx = SourceCtx {
+                    virtual_path: &target.virtual_path,
                     request_uid: identity.uid,
                     request_pid: identity.pid,
+                    operation: Operation::Read,
                 };
-                match handler.generate(&ctx) {
-                    Ok(bytes) => GeneratedRead { bytes, dependencies: None },
+                match source.pin(&ctx).and_then(|pinned| pinned.read()) {
+                    Ok(snapshot) => {
+                        let mut bytes = snapshot.bytes;
+                        GeneratedRead {
+                            bytes: std::mem::take(&mut *bytes),
+                            dependencies: None,
+                        }
+                    }
                     Err(error) => {
-                        tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), "handler failed: {error}");
+                        tracing::warn!(path = %target.virtual_path, reader = %identity.chain_display(), "content source failed: {error}");
                         return Err(errno(libc::EIO));
                     }
                 }
@@ -573,7 +580,7 @@ impl Shared {
             }
         };
         // Store-backed secrets and direct EnvFile surfaces are writable. Composed surfaces and
-        // generated handlers stay read-only.
+        // Generated static sources stay read-only.
         let wants_write = flags & libc::O_ACCMODE != libc::O_RDONLY;
         let write_target = match (&target.kind, wants_write) {
             (OpenKind::Secret(id), true) => Some(WriteOpenTarget::Secret(id.clone())),
@@ -839,7 +846,7 @@ struct PendingRead {
 }
 
 enum OpenKind {
-    Handler(ContentHandler),
+    Static(Arc<dyn ContentSource>),
     Secret(String),
     ComposedSurface(String),
     DirectEnvFileSurface(String),
@@ -1146,7 +1153,7 @@ impl fuser::Filesystem for AccessFs {
     }
 
     fn open(&self, req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
-        // Dispatch to the pool so a blocking authorization prompt (or slow handler) never
+        // Dispatch to the pool so a blocking authorization prompt (or slow content source) never
         // stalls the single-threaded event loop. The reply is Send and completed there.
         let (uid, gid, pid) = (req.uid(), req.gid(), req.pid() as i32);
         let shared = Arc::clone(&self.inner);
@@ -2064,7 +2071,9 @@ mod tests {
                 ttl: Duration::ZERO,
                 enforcement: Enforcement::Allow,
                 declared_size: None,
-                handler: ContentHandler::Constant(Arc::new(b"constant bytes".to_vec())),
+                source: Arc::new(accessfs_core::source::LiteralSource::new(Arc::new(
+                    b"constant bytes".to_vec(),
+                ))),
             },
             FileEntry {
                 path: "nested/script.txt".to_string(),
@@ -2073,13 +2082,11 @@ mod tests {
                 ttl: Duration::ZERO,
                 enforcement: Enforcement::Allow,
                 declared_size: Some(256),
-                handler: ContentHandler::Script {
-                    argv: vec![
-                        "/bin/sh".to_string(),
-                        "-c".to_string(),
-                        "printf '%s:%s' \"$ACCESSFS_PATH\" \"$ACCESSFS_REQUEST_PID\"".to_string(),
-                    ],
-                },
+                source: Arc::new(accessfs_core::source::CommandSource::new(vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "printf '%s:%s' \"$ACCESSFS_PATH\" \"$ACCESSFS_REQUEST_PID\"".to_string(),
+                ])),
             },
         ];
         let store = Arc::new(ReadWriteStore::fixture());

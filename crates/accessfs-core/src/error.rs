@@ -15,8 +15,8 @@ pub enum CoreError {
     #[error("insecure permissions on {path}: {reason}")]
     InsecurePerms { path: PathBuf, reason: String },
 
-    #[error("handler error: {0}")]
-    Handler(String),
+    #[error("content source error: {0}")]
+    Source(String),
 }
 
 impl CoreError {
@@ -24,8 +24,8 @@ impl CoreError {
         CoreError::Config(msg.into())
     }
 
-    pub fn handler(msg: impl Into<String>) -> Self {
-        CoreError::Handler(msg.into())
+    pub fn source(msg: impl Into<String>) -> Self {
+        CoreError::Source(msg.into())
     }
 }
 

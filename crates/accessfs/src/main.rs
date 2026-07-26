@@ -55,7 +55,7 @@ enum Cmd {
         #[arg(short, long, default_value = "accessfs.toml")]
         config: PathBuf,
     },
-    /// Self-check: macFUSE readiness, mount point, config, and handler permissions.
+    /// Self-check: macFUSE readiness, mount point, config, and content-source permissions.
     Doctor {
         #[arg(short, long, default_value = "accessfs.toml")]
         config: PathBuf,
@@ -1209,12 +1209,15 @@ fn cmd_doctor(config: &Path) -> Result<()> {
 
             println!("  resolved {} virtual file(s):", cfg.files.len());
             for f in &cfg.files {
-                let kind = match &f.handler {
-                    accessfs_core::handler::ContentHandler::Constant(b) => {
-                        format!("constant, {} bytes", b.len())
+                let kind = match f.source.storage_disposition() {
+                    accessfs_core::source::StorageDisposition::InlinePlaintext => {
+                        format!("inline, {} bytes", f.source.exact_size().unwrap_or(0))
                     }
-                    accessfs_core::handler::ContentHandler::Script { argv } => {
-                        format!("script `{}`", argv.join(" "))
+                    accessfs_core::source::StorageDisposition::Computed => {
+                        format!("computed, up to {} bytes", f.declared_size.unwrap_or(0))
+                    }
+                    accessfs_core::source::StorageDisposition::EncryptedReference => {
+                        "encrypted reference".to_string()
                     }
                 };
                 println!("    - {}  ({kind})", f.path);

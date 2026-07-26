@@ -79,7 +79,7 @@ pub fn mount_config(volname: &str) -> fuser::Config {
         // POSIX opens from FUSE_OPEN. Disabling readahead, UBC, and vnode caching ensures each
         // reader still reaches FUSE_READ, where process-scoped authorization is enforced.
         MountOption::CUSTOM("nolocalcaches".to_string()),
-        // Give slow handlers enough time so the kernel doesn't declare the mount dead.
+        // Give slow content sources enough time so the kernel doesn't declare the mount dead.
         MountOption::CUSTOM("daemon_timeout=60".to_string()),
     ];
     // fuser's event loop is single-threaded on macOS (n_threads > 1 is Linux-only), so a

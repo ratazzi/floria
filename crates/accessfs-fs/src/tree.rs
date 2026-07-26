@@ -1,7 +1,8 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use accessfs_core::config::{FileEntry, SECRETS_DIR, SURFACES_DIR};
-use accessfs_core::handler::ContentHandler;
+use accessfs_core::source::ContentSource;
 
 /// Root inode. FUSE convention: root = 1.
 const ROOT_INO: u64 = 1;
@@ -43,7 +44,7 @@ pub enum NodeKind {
 }
 
 pub struct FileNode {
-    pub handler: ContentHandler,
+    pub source: Arc<dyn ContentSource>,
     pub virtual_path: String,
     /// Stable size reported by getattr. Constant files = exact length; script files = declared upper bound.
     pub report_size: u64,
@@ -89,11 +90,10 @@ impl Tree {
                 .last()
                 .expect("validated non-empty path")
                 .clone();
-            let (report_size, direct_io) = match (&entry.handler, entry.declared_size) {
-                (ContentHandler::Constant(bytes), _) => (bytes.len() as u64, false),
-                // Script/secret files are dynamic: direct-io, size is the declared upper bound.
-                (_, Some(size)) => (size, true),
-                (_, None) => (0, true),
+            let (report_size, direct_io) = match entry.source.exact_size() {
+                Some(size) => (size, false),
+                // Computed sources are dynamic: direct-io, size is the declared upper bound.
+                None => (entry.declared_size.unwrap_or(0), true),
             };
 
             let ino = next_ino;
@@ -105,7 +105,7 @@ impl Tree {
                     name: file_name.clone(),
                     mode: entry.mode,
                     kind: NodeKind::File(FileNode {
-                        handler: entry.handler.clone(),
+                        source: Arc::clone(&entry.source),
                         virtual_path: entry.path.clone(),
                         report_size,
                         direct_io,
