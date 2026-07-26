@@ -263,7 +263,7 @@ fn handle_connection(
                 break;
             }
         };
-        let changes_runtime = changes_runtime(&request.command);
+        let is_read_only = is_read_only(&request.command);
         let services = DispatchServices {
             store: dependencies.store.as_deref(),
             mount_path: dependencies.mount_path.as_deref(),
@@ -275,7 +275,7 @@ fn handle_connection(
         };
         let outcome = match dispatch(&catalog, services, request.command) {
             Ok(result) => {
-                if changes_runtime {
+                if !is_read_only {
                     notify_observer(&catalog, dependencies.observer.as_deref());
                 }
                 ControlOutcome::Ok { result }
@@ -292,34 +292,26 @@ fn handle_connection(
     }
 }
 
-fn changes_runtime(command: &ControlCommand) -> bool {
+/// Commands known not to mutate catalog, store, generated files, or runtime policy state.
+/// New commands deliberately default to mutating so a missed classification causes only an
+/// idempotent refresh rather than leaving the daemon on stale policy.
+fn is_read_only(command: &ControlCommand) -> bool {
     matches!(
         command,
-        ControlCommand::ProjectUpsert { .. }
-            | ControlCommand::ProjectCreate { .. }
-            | ControlCommand::ProjectRemove { .. }
-            | ControlCommand::EnvironmentUpsert { .. }
-            | ControlCommand::EnvironmentRemove { .. }
-            | ControlCommand::ResourceUpsert { .. }
-            | ControlCommand::ResourceRemove { .. }
-            | ControlCommand::BindingUpsert { .. }
-            | ControlCommand::BindingRemove { .. }
-            | ControlCommand::SurfaceUpsert { .. }
-            | ControlCommand::SurfaceRemove { .. }
-            | ControlCommand::SharedSecretCreate { .. }
-            | ControlCommand::SharedSecretUpdate { .. }
-            | ControlCommand::SharedSecretRemove { .. }
-            | ControlCommand::SshIdentityImport { .. }
-            | ControlCommand::SshIdentityRemove { .. }
-            | ControlCommand::EnvFileCreate { .. }
-            | ControlCommand::ResourceMetadataUpdate { .. }
-            | ControlCommand::FileProtect { .. }
-            | ControlCommand::ProtectedFileMetadataUpdate { .. }
-            | ControlCommand::FileRestore { .. }
-            | ControlCommand::DiscoverApply { .. }
-            | ControlCommand::DiscoverReferenceResolve { .. }
-            | ControlCommand::ProjectCheckoutUpsert { .. }
-            | ControlCommand::ProjectCheckoutRemove { .. }
+        ControlCommand::Ping
+            | ControlCommand::PolicyModeGet
+            | ControlCommand::GrantList
+            | ControlCommand::AccessHistory { .. }
+            | ControlCommand::Snapshot
+            | ControlCommand::Discover { .. }
+            | ControlCommand::ProjectCheckoutInventory
+            | ControlCommand::ProjectCheckoutDiscover { .. }
+            | ControlCommand::SshAgentDiscover { .. }
+            | ControlCommand::SshConfigStatus
+            | ControlCommand::ProtectedFiles
+            | ControlCommand::ProtectedFileHistory { .. }
+            | ControlCommand::ResolveEnvironment { .. }
+            | ControlCommand::ResourceUsage { .. }
     )
 }
 
@@ -4381,12 +4373,28 @@ mod tests {
     }
 
     #[test]
+    fn observer_classification_defaults_head_changes_to_mutating() {
+        assert!(is_read_only(&ControlCommand::Snapshot));
+        assert!(is_read_only(&ControlCommand::ProtectedFileHistory {
+            id: "fixture".to_string(),
+        }));
+        assert!(!is_read_only(&ControlCommand::SharedSecretRotate {
+            resource_id: "fixture".to_string(),
+            value: crate::protocol::SecretValue::new("fixture-value"),
+        }));
+        assert!(!is_read_only(&ControlCommand::ProtectedFileRollback {
+            id: "fixture".to_string(),
+            version: 1,
+        }));
+    }
+
+    #[test]
     fn shared_secret_lifecycle_over_ipc_keeps_plaintext_out_of_catalog() {
         let dir = tempfile::tempdir().unwrap();
         let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
         let socket = dir.path().join("control.sock");
         let store = Arc::new(FixtureStore::new());
-        let observer: Arc<dyn CatalogObserver> = Arc::new(SnapshotObserver {
+        let observer = Arc::new(SnapshotObserver {
             notifications: AtomicUsize::new(0),
             latest: Mutex::new(None),
         });
@@ -4395,7 +4403,7 @@ mod tests {
             catalog.clone(),
             Arc::clone(&store) as Arc<dyn SecretStore>,
             dir.path().join("mount"),
-            observer,
+            Arc::clone(&observer) as Arc<dyn CatalogObserver>,
             test_peer_verifier(),
         )
         .unwrap();
@@ -4421,6 +4429,7 @@ mod tests {
             created,
             ControlResult::SharedSecretCreated { version: 1, .. }
         ));
+        assert_eq!(observer.notifications.load(Ordering::Relaxed), 1);
         let resource = catalog.resource("fixture-shared-secret").unwrap();
         assert_eq!(
             resource.source,
@@ -4444,6 +4453,11 @@ mod tests {
                 resource_id: "fixture-shared-secret".to_string(),
                 version: 2,
             }
+        );
+        assert_eq!(
+            observer.notifications.load(Ordering::Relaxed),
+            2,
+            "rotating a secret head must refresh managed runtime policy"
         );
         let secret_id: SecretId = FIXTURE_SECRET_ID.parse().unwrap();
         assert_eq!(store.get_version(&secret_id, 1).unwrap().as_slice(), b"fixture-value-one");
@@ -4515,7 +4529,7 @@ mod tests {
         let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
         let socket = dir.path().join("control.sock");
         let store = Arc::new(FixtureStore::new());
-        let observer: Arc<dyn CatalogObserver> = Arc::new(SnapshotObserver {
+        let observer = Arc::new(SnapshotObserver {
             notifications: AtomicUsize::new(0),
             latest: Mutex::new(None),
         });
@@ -4524,7 +4538,7 @@ mod tests {
             catalog.clone(),
             Arc::clone(&store) as Arc<dyn SecretStore>,
             dir.path().join("mount"),
-            observer,
+            Arc::clone(&observer) as Arc<dyn CatalogObserver>,
             test_peer_verifier(),
         )
         .unwrap();
@@ -4587,7 +4601,7 @@ mod tests {
         std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
         let canonical_source = canonical_source_path(&source).unwrap();
         let store = Arc::new(FixtureStore::new());
-        let observer: Arc<dyn CatalogObserver> = Arc::new(SnapshotObserver {
+        let observer = Arc::new(SnapshotObserver {
             notifications: AtomicUsize::new(0),
             latest: Mutex::new(None),
         });
@@ -4596,7 +4610,7 @@ mod tests {
             catalog,
             Arc::clone(&store) as Arc<dyn SecretStore>,
             mount.clone(),
-            observer,
+            Arc::clone(&observer) as Arc<dyn CatalogObserver>,
             test_peer_verifier(),
         )
         .unwrap();
@@ -4613,6 +4627,7 @@ mod tests {
         assert_eq!(file.mode, 0o600);
         assert_eq!(file.current_version, 1);
         assert!(file.linked);
+        assert_eq!(observer.notifications.load(Ordering::Relaxed), 1);
         assert!(std::fs::symlink_metadata(&source).unwrap().file_type().is_symlink());
         assert_eq!(
             std::fs::read_link(&source).unwrap(),
@@ -4689,6 +4704,11 @@ mod tests {
             panic!("expected protected file rollback");
         };
         assert_eq!(file.current_version, 1);
+        assert_eq!(
+            observer.notifications.load(Ordering::Relaxed),
+            4,
+            "rolling back a protected-file head must refresh managed runtime policy"
+        );
 
         client
             .request(ControlCommand::ResourceUpsert {
