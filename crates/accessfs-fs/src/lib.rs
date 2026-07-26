@@ -1629,15 +1629,482 @@ pub fn mount_with_audit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use accessfs_catalog::{CatalogSnapshot, Surface, SurfaceInput, SurfaceKind};
-    use accessfs_core::authz::AllowAll;
+    use accessfs_catalog::{
+        Binding, BindingScope, CatalogSnapshot, EntrySelection, EntrySpec, Environment, Project,
+        Resource, ResourceCodec, ResourceKind, ResourceSource, Surface, SurfaceInput, SurfaceKind,
+        ValueShape,
+    };
+    use accessfs_core::authz::{AllowAll, Enforcement};
+    use accessfs_core::config::FileEntry;
     use accessfs_core::identity::ProcessIdentity;
-    use accessfs_store::{NewSecret, SecretOrigin, SecretRecord, StoreResult, VersionRecord};
+    use accessfs_store::{
+        NewSecret, SecretOrigin, SecretRecord, StoreError, StoreResult, VersionRecord,
+    };
+    use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
     use std::sync::mpsc;
     use std::sync::Mutex;
     use std::time::Duration;
     use zeroize::Zeroizing;
+
+    const RAW_SECRET_ID: &str = "00000000-0000-0000-0000-000000000401";
+    const MANAGED_SECRET_ID: &str = "00000000-0000-0000-0000-000000000402";
+    const INI_SECRET_ID: &str = "00000000-0000-0000-0000-000000000403";
+    const DIRECT_SECRET_ID: &str = "00000000-0000-0000-0000-000000000404";
+
+    #[derive(Clone)]
+    struct StoredFixture {
+        origin: SecretOrigin,
+        mode: u32,
+        versions: Vec<Vec<u8>>,
+        head: u32,
+    }
+
+    struct ReadWriteStore {
+        entries: Mutex<HashMap<String, StoredFixture>>,
+        fail_get: Mutex<HashSet<String>>,
+    }
+
+    impl ReadWriteStore {
+        fn fixture() -> Self {
+            ReadWriteStore {
+                entries: Mutex::new(HashMap::from([
+                    (
+                        RAW_SECRET_ID.to_string(),
+                        StoredFixture {
+                            origin: SecretOrigin::File {
+                                source_path: PathBuf::from("/fixture/protected.txt"),
+                            },
+                            mode: 0o640,
+                            versions: vec![b"protected-value".to_vec()],
+                            head: 1,
+                        },
+                    ),
+                    (
+                        MANAGED_SECRET_ID.to_string(),
+                        StoredFixture {
+                            origin: SecretOrigin::Managed {
+                                label: "Managed fixture".to_string(),
+                            },
+                            mode: 0o600,
+                            versions: vec![b"managed-value".to_vec()],
+                            head: 1,
+                        },
+                    ),
+                    (
+                        INI_SECRET_ID.to_string(),
+                        StoredFixture {
+                            origin: SecretOrigin::Managed {
+                                label: "INI fixture".to_string(),
+                            },
+                            mode: 0o600,
+                            versions: vec![b"[dev]\nKEY=ini-value\n".to_vec()],
+                            head: 1,
+                        },
+                    ),
+                    (
+                        DIRECT_SECRET_ID.to_string(),
+                        StoredFixture {
+                            origin: SecretOrigin::File {
+                                source_path: PathBuf::from("/fixture/project/.env.source"),
+                            },
+                            mode: 0o644,
+                            versions: vec![b"# preserved\nKEY='direct value'\n".to_vec()],
+                            head: 1,
+                        },
+                    ),
+                ])),
+                fail_get: Mutex::new(HashSet::new()),
+            }
+        }
+
+        fn current_bytes(&self, id: &str) -> Vec<u8> {
+            let entries = self.entries.lock().unwrap();
+            let entry = entries.get(id).unwrap();
+            entry.versions[(entry.head - 1) as usize].clone()
+        }
+
+        fn current_version(&self, id: &str) -> u32 {
+            self.entries.lock().unwrap().get(id).unwrap().head
+        }
+    }
+
+    impl SecretStore for ReadWriteStore {
+        fn get(&self, id: &SecretId) -> StoreResult<Zeroizing<Vec<u8>>> {
+            if self.fail_get.lock().unwrap().contains(id.as_str()) {
+                return Err(StoreError::Crypto("fixture read failure".to_string()));
+            }
+            let entries = self.entries.lock().unwrap();
+            let entry = entries
+                .get(id.as_str())
+                .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
+            Ok(Zeroizing::new(
+                entry.versions[(entry.head - 1) as usize].clone(),
+            ))
+        }
+
+        fn get_version(&self, id: &SecretId, version: u32) -> StoreResult<Zeroizing<Vec<u8>>> {
+            let entries = self.entries.lock().unwrap();
+            let entry = entries
+                .get(id.as_str())
+                .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
+            let bytes = entry
+                .versions
+                .get((version - 1) as usize)
+                .ok_or_else(|| StoreError::NotFound(format!("{id}@{version}")))?;
+            Ok(Zeroizing::new(bytes.clone()))
+        }
+
+        fn append_version(&self, id: &SecretId, plaintext: &[u8]) -> StoreResult<u32> {
+            let mut entries = self.entries.lock().unwrap();
+            let entry = entries
+                .get_mut(id.as_str())
+                .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
+            entry.versions.push(plaintext.to_vec());
+            entry.head = entry.versions.len() as u32;
+            Ok(entry.head)
+        }
+
+        fn record(&self, id: &SecretId) -> StoreResult<Option<SecretRecord>> {
+            let entries = self.entries.lock().unwrap();
+            Ok(entries.get(id.as_str()).map(|entry| SecretRecord {
+                id: id.clone(),
+                origin: entry.origin.clone(),
+                mode: entry.mode,
+                size: entry.versions[(entry.head - 1) as usize].len() as u64,
+                created: "fixture-time".to_string(),
+                current_version: entry.head,
+                enforcement: Enforcement::Prompt,
+                metadata: Default::default(),
+            }))
+        }
+
+        fn delete(&self, id: &SecretId) -> StoreResult<()> {
+            self.entries
+                .lock()
+                .unwrap()
+                .remove(id.as_str())
+                .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
+            Ok(())
+        }
+
+        fn put(&self, _meta: NewSecret, _plaintext: &[u8]) -> StoreResult<SecretId> {
+            unimplemented!()
+        }
+
+        fn history(&self, _id: &SecretId) -> StoreResult<Vec<VersionRecord>> {
+            unimplemented!()
+        }
+
+        fn set_head(&self, _id: &SecretId, _version: u32) -> StoreResult<()> {
+            unimplemented!()
+        }
+
+        fn list(&self) -> StoreResult<Vec<SecretRecord>> {
+            unimplemented!()
+        }
+
+        fn get_by_path(&self, _source_path: &Path) -> StoreResult<Option<SecretRecord>> {
+            unimplemented!()
+        }
+
+        fn update_settings(
+            &self,
+            _id: &SecretId,
+            _metadata: accessfs_core::metadata::ItemMetadata,
+            _enforcement: Enforcement,
+        ) -> StoreResult<()> {
+            unimplemented!()
+        }
+    }
+
+    fn upsert_resource(catalog: &Catalog, resource: Resource) {
+        catalog.upsert_resource(&resource).unwrap();
+    }
+
+    fn upsert_binding(catalog: &Catalog, id: &str, resource_id: &str, position: i64) {
+        catalog
+            .upsert_binding(&Binding {
+                id: id.to_string(),
+                project_id: "fixture-project".to_string(),
+                scope: BindingScope::Environment {
+                    environment_id: "fixture-environment".to_string(),
+                },
+                resource_id: resource_id.to_string(),
+                selection: EntrySelection::All,
+                key_override: None,
+                enabled: true,
+                allow_override: false,
+                position,
+            })
+            .unwrap();
+    }
+
+    fn upsert_surface(
+        catalog: &Catalog,
+        id: &str,
+        name: &str,
+        kind: SurfaceKind,
+        input: SurfaceInput,
+        position: i64,
+    ) {
+        catalog
+            .upsert_surface(&Surface {
+                id: id.to_string(),
+                environment_id: "fixture-environment".to_string(),
+                name: name.to_string(),
+                kind,
+                path: PathBuf::from(format!("/fixture/project/{name}")),
+                input,
+                enforcement: Enforcement::Prompt,
+                position,
+            })
+            .unwrap();
+    }
+
+    fn surface_catalog(path: &Path) -> Catalog {
+        let catalog = Catalog::open(path).unwrap();
+        catalog
+            .upsert_project(&Project {
+                id: "fixture-project".to_string(),
+                name: "Fixture Project".to_string(),
+                path: PathBuf::from("/fixture/project"),
+            })
+            .unwrap();
+        catalog
+            .upsert_environment(&Environment {
+                id: "fixture-environment".to_string(),
+                project_id: "fixture-project".to_string(),
+                name: "Development".to_string(),
+                position: 0,
+            })
+            .unwrap();
+
+        upsert_resource(
+            &catalog,
+            Resource {
+                id: "fixture-env".to_string(),
+                name: "Fixture Environment Value".to_string(),
+                kind: ResourceKind::Literal,
+                shape: ValueShape::Scalar,
+                codec: ResourceCodec::Opaque,
+                default_env_key: Some("TOKEN".to_string()),
+                entries: vec![EntrySpec {
+                    address: "value".to_string(),
+                    label: "TOKEN".to_string(),
+                    key: Some("TOKEN".to_string()),
+                    sensitive: true,
+                }],
+                source: ResourceSource::Literal {
+                    value: "literal-value".to_string(),
+                },
+                enforcement: Enforcement::Prompt,
+                metadata: Default::default(),
+                origin: Default::default(),
+            },
+        );
+        upsert_resource(
+            &catalog,
+            Resource {
+                id: "fixture-ini".to_string(),
+                name: "Fixture INI".to_string(),
+                kind: ResourceKind::EnvFile,
+                shape: ValueShape::KeyValueSet,
+                codec: ResourceCodec::Ini,
+                default_env_key: None,
+                entries: vec![EntrySpec {
+                    address: "sections/dev/keys/KEY".to_string(),
+                    label: "[dev] KEY".to_string(),
+                    key: Some("KEY".to_string()),
+                    sensitive: true,
+                }],
+                source: ResourceSource::SecretRef {
+                    secret_id: INI_SECRET_ID.to_string(),
+                },
+                enforcement: Enforcement::Prompt,
+                metadata: Default::default(),
+                origin: Default::default(),
+            },
+        );
+        upsert_resource(
+            &catalog,
+            Resource {
+                id: "fixture-line".to_string(),
+                name: "Fixture Line".to_string(),
+                kind: ResourceKind::Literal,
+                shape: ValueShape::Scalar,
+                codec: ResourceCodec::Opaque,
+                default_env_key: None,
+                entries: vec![EntrySpec {
+                    address: "value".to_string(),
+                    label: "Fixture Line".to_string(),
+                    key: None,
+                    sensitive: true,
+                }],
+                source: ResourceSource::Literal {
+                    value: "line-value".to_string(),
+                },
+                enforcement: Enforcement::Prompt,
+                metadata: Default::default(),
+                origin: Default::default(),
+            },
+        );
+        upsert_resource(
+            &catalog,
+            Resource {
+                id: "fixture-direct".to_string(),
+                name: "Fixture Direct Env".to_string(),
+                kind: ResourceKind::EnvFile,
+                shape: ValueShape::KeyValueSet,
+                codec: ResourceCodec::Dotenv,
+                default_env_key: None,
+                entries: vec![EntrySpec {
+                    address: "keys/KEY".to_string(),
+                    label: "KEY".to_string(),
+                    key: Some("KEY".to_string()),
+                    sensitive: true,
+                }],
+                source: ResourceSource::SecretRef {
+                    secret_id: DIRECT_SECRET_ID.to_string(),
+                },
+                enforcement: Enforcement::Prompt,
+                metadata: Default::default(),
+                origin: Default::default(),
+            },
+        );
+        upsert_resource(
+            &catalog,
+            Resource {
+                id: "fixture-protected-line".to_string(),
+                name: "Fixture Protected Line".to_string(),
+                kind: ResourceKind::SharedSecret,
+                shape: ValueShape::Scalar,
+                codec: ResourceCodec::Opaque,
+                default_env_key: None,
+                entries: vec![EntrySpec {
+                    address: "value".to_string(),
+                    label: "Fixture Protected Line".to_string(),
+                    key: None,
+                    sensitive: true,
+                }],
+                source: ResourceSource::SecretRef {
+                    secret_id: RAW_SECRET_ID.to_string(),
+                },
+                enforcement: Enforcement::Prompt,
+                metadata: Default::default(),
+                origin: Default::default(),
+            },
+        );
+
+        upsert_binding(&catalog, "fixture-env-binding", "fixture-env", 0);
+        upsert_binding(&catalog, "fixture-ini-binding", "fixture-ini", 1);
+        upsert_binding(&catalog, "fixture-line-binding", "fixture-line", 2);
+        upsert_binding(
+            &catalog,
+            "fixture-protected-line-binding",
+            "fixture-protected-line",
+            3,
+        );
+        upsert_surface(
+            &catalog,
+            "fixture-dotenv",
+            ".env",
+            SurfaceKind::DotenvFile,
+            SurfaceInput::Bindings {
+                binding_ids: vec!["fixture-env-binding".to_string()],
+            },
+            0,
+        );
+        upsert_surface(
+            &catalog,
+            "fixture-direnv",
+            ".envrc",
+            SurfaceKind::DirenvFile,
+            SurfaceInput::Bindings {
+                binding_ids: vec!["fixture-env-binding".to_string()],
+            },
+            1,
+        );
+        upsert_surface(
+            &catalog,
+            "fixture-ini-surface",
+            "credentials.ini",
+            SurfaceKind::IniFile,
+            SurfaceInput::Bindings {
+                binding_ids: vec!["fixture-ini-binding".to_string()],
+            },
+            2,
+        );
+        upsert_surface(
+            &catalog,
+            "fixture-lines",
+            "credentials.lines",
+            SurfaceKind::LinesFile,
+            SurfaceInput::Bindings {
+                binding_ids: vec!["fixture-line-binding".to_string()],
+            },
+            3,
+        );
+        upsert_surface(
+            &catalog,
+            "fixture-direct-surface",
+            ".env.source",
+            SurfaceKind::EnvFileDirect,
+            SurfaceInput::Resource {
+                resource_id: "fixture-direct".to_string(),
+            },
+            4,
+        );
+        upsert_surface(
+            &catalog,
+            "fixture-protected-lines",
+            "protected.lines",
+            SurfaceKind::LinesFile,
+            SurfaceInput::Bindings {
+                binding_ids: vec!["fixture-protected-line-binding".to_string()],
+            },
+            5,
+        );
+        catalog
+    }
+
+    fn shared_fixture(
+        files: &[FileEntry],
+        store: Arc<dyn SecretStore>,
+        catalog: Option<Catalog>,
+        registry: Option<Arc<SurfaceRegistry>>,
+        tmp: &Path,
+    ) -> Arc<Shared> {
+        let tree = Tree::build(files);
+        let next_ino = Arc::new(AtomicU64::new(tree.next_ino()));
+        let secrets = SecretsNs::new(
+            Arc::clone(&store),
+            catalog.clone(),
+            tree.secrets_dir_ino(),
+            Arc::clone(&next_ino),
+        );
+        let surfaces = match (catalog, registry) {
+            (Some(catalog), Some(registry)) => Some(SurfaceNs::new(
+                registry,
+                SurfaceResolver::new(catalog, store),
+                tree.surfaces_dir_ino(),
+                next_ino,
+            )),
+            _ => None,
+        };
+        Arc::new(Shared {
+            tree,
+            reads: ReadSessionTable::new(),
+            writes: WriteBufTable::new(),
+            audit: Arc::new(AuditLog::open(&tmp.join("audit.jsonl")).unwrap()),
+            authorizer: Arc::new(AllowAll),
+            secrets: Some(secrets),
+            surfaces,
+            mount_epoch: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            mount_uid: 501,
+            mount_gid: 20,
+        })
+    }
 
     #[test]
     fn raw_secret_namespace_exposes_only_file_origin_records() {
@@ -1658,6 +2125,290 @@ mod tests {
         assert!(!exposed_as_raw_secret(&record(SecretOrigin::Managed {
             label: "Fixture managed value".to_string(),
         })));
+    }
+
+    #[test]
+    fn resolves_and_generates_static_files_without_mounting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let files = vec![
+            FileEntry {
+                path: "constant.txt".to_string(),
+                components: vec!["constant.txt".to_string()],
+                mode: 0o440,
+                ttl: Duration::ZERO,
+                enforcement: Enforcement::Allow,
+                declared_size: None,
+                handler: ContentHandler::Constant(Arc::new(b"constant bytes".to_vec())),
+            },
+            FileEntry {
+                path: "nested/script.txt".to_string(),
+                components: vec!["nested".to_string(), "script.txt".to_string()],
+                mode: 0o400,
+                ttl: Duration::ZERO,
+                enforcement: Enforcement::Allow,
+                declared_size: Some(256),
+                handler: ContentHandler::Script {
+                    argv: vec![
+                        "/bin/sh".to_string(),
+                        "-c".to_string(),
+                        "printf '%s:%s' \"$ACCESSFS_PATH\" \"$ACCESSFS_REQUEST_PID\"".to_string(),
+                    ],
+                },
+            },
+        ];
+        let store = Arc::new(ReadWriteStore::fixture());
+        let shared = shared_fixture(
+            &files,
+            store as Arc<dyn SecretStore>,
+            None,
+            None,
+            tmp.path(),
+        );
+        let identity = ProcessIdentity::bare(4242, 501, 20);
+
+        let constant_ino = shared.tree.lookup_child(1, "constant.txt").unwrap();
+        let constant = shared.resolve_open_target(constant_ino).unwrap();
+        assert_eq!(constant.virtual_path, "constant.txt");
+        assert_eq!(constant.display, None);
+        assert!(!constant.direct_io);
+        let generated = shared.generate_read(&constant, &identity).unwrap();
+        assert_eq!(generated.bytes, b"constant bytes");
+        assert!(generated.dependencies.is_none());
+
+        let nested_ino = shared.tree.lookup_child(1, "nested").unwrap();
+        let script_ino = shared.tree.lookup_child(nested_ino, "script.txt").unwrap();
+        let script = shared.resolve_open_target(script_ino).unwrap();
+        assert_eq!(script.virtual_path, "nested/script.txt");
+        assert!(script.direct_io);
+        let generated = shared.generate_read(&script, &identity).unwrap();
+        assert_eq!(generated.bytes, b"nested/script.txt:4242");
+        assert!(generated.dependencies.is_none());
+
+        assert_eq!(
+            shared.resolve_open_target(nested_ino).err().unwrap().code(),
+            libc::EISDIR
+        );
+        assert_eq!(
+            shared.resolve_open_target(u64::MAX).err().unwrap().code(),
+            libc::ENOENT
+        );
+    }
+
+    #[test]
+    fn raw_secret_resolution_enforces_origin_existence_and_read_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(ReadWriteStore::fixture());
+        let shared = shared_fixture(
+            &[],
+            Arc::clone(&store) as Arc<dyn SecretStore>,
+            None,
+            None,
+            tmp.path(),
+        );
+        let identity = ProcessIdentity::bare(4242, 501, 20);
+        let secrets = shared.secrets.as_ref().unwrap();
+
+        let raw_ino = secrets.ino_for(RAW_SECRET_ID);
+        let target = shared.resolve_open_target(raw_ino).unwrap();
+        assert_eq!(target.virtual_path, format!("secrets/{RAW_SECRET_ID}"));
+        assert_eq!(
+            target.display.as_deref(),
+            Some("/fixture/protected.txt")
+        );
+        assert!(target.direct_io);
+        let generated = shared.generate_read(&target, &identity).unwrap();
+        assert_eq!(generated.bytes, b"protected-value");
+        assert!(generated.dependencies.is_none());
+
+        store
+            .fail_get
+            .lock()
+            .unwrap()
+            .insert(RAW_SECRET_ID.to_string());
+        assert_eq!(
+            shared.generate_read(&target, &identity).err().unwrap().code(),
+            libc::EIO
+        );
+
+        let managed_ino = secrets.ino_for(MANAGED_SECRET_ID);
+        assert_eq!(
+            shared.resolve_open_target(managed_ino).err().unwrap().code(),
+            libc::ENOENT
+        );
+
+        store
+            .delete(&RAW_SECRET_ID.parse::<SecretId>().unwrap())
+            .unwrap();
+        assert_eq!(
+            shared.resolve_open_target(raw_ino).err().unwrap().code(),
+            libc::ENOENT
+        );
+    }
+
+    #[test]
+    fn file_surfaces_resolve_to_stable_paths_and_generate_auditable_snapshots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = surface_catalog(&tmp.path().join("catalog.sqlite"));
+        let registry = Arc::new(SurfaceRegistry::from_snapshot(&catalog.snapshot().unwrap()));
+        let store = Arc::new(ReadWriteStore::fixture());
+        let shared = shared_fixture(
+            &[],
+            store as Arc<dyn SecretStore>,
+            Some(catalog.clone()),
+            Some(registry),
+            tmp.path(),
+        );
+        let identity = ProcessIdentity::bare(4242, 501, 20);
+        let surfaces = shared.surfaces.as_ref().unwrap();
+        let cases: &[(&str, &str, &[u8])] = &[
+            ("fixture-dotenv", ".env", b"TOKEN=literal-value\n"),
+            (
+                "fixture-direnv",
+                ".envrc",
+                b"export TOKEN='literal-value'\n",
+            ),
+            (
+                "fixture-ini-surface",
+                "credentials.ini",
+                b"[dev]\nKEY = ini-value\n",
+            ),
+            ("fixture-lines", "credentials.lines", b"line-value\n"),
+            (
+                "fixture-direct-surface",
+                ".env.source",
+                b"# preserved\nKEY='direct value'\n",
+            ),
+        ];
+
+        for (surface_id, name, expected) in cases {
+            let ino = surfaces.ino_for(surface_id);
+            let target = shared.resolve_open_target(ino).unwrap();
+            assert_eq!(target.virtual_path, format!("surfaces/{surface_id}"));
+            assert_eq!(
+                target.display.as_deref(),
+                Some(format!("/fixture/project/{name}").as_str())
+            );
+            assert!(target.direct_io);
+
+            let generated = shared.generate_read(&target, &identity).unwrap();
+            assert_eq!(&generated.bytes, expected);
+            assert!(
+                generated
+                    .dependencies
+                    .as_ref()
+                    .is_some_and(|dependencies| !dependencies.is_empty())
+            );
+        }
+
+        let stale_target = shared
+            .resolve_open_target(surfaces.ino_for("fixture-dotenv"))
+            .unwrap();
+        catalog.remove_surface("fixture-dotenv").unwrap();
+        assert_eq!(
+            shared.generate_read(&stale_target, &identity).err().unwrap().code(),
+            libc::EIO
+        );
+    }
+
+    #[test]
+    fn surface_attributes_freeze_composed_limits_and_preserve_direct_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = surface_catalog(&tmp.path().join("catalog.sqlite"));
+        let registry = Arc::new(SurfaceRegistry::from_snapshot(&catalog.snapshot().unwrap()));
+        let store = Arc::new(ReadWriteStore::fixture());
+        let shared = shared_fixture(
+            &[],
+            store as Arc<dyn SecretStore>,
+            Some(catalog),
+            Some(Arc::clone(&registry)),
+            tmp.path(),
+        );
+        let surfaces = shared.surfaces.as_ref().unwrap();
+
+        for (surface_id, expected_size) in [
+            ("fixture-dotenv", DOTENV_MAX_SIZE as u64),
+            ("fixture-direnv", DIRENV_MAX_SIZE as u64),
+            ("fixture-ini-surface", INI_MAX_SIZE as u64),
+            ("fixture-lines", LINES_MAX_SIZE as u64),
+        ] {
+            let registered = registry.get(surface_id).unwrap();
+            let attr = shared
+                .surface_attr(surfaces.ino_for(surface_id), &registered)
+                .unwrap();
+            assert_eq!(attr.size, expected_size, "{surface_id}");
+            assert_eq!(attr.perm, 0o400, "{surface_id}");
+        }
+
+        let registered = registry.get("fixture-direct-surface").unwrap();
+        let attr = shared
+            .surface_attr(
+                surfaces.ino_for("fixture-direct-surface"),
+                &registered,
+            )
+            .unwrap();
+        assert_eq!(attr.size, b"# preserved\nKEY='direct value'\n".len() as u64);
+        assert_eq!(attr.perm, 0o644);
+    }
+
+    #[test]
+    fn commits_validate_catalog_secrets_and_direct_env_file_schema() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = surface_catalog(&tmp.path().join("catalog.sqlite"));
+        let registry = Arc::new(SurfaceRegistry::from_snapshot(&catalog.snapshot().unwrap()));
+        let store = Arc::new(ReadWriteStore::fixture());
+        let shared = shared_fixture(
+            &[],
+            Arc::clone(&store) as Arc<dyn SecretStore>,
+            Some(catalog),
+            Some(registry),
+            tmp.path(),
+        );
+        let identity = Arc::new(ProcessIdentity::bare(4242, 501, 20));
+
+        let raw_ino = shared.secrets.as_ref().unwrap().ino_for(RAW_SECRET_ID);
+        let raw_fh = shared
+            .writes
+            .insert(raw_ino, Arc::clone(&identity), Vec::new());
+        shared
+            .writes
+            .write_at(raw_fh, 0, b"first line\nsecond line")
+            .unwrap();
+        let error = shared.commit_write(raw_fh).unwrap_err();
+        assert!(
+            error.to_string().contains("one line"),
+            "unexpected validation error: {error}"
+        );
+        assert_eq!(store.current_version(RAW_SECRET_ID), 1);
+        assert_eq!(store.current_bytes(RAW_SECRET_ID), b"protected-value");
+
+        let direct_ino = shared
+            .surfaces
+            .as_ref()
+            .unwrap()
+            .ino_for("fixture-direct-surface");
+        let direct_fh = shared
+            .writes
+            .insert(direct_ino, Arc::clone(&identity), Vec::new());
+        shared
+            .writes
+            .write_at(direct_fh, 0, b"# changed\nKEY=new-value\n")
+            .unwrap();
+        assert!(shared.commit_write(direct_fh).unwrap());
+        assert_eq!(store.current_version(DIRECT_SECRET_ID), 2);
+        assert_eq!(
+            store.current_bytes(DIRECT_SECRET_ID),
+            b"# changed\nKEY=new-value\n"
+        );
+
+        let invalid_fh = shared.writes.insert(direct_ino, identity, Vec::new());
+        shared
+            .writes
+            .write_at(invalid_fh, 0, b"OTHER=new-value\n")
+            .unwrap();
+        let error = shared.commit_write(invalid_fh).unwrap_err();
+        assert_eq!(error.errno.code(), libc::EINVAL);
+        assert!(error.to_string().contains("entries changed"));
+        assert_eq!(store.current_version(DIRECT_SECRET_ID), 2);
     }
 
     #[test]
