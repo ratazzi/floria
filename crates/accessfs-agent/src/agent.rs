@@ -15,7 +15,7 @@ use accessfs_core::authz::{
 };
 use accessfs_core::config::ResolvedConfig;
 use accessfs_core::identity::ProcessIdentity;
-use accessfs_core::rules::{repo_root, RuleSet};
+use accessfs_core::rules::{repo_root, RuleObject, RuleRequest, RuleSet};
 use accessfs_platform::SocketPeerVerifier;
 
 use crate::grant_cache::{ActiveGrant, GrantCache, GrantKey, GrantMetadata};
@@ -326,9 +326,21 @@ impl Authorizer for SocketAgent {
     fn authorize(&self, req: &AuthRequest) -> Decision {
         // Derive the reader's git checkout once; both rule matching and grant keying use it.
         let repo = req.identity.cwd.as_deref().and_then(repo_root);
+        let object = match req.context {
+            Some(accessfs_core::authz::AccessContext::SshSign(context)) => RuleObject {
+                resource_id: Some(context.resource_id),
+            },
+            None => RuleObject::default(),
+        };
+        let rule_request = RuleRequest {
+            identity: req.identity,
+            path: req.path,
+            repo: repo.as_deref(),
+            operation: req.operation,
+            object,
+        };
         let (mut enforcement, mut rule_id) =
-            self.rules
-                .decide(req.identity, req.path, repo.as_deref(), req.operation);
+            self.rules.decide(&rule_request);
         if matches!(rule_id.as_deref(), Some("secrets-default" | "surfaces-default")) {
             if let Some(level) = self.request_enforcement(req) {
                 enforcement = level;
@@ -420,7 +432,7 @@ mod tests {
     use super::*;
     use crate::protocol::{read_msg, write_msg};
     use accessfs_core::authz::{AccessContext, Operation, SshSignContext};
-    use accessfs_core::rules::{any_path_glob, Rule, RuleOps, SubjectMatch};
+    use accessfs_core::rules::{any_path_glob, ObjectMatch, Rule, RuleOps, SubjectMatch};
     use accessfs_platform::SameUserPeerVerifier;
     use serde_json::{json, Value};
     use std::os::unix::net::UnixStream;
@@ -460,6 +472,7 @@ mod tests {
                 id: "prompt-all".into(),
                 priority: 0,
                 subject: SubjectMatch::default(),
+                object: ObjectMatch::default(),
                 path_glob: any_path_glob(),
                 ops: RuleOps::READ_WRITE,
                 enforcement: Enforcement::Prompt,
@@ -737,6 +750,7 @@ mod tests {
                 id: "prompt-sign".into(),
                 priority: 0,
                 subject: SubjectMatch::default(),
+                object: ObjectMatch::default(),
                 path_glob: any_path_glob(),
                 ops: RuleOps::SIGN,
                 enforcement: Enforcement::Prompt,
@@ -801,6 +815,7 @@ mod tests {
                 id: "legacy-allow".into(),
                 priority: 10,
                 subject: SubjectMatch::default(),
+                object: ObjectMatch::default(),
                 path_glob: any_path_glob(),
                 ops: RuleOps::READ, // what `operation = None` in config resolves to
                 enforcement: Enforcement::Allow,
@@ -828,6 +843,7 @@ mod tests {
                 id: "secrets-default".into(),
                 priority: 0,
                 subject: SubjectMatch::default(),
+                object: ObjectMatch::default(),
                 path_glob: any_path_glob(),
                 ops: RuleOps::READ_WRITE,
                 enforcement: Enforcement::Prompt,
@@ -883,6 +899,7 @@ mod tests {
                 id: "surfaces-default".into(),
                 priority: 0,
                 subject: SubjectMatch::default(),
+                object: ObjectMatch::default(),
                 path_glob: any_path_glob(),
                 ops: RuleOps::SIGN,
                 enforcement: Enforcement::Prompt,
@@ -927,6 +944,7 @@ mod tests {
                     id: "explicit-deny".into(),
                     priority: 100,
                     subject: SubjectMatch::default(),
+                    object: ObjectMatch::default(),
                     path_glob: any_path_glob(),
                     ops: RuleOps::READ,
                     enforcement: Enforcement::Deny,
@@ -936,6 +954,7 @@ mod tests {
                     id: "secrets-default".into(),
                     priority: 0,
                     subject: SubjectMatch::default(),
+                    object: ObjectMatch::default(),
                     path_glob: any_path_glob(),
                     ops: RuleOps::READ_WRITE,
                     enforcement: Enforcement::Prompt,

@@ -9,7 +9,8 @@ use crate::authz::Enforcement;
 use crate::error::{CoreError, Result};
 use crate::handler::ContentHandler;
 use crate::rules::{
-    any_path_glob, compile_glob, exact_path_glob, Rule, RuleOps, RuleSet, SubjectMatch,
+    any_path_glob, compile_glob, exact_path_glob, ObjectMatch, Rule, RuleOps, RuleSet,
+    SubjectMatch,
 };
 
 /// Virtual directory under the mount where store-backed secrets are surfaced (`secrets/<id>`).
@@ -246,6 +247,7 @@ fn build_ruleset(rule_cfgs: Vec<RuleCfg>, files: &[FileEntry]) -> Result<RuleSet
             id: format!("file:{}", f.path),
             priority: 0,
             subject: SubjectMatch::default(),
+            object: ObjectMatch::default(),
             path_glob: exact_path_glob(&f.path),
             ops: RuleOps::READ,
             enforcement: f.enforcement,
@@ -260,6 +262,7 @@ fn build_ruleset(rule_cfgs: Vec<RuleCfg>, files: &[FileEntry]) -> Result<RuleSet
         id: "secrets-default".to_string(),
         priority: i32::MIN + 1,
         subject: SubjectMatch::default(),
+        object: ObjectMatch::default(),
         path_glob: compile_glob(&format!("{SECRETS_DIR}/**"))
             .expect("`secrets/**` is a valid glob"),
         ops: RuleOps::READ_WRITE,
@@ -273,6 +276,7 @@ fn build_ruleset(rule_cfgs: Vec<RuleCfg>, files: &[FileEntry]) -> Result<RuleSet
         id: "surfaces-default".to_string(),
         priority: i32::MIN + 1,
         subject: SubjectMatch::default(),
+        object: ObjectMatch::default(),
         path_glob: compile_glob(&format!("{SURFACES_DIR}/**"))
             .expect("`surfaces/**` is a valid glob"),
         ops: RuleOps::READ_WRITE_SIGN,
@@ -286,6 +290,7 @@ fn build_ruleset(rule_cfgs: Vec<RuleCfg>, files: &[FileEntry]) -> Result<RuleSet
         id: "default".to_string(),
         priority: i32::MIN,
         subject: SubjectMatch::default(),
+        object: ObjectMatch::default(),
         path_glob: any_path_glob(),
         ops: RuleOps::READ,
         enforcement: Enforcement::Allow,
@@ -324,6 +329,7 @@ fn resolve_rule(rc: RuleCfg, idx: usize) -> Result<Rule> {
         id,
         priority: rc.priority.unwrap_or(0),
         subject,
+        object: ObjectMatch::default(),
         path_glob,
         ops,
         enforcement,
@@ -528,6 +534,7 @@ pub fn check_secure_perms(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rules::{RuleObject, RuleRequest};
     use crate::authz::Operation;
     use crate::identity::ProcessIdentity;
 
@@ -626,6 +633,21 @@ mod tests {
         }
     }
 
+    fn decide(
+        rules: &RuleSet,
+        identity: &ProcessIdentity,
+        path: &str,
+        operation: Operation,
+    ) -> (Enforcement, Option<String>) {
+        rules.decide(&RuleRequest {
+            identity,
+            path,
+            repo: None,
+            operation,
+            object: RuleObject::default(),
+        })
+    }
+
     #[test]
     fn builds_ruleset_with_explicit_file_and_default_layers() {
         let file = resolve_file(
@@ -654,42 +676,42 @@ mod tests {
         // any secrets/<id> path is prompted by the built-in rule — for reads AND writes
         let id = ProcessIdentity::bare(1, 501, 20);
         assert_eq!(
-            rules.decide(&id, "secrets/abc-123", None, Operation::Read),
+            decide(&rules, &id, "secrets/abc-123", Operation::Read),
             (Enforcement::Prompt, Some("secrets-default".to_string()))
         );
         assert_eq!(
-            rules.decide(&id, "secrets/abc-123", None, Operation::Write),
+            decide(&rules, &id, "secrets/abc-123", Operation::Write),
             (Enforcement::Prompt, Some("secrets-default".to_string()))
         );
 
         // surfaces are gated for both operations; the filesystem decides which kinds are writable
         assert_eq!(
-            rules.decide(&id, "surfaces/fixture-dotenv", None, Operation::Read),
+            decide(&rules, &id, "surfaces/fixture-dotenv", Operation::Read),
             (Enforcement::Prompt, Some("surfaces-default".to_string()))
         );
         assert_eq!(
-            rules.decide(&id, "surfaces/fixture-dotenv", None, Operation::Write),
+            decide(&rules, &id, "surfaces/fixture-dotenv", Operation::Write),
             (Enforcement::Prompt, Some("surfaces-default".to_string()))
         );
 
         // explicit deny rule wins for prod
         assert_eq!(
-            rules.decide(&id, "env/svc/prod.env", None, Operation::Read),
+            decide(&rules, &id, "env/svc/prod.env", Operation::Read),
             (Enforcement::Deny, Some("prod".to_string()))
         );
         // per-file prompt applies to dev.env
         assert_eq!(
-            rules.decide(&id, "env/demo/dev.env", None, Operation::Read),
+            decide(&rules, &id, "env/demo/dev.env", Operation::Read),
             (Enforcement::Prompt, Some("file:env/demo/dev.env".to_string()))
         );
         // reads on anything else fall through to the visible catch-all allow...
         assert_eq!(
-            rules.decide(&id, "demo/hello.txt", None, Operation::Read),
+            decide(&rules, &id, "demo/hello.txt", Operation::Read),
             (Enforcement::Allow, Some("default".to_string()))
         );
         // ...but writes never ride the read catch-all: unmatched writes fail closed.
         assert_eq!(
-            rules.decide(&id, "demo/hello.txt", None, Operation::Write),
+            decide(&rules, &id, "demo/hello.txt", Operation::Write),
             (Enforcement::Deny, Some("default-deny".to_string()))
         );
     }
@@ -702,11 +724,11 @@ mod tests {
         let id = ProcessIdentity::bare(1, 501, 20);
         // write-only allow matches writes, not reads (reads fall to secrets-default prompt)
         assert_eq!(
-            rules.decide(&id, "secrets/abc", None, Operation::Write),
+            decide(&rules, &id, "secrets/abc", Operation::Write),
             (Enforcement::Allow, Some("w".to_string()))
         );
         assert_eq!(
-            rules.decide(&id, "secrets/abc", None, Operation::Read),
+            decide(&rules, &id, "secrets/abc", Operation::Read),
             (Enforcement::Prompt, Some("secrets-default".to_string()))
         );
 

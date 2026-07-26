@@ -1,4 +1,5 @@
-//! Policy rule engine: `who (subject) × what (path) × how-accessed (operation) -> how (enforcement)`.
+//! Policy rule engine:
+//! `who (subject) × what (path + object) × how-accessed (operation) -> how (enforcement)`.
 //!
 //! Evaluation is **first-match by priority** (like pf/iptables): rules are ordered by
 //! descending priority and the first enabled rule whose subject *and* path both match wins.
@@ -102,6 +103,37 @@ impl SubjectMatch {
     }
 }
 
+/// Trusted object metadata selected by the runtime for one authorization request.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RuleObject<'a> {
+    pub resource_id: Option<&'a str>,
+}
+
+/// Object facets matched by one rule. Every `Some` facet is combined with the subject and path
+/// using AND; `None` remains a wildcard.
+#[derive(Debug, Clone, Default)]
+pub struct ObjectMatch {
+    pub resource_id: Option<String>,
+}
+
+impl ObjectMatch {
+    fn matches(&self, object: RuleObject<'_>) -> bool {
+        self.resource_id
+            .as_deref()
+            .is_none_or(|resource_id| object.resource_id == Some(resource_id))
+    }
+}
+
+/// Complete input to one rule-engine decision.
+#[derive(Debug, Clone, Copy)]
+pub struct RuleRequest<'a> {
+    pub identity: &'a ProcessIdentity,
+    pub path: &'a str,
+    pub repo: Option<&'a str>,
+    pub operation: Operation,
+    pub object: RuleObject<'a>,
+}
+
 /// One policy rule.
 #[derive(Debug, Clone)]
 pub struct Rule {
@@ -109,6 +141,7 @@ pub struct Rule {
     /// Higher priority is evaluated first.
     pub priority: i32,
     pub subject: SubjectMatch,
+    pub object: ObjectMatch,
     /// Glob over the virtual path, e.g. `env/*/prod.env`.
     pub path_glob: GlobMatcher,
     /// Which operations this rule applies to (config defaults to read-only).
@@ -131,22 +164,17 @@ impl RuleSet {
         RuleSet { rules }
     }
 
-    /// Decide enforcement for `id` performing `op` on `path`. Returns the matched rule's
+    /// Decide enforcement for one typed request. Returns the matched rule's
     /// enforcement and id. If nothing matches, **fail closed**: config appends a read
     /// catch-all, so this is reachable only for operations no rule opted into — the visible
     /// catch-all expresses monitor-mode allow, a hidden default must not.
-    pub fn decide(
-        &self,
-        id: &ProcessIdentity,
-        path: &str,
-        repo: Option<&str>,
-        op: Operation,
-    ) -> (Enforcement, Option<String>) {
+    pub fn decide(&self, request: &RuleRequest<'_>) -> (Enforcement, Option<String>) {
         for r in &self.rules {
             if r.enabled
-                && r.ops.matches(op)
-                && r.path_glob.is_match(path)
-                && r.subject.matches(id, repo)
+                && r.ops.matches(request.operation)
+                && r.path_glob.is_match(request.path)
+                && r.subject.matches(request.identity, request.repo)
+                && r.object.matches(request.object)
             {
                 return (r.enforcement, Some(r.id.clone()));
             }
@@ -207,11 +235,28 @@ mod tests {
             id: id.to_string(),
             priority,
             subject,
+            object: ObjectMatch::default(),
             path_glob: compile_glob(path).unwrap(),
             ops: RuleOps::READ,
             enforcement: enf,
             enabled: true,
         }
+    }
+
+    fn decide(
+        set: &RuleSet,
+        identity: &ProcessIdentity,
+        path: &str,
+        repo: Option<&str>,
+        operation: Operation,
+    ) -> (Enforcement, Option<String>) {
+        set.decide(&RuleRequest {
+            identity,
+            path,
+            repo,
+            operation,
+            object: RuleObject::default(),
+        })
     }
 
     #[test]
@@ -221,11 +266,11 @@ mod tests {
             rule("high", 100, SubjectMatch::default(), "env/**", Enforcement::Deny),
         ]);
         let id = ident("/usr/bin/cat", None);
-        let (enf, matched) = set.decide(&id, "env/demo/dev.env", None, Operation::Read);
+        let (enf, matched) = decide(&set, &id, "env/demo/dev.env", None, Operation::Read);
         assert_eq!(enf, Enforcement::Deny);
         assert_eq!(matched.as_deref(), Some("high"));
         // A path outside the high rule falls through to the catch-all.
-        let (enf, matched) = set.decide(&id, "demo/hello.txt", None, Operation::Read);
+        let (enf, matched) = decide(&set, &id, "demo/hello.txt", None, Operation::Read);
         assert_eq!(enf, Enforcement::Allow);
         assert_eq!(matched.as_deref(), Some("low"));
     }
@@ -246,15 +291,15 @@ mod tests {
         )]);
 
         let chrome = ident("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", Some("EQHXZ8M8AV"));
-        assert_eq!(set.decide(&chrome, "env/x", None, Operation::Read).0, Enforcement::Prompt);
+        assert_eq!(decide(&set, &chrome, "env/x", None, Operation::Read).0, Enforcement::Prompt);
 
         // Right team, wrong exe -> no match, falls to the fail-closed default.
         let other = ident("/usr/bin/curl", Some("EQHXZ8M8AV"));
-        assert_eq!(set.decide(&other, "env/x", None, Operation::Read).0, Enforcement::Deny);
+        assert_eq!(decide(&set, &other, "env/x", None, Operation::Read).0, Enforcement::Deny);
 
         // Right exe, wrong team -> no match.
         let unsigned = ident("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", None);
-        assert_eq!(set.decide(&unsigned, "env/x", None, Operation::Read).0, Enforcement::Deny);
+        assert_eq!(decide(&set, &unsigned, "env/x", None, Operation::Read).0, Enforcement::Deny);
     }
 
     #[test]
@@ -265,9 +310,9 @@ mod tests {
         };
         let set = RuleSet::new(vec![rule("proj", 10, subject, "**", Enforcement::TouchId)]);
         let node = ident("/usr/local/bin/node", Some("HX7739G8FX"));
-        assert_eq!(set.decide(&node, "env/x", Some("/Users/me/proj"), Operation::Read).0, Enforcement::TouchId);
-        assert_eq!(set.decide(&node, "env/x", Some("/Users/me/other"), Operation::Read).0, Enforcement::Deny);
-        assert_eq!(set.decide(&node, "env/x", None, Operation::Read).0, Enforcement::Deny);
+        assert_eq!(decide(&set, &node, "env/x", Some("/Users/me/proj"), Operation::Read).0, Enforcement::TouchId);
+        assert_eq!(decide(&set, &node, "env/x", Some("/Users/me/other"), Operation::Read).0, Enforcement::Deny);
+        assert_eq!(decide(&set, &node, "env/x", None, Operation::Read).0, Enforcement::Deny);
     }
 
     #[test]
@@ -275,7 +320,13 @@ mod tests {
         let mut r = rule("off", 100, SubjectMatch::default(), "**", Enforcement::Deny);
         r.enabled = false;
         let set = RuleSet::new(vec![r]);
-        let (enf, matched) = set.decide(&ident("/usr/bin/cat", None), "x", None, Operation::Read);
+        let (enf, matched) = decide(
+            &set,
+            &ident("/usr/bin/cat", None),
+            "x",
+            None,
+            Operation::Read,
+        );
         assert_eq!(enf, Enforcement::Deny);
         assert_eq!(matched.as_deref(), Some("default-deny"), "must not match the disabled rule");
     }
@@ -285,9 +336,9 @@ mod tests {
         // A pre-write-era config: a broad allow with no operation declared (defaults to read).
         let set = RuleSet::new(vec![rule("legacy-allow", 10, SubjectMatch::default(), "**", Enforcement::Allow)]);
         let id = ident("/usr/bin/cat", None);
-        assert_eq!(set.decide(&id, "secrets/x", None, Operation::Read).0, Enforcement::Allow);
+        assert_eq!(decide(&set, &id, "secrets/x", None, Operation::Read).0, Enforcement::Allow);
         // The same subject writing must NOT ride the read rule: no match -> fail closed.
-        let (enf, matched) = set.decide(&id, "secrets/x", None, Operation::Write);
+        let (enf, matched) = decide(&set, &id, "secrets/x", None, Operation::Write);
         assert_eq!(enf, Enforcement::Deny);
         assert_eq!(matched.as_deref(), Some("default-deny"));
 
@@ -295,8 +346,48 @@ mod tests {
         let mut rw = rule("rw", 10, SubjectMatch::default(), "**", Enforcement::Prompt);
         rw.ops = RuleOps::READ_WRITE;
         let set = RuleSet::new(vec![rw]);
-        assert_eq!(set.decide(&id, "secrets/x", None, Operation::Write).0, Enforcement::Prompt);
-        assert_eq!(set.decide(&id, "secrets/x", None, Operation::Read).0, Enforcement::Prompt);
+        assert_eq!(decide(&set, &id, "secrets/x", None, Operation::Write).0, Enforcement::Prompt);
+        assert_eq!(decide(&set, &id, "secrets/x", None, Operation::Read).0, Enforcement::Prompt);
+    }
+
+    #[test]
+    fn object_resource_facet_is_anded_and_none_is_a_wildcard() {
+        let id = ident("/usr/bin/ssh", None);
+        let mut resource = rule(
+            "managed-resource",
+            20,
+            SubjectMatch::default(),
+            "surfaces/**",
+            Enforcement::TouchId,
+        );
+        resource.ops = RuleOps::SIGN;
+        resource.object.resource_id = Some("fixture-key".to_string());
+        let mut surface = rule(
+            "managed-surface",
+            10,
+            SubjectMatch::default(),
+            "surfaces/**",
+            Enforcement::Prompt,
+        );
+        surface.ops = RuleOps::SIGN;
+        let set = RuleSet::new(vec![surface, resource]);
+
+        let request = |resource_id| RuleRequest {
+            identity: &id,
+            path: "surfaces/fixture-agent",
+            repo: None,
+            operation: Operation::Sign,
+            object: RuleObject { resource_id },
+        };
+        assert_eq!(
+            set.decide(&request(Some("fixture-key"))).0,
+            Enforcement::TouchId
+        );
+        assert_eq!(
+            set.decide(&request(Some("other-key"))).0,
+            Enforcement::Prompt
+        );
+        assert_eq!(set.decide(&request(None)).0, Enforcement::Prompt);
     }
 
     #[test]
@@ -310,7 +401,7 @@ mod tests {
             Enforcement::Allow,
         )]);
         assert_eq!(
-            read.decide(&id, "surfaces/agent", None, Operation::Sign),
+            decide(&read, &id, "surfaces/agent", None, Operation::Sign),
             (Enforcement::Deny, Some("default-deny".to_string()))
         );
 
@@ -323,9 +414,14 @@ mod tests {
         );
         sign.ops = RuleOps::SIGN;
         assert_eq!(
-            RuleSet::new(vec![sign])
-                .decide(&id, "surfaces/agent", None, Operation::Sign)
-                .0,
+            decide(
+                &RuleSet::new(vec![sign]),
+                &id,
+                "surfaces/agent",
+                None,
+                Operation::Sign,
+            )
+            .0,
             Enforcement::Prompt
         );
     }
