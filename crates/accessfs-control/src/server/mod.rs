@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -14,7 +14,7 @@ use accessfs_catalog::{
 use accessfs_core::audit::{read_recent_access, AuditAccessRecord};
 use accessfs_core::authz::{Enforcement, PolicyMode, PolicyModeStatus};
 use accessfs_discover::{
-    classify_key, discover, discover_git_checkouts, DiscoveredContent, DiscoveredFileAction,
+    classify_key, discover_git_checkouts, discover_many, DiscoveredContent, DiscoveredFileAction,
     DiscoveredFileKind, ExistingEnvironment, ExistingProject, ExistingSecret, ExistingSurface,
     GitCheckoutDiscovery, GitCheckoutMonitor, KeyClass, MonitoredGitCheckout,
 };

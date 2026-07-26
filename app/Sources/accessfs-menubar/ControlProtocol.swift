@@ -382,8 +382,8 @@ struct ProjectCheckoutCandidate: Codable, Hashable, Identifiable, Sendable {
 }
 
 struct DiscoveryPlan: Codable, Hashable, Sendable {
-    let path: String
-    let project: DiscoveredProject
+    let paths: [String]
+    let projects: [DiscoveredProject]
     let files: [DiscoveredFile]
     let summary: DiscoverySummary
 }
@@ -391,11 +391,37 @@ struct DiscoveryPlan: Codable, Hashable, Sendable {
 struct DiscoveredProject: Codable, Hashable, Sendable {
     let name: String
     let path: String
+    let markers: [ProjectMarker]
+    let ecosystems: [String]
     let managedProjectID: String?
 
     enum CodingKeys: String, CodingKey {
-        case name, path
+        case name, path, markers, ecosystems
         case managedProjectID = "managed_project_id"
+    }
+}
+
+struct ProjectMarker: Codable, Hashable, Identifiable, Sendable {
+    var id: String { "\(kind):\(path)" }
+    let kind: String
+    let path: String
+}
+
+enum ProjectAssignmentState: String, Codable, Hashable, Sendable {
+    case assigned
+    case unassigned
+    case needsReview = "needs_review"
+}
+
+struct ProjectAssignment: Codable, Hashable, Sendable {
+    let state: ProjectAssignmentState
+    let projectPath: String?
+    let candidateProjectPaths: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case state
+        case projectPath = "project_path"
+        case candidateProjectPaths = "candidate_project_paths"
     }
 }
 
@@ -422,6 +448,7 @@ enum DiscoveredFileKind: String, Codable, Hashable, Sendable {
     case awsCredentials = "aws_credentials"
     case pgpass
     case sshPrivateKey = "ssh_private_key"
+    case protectedFile = "protected_file"
 }
 
 enum DiscoveredFileAction: String, Codable, Hashable, Sendable {
@@ -436,6 +463,7 @@ struct DiscoveredFile: Codable, Hashable, Sendable, Identifiable {
     var id: String { path }
     let path: String
     let relativePath: String
+    let assignment: ProjectAssignment
     let kind: DiscoveredFileKind
     let codec: String
     let environment: String?
@@ -446,7 +474,7 @@ struct DiscoveredFile: Codable, Hashable, Sendable, Identifiable {
     let action: DiscoveredFileAction
 
     enum CodingKeys: String, CodingKey {
-        case path, kind, codec, environment, tags, entries, warnings, action
+        case path, assignment, kind, codec, environment, tags, entries, warnings, action
         case relativePath = "relative_path"
         case managedSurfaceID = "managed_surface_id"
     }
@@ -483,6 +511,7 @@ struct DiscoveryWarning: Codable, Hashable, Sendable, Identifiable {
 
 struct DiscoveryApplyResult: Codable, Hashable, Sendable {
     let projectID: String?
+    let projectIDs: [String]
     let createdResources: Int
     let reusedResources: Int
     let protectedFiles: Int
@@ -492,6 +521,7 @@ struct DiscoveryApplyResult: Codable, Hashable, Sendable {
     enum CodingKeys: String, CodingKey {
         case files
         case projectID = "project_id"
+        case projectIDs = "project_ids"
         case createdResources = "created_resources"
         case reusedResources = "reused_resources"
         case protectedFiles = "protected_files"
@@ -549,6 +579,16 @@ struct DiscoveryReferenceResolution: Codable, Hashable, Sendable {
 struct DiscoverySeparateEntry: Codable, Hashable, Sendable {
     let path: String
     let address: String
+}
+
+struct DiscoveryProjectAssignment: Codable, Hashable, Sendable {
+    let path: String
+    let projectPath: String
+
+    enum CodingKeys: String, CodingKey {
+        case path
+        case projectPath = "project_path"
+    }
 }
 
 struct DiscoveredSshIdentity: Codable, Hashable, Sendable {
@@ -612,9 +652,11 @@ enum ControlCommand: Sendable {
     case grantClear
     case accessHistory(limit: Int)
     case snapshot
-    case discover(path: String)
+    case discover(paths: [String])
     case discoverApply(
-        path: String, files: [String], separateEntries: [DiscoverySeparateEntry],
+        paths: [String], files: [String],
+        projectAssignments: [DiscoveryProjectAssignment],
+        separateEntries: [DiscoverySeparateEntry],
         promoteEntries: [DiscoverySeparateEntry], demoteEntries: [DiscoverySeparateEntry])
     case discoverReferenceResolve(
         surfaceID: String, key: String, source: DiscoveryReferenceSource)
@@ -729,18 +771,20 @@ enum ControlCommand: Sendable {
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: AccessHistoryParams(limit: limit)))
-        case .discover(let path):
+        case .discover(let paths):
             return try encoder.encode(
                 ControlRequest(
                     requestID: requestID, method: method,
-                    params: DiscoverParams(path: path)))
+                    params: DiscoverParams(paths: paths)))
         case .discoverApply(
-            let path, let files, let separateEntries, let promoteEntries, let demoteEntries):
+            let paths, let files, let projectAssignments, let separateEntries,
+            let promoteEntries, let demoteEntries):
             return try encoder.encode(
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: DiscoverApplyParams(
-                        path: path, files: files, separateEntries: separateEntries,
+                        paths: paths, files: files, projectAssignments: projectAssignments,
+                        separateEntries: separateEntries,
                         promoteEntries: promoteEntries, demoteEntries: demoteEntries)))
         case .discoverReferenceResolve(let surfaceID, let key, let source):
             return try encoder.encode(
@@ -885,13 +929,21 @@ private struct PolicyModeSetParams: Encodable {
 
 private struct GrantIDParams: Encodable { let id: String }
 private struct AccessHistoryParams: Encodable { let limit: Int }
-private struct DiscoverParams: Encodable { let path: String }
+private struct DiscoverParams: Encodable { let paths: [String] }
 private struct DiscoverApplyParams: Encodable {
-    let path: String
+    let paths: [String]
     let files: [String]
+    let projectAssignments: [DiscoveryProjectAssignment]
     let separateEntries: [DiscoverySeparateEntry]
     let promoteEntries: [DiscoverySeparateEntry]
     let demoteEntries: [DiscoverySeparateEntry]
+    enum CodingKeys: String, CodingKey {
+        case paths, files
+        case projectAssignments = "project_assignments"
+        case separateEntries = "separate_entries"
+        case promoteEntries = "promote_entries"
+        case demoteEntries = "demote_entries"
+    }
 }
 private struct DiscoverReferenceResolveParams: Encodable {
     let surfaceID: String

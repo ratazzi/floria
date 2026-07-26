@@ -826,14 +826,15 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
                 .with_context(|| format!("resolving discovery path {}", path.display()))?;
             if apply {
                 ControlCommand::DiscoverApply {
-                    path,
+                    paths: vec![path],
                     files: None,
+                    project_assignments: Vec::new(),
                     separate_entries: Vec::new(),
                     promote_entries: Vec::new(),
                     demote_entries: Vec::new(),
                 }
             } else {
-                ControlCommand::Discover { path }
+                ControlCommand::Discover { paths: vec![path] }
             }
         }
         ControlCmd::Resolve { project_id, environment_id } => {

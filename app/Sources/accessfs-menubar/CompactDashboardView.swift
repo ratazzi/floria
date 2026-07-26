@@ -97,8 +97,9 @@ struct DashboardView: View {
             searchIsFocused = true
         }
         .dropDestination(for: URL.self) { urls, _ in
-            guard let url = urls.first else { return false }
-            beginDiscovery(at: url.path)
+            let paths = urls.filter(\.isFileURL).map(\.path)
+            guard !paths.isEmpty else { return false }
+            beginDiscovery(at: paths)
             return true
         } isTargeted: { isDropTargeted = $0 }
         .sheet(item: $discovery) { presentation in
@@ -107,9 +108,12 @@ struct DashboardView: View {
                 sharedSecrets: state.workspace.resources.filter {
                     $0.kind == .sharedSecret && $0.shape == .scalar
                 },
-                apply: { files, separateEntries, promoteEntries, demoteEntries in
+                apply: {
+                    files, projectAssignments, separateEntries, promoteEntries,
+                    demoteEntries in
                     try await state.workspace.applyDiscovery(
-                        at: presentation.plan.path, files: files,
+                        at: presentation.plan.paths, files: files,
+                        projectAssignments: projectAssignments,
                         separateEntries: separateEntries,
                         promoteEntries: promoteEntries,
                         demoteEntries: demoteEntries)
@@ -732,19 +736,19 @@ struct DashboardView: View {
         panel.prompt = "Discover"
         panel.canChooseDirectories = true
         panel.canChooseFiles = true
-        panel.allowsMultipleSelection = false
+        panel.allowsMultipleSelection = true
         panel.resolvesAliases = true
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        beginDiscovery(at: url.path)
+        guard panel.runModal() == .OK, !panel.urls.isEmpty else { return }
+        beginDiscovery(at: panel.urls.map(\.path))
     }
 
-    private func beginDiscovery(at path: String) {
+    private func beginDiscovery(at paths: [String]) {
         guard !isDiscovering else { return }
         isDiscovering = true
         Task {
             defer { isDiscovering = false }
             do {
-                let plan = try await state.workspace.discover(at: path)
+                let plan = try await state.workspace.discover(at: paths)
                 discovery = DiscoveryPresentation(plan: plan)
             } catch {
                 discoveryError = error.localizedDescription
@@ -1666,13 +1670,57 @@ private struct CompactBindingRow: View {
     }
 }
 
+private struct DiscoveryProjectGroup: Identifiable {
+    let id: String
+    let project: DiscoveredProject?
+    let files: [DiscoveredFile]
+    let needsReview: Bool
+}
+
+private struct DiscoveryProjectHeader: View {
+    let group: DiscoveryProjectGroup
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Image(systemName: group.needsReview ? "questionmark.folder" : "folder")
+                .foregroundStyle(group.needsReview ? Color.orange : Color.blue)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(group.project?.name ?? (group.needsReview ? "Needs Review" : "Unassigned"))
+                    .font(.callout.weight(.semibold))
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer()
+            Text("\(group.files.count) file\(group.files.count == 1 ? "" : "s")")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 2)
+    }
+
+    private var detail: String {
+        guard let project = group.project else {
+            return group.needsReview
+                ? "Choose the project that should own each file."
+                : "No project is required for these files."
+        }
+        let ecosystems = project.ecosystems.joined(separator: " · ")
+        return ecosystems.isEmpty ? project.path : "\(project.path) · \(ecosystems)"
+    }
+}
+
 private struct DiscoveryReviewSheet: View {
     @Environment(\.dismiss) private var dismiss
     let plan: DiscoveryPlan
     let sharedSecrets: [WorkspaceResource]
     let apply:
-        ([String], [DiscoverySeparateEntry], [DiscoverySeparateEntry], [DiscoverySeparateEntry])
-            async throws -> DiscoveryApplyResult
+        (
+            [String], [DiscoveryProjectAssignment], [DiscoverySeparateEntry],
+            [DiscoverySeparateEntry], [DiscoverySeparateEntry]
+        ) async throws -> DiscoveryApplyResult
     let resolveReference:
         (String, String, DiscoveryReferenceSource) async throws
             -> DiscoveryReferenceResolution
@@ -1681,6 +1729,7 @@ private struct DiscoveryReviewSheet: View {
     @State private var appliedResult: DiscoveryApplyResult?
     @State private var applyError: String?
     @State private var selectedFilePaths: Set<String>
+    @State private var assignedProjectPaths: [String: String]
     @State private var separateEntryIDs: Set<String> = []
     @State private var promotedEntryIDs: Set<String> = []
     @State private var demotedEntryIDs: Set<String> = []
@@ -1691,7 +1740,8 @@ private struct DiscoveryReviewSheet: View {
         plan: DiscoveryPlan,
         sharedSecrets: [WorkspaceResource],
         apply: @escaping (
-            [String], [DiscoverySeparateEntry], [DiscoverySeparateEntry],
+            [String], [DiscoveryProjectAssignment], [DiscoverySeparateEntry],
+            [DiscoverySeparateEntry],
             [DiscoverySeparateEntry]
         ) async throws -> DiscoveryApplyResult,
         resolveReference: @escaping
@@ -1706,6 +1756,52 @@ private struct DiscoveryReviewSheet: View {
         self.openProject = openProject
         _selectedFilePaths = State(
             initialValue: Set(plan.files.filter(\.canApplyDiscovery).map(\.path)))
+        _assignedProjectPaths = State(
+            initialValue: Dictionary(
+                uniqueKeysWithValues: plan.files.compactMap { file in
+                    file.assignment.projectPath.map { (file.path, $0) }
+                }))
+    }
+
+    private var discoveryScopeTitle: String {
+        if plan.paths.count == 1, let path = plan.paths.first {
+            return path
+        }
+        return "\(plan.paths.count) inputs · \(plan.projects.count) projects"
+    }
+
+    private var discoveryGroups: [DiscoveryProjectGroup] {
+        var groups = plan.projects.compactMap { project -> DiscoveryProjectGroup? in
+            let files = plan.files.filter {
+                $0.assignment.projectPath == project.path
+            }
+            guard !files.isEmpty else { return nil }
+            return DiscoveryProjectGroup(
+                id: project.path, project: project, files: files, needsReview: false)
+        }
+        let unassigned = plan.files.filter { $0.assignment.projectPath == nil }
+        if !unassigned.isEmpty {
+            groups.insert(
+                DiscoveryProjectGroup(
+                    id: "needs-review", project: nil, files: unassigned,
+                    needsReview: unassigned.contains {
+                        $0.assignment.state == .needsReview
+                    }),
+                at: 0)
+        }
+        return groups
+    }
+
+    private var needsReviewCount: Int {
+        plan.files.filter {
+            selectedFilePaths.contains($0.path)
+                && $0.action == .compose
+                && assignedProjectPaths[$0.path] == nil
+        }.count
+    }
+
+    private var hasUnresolvedAssignments: Bool {
+        needsReviewCount > 0
     }
 
     var body: some View {
@@ -1718,11 +1814,11 @@ private struct DiscoveryReviewSheet: View {
                     .background(Color.blue.opacity(0.10), in: RoundedRectangle(cornerRadius: 11))
                 VStack(alignment: .leading, spacing: 2) {
                     Text(
-                        plan.project.managedProjectID == nil
+                        plan.projects.allSatisfy { $0.managedProjectID == nil }
                             ? "Review Discovery"
                             : "Review Changes")
                         .font(.title2.bold())
-                    Text(plan.project.path)
+                    Text(discoveryScopeTitle)
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
@@ -1736,10 +1832,10 @@ private struct DiscoveryReviewSheet: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
                     HStack(spacing: 10) {
+                        SummaryMetric(value: plan.projects.count, label: "Projects")
                         SummaryMetric(value: plan.summary.files, label: "Files")
                         SummaryMetric(value: selectedSecretSummary.new, label: "New")
-                        SummaryMetric(value: selectedSecretSummary.reused, label: "Reused")
-                        SummaryMetric(value: plan.summary.warnings, label: "Warnings")
+                        SummaryMetric(value: needsReviewCount, label: "Needs Review")
                     }
                     if let appliedResult {
                         Label(
@@ -1751,31 +1847,40 @@ private struct DiscoveryReviewSheet: View {
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .background(Color.green.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
                     }
-                    ForEach(plan.files) { file in
-                        DiscoveryFileCard(
-                            file: file,
-                            selected: Binding(
-                                get: { selectedFilePaths.contains(file.path) },
-                                set: { selected in
-                                    if selected {
-                                        selectedFilePaths.insert(file.path)
-                                    } else {
-                                        selectedFilePaths.remove(file.path)
-                                    }
-                                }),
-                            result: appliedResult?.files.first { $0.path == file.path },
-                            locked: appliedResult != nil,
-                            separateEntryIDs: $separateEntryIDs,
-                            promotedEntryIDs: $promotedEntryIDs,
-                            demotedEntryIDs: $demotedEntryIDs,
-                            sharedGroupCounts: sharedGroupCounts,
-                            automaticGroupCounts: automaticGroupCounts,
-                            automaticGroupPrimaryEntryIDs: automaticGroupPrimaryEntryIDs,
-                            resolvedReferenceEntryIDs: resolvedReferenceEntryIDs,
-                            resolveReference: { entry in
-                                referenceTarget = ReferenceResolutionTarget(
-                                    file: file, entry: entry)
-                            })
+                    ForEach(discoveryGroups) { group in
+                        VStack(alignment: .leading, spacing: 9) {
+                            DiscoveryProjectHeader(group: group)
+                            ForEach(group.files) { file in
+                                DiscoveryFileCard(
+                                    file: file,
+                                    projects: plan.projects,
+                                    projectPath: Binding(
+                                        get: { assignedProjectPaths[file.path] },
+                                        set: { assignedProjectPaths[file.path] = $0 }),
+                                    selected: Binding(
+                                        get: { selectedFilePaths.contains(file.path) },
+                                        set: { selected in
+                                            if selected {
+                                                selectedFilePaths.insert(file.path)
+                                            } else {
+                                                selectedFilePaths.remove(file.path)
+                                            }
+                                        }),
+                                    result: appliedResult?.files.first { $0.path == file.path },
+                                    locked: appliedResult != nil,
+                                    separateEntryIDs: $separateEntryIDs,
+                                    promotedEntryIDs: $promotedEntryIDs,
+                                    demotedEntryIDs: $demotedEntryIDs,
+                                    sharedGroupCounts: sharedGroupCounts,
+                                    automaticGroupCounts: automaticGroupCounts,
+                                    automaticGroupPrimaryEntryIDs: automaticGroupPrimaryEntryIDs,
+                                    resolvedReferenceEntryIDs: resolvedReferenceEntryIDs,
+                                    resolveReference: { entry in
+                                        referenceTarget = ReferenceResolutionTarget(
+                                            file: file, entry: entry)
+                                    })
+                            }
+                        }
                     }
                     if plan.files.isEmpty {
                         ContentUnavailableView(
@@ -1823,14 +1928,17 @@ private struct DiscoveryReviewSheet: View {
                                     : (appliedResult?.projectID == nil ? "Done" : "Open Project"))
                         }
                     }
-                    .disabled(isApplying || (appliedResult == nil && selectedFilePaths.isEmpty))
+                    .disabled(
+                        isApplying
+                            || (appliedResult == nil
+                                && (selectedFilePaths.isEmpty || hasUnresolvedAssignments)))
                     .keyboardShortcut(.defaultAction)
                 }
             }
             .padding(.horizontal, 22)
             .frame(height: 58)
         }
-        .frame(width: 640, height: 620)
+        .frame(width: 720, height: 650)
         .alert(
             "Import could not finish",
             isPresented: Binding(
@@ -1877,6 +1985,11 @@ private struct DiscoveryReviewSheet: View {
 
     private var discoveryNote: String {
         var notes = ["Static scan only; project code was not executed."]
+        if hasUnresolvedAssignments {
+            notes.append(
+                "\(needsReviewCount) selected file\(needsReviewCount == 1 ? "" : "s") need a project."
+            )
+        }
         let referenceCount = plan.files.filter { $0.action == .reference }.count
         if referenceCount > 0 {
             notes.append(
@@ -1902,7 +2015,7 @@ private struct DiscoveryReviewSheet: View {
     }
 
     private var emptyResultKind: String {
-        plan.project.managedProjectID == nil ? "items" : "changes"
+        plan.projects.allSatisfy { $0.managedProjectID == nil } ? "items" : "changes"
     }
 
     private func applyDiscovery() {
@@ -1923,8 +2036,14 @@ private struct DiscoveryReviewSheet: View {
                         }
                     }
                 }
+                let projectAssignments = selectedFiles.compactMap { file in
+                    assignedProjectPaths[file.path].map {
+                        DiscoveryProjectAssignment(path: file.path, projectPath: $0)
+                    }
+                }
                 appliedResult = try await apply(
                     selectedFilePaths.sorted(),
+                    projectAssignments,
                     entriesMatching(separateEntryIDs),
                     entriesMatching(promotedEntryIDs),
                     entriesMatching(demotedEntryIDs))
@@ -2247,6 +2366,8 @@ private struct SummaryMetric: View {
 
 private struct DiscoveryFileCard: View {
     let file: DiscoveredFile
+    let projects: [DiscoveredProject]
+    @Binding var projectPath: String?
     @Binding var selected: Bool
     let result: DiscoveryAppliedFile?
     let locked: Bool
@@ -2279,6 +2400,31 @@ private struct DiscoveryFileCard: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
+                if file.action == .compose {
+                    Menu {
+                        ForEach(projectChoices, id: \.path) { project in
+                            Button {
+                                projectPath = project.path
+                            } label: {
+                                if projectPath == project.path {
+                                    Label(project.name, systemImage: "checkmark")
+                                } else {
+                                    Text(project.name)
+                                }
+                            }
+                        }
+                    } label: {
+                        Label(
+                            assignedProject?.name ?? "Choose Project",
+                            systemImage: "folder")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(
+                                assignedProject == nil ? Color.orange : Color.secondary)
+                    }
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .disabled(locked || projectChoices.isEmpty)
+                }
                 Text(statusTitle)
                     .font(.caption.weight(.medium))
                     .foregroundStyle(statusColor)
@@ -2317,6 +2463,11 @@ private struct DiscoveryFileCard: View {
             RoundedRectangle(cornerRadius: 12)
                 .stroke(Color.secondary.opacity(0.15), lineWidth: 1)
         }
+    }
+
+    private var assignedProject: DiscoveredProject? {
+        guard let projectPath else { return nil }
+        return projects.first { $0.path == projectPath }
     }
 
     private var detail: String {
@@ -2383,6 +2534,9 @@ private struct DiscoveryFileCard: View {
         }
         if file.action == .compose && file.entries.isEmpty {
             return "No statically importable values were found."
+        }
+        if file.action == .compose && assignedProject == nil {
+            return "Choose which discovered project should own this output."
         }
         return selected ? "Include in this import" : "Leave this file unchanged"
     }
@@ -2579,6 +2733,7 @@ private struct DiscoveryFileCard: View {
         case .awsCredentials: "cloud"
         case .pgpass: "cylinder"
         case .sshPrivateKey: "key.horizontal.fill"
+        case .protectedFile: "doc.badge.lock"
         }
     }
 
@@ -2590,6 +2745,14 @@ private struct DiscoveryFileCard: View {
         case .reference: .secondary
         case .review: .secondary
         }
+    }
+
+    private var projectChoices: [DiscoveredProject] {
+        var allowedPaths = Set(file.assignment.candidateProjectPaths)
+        if let assignedPath = file.assignment.projectPath {
+            allowedPaths.insert(assignedPath)
+        }
+        return projects.filter { allowedPaths.contains($0.path) }
     }
 }
 
@@ -2619,6 +2782,7 @@ private extension DiscoveredFileKind {
         case .awsCredentials: "AWS credentials"
         case .pgpass: "PostgreSQL password file"
         case .sshPrivateKey: "SSH private key"
+        case .protectedFile: "Protected file"
         }
     }
 }

@@ -78,8 +78,12 @@ final class ControlClient: @unchecked Sendable {
     }
 
     func discover(path: String) async throws -> DiscoveryPlan {
+        try await discover(paths: [path])
+    }
+
+    func discover(paths: [String]) async throws -> DiscoveryPlan {
         guard let plan: DiscoveryPlan = try await request(
-            .discover(path: path), expecting: "discovery", as: DiscoveryPlan.self)
+            .discover(paths: paths), expecting: "discovery", as: DiscoveryPlan.self)
         else {
             throw ControlClientError.missingResult("discovery")
         }
@@ -87,13 +91,16 @@ final class ControlClient: @unchecked Sendable {
     }
 
     func applyDiscovery(
-        path: String, files: [String], separateEntries: [DiscoverySeparateEntry],
+        paths: [String], files: [String],
+        projectAssignments: [DiscoveryProjectAssignment],
+        separateEntries: [DiscoverySeparateEntry],
         promoteEntries: [DiscoverySeparateEntry] = [],
         demoteEntries: [DiscoverySeparateEntry] = []
     ) async throws -> DiscoveryApplyResult {
         guard let result: DiscoveryApplyResult = try await request(
             .discoverApply(
-                path: path, files: files, separateEntries: separateEntries,
+                paths: paths, files: files, projectAssignments: projectAssignments,
+                separateEntries: separateEntries,
                 promoteEntries: promoteEntries, demoteEntries: demoteEntries),
             expecting: "discovery_applied",
             as: DiscoveryApplyResult.self)

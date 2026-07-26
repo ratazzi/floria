@@ -49,8 +49,8 @@ pub enum DiscoverError {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveryPlan {
-    pub path: PathBuf,
-    pub project: DiscoveredProject,
+    pub paths: Vec<PathBuf>,
+    pub projects: Vec<DiscoveredProject>,
     pub files: Vec<DiscoveredFile>,
     pub summary: DiscoverySummary,
 }
@@ -59,8 +59,33 @@ pub struct DiscoveryPlan {
 pub struct DiscoveredProject {
     pub name: String,
     pub path: PathBuf,
+    pub markers: Vec<ProjectMarker>,
+    pub ecosystems: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_project_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectMarker {
+    pub kind: ProjectMarkerKind,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectMarkerKind {
+    Git,
+    PackageJson,
+    JavaScriptLock,
+    Pyproject,
+    PythonRequirements,
+    GoModule,
+    Cargo,
+    CargoLock,
+    Compose,
+    Dockerfile,
+    SelectedFolder,
+    SelectedFileParent,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +102,7 @@ pub struct DiscoverySummary {
 pub struct DiscoveredFile {
     pub path: PathBuf,
     pub relative_path: PathBuf,
+    pub assignment: ProjectAssignment,
     pub kind: DiscoveredFileKind,
     pub codec: ResourceCodec,
     pub environment: Option<String>,
@@ -88,6 +114,23 @@ pub struct DiscoveredFile {
     pub action: DiscoveredFileAction,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectAssignment {
+    pub state: ProjectAssignmentState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_path: Option<PathBuf>,
+    #[serde(default)]
+    pub candidate_project_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectAssignmentState {
+    Assigned,
+    Unassigned,
+    NeedsReview,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiscoveredFileKind {
@@ -97,6 +140,7 @@ pub enum DiscoveredFileKind {
     AwsCredentials,
     Pgpass,
     SshPrivateKey,
+    ProtectedFile,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -217,6 +261,7 @@ pub struct ExistingSecret {
 /// Existing managed outputs used to compare reference declarations without decrypting values.
 pub struct ExistingProject {
     pub id: String,
+    pub path: PathBuf,
     pub environments: Vec<ExistingEnvironment>,
 }
 
@@ -232,8 +277,8 @@ pub struct ExistingSurface {
 }
 
 pub struct Discovery {
-    requested_path: PathBuf,
-    project: DiscoveredProject,
+    requested_paths: Vec<PathBuf>,
+    projects: Vec<DiscoveredProject>,
     files: Vec<InternalFile>,
 }
 
@@ -243,6 +288,7 @@ pub struct Discovery {
 pub struct DiscoveredContent {
     pub path: PathBuf,
     pub relative_path: PathBuf,
+    pub assignment: ProjectAssignment,
     pub kind: DiscoveredFileKind,
     pub codec: ResourceCodec,
     pub environment: Option<String>,
@@ -262,6 +308,7 @@ pub struct DiscoveredValue {
 struct InternalFile {
     path: PathBuf,
     relative_path: PathBuf,
+    assignment: ProjectAssignment,
     kind: DiscoveredFileKind,
     codec: ResourceCodec,
     environment: Option<String>,
@@ -287,64 +334,101 @@ enum EntryDisposition {
     Reference,
 }
 
-/// Discover supported files below `path` without executing any project-controlled content.
+/// Discover supported files below one path without executing project-controlled content.
+///
+/// This compatibility wrapper shares the multi-input implementation used by workspace discovery.
 pub fn discover(path: &Path) -> Result<Discovery, DiscoverError> {
-    if !path.is_absolute() {
-        return Err(DiscoverError::RelativePath(path.to_path_buf()));
-    }
-    if !path.exists() {
-        return Err(DiscoverError::NotFound(path.to_path_buf()));
-    }
+    discover_many(&[path.to_path_buf()])
+}
 
-    let root = if path.is_dir() {
-        path.to_path_buf()
-    } else {
-        path.parent().unwrap_or(path).to_path_buf()
-    };
-    let project_path = find_project_root(&root);
-    let project = DiscoveredProject {
-        name: project_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("Project")
-            .to_string(),
-        path: project_path,
-        managed_project_id: None,
-    };
-
-    let candidates = collect_candidates(path)?;
-    let mut files = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        match discover_file(&root, &candidate) {
-            Ok(Some(file)) => files.push(file),
-            Ok(None) => {}
-            Err(error) => files.push(warning_file(&root, &candidate, error.to_string())),
+/// Discover supported files and Project Candidates from files, projects, or Workspace Folders.
+pub fn discover_many(paths: &[PathBuf]) -> Result<Discovery, DiscoverError> {
+    let mut requested_paths = Vec::with_capacity(paths.len());
+    for path in paths {
+        if !path.is_absolute() {
+            return Err(DiscoverError::RelativePath(path.clone()));
+        }
+        if !path.exists() {
+            return Err(DiscoverError::NotFound(path.clone()));
+        }
+        if !requested_paths.contains(path) {
+            requested_paths.push(path.clone());
         }
     }
-    files.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    if requested_paths.is_empty() {
+        return Err(DiscoverError::NotFound(PathBuf::from("<empty discovery>")));
+    }
 
-    Ok(Discovery {
-        requested_path: path.to_path_buf(),
-        project,
-        files,
-    })
+    let projects = discover_project_candidates(&requested_paths)?;
+    let mut candidate_paths = Vec::new();
+    for path in &requested_paths {
+        for candidate in collect_candidates(path)? {
+            if !candidate_paths.contains(&candidate) {
+                candidate_paths.push(candidate);
+            }
+        }
+    }
+
+    let mut files = Vec::with_capacity(candidate_paths.len());
+    for candidate in candidate_paths {
+        let scan_root = containing_input_root(&requested_paths, &candidate)
+            .unwrap_or_else(|| candidate.parent().unwrap_or(&candidate).to_path_buf());
+        let assignment = assign_project(&candidate, &projects);
+        let relative_root =
+            assignment.project_path.as_deref().unwrap_or(scan_root.as_path());
+        match discover_file(relative_root, &candidate) {
+            Ok(Some(mut file)) => {
+                file.assignment = assignment_for_action(assignment, file.action);
+                files.push(file);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let mut file =
+                    warning_file(relative_root, &candidate, error.to_string());
+                file.assignment = assignment_for_action(assignment, file.action);
+                files.push(file);
+            }
+        }
+    }
+    files.sort_by(|left, right| {
+        left.assignment
+            .project_path
+            .cmp(&right.assignment.project_path)
+            .then_with(|| left.relative_path.cmp(&right.relative_path))
+    });
+
+    Ok(Discovery { requested_paths, projects, files })
 }
 
 impl Discovery {
-    pub fn project(&self) -> &DiscoveredProject {
-        &self.project
+    pub fn projects(&self) -> &[DiscoveredProject] {
+        &self.projects
+    }
+
+    /// Return only keys whose discovered values may reuse an existing Shared Secret.
+    ///
+    /// Callers can use this before loading plaintext from the secret store, avoiding
+    /// unrelated decryptions during discovery.
+    pub fn shared_secret_candidate_keys(&self) -> HashSet<String> {
+        self.files
+            .iter()
+            .filter(|file| matches!(file.entry_disposition, EntryDisposition::SharedSecret))
+            .flat_map(|file| file.entries.iter())
+            .filter(|entry| classify_key(&entry.key) == KeyClass::Secret)
+            .map(|entry| entry.key.clone())
+            .collect()
     }
 
     /// Produce the review-safe plan. No plaintext candidate value is serialized or returned.
     pub fn plan(&self, existing: &[ExistingSecret]) -> DiscoveryPlan {
-        self.plan_with_project(existing, None)
+        self.plan_with_projects(existing, &[])
     }
 
     /// Produce a review-safe plan with the keys already exported by a managed project.
-    pub fn plan_with_project(
+    pub fn plan_with_projects(
         &self,
         existing: &[ExistingSecret],
-        managed_project: Option<&ExistingProject>,
+        managed_projects: &[ExistingProject],
     ) -> DiscoveryPlan {
         let mut reused_secrets = 0;
         let mut new_secrets = 0;
@@ -362,6 +446,11 @@ impl Discovery {
         }
         let mut files = Vec::with_capacity(self.files.len());
         for file in &self.files {
+            let managed_project = file
+                .assignment
+                .project_path
+                .as_ref()
+                .and_then(|path| managed_projects.iter().find(|project| &project.path == path));
             let managed_surface = managed_project
                 .and_then(|project| {
                     project.environments.iter().find(|environment| {
@@ -439,6 +528,7 @@ impl Discovery {
             files.push(DiscoveredFile {
                 path: file.path.clone(),
                 relative_path: file.relative_path.clone(),
+                assignment: file.assignment.clone(),
                 kind: file.kind,
                 codec: file.codec,
                 environment: file.environment.clone(),
@@ -452,11 +542,16 @@ impl Discovery {
         let entries = files.iter().map(|file| file.entries.len()).sum();
         let warnings = files.iter().map(|file| file.warnings.len()).sum();
 
-        let mut project = self.project.clone();
-        project.managed_project_id = managed_project.map(|existing| existing.id.clone());
+        let mut projects = self.projects.clone();
+        for project in &mut projects {
+            project.managed_project_id = managed_projects
+                .iter()
+                .find(|existing| existing.path == project.path)
+                .map(|existing| existing.id.clone());
+        }
         DiscoveryPlan {
-            path: self.requested_path.clone(),
-            project,
+            paths: self.requested_paths.clone(),
+            projects,
             summary: DiscoverySummary {
                 files: files.len(),
                 entries,
@@ -475,6 +570,7 @@ impl Discovery {
             .map(|file| DiscoveredContent {
                 path: file.path,
                 relative_path: file.relative_path,
+                assignment: file.assignment,
                 kind: file.kind,
                 codec: file.codec,
                 environment: file.environment,
@@ -495,13 +591,351 @@ impl Discovery {
     }
 }
 
+fn discover_project_candidates(
+    inputs: &[PathBuf],
+) -> Result<Vec<DiscoveredProject>, DiscoverError> {
+    let mut inspected_directories = Vec::new();
+    for input in inputs {
+        let start = if input.is_dir() {
+            input.as_path()
+        } else {
+            input.parent().unwrap_or(input)
+        };
+        collect_directories(start, &mut inspected_directories)?;
+        for ancestor in start.ancestors().skip(1).take(MAX_DEPTH) {
+            if !inspected_directories.iter().any(|path| path == ancestor) {
+                inspected_directories.push(ancestor.to_path_buf());
+            }
+            if ancestor.join(".git").exists() {
+                break;
+            }
+        }
+    }
+
+    let mut marker_directories = inspected_directories
+        .into_iter()
+        .filter_map(|directory| {
+            let markers = project_markers(&directory);
+            (!markers.is_empty()).then_some((directory, markers))
+        })
+        .collect::<Vec<_>>();
+    marker_directories.sort_by(|left, right| {
+        path_depth(&left.0)
+            .cmp(&path_depth(&right.0))
+            .then_with(|| left.0.cmp(&right.0))
+    });
+
+    let mut projects = marker_directories
+        .iter()
+        .filter(|(_, markers)| markers.iter().any(|marker| marker.kind == ProjectMarkerKind::Git))
+        .map(|(path, markers)| discovered_project(path, markers.clone()))
+        .collect::<Vec<_>>();
+
+    for (path, markers) in marker_directories {
+        if markers.iter().any(|marker| marker.kind == ProjectMarkerKind::Git) {
+            continue;
+        }
+        if let Some(project) = projects
+            .iter_mut()
+            .filter(|project| path.starts_with(&project.path))
+            .max_by_key(|project| path_depth(&project.path))
+        {
+            merge_project_markers(project, markers);
+            continue;
+        }
+        if let Some(project) = projects
+            .iter_mut()
+            .filter(|project| {
+                !project
+                    .markers
+                    .iter()
+                    .any(|marker| marker.kind == ProjectMarkerKind::Git)
+                    && path.starts_with(&project.path)
+            })
+            .max_by_key(|project| path_depth(&project.path))
+        {
+            merge_project_markers(project, markers);
+        } else {
+            projects.push(discovered_project(&path, markers));
+        }
+    }
+
+    for input in inputs.iter().filter(|input| input.is_dir()) {
+        let has_project = projects.iter().any(|project| {
+            project.path.starts_with(input) || input.starts_with(&project.path)
+        });
+        if !has_project {
+            projects.push(discovered_project(
+                input,
+                vec![ProjectMarker {
+                    kind: ProjectMarkerKind::SelectedFolder,
+                    path: input.clone(),
+                }],
+            ));
+            continue;
+        }
+        for candidate in collect_candidates(input)? {
+            if !candidate_likely_needs_project(&candidate)
+                || projects.iter().any(|project| candidate.starts_with(&project.path))
+            {
+                continue;
+            }
+            let Some(parent) = candidate.parent().map(Path::to_path_buf) else { continue };
+            let marker = ProjectMarker {
+                kind: ProjectMarkerKind::SelectedFileParent,
+                path: candidate,
+            };
+            if let Some(project) =
+                projects.iter_mut().find(|project| project.path == parent)
+            {
+                merge_project_markers(project, vec![marker]);
+            } else {
+                projects.push(discovered_project(&parent, vec![marker]));
+            }
+        }
+    }
+
+    for input in inputs.iter().filter(|input| input.is_file()) {
+        if !is_candidate(input) {
+            continue;
+        }
+        let Some(parent) = input.parent() else { continue };
+        let has_project = projects.iter().any(|project| input.starts_with(&project.path));
+        if !has_project {
+            projects.push(discovered_project(
+                parent,
+                vec![ProjectMarker {
+                    kind: ProjectMarkerKind::SelectedFileParent,
+                    path: input.clone(),
+                }],
+            ));
+        }
+    }
+
+    projects.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(projects)
+}
+
+fn collect_directories(
+    root: &Path,
+    directories: &mut Vec<PathBuf>,
+) -> Result<(), DiscoverError> {
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    while let Some((directory, depth)) = stack.pop() {
+        if directories.iter().any(|path| path == &directory) {
+            continue;
+        }
+        directories.push(directory.clone());
+        if depth >= MAX_DEPTH {
+            continue;
+        }
+        let entries = fs::read_dir(&directory)
+            .map_err(|source| DiscoverError::Io { path: directory.clone(), source })?;
+        for entry in entries {
+            let entry = entry.map_err(|source| DiscoverError::Io {
+                path: directory.clone(),
+                source,
+            })?;
+            let file_type = entry.file_type().map_err(|source| DiscoverError::Io {
+                path: entry.path(),
+                source,
+            })?;
+            if !file_type.is_dir() || file_type.is_symlink() {
+                continue;
+            }
+            let name = entry.file_name();
+            if IGNORED_DIRECTORIES.iter().any(|ignored| name == *ignored) {
+                continue;
+            }
+            stack.push((entry.path(), depth + 1));
+        }
+    }
+    Ok(())
+}
+
+fn project_markers(directory: &Path) -> Vec<ProjectMarker> {
+    let mut markers = Vec::new();
+    let known = [
+        (".git", ProjectMarkerKind::Git),
+        ("package.json", ProjectMarkerKind::PackageJson),
+        ("bun.lock", ProjectMarkerKind::JavaScriptLock),
+        ("bun.lockb", ProjectMarkerKind::JavaScriptLock),
+        ("package-lock.json", ProjectMarkerKind::JavaScriptLock),
+        ("pnpm-lock.yaml", ProjectMarkerKind::JavaScriptLock),
+        ("yarn.lock", ProjectMarkerKind::JavaScriptLock),
+        ("pyproject.toml", ProjectMarkerKind::Pyproject),
+        ("uv.lock", ProjectMarkerKind::PythonRequirements),
+        ("Pipfile", ProjectMarkerKind::PythonRequirements),
+        ("poetry.lock", ProjectMarkerKind::PythonRequirements),
+        ("go.mod", ProjectMarkerKind::GoModule),
+        ("go.work", ProjectMarkerKind::GoModule),
+        ("Cargo.toml", ProjectMarkerKind::Cargo),
+        ("Cargo.lock", ProjectMarkerKind::CargoLock),
+        ("compose.yaml", ProjectMarkerKind::Compose),
+        ("compose.yml", ProjectMarkerKind::Compose),
+        ("docker-compose.yaml", ProjectMarkerKind::Compose),
+        ("docker-compose.yml", ProjectMarkerKind::Compose),
+    ];
+    for (name, kind) in known {
+        let path = directory.join(name);
+        if path.exists() {
+            markers.push(ProjectMarker { kind, path });
+        }
+    }
+    if let Ok(entries) = fs::read_dir(directory) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name.to_str().is_some_and(|name| name.starts_with("Dockerfile"))
+                && entry.path().is_file()
+            {
+                markers.push(ProjectMarker {
+                    kind: ProjectMarkerKind::Dockerfile,
+                    path: entry.path(),
+                });
+            }
+            if name.to_str().is_some_and(|name| {
+                name == "requirements.txt"
+                    || (name.starts_with("requirements-") && name.ends_with(".txt"))
+            }) && entry.path().is_file()
+            {
+                markers.push(ProjectMarker {
+                    kind: ProjectMarkerKind::PythonRequirements,
+                    path: entry.path(),
+                });
+            }
+        }
+    }
+    markers
+}
+
+fn discovered_project(path: &Path, markers: Vec<ProjectMarker>) -> DiscoveredProject {
+    let mut project = DiscoveredProject {
+        name: path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("Project")
+            .to_string(),
+        path: path.to_path_buf(),
+        markers,
+        ecosystems: Vec::new(),
+        managed_project_id: None,
+    };
+    project.ecosystems = project_ecosystems(&project.markers);
+    project
+}
+
+fn merge_project_markers(project: &mut DiscoveredProject, markers: Vec<ProjectMarker>) {
+    for marker in markers {
+        if !project.markers.contains(&marker) {
+            project.markers.push(marker);
+        }
+    }
+    project.markers.sort_by(|left, right| left.path.cmp(&right.path));
+    project.ecosystems = project_ecosystems(&project.markers);
+}
+
+fn project_ecosystems(markers: &[ProjectMarker]) -> Vec<String> {
+    let mut ecosystems = Vec::new();
+    for marker in markers {
+        let ecosystem = match marker.kind {
+            ProjectMarkerKind::PackageJson => Some("javascript"),
+            ProjectMarkerKind::JavaScriptLock => Some("javascript"),
+            ProjectMarkerKind::Pyproject | ProjectMarkerKind::PythonRequirements => Some("python"),
+            ProjectMarkerKind::GoModule => Some("go"),
+            ProjectMarkerKind::Cargo | ProjectMarkerKind::CargoLock => Some("rust"),
+            ProjectMarkerKind::Compose | ProjectMarkerKind::Dockerfile => Some("docker"),
+            ProjectMarkerKind::Git
+            | ProjectMarkerKind::SelectedFolder
+            | ProjectMarkerKind::SelectedFileParent => None,
+        };
+        if let Some(ecosystem) = ecosystem {
+            if !ecosystems.iter().any(|candidate| candidate == ecosystem) {
+                ecosystems.push(ecosystem.to_string());
+            }
+        }
+    }
+    ecosystems
+}
+
+fn assign_project(path: &Path, projects: &[DiscoveredProject]) -> ProjectAssignment {
+    let containing_projects = projects
+        .iter()
+        .filter(|project| path.starts_with(&project.path))
+        .collect::<Vec<_>>();
+    if let Some(project) = containing_projects
+        .iter()
+        .copied()
+        .max_by_key(|project| path_depth(&project.path))
+    {
+        let candidate_project_paths = containing_projects
+            .iter()
+            .map(|candidate| candidate.path.clone())
+            .collect::<Vec<_>>();
+        if project.markers.iter().all(|marker| {
+            marker.kind == ProjectMarkerKind::SelectedFileParent
+        }) {
+            return ProjectAssignment {
+                state: ProjectAssignmentState::Unassigned,
+                project_path: None,
+                candidate_project_paths,
+            };
+        }
+        return ProjectAssignment {
+            state: ProjectAssignmentState::Assigned,
+            project_path: Some(project.path.clone()),
+            candidate_project_paths,
+        };
+    }
+    ProjectAssignment {
+        state: ProjectAssignmentState::Unassigned,
+        project_path: None,
+        candidate_project_paths: projects.iter().map(|project| project.path.clone()).collect(),
+    }
+}
+
+fn assignment_for_action(
+    mut assignment: ProjectAssignment,
+    action: DiscoveredFileAction,
+) -> ProjectAssignment {
+    if assignment.state == ProjectAssignmentState::Unassigned
+        && matches!(
+            action,
+            DiscoveredFileAction::Compose | DiscoveredFileAction::Reference
+        )
+    {
+        assignment.state = ProjectAssignmentState::NeedsReview;
+    }
+    assignment
+}
+
+fn unassigned_project() -> ProjectAssignment {
+    ProjectAssignment {
+        state: ProjectAssignmentState::Unassigned,
+        project_path: None,
+        candidate_project_paths: Vec::new(),
+    }
+}
+
+fn containing_input_root(inputs: &[PathBuf], path: &Path) -> Option<PathBuf> {
+    inputs
+        .iter()
+        .filter_map(|input| {
+            if input.is_file() {
+                (input == path).then(|| input.parent().unwrap_or(input).to_path_buf())
+            } else {
+                path.starts_with(input).then(|| input.clone())
+            }
+        })
+        .max_by_key(|input| path_depth(input))
+}
+
+fn path_depth(path: &Path) -> usize {
+    path.components().count()
+}
+
 fn collect_candidates(path: &Path) -> Result<Vec<PathBuf>, DiscoverError> {
     if path.is_file() {
-        return Ok(if is_candidate(path) {
-            vec![path.to_path_buf()]
-        } else {
-            Vec::new()
-        });
+        return Ok(vec![path.to_path_buf()]);
     }
 
     let mut candidates = Vec::new();
@@ -529,15 +963,110 @@ fn collect_candidates(path: &Path) -> Result<Vec<PathBuf>, DiscoverError> {
                 {
                     stack.push((child, depth + 1));
                 }
-            } else if file_type.is_file() && is_candidate(&child) {
-                candidates.push(child);
-                if candidates.len() >= MAX_CANDIDATES {
-                    return Ok(candidates);
+            } else if file_type.is_file() {
+                if is_candidate(&child) && !candidates.contains(&child) {
+                    candidates.push(child.clone());
+                    if candidates.len() >= MAX_CANDIDATES {
+                        return Ok(candidates);
+                    }
+                }
+                if is_compose_file(&child) {
+                    for referenced in static_compose_references(&child, path) {
+                        if !candidates.contains(&referenced) {
+                            candidates.push(referenced);
+                            if candidates.len() >= MAX_CANDIDATES {
+                                return Ok(candidates);
+                            }
+                        }
+                    }
                 }
             }
         }
     }
     Ok(candidates)
+}
+
+fn is_compose_file(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
+        matches!(
+            name,
+            "compose.yaml" | "compose.yml" | "docker-compose.yaml" | "docker-compose.yml"
+        )
+    })
+}
+
+/// Resolve only literal, local file references from common Compose forms.
+///
+/// Referenced paths must already exist below the selected scan root and may not be symlinks.
+/// Variables, anchors, URLs, and other YAML expressions are deliberately ignored.
+fn static_compose_references(compose: &Path, scan_root: &Path) -> Vec<PathBuf> {
+    let Ok(text) = fs::read_to_string(compose) else { return Vec::new() };
+    let canonical_root = fs::canonicalize(scan_root).unwrap_or_else(|_| scan_root.to_path_buf());
+    let mut references = Vec::new();
+    let mut top_section = String::new();
+    let mut env_file_indent = None;
+
+    for line in text.lines() {
+        let indent = line.chars().take_while(|character| character.is_whitespace()).count();
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if indent == 0 {
+            top_section = trimmed
+                .split_once(':')
+                .map(|(key, _)| key.trim().to_string())
+                .unwrap_or_default();
+        }
+        if env_file_indent.is_some_and(|block_indent| indent <= block_indent)
+            && !trimmed.starts_with("env_file:")
+        {
+            env_file_indent = None;
+        }
+
+        let mut scalar = None;
+        if let Some(value) = trimmed.strip_prefix("env_file:") {
+            env_file_indent = Some(indent);
+            if !value.trim().is_empty() {
+                scalar = Some(value.trim());
+            }
+        } else if env_file_indent.is_some_and(|block_indent| indent > block_indent) {
+            let item = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+            scalar = Some(item.strip_prefix("path:").map(str::trim).unwrap_or(item));
+        } else if matches!(top_section.as_str(), "secrets" | "configs") {
+            scalar = trimmed.strip_prefix("file:").map(str::trim);
+        }
+
+        let Some(value) = scalar.and_then(literal_yaml_path) else { continue };
+        let path = compose.parent().unwrap_or(compose).join(value);
+        let Ok(metadata) = fs::symlink_metadata(&path) else { continue };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let Ok(canonical) = fs::canonicalize(&path) else { continue };
+        if canonical.starts_with(&canonical_root) && !references.contains(&path) {
+            references.push(path);
+        }
+    }
+    references
+}
+
+fn literal_yaml_path(value: &str) -> Option<&str> {
+    let value = value
+        .split_once(" #")
+        .map(|(value, _)| value)
+        .unwrap_or(value)
+        .trim()
+        .trim_matches(|character| matches!(character, '\'' | '"'));
+    if value.is_empty()
+        || value.contains("${")
+        || value.contains(['{', '}', '[', ']', '*', '&', '!'])
+        || value.contains("://")
+    {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 fn is_candidate(path: &Path) -> bool {
@@ -547,12 +1076,48 @@ fn is_candidate(path: &Path) -> bool {
     let parent = path.parent().and_then(Path::file_name).and_then(|name| name.to_str());
     name == ".env"
         || name.starts_with(".env.")
+        || name.ends_with(".env")
+        || name == ".dev.vars"
+        || name.starts_with(".dev.vars.")
         || name == ".envrc"
         || matches!(name, "mise.toml" | ".mise.toml" | "mise.local.toml")
         || name == ".pgpass"
         || (name == "credentials" && parent == Some(".aws"))
         || (parent == Some(".ssh") && name.starts_with("id_") && !name.ends_with(".pub"))
+        || matches!(name, ".npmrc" | ".pypirc" | ".netrc" | "pip.conf")
+        || (parent == Some(".cargo") && name == "credentials.toml")
+        || (parent == Some(".docker") && name == "config.json")
         || name.ends_with(".pem")
+}
+
+fn candidate_likely_needs_project(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    name == ".env"
+        || name.starts_with(".env.")
+        || name.ends_with(".env")
+        || name == ".dev.vars"
+        || name.starts_with(".dev.vars.")
+        || name == ".envrc"
+        || matches!(name, "mise.toml" | ".mise.toml" | "mise.local.toml")
+}
+
+fn credential_file_tag(path: &Path) -> &'static str {
+    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+    let parent = path.parent().and_then(Path::file_name).and_then(|name| name.to_str());
+    match (parent, name) {
+        (_, ".npmrc") => "javascript",
+        (_, ".pypirc" | "pip.conf") => "python",
+        (Some(".cargo"), "credentials.toml") => "rust",
+        (Some(".docker"), "config.json") => "docker",
+        (_, ".netrc") => "credentials",
+        _ => "protected",
+    }
+}
+
+fn is_opaque_credential_file(path: &Path) -> bool {
+    credential_file_tag(path) != "protected"
 }
 
 fn discover_file(root: &Path, path: &Path) -> Result<Option<InternalFile>, DiscoverError> {
@@ -569,7 +1134,12 @@ fn discover_file(root: &Path, path: &Path) -> Result<Option<InternalFile>, Disco
         fs::read(path).map_err(|source| DiscoverError::Io { path: path.to_path_buf(), source })?;
     let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
 
-    if name == ".env" || name.starts_with(".env.") {
+    if name == ".env"
+        || name.starts_with(".env.")
+        || name.ends_with(".env")
+        || name == ".dev.vars"
+        || name.starts_with(".dev.vars.")
+    {
         return Ok(Some(discover_dotenv(root, path, &bytes)));
     }
     if name == ".envrc" {
@@ -592,6 +1162,15 @@ fn discover_file(root: &Path, path: &Path) -> Result<Option<InternalFile>, Disco
             "database",
         )));
     }
+    if is_opaque_credential_file(path) {
+        return Ok(Some(opaque_file(
+            root,
+            path,
+            DiscoveredFileKind::ProtectedFile,
+            DiscoveredFileAction::Protect,
+            credential_file_tag(path),
+        )));
+    }
     if looks_like_private_key(&bytes) {
         return Ok(Some(opaque_file(
             root,
@@ -601,7 +1180,30 @@ fn discover_file(root: &Path, path: &Path) -> Result<Option<InternalFile>, Disco
             "ssh",
         )));
     }
-    Ok(None)
+    let mut dotenv_warnings = Vec::new();
+    let entries = if looks_like_dotenv_assignments(&bytes) {
+        decode_entries(ResourceCodec::Dotenv, path, &bytes, &mut dotenv_warnings)
+    } else {
+        Vec::new()
+    };
+    if !entries.is_empty() && dotenv_warnings.is_empty() {
+        return Ok(Some(structured_file(
+            root,
+            path,
+            DiscoveredFileKind::Dotenv,
+            ResourceCodec::Dotenv,
+            Some("development".to_string()),
+            entries,
+            Vec::new(),
+        )));
+    }
+    Ok(Some(opaque_file(
+        root,
+        path,
+        DiscoveredFileKind::ProtectedFile,
+        DiscoveredFileAction::Protect,
+        credential_file_tag(path),
+    )))
 }
 
 fn discover_dotenv(root: &Path, path: &Path, bytes: &[u8]) -> InternalFile {
@@ -798,6 +1400,7 @@ fn structured_file(
     InternalFile {
         path: path.to_path_buf(),
         relative_path: relative_to(root, path),
+        assignment: unassigned_project(),
         kind,
         codec,
         environment,
@@ -822,6 +1425,7 @@ fn opaque_file(
     InternalFile {
         path: path.to_path_buf(),
         relative_path: relative_to(root, path),
+        assignment: unassigned_project(),
         kind,
         codec: ResourceCodec::Opaque,
         environment: None,
@@ -837,6 +1441,7 @@ fn warning_file(root: &Path, path: &Path, message: String) -> InternalFile {
     InternalFile {
         path: path.to_path_buf(),
         relative_path: relative_to(root, path),
+        assignment: unassigned_project(),
         kind: DiscoveredFileKind::Dotenv,
         codec: ResourceCodec::Opaque,
         environment: None,
@@ -848,25 +1453,22 @@ fn warning_file(root: &Path, path: &Path, message: String) -> InternalFile {
     }
 }
 
-fn find_project_root(start: &Path) -> PathBuf {
-    let fallback = match start.file_name().and_then(|name| name.to_str()) {
-        Some(".aws" | ".ssh") => start.parent().unwrap_or(start),
-        _ => start,
-    };
-    let mut current = Some(start);
-    while let Some(path) = current {
-        if path.join(".git").exists() {
-            return path.to_path_buf();
-        }
-        current = path.parent();
-    }
-    fallback.to_path_buf()
-}
-
 fn dotenv_environment(path: &Path) -> Option<String> {
     let name = path.file_name()?.to_str()?;
     if name == ".env" {
         return Some("development".to_string());
+    }
+    if name == ".dev.vars" || (name.ends_with(".env") && !name.starts_with(".env.")) {
+        return Some("development".to_string());
+    }
+    if let Some(suffix) = name.strip_prefix(".dev.vars.") {
+        return Some(
+            suffix
+                .split('.')
+                .find(|part| !part.is_empty() && *part != "local")
+                .unwrap_or("development")
+                .to_string(),
+        );
     }
     let suffix = name.strip_prefix(".env.")?;
     suffix
@@ -923,6 +1525,7 @@ fn file_kind_tag(kind: DiscoveredFileKind) -> &'static str {
         DiscoveredFileKind::AwsCredentials => "aws",
         DiscoveredFileKind::Pgpass => "database",
         DiscoveredFileKind::SshPrivateKey => "ssh",
+        DiscoveredFileKind::ProtectedFile => "protected",
     }
 }
 
@@ -948,6 +1551,22 @@ fn looks_like_private_key(bytes: &[u8]) -> bool {
     ]
     .iter()
     .any(|marker| text.contains(marker))
+}
+
+fn looks_like_dotenv_assignments(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else { return false };
+    let mut found = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if !line.contains('=') {
+            return false;
+        }
+        found = true;
+    }
+    found
 }
 
 #[cfg(test)]
@@ -982,7 +1601,8 @@ mod tests {
         let discovery = discover(root).unwrap();
         let plan = discovery.plan(&[]);
 
-        assert_eq!(plan.project.path, root);
+        assert_eq!(plan.projects.len(), 1);
+        assert_eq!(plan.projects[0].path, root);
         assert_eq!(plan.summary.files, 5);
         assert_eq!(plan.summary.entries, 4);
         assert_eq!(plan.summary.new_secrets, 1);
@@ -1028,7 +1648,7 @@ mod tests {
 
         let plan = discovery.plan(&existing);
 
-        assert_eq!(plan.path, file);
+        assert_eq!(plan.paths, vec![file]);
         assert_eq!(plan.summary.reused_secrets, 1);
         assert_eq!(plan.summary.new_secrets, 0);
         assert_eq!(
@@ -1243,6 +1863,7 @@ mod tests {
         .unwrap();
         let managed = ExistingProject {
             id: "fixture-project".to_string(),
+            path: root.to_path_buf(),
             environments: vec![ExistingEnvironment {
                 name: "QA West".to_string(),
                 surfaces: vec![ExistingSurface {
@@ -1253,9 +1874,12 @@ mod tests {
             }],
         };
 
-        let plan = discover(root).unwrap().plan_with_project(&[], Some(&managed));
+        let plan = discover(root).unwrap().plan_with_projects(&[], &[managed]);
 
-        assert_eq!(plan.project.managed_project_id.as_deref(), Some("fixture-project"));
+        assert_eq!(
+            plan.projects[0].managed_project_id.as_deref(),
+            Some("fixture-project")
+        );
         assert_eq!(plan.summary.missing_reference_entries, 1);
         assert_eq!(plan.files[0].managed_surface_id.as_deref(), Some("fixture-surface"));
         let entries = &plan.files[0].entries;
@@ -1269,5 +1893,196 @@ mod tests {
                 && entry.action
                     == DiscoveredEntryAction::ReferenceEntry { matched: false }
         }));
+    }
+
+    #[test]
+    fn workspace_discovery_groups_files_by_independent_git_projects() {
+        let directory = tempdir().unwrap();
+        let workspace = directory.path();
+        let web = workspace.join("web");
+        let api = workspace.join("api");
+        fs::create_dir_all(web.join(".git")).unwrap();
+        fs::create_dir_all(api.join(".git")).unwrap();
+        fs::write(web.join("package.json"), "{}\n").unwrap();
+        fs::write(web.join(".env"), "WEB_TOKEN=fixture-web\n").unwrap();
+        fs::write(api.join("pyproject.toml"), "[project]\nname='fixture'\n").unwrap();
+        fs::write(api.join(".env"), "API_TOKEN=fixture-api\n").unwrap();
+        fs::write(workspace.join(".env"), "SHARED_TOKEN=fixture-shared\n").unwrap();
+
+        let plan = discover(workspace).unwrap().plan(&[]);
+
+        assert_eq!(plan.projects.len(), 3);
+        assert_eq!(
+            plan.projects
+                .iter()
+                .map(|project| project.path.clone())
+                .collect::<HashSet<_>>(),
+            HashSet::from([workspace.to_path_buf(), web.clone(), api.clone()])
+        );
+        assert!(plan.projects.iter().any(|project| {
+            project.path == web && project.ecosystems == ["javascript"]
+        }));
+        assert!(plan.projects.iter().any(|project| {
+            project.path == api && project.ecosystems == ["python"]
+        }));
+        assert!(plan.files.iter().any(|file| {
+            file.path == web.join(".env")
+                && file.assignment.state == ProjectAssignmentState::Assigned
+                && file.assignment.project_path.as_ref() == Some(&web)
+        }));
+        let shared = plan
+            .files
+            .iter()
+            .find(|file| file.path == workspace.join(".env"))
+            .unwrap();
+        assert_eq!(shared.assignment.state, ProjectAssignmentState::NeedsReview);
+        assert_eq!(
+            shared.assignment.candidate_project_paths,
+            vec![workspace.to_path_buf()]
+        );
+    }
+
+    #[test]
+    fn one_git_project_can_be_polyglot() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(root.join("package.json"), "{}\n").unwrap();
+        fs::write(root.join("Cargo.toml"), "[package]\nname='fixture'\nversion='0.0.0'\n")
+            .unwrap();
+        fs::write(root.join(".env"), "APP_TOKEN=fixture-app\n").unwrap();
+
+        let plan = discover(root).unwrap().plan(&[]);
+
+        assert_eq!(plan.projects.len(), 1);
+        assert_eq!(
+            plan.projects[0]
+                .ecosystems
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>(),
+            HashSet::from(["javascript", "rust"])
+        );
+    }
+
+    #[test]
+    fn package_markers_find_mainstream_projects_without_git() {
+        let directory = tempdir().unwrap();
+        let workspace = directory.path();
+        let javascript = workspace.join("javascript");
+        let python = workspace.join("python");
+        let go = workspace.join("go");
+        let rust = workspace.join("rust");
+        let docker = workspace.join("docker");
+        for path in [&javascript, &python, &go, &rust, &docker] {
+            fs::create_dir(path).unwrap();
+            fs::write(path.join(".env"), "FIXTURE_VALUE=not-a-secret\n").unwrap();
+        }
+        fs::write(javascript.join("package.json"), "{}\n").unwrap();
+        fs::write(python.join("requirements.txt"), "fixture-package==0.0.0\n").unwrap();
+        fs::write(go.join("go.mod"), "module example.invalid/fixture\n").unwrap();
+        fs::write(
+            rust.join("Cargo.toml"),
+            "[package]\nname='fixture'\nversion='0.0.0'\n",
+        )
+        .unwrap();
+        fs::write(docker.join("compose.yaml"), "services: {}\n").unwrap();
+
+        let plan = discover(workspace).unwrap().plan(&[]);
+
+        assert_eq!(plan.projects.len(), 5);
+        let ecosystems = plan
+            .projects
+            .iter()
+            .flat_map(|project| project.ecosystems.iter().map(String::as_str))
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            ecosystems,
+            HashSet::from(["javascript", "python", "go", "rust", "docker"])
+        );
+        assert!(plan
+            .files
+            .iter()
+            .all(|file| file.assignment.state == ProjectAssignmentState::Assigned));
+    }
+
+    #[test]
+    fn compose_literal_file_references_join_discovery_without_following_outside_paths() {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("project");
+        let outside = directory.path().join("outside.env");
+        fs::create_dir_all(project.join("secrets")).unwrap();
+        fs::write(project.join("runtime.values"), "APP_MODE=fixture\n").unwrap();
+        fs::write(project.join("secrets/database-password"), "fixture-password\n").unwrap();
+        fs::write(&outside, "OUTSIDE_VALUE=ignored\n").unwrap();
+        fs::write(
+            project.join("compose.yaml"),
+            format!(
+                "services:\n  app:\n    env_file:\n      - runtime.values\nsecrets:\n  database_password:\n    file: ./secrets/database-password\nconfigs:\n  outside:\n    file: {}\n",
+                outside.display()
+            ),
+        )
+        .unwrap();
+
+        let plan = discover(&project).unwrap().plan(&[]);
+
+        assert!(plan.files.iter().any(|file| {
+            file.relative_path == Path::new("runtime.values")
+                && file.kind == DiscoveredFileKind::Dotenv
+                && file.action == DiscoveredFileAction::Compose
+        }));
+        assert!(
+            plan.files.iter().any(|file| {
+                file.relative_path == Path::new("secrets/database-password")
+                    && file.kind == DiscoveredFileKind::ProtectedFile
+                    && file.action == DiscoveredFileAction::Protect
+            }),
+            "{plan:#?}"
+        );
+        assert!(!plan.files.iter().any(|file| file.path == outside));
+    }
+
+    #[test]
+    fn an_explicit_unknown_file_is_discovered_losslessly() {
+        let directory = tempdir().unwrap();
+        let file = directory.path().join("credential.data");
+        fs::write(&file, "fixture opaque credential\n").unwrap();
+
+        let plan = discover(&file).unwrap().plan(&[]);
+
+        assert_eq!(plan.projects.len(), 0);
+        assert_eq!(plan.files.len(), 1);
+        assert_eq!(plan.files[0].kind, DiscoveredFileKind::ProtectedFile);
+        assert_eq!(plan.files[0].action, DiscoveredFileAction::Protect);
+        assert_eq!(
+            plan.files[0].assignment.state,
+            ProjectAssignmentState::Unassigned
+        );
+    }
+
+    #[test]
+    fn an_explicit_dotenv_without_project_markers_requires_parent_confirmation() {
+        let directory = tempdir().unwrap();
+        let file = directory.path().join(".env");
+        fs::write(&file, "SERVICE_TOKEN=fixture-value\n").unwrap();
+
+        let plan = discover(&file).unwrap().plan(&[]);
+
+        assert_eq!(plan.projects.len(), 1);
+        assert_eq!(plan.projects[0].path, directory.path());
+        assert_eq!(
+            plan.projects[0].markers[0].kind,
+            ProjectMarkerKind::SelectedFileParent
+        );
+        assert_eq!(plan.files.len(), 1);
+        assert_eq!(
+            plan.files[0].assignment.state,
+            ProjectAssignmentState::NeedsReview
+        );
+        assert_eq!(plan.files[0].assignment.project_path, None);
+        assert_eq!(
+            plan.files[0].assignment.candidate_project_paths,
+            vec![directory.path().to_path_buf()]
+        );
     }
 }

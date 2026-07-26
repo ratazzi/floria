@@ -62,10 +62,12 @@ pub enum ControlCommand {
     GrantClear,
     AccessHistory { limit: usize },
     Snapshot,
-    Discover { path: PathBuf },
+    Discover { paths: Vec<PathBuf> },
     DiscoverApply {
-        path: PathBuf,
+        paths: Vec<PathBuf>,
         files: Option<Vec<PathBuf>>,
+        #[serde(default)]
+        project_assignments: Vec<DiscoveryProjectAssignment>,
         separate_entries: Vec<DiscoveryEntryRef>,
         /// Review overrides: import these plain-classified entries as secrets.
         #[serde(default)]
@@ -287,11 +289,18 @@ pub struct AccessHistorySsh {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscoveryApplyResult {
     pub project_id: Option<String>,
+    pub project_ids: Vec<String>,
     pub created_resources: usize,
     pub reused_resources: usize,
     pub protected_files: usize,
     pub imported_ssh_identities: usize,
     pub files: Vec<DiscoveryAppliedFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DiscoveryProjectAssignment {
+    pub path: PathBuf,
+    pub project_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -543,13 +552,16 @@ mod tests {
         let request = ControlRequest {
             request_id: 12,
             command: ControlCommand::Discover {
-                path: PathBuf::from("/fixture/project"),
+                paths: vec![PathBuf::from("/fixture/project")],
             },
         };
         let value = serde_json::to_value(request).unwrap();
 
         assert_eq!(value["method"], "discover");
-        assert_eq!(value["params"]["path"], "/fixture/project");
+        assert_eq!(
+            value["params"]["paths"],
+            serde_json::json!(["/fixture/project"])
+        );
         assert_eq!(value["params"].as_object().unwrap().len(), 1);
     }
 
@@ -638,8 +650,12 @@ mod tests {
         let request = ControlRequest {
             request_id: 13,
             command: ControlCommand::DiscoverApply {
-                path: PathBuf::from("/fixture/project"),
+                paths: vec![PathBuf::from("/fixture/project")],
                 files: Some(vec![PathBuf::from("/fixture/project/.env")]),
+                project_assignments: vec![DiscoveryProjectAssignment {
+                    path: PathBuf::from("/fixture/project/.env"),
+                    project_path: PathBuf::from("/fixture/project"),
+                }],
                 separate_entries: vec![DiscoveryEntryRef {
                     path: PathBuf::from("/fixture/project/.env"),
                     address: "keys/API_TOKEN".to_string(),
@@ -651,7 +667,10 @@ mod tests {
         let value = serde_json::to_value(request).unwrap();
 
         assert_eq!(value["method"], "discover_apply");
-        assert_eq!(value["params"]["path"], "/fixture/project");
+        assert_eq!(
+            value["params"]["paths"],
+            serde_json::json!(["/fixture/project"])
+        );
         assert_eq!(
             value["params"]["files"],
             serde_json::json!(["/fixture/project/.env"])

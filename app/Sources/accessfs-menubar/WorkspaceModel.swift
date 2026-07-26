@@ -805,15 +805,21 @@ final class WorkspaceStore {
     }
 
     func discover(at path: String) async throws -> DiscoveryPlan {
+        try await discover(at: [path])
+    }
+
+    func discover(at paths: [String]) async throws -> DiscoveryPlan {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
-        let standardized = (path as NSString).standardizingPath
-        let plan = try await controlClient.discover(path: standardized)
+        let standardized = paths.map { ($0 as NSString).standardizingPath }
+        let plan = try await controlClient.discover(paths: standardized)
         lastError = nil
         return plan
     }
 
     func applyDiscovery(
-        at path: String, files: [String], separateEntries: [DiscoverySeparateEntry],
+        at paths: [String], files: [String],
+        projectAssignments: [DiscoveryProjectAssignment],
+        separateEntries: [DiscoverySeparateEntry],
         promoteEntries: [DiscoverySeparateEntry] = [],
         demoteEntries: [DiscoverySeparateEntry] = []
     ) async throws -> DiscoveryApplyResult {
@@ -826,8 +832,13 @@ final class WorkspaceStore {
             }
         }
         let result = try await controlClient.applyDiscovery(
-            path: (path as NSString).standardizingPath,
+            paths: paths.map { ($0 as NSString).standardizingPath },
             files: files.map { ($0 as NSString).standardizingPath },
+            projectAssignments: projectAssignments.map {
+                DiscoveryProjectAssignment(
+                    path: ($0.path as NSString).standardizingPath,
+                    projectPath: ($0.projectPath as NSString).standardizingPath)
+            },
             separateEntries: standardized(separateEntries),
             promoteEntries: standardized(promoteEntries),
             demoteEntries: standardized(demoteEntries))

@@ -5,15 +5,17 @@ pub(super) fn apply_discovery(
     catalog: &Catalog,
     store: &dyn SecretStore,
     mount_path: &Path,
-    path: &Path,
+    paths: &[PathBuf],
     selected_files: Option<&[PathBuf]>,
+    project_assignments: &[crate::protocol::DiscoveryProjectAssignment],
     separate_entries: &[crate::protocol::DiscoveryEntryRef],
     promote_entries: &[crate::protocol::DiscoveryEntryRef],
     demote_entries: &[crate::protocol::DiscoveryEntryRef],
 ) -> Result<ControlResult, DispatchError> {
-    let discovery =
-        discover(path).map_err(|error| DispatchError::Validation(error.to_string()))?;
-    let mut existing = existing_discovery_secrets(catalog, store)?;
+    let discovery = discover_many(paths)
+        .map_err(|error| DispatchError::Validation(error.to_string()))?;
+    let candidate_keys = discovery.shared_secret_candidate_keys();
+    let mut existing = existing_discovery_secrets(catalog, store, &candidate_keys)?;
     let plan = discovery.plan(&existing);
     let mut contents = discovery.into_contents();
     if let Some(selected_files) = selected_files {
@@ -32,6 +34,51 @@ pub(super) fn apply_discovery(
                     .map(|path| path.display().to_string())
                     .collect::<Vec<_>>()
                     .join(", ")
+            )));
+        }
+    }
+    let valid_project_paths = plan
+        .projects
+        .iter()
+        .map(|project| project.path.clone())
+        .collect::<HashSet<_>>();
+    let valid_file_paths =
+        contents.iter().map(|file| file.path.clone()).collect::<HashSet<_>>();
+    let mut explicit_assignments = HashMap::<PathBuf, PathBuf>::new();
+    for assignment in project_assignments {
+        if !valid_file_paths.contains(&assignment.path) {
+            return Err(DispatchError::Validation(format!(
+                "project assignment file was not part of the reviewed discovery: {}",
+                assignment.path.display()
+            )));
+        }
+        if !valid_project_paths.contains(&assignment.project_path) {
+            return Err(DispatchError::Validation(format!(
+                "project assignment target was not part of the reviewed discovery: {}",
+                assignment.project_path.display()
+            )));
+        }
+        if explicit_assignments
+            .insert(assignment.path.clone(), assignment.project_path.clone())
+            .is_some()
+        {
+            return Err(DispatchError::Validation(format!(
+                "project assignment was provided more than once: {}",
+                assignment.path.display()
+            )));
+        }
+    }
+    for file in &mut contents {
+        if let Some(project_path) = explicit_assignments.get(&file.path) {
+            file.assignment.project_path = Some(project_path.clone());
+            file.assignment.state = accessfs_discover::ProjectAssignmentState::Assigned;
+        }
+        if file.action == DiscoveredFileAction::Compose
+            && file.assignment.project_path.is_none()
+        {
+            return Err(DispatchError::Validation(format!(
+                "choose a project for {} before importing it",
+                file.path.display()
             )));
         }
     }
@@ -73,24 +120,42 @@ pub(super) fn apply_discovery(
             )));
         }
     }
-    let needs_project = contents
+    let required_project_paths = contents
         .iter()
-        .any(|file| file.action == DiscoveredFileAction::Compose);
-    let (project_id, project_created) = if needs_project {
-        let (id, created) = ensure_discovered_project(catalog, &plan.project)?;
-        (Some(id), created)
-    } else {
-        (None, false)
-    };
+        .filter(|file| file.action == DiscoveredFileAction::Compose)
+        .filter_map(|file| file.assignment.project_path.clone())
+        .collect::<HashSet<_>>();
+    let mut project_states = HashMap::<PathBuf, (String, bool)>::new();
+    for project_path in &required_project_paths {
+        let project = plan
+            .projects
+            .iter()
+            .find(|project| &project.path == project_path)
+            .ok_or_else(|| {
+                DispatchError::Validation(format!(
+                    "assigned project was not part of discovery: {}",
+                    project_path.display()
+                ))
+            })?;
+        let state = ensure_discovered_project(catalog, project)?;
+        project_states.insert(project_path.clone(), state);
+    }
+    let mut project_ids = project_states
+        .values()
+        .map(|(id, _)| id.clone())
+        .collect::<Vec<_>>();
+    project_ids.sort();
+    project_ids.dedup();
     let mut result = DiscoveryApplyResult {
-        project_id: project_id.clone(),
+        project_id: (project_ids.len() == 1).then(|| project_ids[0].clone()),
+        project_ids,
         created_resources: 0,
         reused_resources: 0,
         protected_files: 0,
         imported_ssh_identities: 0,
         files: Vec::new(),
     };
-    let mut composed_success = false;
+    let mut composed_success = HashSet::<PathBuf>::new();
 
     for file in contents {
         if file.action == DiscoveredFileAction::Compose && !file.warnings.is_empty() {
@@ -104,6 +169,11 @@ pub(super) fn apply_discovery(
         }
 
         let file_path = file.path.clone();
+        let assigned_project_path = file.assignment.project_path.clone();
+        let assigned_project_id = assigned_project_path
+            .as_ref()
+            .and_then(|path| project_states.get(path))
+            .map(|(id, _)| id.clone());
         let existing_len = existing.len();
         let applied = (|| -> Result<bool, DispatchError> {
             match file.action {
@@ -146,7 +216,7 @@ pub(super) fn apply_discovery(
                             kind: OriginKind::Discovered,
                             sources: vec![OriginSource {
                                 path: file.path.clone(),
-                                project_id: project_id.clone(),
+                                project_id: assigned_project_id.clone(),
                                 environment: None,
                                 imported_at: now_rfc3339(),
                             }],
@@ -161,7 +231,7 @@ pub(super) fn apply_discovery(
                     Ok(false)
                 }
                 DiscoveredFileAction::Compose => {
-                    let Some(project_id) = project_id.as_deref() else {
+                    let Some(project_id) = assigned_project_id.as_deref() else {
                         return Err(DispatchError::Validation(
                             "discovery composition requires a project".to_string(),
                         ));
@@ -201,7 +271,12 @@ pub(super) fn apply_discovery(
             }
         })();
         match applied {
-            Ok(imported_composed_file) => composed_success |= imported_composed_file,
+            Ok(true) => {
+                if let Some(project_path) = assigned_project_path {
+                    composed_success.insert(project_path);
+                }
+            }
+            Ok(false) => {}
             Err(error) => {
                 existing.truncate(existing_len);
                 result.files.push(DiscoveryAppliedFile {
@@ -213,12 +288,20 @@ pub(super) fn apply_discovery(
         }
     }
 
-    if project_created && !composed_success {
-        if let Some(project_id) = project_id {
-            catalog.remove_project(&project_id)?;
-            result.project_id = None;
+    for (project_path, (project_id, created)) in &project_states {
+        if *created && !composed_success.contains(project_path) {
+            catalog.remove_project(project_id)?;
         }
     }
+    result.project_ids = project_states
+        .iter()
+        .filter(|(path, _)| composed_success.contains(*path))
+        .map(|(_, (id, _))| id.clone())
+        .collect();
+    result.project_ids.sort();
+    result.project_ids.dedup();
+    result.project_id =
+        (result.project_ids.len() == 1).then(|| result.project_ids[0].clone());
     Ok(ControlResult::DiscoveryApplied(result))
 }
 
@@ -671,60 +754,69 @@ pub(super) fn generated_id(prefix: &str) -> String {
     format!("{prefix}-{}", SecretId::generate())
 }
 
-pub(super) fn existing_discovery_project(
+pub(super) fn existing_discovery_projects(
     catalog: &Catalog,
-    discovered: &accessfs_discover::DiscoveredProject,
-) -> Result<Option<ExistingProject>, DispatchError> {
+    discovered: &[accessfs_discover::DiscoveredProject],
+) -> Result<Vec<ExistingProject>, DispatchError> {
     let snapshot = catalog.snapshot()?;
-    let Some(project) = snapshot
-        .projects
-        .iter()
-        .find(|project| project.path == discovered.path)
-    else {
-        return Ok(None);
-    };
-    let environments = snapshot
-        .environments
-        .iter()
-        .filter(|environment| environment.project_id == project.id)
-        .map(|environment| {
-            let surfaces = snapshot
-                .surfaces
-                .iter()
-                .filter(|surface| {
-                    surface.environment_id == environment.id
-                        && matches!(
-                            surface.kind.composed_format(),
-                            Some(SurfaceFormat::Dotenv | SurfaceFormat::Direnv)
-                        )
-                })
-                .map(|surface| {
-                    Ok(ExistingSurface {
-                        id: surface.id.clone(),
-                        path: surface.path.clone(),
-                        keys: resolve_catalog_surface(&snapshot, &surface.id)?
-                            .into_iter()
-                            .map(|export| export.key)
-                            .collect(),
+    let mut existing = Vec::new();
+    for discovered_project in discovered {
+        let Some(project) = snapshot
+            .projects
+            .iter()
+            .find(|project| project.path == discovered_project.path)
+        else {
+            continue;
+        };
+        let environments = snapshot
+            .environments
+            .iter()
+            .filter(|environment| environment.project_id == project.id)
+            .map(|environment| {
+                let surfaces = snapshot
+                    .surfaces
+                    .iter()
+                    .filter(|surface| {
+                        surface.environment_id == environment.id
+                            && matches!(
+                                surface.kind.composed_format(),
+                                Some(SurfaceFormat::Dotenv | SurfaceFormat::Direnv)
+                            )
                     })
+                    .map(|surface| {
+                        Ok(ExistingSurface {
+                            id: surface.id.clone(),
+                            path: surface.path.clone(),
+                            keys: resolve_catalog_surface(&snapshot, &surface.id)?
+                                .into_iter()
+                                .map(|export| export.key)
+                                .collect(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, CatalogError>>()?;
+                Ok(ExistingEnvironment {
+                    name: environment.name.clone(),
+                    surfaces,
                 })
-                .collect::<Result<Vec<_>, CatalogError>>()?;
-            Ok(ExistingEnvironment {
-                name: environment.name.clone(),
-                surfaces,
             })
-        })
-        .collect::<Result<Vec<_>, CatalogError>>()?;
-    Ok(Some(ExistingProject {
-        id: project.id.clone(),
-        environments,
-    }))
+            .collect::<Result<Vec<_>, CatalogError>>()?;
+        existing.push(ExistingProject {
+            id: project.id.clone(),
+            path: project.path.clone(),
+            environments,
+        });
+    }
+    Ok(existing)
 }
 
 pub(super) fn existing_discovery_secrets(
     catalog: &Catalog,
     store: &dyn SecretStore,
+    candidate_keys: &HashSet<String>,
 ) -> Result<Vec<ExistingSecret>, DispatchError> {
+    if candidate_keys.is_empty() {
+        return Ok(Vec::new());
+    }
     let snapshot = catalog.snapshot()?;
     let mut existing = Vec::new();
     for resource in snapshot.resources {
@@ -732,6 +824,9 @@ pub(super) fn existing_discovery_secrets(
             continue;
         }
         let Some(key) = resource.default_env_key else { continue };
+        if !candidate_keys.contains(&key) {
+            continue;
+        }
         let ResourceSource::SecretRef { secret_id } = resource.source else { continue };
         let id = match secret_id.parse::<SecretId>() {
             Ok(id) => id,

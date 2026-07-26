@@ -80,19 +80,22 @@ pub(super) fn dispatch(
             limit.min(500),
         ),
         ControlCommand::Snapshot => Ok(ControlResult::Snapshot(catalog.snapshot()?)),
-        ControlCommand::Discover { path } => {
+        ControlCommand::Discover { paths } => {
             let store = store.ok_or(DispatchError::StoreUnavailable)?;
-            let discovery =
-                discover(&path).map_err(|error| DispatchError::Validation(error.to_string()))?;
-            let existing = existing_discovery_secrets(catalog, store)?;
-            let managed_project = existing_discovery_project(catalog, discovery.project())?;
+            let discovery = discover_many(&paths)
+                .map_err(|error| DispatchError::Validation(error.to_string()))?;
+            let candidate_keys = discovery.shared_secret_candidate_keys();
+            let existing = existing_discovery_secrets(catalog, store, &candidate_keys)?;
+            let managed_projects =
+                existing_discovery_projects(catalog, discovery.projects())?;
             Ok(ControlResult::Discovery(
-                discovery.plan_with_project(&existing, managed_project.as_ref()),
+                discovery.plan_with_projects(&existing, &managed_projects),
             ))
         }
         ControlCommand::DiscoverApply {
-            path,
+            paths,
             files,
+            project_assignments,
             separate_entries,
             promote_entries,
             demote_entries,
@@ -100,8 +103,9 @@ pub(super) fn dispatch(
             catalog,
             store.ok_or(DispatchError::StoreUnavailable)?,
             mount_path.ok_or(DispatchError::StoreUnavailable)?,
-            &path,
+            &paths,
             files.as_deref(),
+            &project_assignments,
             &separate_entries,
             &promote_entries,
             &demote_entries,

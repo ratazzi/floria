@@ -41,6 +41,7 @@
         entries: Mutex<HashMap<String, Vec<Vec<u8>>>>,
         metadata: Mutex<HashMap<String, (SecretOrigin, u32, ItemMetadata)>>,
         heads: Mutex<HashMap<String, u32>>,
+        get_calls: AtomicUsize,
     }
 
     impl FixtureStore {
@@ -49,6 +50,7 @@
                 entries: Mutex::new(HashMap::new()),
                 metadata: Mutex::new(HashMap::new()),
                 heads: Mutex::new(HashMap::new()),
+                get_calls: AtomicUsize::new(0),
             }
         }
     }
@@ -67,6 +69,7 @@
                         | "credentials"
                         | "DEBUG"
                         | ".env"
+                        | ".env.shared"
                 ));
             }
             let id: SecretId = FIXTURE_SECRET_ID.parse().unwrap();
@@ -83,6 +86,7 @@
         }
 
         fn get(&self, id: &SecretId) -> StoreResult<Zeroizing<Vec<u8>>> {
+            self.get_calls.fetch_add(1, Ordering::Relaxed);
             let entries = self.entries.lock().unwrap();
             let head = self.heads.lock().unwrap()[id.as_str()];
             Ok(Zeroizing::new(entries[id.as_str()][(head - 1) as usize].clone()))
@@ -553,7 +557,7 @@
         let result = dispatch(
             &catalog,
             DispatchServices { store: Some(&store), ..DispatchServices::default() },
-            ControlCommand::Discover { path: project_path },
+            ControlCommand::Discover { paths: vec![project_path] },
         )
         .unwrap();
         let serialized = serde_json::to_string(&result).unwrap();
@@ -580,6 +584,39 @@
     }
 
     #[test]
+    fn discovery_without_values_does_not_read_existing_secret_plaintext() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("empty-project");
+        std::fs::create_dir(&project_path).unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let store = FixtureStore::new();
+
+        dispatch(
+            &catalog,
+            DispatchServices { store: Some(&store), ..DispatchServices::default() },
+            ControlCommand::SharedSecretCreate {
+                resource_id: "fixture-unused-secret".to_string(),
+                name: "Fixture Shared Secret".to_string(),
+                default_env_key: Some("UNUSED_TOKEN".to_string()),
+                value: crate::protocol::SecretValue::new("fixture-unused-value"),
+                enforcement: Enforcement::Prompt,
+                metadata: ItemMetadata::default(),
+            },
+        )
+        .unwrap();
+
+        let result = dispatch(
+            &catalog,
+            DispatchServices { store: Some(&store), ..DispatchServices::default() },
+            ControlCommand::Discover { paths: vec![project_path] },
+        )
+        .unwrap();
+
+        assert!(matches!(result, ControlResult::Discovery(_)));
+        assert_eq!(store.get_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn discovery_apply_replaces_dotenv_with_a_composed_surface() {
         let dir = tempfile::tempdir().unwrap();
         let project_path = dir.path().join("fixture-project");
@@ -603,8 +640,9 @@
                 ..DispatchServices::default()
             },
             ControlCommand::DiscoverApply {
-                path: project_path.clone(),
+                paths: vec![project_path.clone()],
                 files: Some(vec![source_path.clone()]),
+                project_assignments: Vec::new(),
                 separate_entries: Vec::new(),
                 promote_entries: Vec::new(),
                 demote_entries: Vec::new(),
@@ -643,6 +681,94 @@
     }
 
     #[test]
+    fn discovery_apply_handles_multiple_projects_and_an_explicit_file_assignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace_path = dir.path().join("workspace");
+        let first_project_path = workspace_path.join("first-project");
+        let second_project_path = workspace_path.join("second-project");
+        let first_source_path = first_project_path.join(".env");
+        let second_source_path = second_project_path.join(".env");
+        let shared_source_path = workspace_path.join(".env.shared");
+        let mount_path = dir.path().join("mount");
+        std::fs::create_dir_all(first_project_path.join(".git")).unwrap();
+        std::fs::create_dir_all(second_project_path.join(".git")).unwrap();
+        std::fs::create_dir_all(mount_path.join(accessfs_core::config::SURFACES_DIR)).unwrap();
+        std::fs::write(&first_source_path, "FIRST_MODE=fixture-first\n").unwrap();
+        std::fs::write(&second_source_path, "SECOND_MODE=fixture-second\n").unwrap();
+        std::fs::write(&shared_source_path, "SHARED_MODE=fixture-shared\n").unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let store = FixtureStore::new();
+
+        let reviewed = dispatch(
+            &catalog,
+            DispatchServices { store: Some(&store), ..DispatchServices::default() },
+            ControlCommand::Discover { paths: vec![workspace_path.clone()] },
+        )
+        .unwrap();
+        let ControlResult::Discovery(plan) = reviewed else {
+            panic!("expected discovery result");
+        };
+        assert_eq!(plan.projects.len(), 3);
+        assert_eq!(
+            plan.files
+                .iter()
+                .find(|file| file.path == shared_source_path)
+                .unwrap()
+                .assignment
+                .state,
+            accessfs_discover::ProjectAssignmentState::NeedsReview
+        );
+
+        let applied = dispatch(
+            &catalog,
+            DispatchServices {
+                store: Some(&store),
+                mount_path: Some(&mount_path),
+                ..DispatchServices::default()
+            },
+            ControlCommand::DiscoverApply {
+                paths: vec![workspace_path.clone()],
+                files: Some(vec![
+                    first_source_path.clone(),
+                    second_source_path.clone(),
+                    shared_source_path.clone(),
+                ]),
+                project_assignments: vec![crate::protocol::DiscoveryProjectAssignment {
+                    path: shared_source_path.clone(),
+                    project_path: workspace_path.clone(),
+                }],
+                separate_entries: Vec::new(),
+                promote_entries: Vec::new(),
+                demote_entries: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let ControlResult::DiscoveryApplied(result) = applied else {
+            panic!("expected discovery apply result");
+        };
+        assert_eq!(result.project_ids.len(), 3);
+        assert_eq!(result.project_id, None);
+        assert_eq!(result.files.len(), 3);
+        assert!(
+            result
+                .files
+                .iter()
+                .all(|file| file.outcome == DiscoveryApplyOutcome::Imported),
+            "{result:#?}"
+        );
+        let snapshot = catalog.snapshot().unwrap();
+        assert_eq!(snapshot.projects.len(), 3);
+        assert_eq!(snapshot.surfaces.len(), 3);
+        for source_path in [first_source_path, second_source_path, shared_source_path] {
+            assert!(std::fs::symlink_metadata(source_path)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        }
+    }
+
+    #[test]
     fn discovery_apply_splits_plain_values_into_an_env_file_with_origins() {
         let dir = tempfile::tempdir().unwrap();
         let project_path = dir.path().join("fixture-project");
@@ -666,8 +792,9 @@
                 ..DispatchServices::default()
             },
             ControlCommand::DiscoverApply {
-                path: project_path,
+                paths: vec![project_path],
                 files: Some(vec![source_path.clone()]),
+                project_assignments: Vec::new(),
                 separate_entries: Vec::new(),
                 promote_entries: Vec::new(),
                 demote_entries: Vec::new(),
@@ -737,8 +864,9 @@
                 ..DispatchServices::default()
             },
             ControlCommand::DiscoverApply {
-                path: project_path,
+                paths: vec![project_path],
                 files: Some(vec![source_path.clone()]),
+                project_assignments: Vec::new(),
                 separate_entries: Vec::new(),
                 promote_entries: vec![crate::protocol::DiscoveryEntryRef {
                     path: source_path.clone(),
@@ -809,8 +937,9 @@
                 ..DispatchServices::default()
             },
             ControlCommand::DiscoverApply {
-                path: project_path,
+                paths: vec![project_path],
                 files: Some(vec![source_path.clone()]),
+                project_assignments: Vec::new(),
                 separate_entries: Vec::new(),
                 promote_entries: Vec::new(),
                 demote_entries: Vec::new(),
@@ -846,8 +975,9 @@
                 ..DispatchServices::default()
             },
             ControlCommand::DiscoverApply {
-                path: project_path,
+                paths: vec![project_path],
                 files: Some(vec![production_path.clone()]),
+                project_assignments: Vec::new(),
                 separate_entries: Vec::new(),
                 promote_entries: Vec::new(),
                 demote_entries: Vec::new(),
@@ -895,8 +1025,9 @@
                 ..DispatchServices::default()
             },
             ControlCommand::DiscoverApply {
-                path: project_path.clone(),
+                paths: vec![project_path.clone()],
                 files: None,
+                project_assignments: Vec::new(),
                 separate_entries: Vec::new(),
                 promote_entries: Vec::new(),
                 demote_entries: Vec::new(),
@@ -923,14 +1054,14 @@
         let rediscovered = dispatch(
             &catalog,
             DispatchServices { store: Some(&store), ..DispatchServices::default() },
-            ControlCommand::Discover { path: project_path.clone() },
+            ControlCommand::Discover { paths: vec![project_path.clone()] },
         )
         .unwrap();
         let ControlResult::Discovery(plan) = rediscovered else {
             panic!("expected discovery result");
         };
         assert_eq!(
-            plan.project.managed_project_id.as_deref(),
+            plan.projects[0].managed_project_id.as_deref(),
             Some(snapshot.projects[0].id.as_str())
         );
         assert_eq!(plan.summary.missing_reference_entries, 2);
@@ -1021,7 +1152,7 @@
         let rediscovered = dispatch(
             &catalog,
             DispatchServices { store: Some(&store), ..DispatchServices::default() },
-            ControlCommand::Discover { path: project_path },
+            ControlCommand::Discover { paths: vec![project_path] },
         )
         .unwrap();
         let ControlResult::Discovery(resolved_plan) = rediscovered else {
@@ -1060,8 +1191,9 @@
                 ..DispatchServices::default()
             },
             ControlCommand::DiscoverApply {
-                path: project_path,
+                paths: vec![project_path],
                 files: Some(vec![development_path, production_path]),
+                project_assignments: Vec::new(),
                 separate_entries: Vec::new(),
                 promote_entries: Vec::new(),
                 demote_entries: Vec::new(),
@@ -1110,8 +1242,9 @@
                 ..DispatchServices::default()
             },
             ControlCommand::DiscoverApply {
-                path: project_path,
+                paths: vec![project_path],
                 files: Some(vec![development_path, production_path.clone()]),
+                project_assignments: Vec::new(),
                 separate_entries: vec![crate::protocol::DiscoveryEntryRef {
                     path: production_path,
                     address: "keys/DISCOVERED_TOKEN".to_string(),
@@ -1153,8 +1286,9 @@
                 ..DispatchServices::default()
             },
             ControlCommand::DiscoverApply {
-                path: project_path.clone(),
+                paths: vec![project_path.clone()],
                 files: Some(vec![project_path.join(".env.not-reviewed")]),
+                project_assignments: Vec::new(),
                 separate_entries: Vec::new(),
                 promote_entries: Vec::new(),
                 demote_entries: Vec::new(),
@@ -1200,8 +1334,9 @@
                 ..DispatchServices::default()
             },
             ControlCommand::DiscoverApply {
-                path: project_path,
+                paths: vec![project_path],
                 files: Some(vec![dotenv_path.clone(), ssh_path.clone()]),
+                project_assignments: Vec::new(),
                 separate_entries: Vec::new(),
                 promote_entries: Vec::new(),
                 demote_entries: Vec::new(),
@@ -1256,8 +1391,9 @@
                 ..DispatchServices::default()
             },
             ControlCommand::DiscoverApply {
-                path: project_path,
+                paths: vec![project_path],
                 files: Some(vec![source_path.clone()]),
+                project_assignments: Vec::new(),
                 separate_entries: Vec::new(),
                 promote_entries: Vec::new(),
                 demote_entries: Vec::new(),
@@ -2184,4 +2320,3 @@
         assert!(!encoded.contains("fixture-region-two"));
         assert!(!encoded.contains("fixture-output"));
     }
-
