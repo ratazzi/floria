@@ -2,8 +2,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use accessfs_catalog::{
-    resolve_catalog_surface, BindingScope, Catalog, CatalogSnapshot, EntrySelection, Resource,
-    ResourceCodec, ResourceKind, ResourceSource, SurfaceInput, SurfaceKind, ValueShape,
+    resolve_catalog_surface, BindingScope, Catalog, CatalogSnapshot, EntrySelection, FileBacking,
+    Resource, ResourceCodec, ResourceKind, ResourceSource, SurfaceFormat, SurfaceInput,
+    SurfaceKind, ValueShape,
 };
 use accessfs_core::audit::AuditDependency;
 use accessfs_store::{SecretId, SecretStore};
@@ -188,7 +189,7 @@ impl SurfaceResolver {
             .iter()
             .find(|surface| surface.id == surface_id)
             .ok_or_else(|| SurfaceError::NotFound(surface_id.to_string()))?;
-        if surface.kind != SurfaceKind::DotenvFile {
+        if surface.kind != SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)) {
             return Err(SurfaceError::UnsupportedSurface {
                 surface_id: surface_id.to_string(),
                 kind: format!("{:?}", surface.kind),
@@ -240,7 +241,7 @@ impl SurfaceResolver {
             .iter()
             .find(|surface| surface.id == surface_id)
             .ok_or_else(|| SurfaceError::NotFound(surface_id.to_string()))?;
-        if surface.kind != SurfaceKind::DirenvFile {
+        if surface.kind != SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Direnv)) {
             return Err(SurfaceError::UnsupportedSurface {
                 surface_id: surface_id.to_string(),
                 kind: format!("{:?}", surface.kind),
@@ -292,7 +293,7 @@ impl SurfaceResolver {
             .iter()
             .find(|surface| surface.id == surface_id)
             .ok_or_else(|| SurfaceError::NotFound(surface_id.to_string()))?;
-        if surface.kind != SurfaceKind::IniFile {
+        if surface.kind != SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Ini)) {
             return Err(SurfaceError::UnsupportedSurface {
                 surface_id: surface_id.to_string(),
                 kind: format!("{:?}", surface.kind),
@@ -440,7 +441,7 @@ impl SurfaceResolver {
             .iter()
             .find(|surface| surface.id == surface_id)
             .ok_or_else(|| SurfaceError::NotFound(surface_id.to_string()))?;
-        if surface.kind != SurfaceKind::LinesFile {
+        if surface.kind != SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Lines)) {
             return Err(SurfaceError::UnsupportedSurface {
                 surface_id: surface_id.to_string(),
                 kind: format!("{:?}", surface.kind),
@@ -683,7 +684,7 @@ fn direct_env_file_target(
         .iter()
         .find(|surface| surface.id == surface_id)
         .ok_or_else(|| SurfaceError::NotFound(surface_id.to_string()))?;
-    if surface.kind != SurfaceKind::EnvFileDirect {
+    if surface.kind != SurfaceKind::File(FileBacking::EnvFileDirect) {
         return Err(SurfaceError::UnsupportedSurface {
             surface_id: surface_id.to_string(),
             kind: format!("{:?}", surface.kind),
@@ -1060,7 +1061,7 @@ mod tests {
                 id: "fixture-dotenv".to_string(),
                 environment_id: "fixture-development".to_string(),
                 name: ".env".to_string(),
-                kind: SurfaceKind::DotenvFile,
+                kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
                 path: PathBuf::from("/fixture/project/.env"),
                 input: SurfaceInput::Bindings {
                     binding_ids: vec![
@@ -1078,7 +1079,7 @@ mod tests {
                 id: "fixture-direct-env".to_string(),
                 environment_id: "fixture-development".to_string(),
                 name: ".env.source".to_string(),
-                kind: SurfaceKind::EnvFileDirect,
+                kind: SurfaceKind::File(FileBacking::EnvFileDirect),
                 path: PathBuf::from("/fixture/project/.env.source"),
                 input: SurfaceInput::Resource {
                     resource_id: "fixture-env-file".to_string(),
@@ -1099,7 +1100,7 @@ mod tests {
                 id: "fixture-direnv".to_string(),
                 environment_id: "fixture-development".to_string(),
                 name: ".envrc".to_string(),
-                kind: SurfaceKind::DirenvFile,
+                kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Direnv)),
                 path: PathBuf::from("/fixture/project/.envrc"),
                 input: SurfaceInput::Bindings {
                     binding_ids: vec![
@@ -1408,7 +1409,7 @@ mod tests {
                 id: "fixture-ini-dotenv".to_string(),
                 environment_id: "fixture-development".to_string(),
                 name: ".env.staging-profile".to_string(),
-                kind: SurfaceKind::DotenvFile,
+                kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
                 path: PathBuf::from("/fixture/project/.env.staging-profile"),
                 input: SurfaceInput::Bindings {
                     binding_ids: vec!["fixture-ini-binding".to_string()],
@@ -1422,7 +1423,7 @@ mod tests {
                 id: "fixture-ini-output".to_string(),
                 environment_id: "fixture-development".to_string(),
                 name: "fixture-credentials.ini".to_string(),
-                kind: SurfaceKind::IniFile,
+                kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Ini)),
                 path: PathBuf::from("/fixture/project/fixture-credentials.ini"),
                 input: SurfaceInput::Bindings {
                     binding_ids: vec!["fixture-ini-binding".to_string()],
@@ -1461,7 +1462,7 @@ mod tests {
             id: "fixture-incompatible-ini".to_string(),
             environment_id: "fixture-development".to_string(),
             name: "incompatible.ini".to_string(),
-            kind: SurfaceKind::IniFile,
+            kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Ini)),
             path: PathBuf::from("/fixture/project/incompatible.ini"),
             input: SurfaceInput::Bindings {
                 binding_ids: vec!["fixture-env-binding".to_string()],
@@ -1475,7 +1476,7 @@ mod tests {
             id: "fixture-incompatible-lines".to_string(),
             environment_id: "fixture-development".to_string(),
             name: "incompatible.lines".to_string(),
-            kind: SurfaceKind::LinesFile,
+            kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Lines)),
             path: PathBuf::from("/fixture/project/incompatible.lines"),
             input: SurfaceInput::Bindings {
                 binding_ids: vec!["fixture-token-binding".to_string()],
@@ -1526,7 +1527,7 @@ mod tests {
             id: "fixture-multiline-lines".to_string(),
             environment_id: "fixture-development".to_string(),
             name: "multiline.lines".to_string(),
-            kind: SurfaceKind::LinesFile,
+            kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Lines)),
             path: PathBuf::from("/fixture/project/multiline.lines"),
             input: SurfaceInput::Bindings {
                 binding_ids: vec![binding.id.clone()],
@@ -1689,7 +1690,7 @@ mod tests {
                 id: "fixture-common-first-ini".to_string(),
                 environment_id: "fixture-development".to_string(),
                 name: "common-first.ini".to_string(),
-                kind: SurfaceKind::IniFile,
+                kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Ini)),
                 path: PathBuf::from("/fixture/project/common-first.ini"),
                 input: SurfaceInput::Bindings {
                     binding_ids: vec![
@@ -1706,7 +1707,7 @@ mod tests {
                 id: "fixture-root-first-ini".to_string(),
                 environment_id: "fixture-development".to_string(),
                 name: "root-first.ini".to_string(),
-                kind: SurfaceKind::IniFile,
+                kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Ini)),
                 path: PathBuf::from("/fixture/project/root-first.ini"),
                 input: SurfaceInput::Bindings {
                     binding_ids: vec![
@@ -1807,7 +1808,7 @@ mod tests {
                 id: "fixture-common-first-lines".to_string(),
                 environment_id: "fixture-development".to_string(),
                 name: "common-first.lines".to_string(),
-                kind: SurfaceKind::LinesFile,
+                kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Lines)),
                 path: PathBuf::from("/fixture/project/common-first.lines"),
                 input: SurfaceInput::Bindings {
                     binding_ids: vec![
@@ -1867,7 +1868,7 @@ mod tests {
                 id: "fixture-lines".to_string(),
                 environment_id: "fixture-development".to_string(),
                 name: ".pgpass".to_string(),
-                kind: SurfaceKind::LinesFile,
+                kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Lines)),
                 path: PathBuf::from("/fixture/project/.pgpass"),
                 input: SurfaceInput::Bindings {
                     binding_ids: vec![
@@ -1884,7 +1885,7 @@ mod tests {
                 id: "fixture-other-lines".to_string(),
                 environment_id: "fixture-development".to_string(),
                 name: "credentials.lines".to_string(),
-                kind: SurfaceKind::LinesFile,
+                kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Lines)),
                 path: PathBuf::from("/fixture/project/credentials.lines"),
                 input: SurfaceInput::Bindings {
                     binding_ids: vec!["fixture-line-two-binding".to_string()],

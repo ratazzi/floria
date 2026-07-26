@@ -9,7 +9,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use accessfs_catalog::{
-    Catalog, CatalogSnapshot, ResourceKind, ResourceSource, Surface, SurfaceKind,
+    Catalog, CatalogSnapshot, ResourceKind, ResourceSource, Surface,
 };
 use accessfs_control::{
     ActiveGrant as ControlActiveGrant, CatalogObserver, ControlClient, ControlCommand,
@@ -765,14 +765,7 @@ fn cleanup_removed_file_links(
         let still_present = current.iter().any(|current| {
             current.id == surface.id
                 && current.path == surface.path
-                && matches!(
-                    current.kind,
-                    SurfaceKind::DotenvFile
-                        | SurfaceKind::DirenvFile
-                        | SurfaceKind::IniFile
-                        | SurfaceKind::EnvFileDirect
-                        | SurfaceKind::LinesFile
-                )
+                && current.kind.is_file()
         });
         if still_present {
             continue;
@@ -1269,8 +1262,8 @@ fn run(program: &str, args: &[&str]) -> bool {
 mod tests {
     use super::*;
     use accessfs_catalog::{
-        Binding, BindingScope, EntrySelection, EntrySpec, Resource, ResourceCodec, ResourceKind,
-        SurfaceInput, ValueShape,
+        Binding, BindingScope, EntrySelection, EntrySpec, FileBacking, Resource, ResourceCodec,
+        ResourceKind, SurfaceFormat, SurfaceInput, SurfaceKind, ValueShape,
     };
     use accessfs_store::SecretOrigin;
 
@@ -1383,7 +1376,7 @@ mod tests {
                 id: "combined".to_string(),
                 environment_id: "fixture-environment".to_string(),
                 name: ".env".to_string(),
-                kind: SurfaceKind::DotenvFile,
+                kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
                 path: PathBuf::from("/fixture/.env"),
                 input: SurfaceInput::Bindings {
                     binding_ids: vec!["audit-binding".to_string(), "bio-binding".to_string()],

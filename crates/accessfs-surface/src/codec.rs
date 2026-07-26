@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use accessfs_catalog::{
-    CatalogSnapshot, Resource, ResourceCodec, ResourceSource, SurfaceInput, SurfaceKind, ValueShape,
+    CatalogSnapshot, FileBacking, Resource, ResourceCodec, ResourceSource, SurfaceFormat,
+    SurfaceInput, SurfaceKind, ValueShape,
 };
 use zeroize::Zeroizing;
 
@@ -190,7 +191,7 @@ pub fn validate_secret_bytes(
     let line_binding_ids = snapshot
         .surfaces
         .iter()
-        .filter(|surface| surface.kind == SurfaceKind::LinesFile)
+        .filter(|surface| surface.kind == SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Lines)))
         .filter_map(|surface| match &surface.input {
             SurfaceInput::Bindings { binding_ids } => Some(binding_ids.as_slice()),
             SurfaceInput::SshAgent { .. } | SurfaceInput::Resource { .. } => None,
@@ -325,7 +326,7 @@ mod tests {
                 id: "fixture-lines".to_string(),
                 environment_id: "fixture-development".to_string(),
                 name: "credentials.lines".to_string(),
-                kind: SurfaceKind::LinesFile,
+                kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Lines)),
                 path: std::path::PathBuf::from("/fixture/credentials.lines"),
                 input: SurfaceInput::Bindings {
                     binding_ids: vec!["fixture-binding".to_string()],

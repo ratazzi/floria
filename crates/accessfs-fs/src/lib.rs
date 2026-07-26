@@ -1630,9 +1630,9 @@ pub fn mount_with_audit(
 mod tests {
     use super::*;
     use accessfs_catalog::{
-        Binding, BindingScope, CatalogSnapshot, EntrySelection, EntrySpec, Environment, Project,
-        Resource, ResourceCodec, ResourceKind, ResourceSource, Surface, SurfaceInput, SurfaceKind,
-        ValueShape,
+        Binding, BindingScope, CatalogSnapshot, EntrySelection, EntrySpec, Environment, FileBacking,
+        Project, Resource, ResourceCodec, ResourceKind, ResourceSource, Surface, SurfaceFormat,
+        SurfaceInput, SurfaceKind, ValueShape,
     };
     use accessfs_core::authz::{AllowAll, Enforcement};
     use accessfs_core::config::FileEntry;
@@ -2009,7 +2009,7 @@ mod tests {
             &catalog,
             "fixture-dotenv",
             ".env",
-            SurfaceKind::DotenvFile,
+            SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
             SurfaceInput::Bindings {
                 binding_ids: vec!["fixture-env-binding".to_string()],
             },
@@ -2019,7 +2019,7 @@ mod tests {
             &catalog,
             "fixture-direnv",
             ".envrc",
-            SurfaceKind::DirenvFile,
+            SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Direnv)),
             SurfaceInput::Bindings {
                 binding_ids: vec!["fixture-env-binding".to_string()],
             },
@@ -2029,7 +2029,7 @@ mod tests {
             &catalog,
             "fixture-ini-surface",
             "credentials.ini",
-            SurfaceKind::IniFile,
+            SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Ini)),
             SurfaceInput::Bindings {
                 binding_ids: vec!["fixture-ini-binding".to_string()],
             },
@@ -2039,7 +2039,7 @@ mod tests {
             &catalog,
             "fixture-lines",
             "credentials.lines",
-            SurfaceKind::LinesFile,
+            SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Lines)),
             SurfaceInput::Bindings {
                 binding_ids: vec!["fixture-line-binding".to_string()],
             },
@@ -2049,7 +2049,7 @@ mod tests {
             &catalog,
             "fixture-direct-surface",
             ".env.source",
-            SurfaceKind::EnvFileDirect,
+            SurfaceKind::File(FileBacking::EnvFileDirect),
             SurfaceInput::Resource {
                 resource_id: "fixture-direct".to_string(),
             },
@@ -2059,7 +2059,7 @@ mod tests {
             &catalog,
             "fixture-protected-lines",
             "protected.lines",
-            SurfaceKind::LinesFile,
+            SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Lines)),
             SurfaceInput::Bindings {
                 binding_ids: vec!["fixture-protected-line-binding".to_string()],
             },
@@ -2468,7 +2468,7 @@ mod tests {
             id: "fixture-dotenv-a".to_string(),
             environment_id: "fixture-development".to_string(),
             name: ".env".to_string(),
-            kind: SurfaceKind::DotenvFile,
+            kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
             path: tmp.path().join("project/.env"),
             input: SurfaceInput::Bindings { binding_ids: Vec::new() },
             enforcement: accessfs_core::authz::Enforcement::Prompt,
@@ -2498,7 +2498,7 @@ mod tests {
             id: "fixture-dotenv-b".to_string(),
             environment_id: "fixture-development".to_string(),
             name: ".env.local".to_string(),
-            kind: SurfaceKind::DotenvFile,
+            kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
             path: tmp.path().join("project/.env.local"),
             input: SurfaceInput::Bindings { binding_ids: Vec::new() },
             enforcement: accessfs_core::authz::Enforcement::Prompt,

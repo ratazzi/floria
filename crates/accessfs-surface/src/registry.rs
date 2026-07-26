@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 
-use accessfs_catalog::{CatalogSnapshot, ResourceSource, Surface, SurfaceInput, SurfaceKind};
+use accessfs_catalog::{
+    CatalogSnapshot, FileBacking, ResourceSource, Surface, SurfaceFormat, SurfaceInput, SurfaceKind,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SurfaceBacking {
@@ -65,19 +67,38 @@ fn file_surfaces(snapshot: &CatalogSnapshot) -> BTreeMap<String, RegisteredSurfa
         .iter()
         .filter_map(|surface| {
             let backing = match surface.kind {
-                SurfaceKind::DotenvFile => SurfaceBacking::DotenvComposed,
-                SurfaceKind::DirenvFile => SurfaceBacking::DirenvComposed,
-                SurfaceKind::IniFile => SurfaceBacking::IniComposed,
-                SurfaceKind::LinesFile => SurfaceBacking::LinesComposed,
-                SurfaceKind::EnvFileDirect => {
+                SurfaceKind::File(FileBacking::Composed(format)) => match format {
+                    SurfaceFormat::Dotenv => SurfaceBacking::DotenvComposed,
+                    SurfaceFormat::Direnv => SurfaceBacking::DirenvComposed,
+                    SurfaceFormat::Ini => SurfaceBacking::IniComposed,
+                    SurfaceFormat::Lines => SurfaceBacking::LinesComposed,
+                },
+                SurfaceKind::File(FileBacking::EnvFileDirect) => {
                     let SurfaceInput::Resource { resource_id } = &surface.input else {
+                        tracing::warn!(
+                            surface_id = %surface.id,
+                            "surface dropped from registry: direct file has no resource input"
+                        );
                         return None;
                     };
-                    let resource = snapshot
+                    let Some(resource) = snapshot
                         .resources
                         .iter()
-                        .find(|resource| resource.id == *resource_id)?;
+                        .find(|resource| resource.id == *resource_id)
+                    else {
+                        tracing::warn!(
+                            surface_id = %surface.id,
+                            resource_id,
+                            "surface dropped from registry: resource is missing"
+                        );
+                        return None;
+                    };
                     let ResourceSource::SecretRef { secret_id } = &resource.source else {
+                        tracing::warn!(
+                            surface_id = %surface.id,
+                            resource_id,
+                            "surface dropped from registry: resource is not store-backed"
+                        );
                         return None;
                     };
                     SurfaceBacking::EnvFileDirect {
@@ -85,7 +106,7 @@ fn file_surfaces(snapshot: &CatalogSnapshot) -> BTreeMap<String, RegisteredSurfa
                         secret_id: secret_id.clone(),
                     }
                 }
-                _ => return None,
+                SurfaceKind::UnixSocket => return None,
             };
             Some((
                 surface.id.clone(),
@@ -122,7 +143,7 @@ mod tests {
             input: SurfaceInput::Resource {
                 resource_id: "fixture-env-resource".to_string(),
             },
-            ..surface("fixture-direct", SurfaceKind::EnvFileDirect)
+            ..surface("fixture-direct", SurfaceKind::File(FileBacking::EnvFileDirect))
         };
         let env_resource = Resource {
             id: "fixture-env-resource".to_string(),
@@ -144,12 +165,12 @@ mod tests {
         };
         let registry = SurfaceRegistry::from_snapshot(&CatalogSnapshot {
             surfaces: vec![
-                surface("fixture-b", SurfaceKind::DotenvFile),
+                surface("fixture-b", SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv))),
                 surface("fixture-socket", SurfaceKind::UnixSocket),
-                surface("fixture-a", SurfaceKind::DotenvFile),
-                surface("fixture-direnv", SurfaceKind::DirenvFile),
-                surface("fixture-ini", SurfaceKind::IniFile),
-                surface("fixture-lines", SurfaceKind::LinesFile),
+                surface("fixture-a", SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv))),
+                surface("fixture-direnv", SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Direnv))),
+                surface("fixture-ini", SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Ini))),
+                surface("fixture-lines", SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Lines))),
                 direct,
             ],
             resources: vec![env_resource],
@@ -181,7 +202,7 @@ mod tests {
         ));
 
         registry.replace(&CatalogSnapshot {
-            surfaces: vec![surface("fixture-c", SurfaceKind::DotenvFile)],
+            surfaces: vec![surface("fixture-c", SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)))],
             ..CatalogSnapshot::default()
         });
         assert!(registry.get("fixture-a").is_none());

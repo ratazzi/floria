@@ -7,9 +7,9 @@ use std::sync::Arc;
 
 use accessfs_catalog::{
     resolve_catalog_surface, Binding, BindingScope, Catalog, CatalogError, CatalogSnapshot,
-    EntrySelection, EntrySpec, Environment, ItemMetadata, OriginKind, OriginSource, Project,
-    Resource, ResourceCodec, ResourceKind, ResourceOrigin, ResourceSource, Surface, SurfaceInput,
-    SurfaceKind, ValueShape,
+    EntrySelection, EntrySpec, Environment, FileBacking, ItemMetadata, OriginKind, OriginSource,
+    Project, Resource, ResourceCodec, ResourceKind, ResourceOrigin, ResourceSource, Surface,
+    SurfaceFormat, SurfaceInput, SurfaceKind, ValueShape,
 };
 use accessfs_core::audit::{read_recent_access, AuditAccessRecord};
 use accessfs_core::authz::{Enforcement, PolicyMode, PolicyModeStatus};
@@ -1334,9 +1334,9 @@ fn apply_composed_discovery(
     }
 
     let surface_kind = match file.kind {
-        DiscoveredFileKind::Dotenv => SurfaceKind::DotenvFile,
-        DiscoveredFileKind::Direnv => SurfaceKind::DirenvFile,
-        DiscoveredFileKind::AwsCredentials => SurfaceKind::IniFile,
+        DiscoveredFileKind::Dotenv => SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
+        DiscoveredFileKind::Direnv => SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Direnv)),
+        DiscoveredFileKind::AwsCredentials => SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Ini)),
         _ => unreachable!("non-composable kinds returned above"),
     };
     let surface = Surface {
@@ -1653,8 +1653,8 @@ fn existing_discovery_project(
                 .filter(|surface| {
                     surface.environment_id == environment.id
                         && matches!(
-                            surface.kind,
-                            SurfaceKind::DotenvFile | SurfaceKind::DirenvFile
+                            surface.kind.composed_format(),
+                            Some(SurfaceFormat::Dotenv | SurfaceFormat::Direnv)
                         )
                 })
                 .map(|surface| {
@@ -1738,7 +1738,10 @@ fn resolve_discovery_reference(
         .find(|surface| surface.id == surface_id)
         .ok_or_else(|| DispatchError::Validation(format!("surface {surface_id:?} was not found")))?
         .clone();
-    if !matches!(surface.kind, SurfaceKind::DotenvFile | SurfaceKind::DirenvFile) {
+    if !matches!(
+        surface.kind.composed_format(),
+        Some(SurfaceFormat::Dotenv | SurfaceFormat::Direnv)
+    ) {
         return Err(DispatchError::Validation(
             "reference values can only be attached to dotenv or direnv outputs".to_string(),
         ));
@@ -3173,7 +3176,7 @@ mod tests {
                 id: "fixture-surface".to_string(),
                 environment_id: "fixture-environment".to_string(),
                 name: ".env".to_string(),
-                kind: SurfaceKind::DotenvFile,
+                kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
                 path: display_path.clone(),
                 input: SurfaceInput::Bindings { binding_ids: Vec::new() },
                 enforcement: Enforcement::Prompt,
@@ -3996,7 +3999,7 @@ mod tests {
             .entries
             .iter()
             .any(|entry| entry.address.contains("staging")));
-        assert_eq!(snapshot.surfaces[0].kind, SurfaceKind::IniFile);
+        assert_eq!(snapshot.surfaces[0].kind, SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Ini)));
         assert!(std::fs::symlink_metadata(source_path)
             .unwrap()
             .file_type()
@@ -4176,7 +4179,7 @@ mod tests {
         let mut client = ControlClient::connect(&socket).unwrap();
         assert_eq!(
             client.request(ControlCommand::Ping).unwrap(),
-            ControlResult::Pong { schema_version: 9 }
+            ControlResult::Pong { schema_version: 10 }
         );
         client
             .request(ControlCommand::ProjectUpsert {
@@ -4254,7 +4257,7 @@ mod tests {
                     id: "fixture-dotenv".to_string(),
                     environment_id: "fixture-development".to_string(),
                     name: ".env".to_string(),
-                    kind: SurfaceKind::DotenvFile,
+                    kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
                     path: PathBuf::from("/fixture/project/.env"),
                     input: SurfaceInput::Bindings { binding_ids: Vec::new() },
                     enforcement: Enforcement::Prompt,
@@ -4296,7 +4299,7 @@ mod tests {
                     id: "fixture-dotenv".to_string(),
                     environment_id: "fixture-development".to_string(),
                     name: ".env".to_string(),
-                    kind: SurfaceKind::DotenvFile,
+                    kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
                     path: PathBuf::from("/outside/.env"),
                     input: SurfaceInput::Bindings { binding_ids: Vec::new() },
                     enforcement: Enforcement::Prompt,

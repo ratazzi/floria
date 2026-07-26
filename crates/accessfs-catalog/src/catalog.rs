@@ -7,14 +7,14 @@ use accessfs_core::authz::Enforcement;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::domain::{
-    Binding, BindingScope, CatalogSnapshot, EntrySelection, Environment, OriginSource, Project,
-    ProjectCheckout, ProjectCheckoutKind, ResolvedEnvironment, ResolvedExport, Resource,
+    Binding, BindingScope, CatalogSnapshot, EntrySelection, Environment, FileBacking, OriginSource,
+    Project, ProjectCheckout, ProjectCheckoutKind, ResolvedEnvironment, ResolvedExport, Resource,
     ResourceBindingUsage, ResourceCodec, ResourceKind, ResourceOrigin, ResourceSource,
-    ResourceUsage, Surface, SurfaceInput, SurfaceKind, ValueShape,
+    ResourceUsage, Surface, SurfaceFormat, SurfaceInput, SurfaceKind, ValueShape,
 };
 use crate::error::{CatalogError, CatalogResult};
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 #[derive(Debug, Clone)]
 pub struct Catalog {
@@ -682,7 +682,7 @@ fn migrate(conn: &mut Connection) -> CatalogResult<()> {
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         CREATE INDEX surfaces_environment_idx ON surfaces(environment_id, position);
-        PRAGMA user_version = 9;",
+        PRAGMA user_version = 10;",
     )?;
     tx.commit()?;
     Ok(())
@@ -877,7 +877,10 @@ pub fn resolve_catalog_surface(
         .iter()
         .find(|surface| surface.id == surface_id)
         .ok_or_else(|| CatalogError::NotFound(format!("surface {surface_id}")))?;
-    if !matches!(surface.kind, SurfaceKind::DotenvFile | SurfaceKind::DirenvFile) {
+    if !matches!(
+        surface.kind.composed_format(),
+        Some(SurfaceFormat::Dotenv | SurfaceFormat::Direnv)
+    ) {
         return Err(CatalogError::Validation(format!(
             "surface {surface_id:?} is not a keyed environment projection"
         )));
@@ -996,12 +999,17 @@ fn validate_snapshot_conflicts(snapshot: &CatalogSnapshot) -> CatalogResult<()> 
     validate_ssh_route_conflicts(snapshot)?;
     for surface in &snapshot.surfaces {
         match surface.kind {
-            SurfaceKind::DotenvFile | SurfaceKind::DirenvFile => {
+            SurfaceKind::File(FileBacking::Composed(
+                SurfaceFormat::Dotenv | SurfaceFormat::Direnv,
+            )) => {
                 resolve_catalog_surface(snapshot, &surface.id)?;
             }
-            SurfaceKind::IniFile => validate_ini_surface_conflicts(snapshot, surface)?,
+            SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Ini)) => {
+                validate_ini_surface_conflicts(snapshot, surface)?
+            }
+            SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Lines))
+            | SurfaceKind::File(FileBacking::EnvFileDirect) => {}
             SurfaceKind::UnixSocket => validate_ssh_agent_surface_conflicts(snapshot, surface)?,
-            _ => {}
         }
     }
     Ok(())
@@ -1061,10 +1069,7 @@ fn validate_surface_inputs(snapshot: &CatalogSnapshot) -> CatalogResult<()> {
         })?;
         match (&surface.kind, &surface.input) {
             (
-                SurfaceKind::DotenvFile
-                    | SurfaceKind::DirenvFile
-                    | SurfaceKind::IniFile
-                    | SurfaceKind::LinesFile,
+                SurfaceKind::File(FileBacking::Composed(_)),
                 SurfaceInput::Bindings { binding_ids },
             )
             | (
@@ -1102,7 +1107,7 @@ fn validate_surface_inputs(snapshot: &CatalogSnapshot) -> CatalogResult<()> {
                     validate_composed_surface_member(surface, binding, resource)?;
                 }
             }
-            (SurfaceKind::EnvFileDirect, SurfaceInput::Resource { resource_id }) => {
+            (SurfaceKind::File(FileBacking::EnvFileDirect), SurfaceInput::Resource { resource_id }) => {
                 let resource = resources.get(resource_id.as_str()).ok_or_else(|| {
                     CatalogError::NotFound(format!("resource {resource_id}"))
                 })?;
@@ -1115,11 +1120,6 @@ fn validate_surface_inputs(snapshot: &CatalogSnapshot) -> CatalogResult<()> {
                         "env_file_direct surface {:?} requires an env_file resource",
                         surface.id
                     )));
-                }
-            }
-            (SurfaceKind::RegularFile, SurfaceInput::Resource { resource_id }) => {
-                if !resources.contains_key(resource_id.as_str()) {
-                    return Err(CatalogError::NotFound(format!("resource {resource_id}")));
                 }
             }
             _ => {
@@ -1143,7 +1143,7 @@ fn validate_composed_surface_member(
         EntrySelection::Entries { addresses } => addresses.contains(&entry.address),
     });
     match surface.kind {
-        SurfaceKind::DotenvFile | SurfaceKind::DirenvFile => {
+        SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)) | SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Direnv)) => {
             let compatible_source = matches!(
                 (&resource.shape, &resource.codec, &resource.source),
                 (
@@ -1171,7 +1171,7 @@ fn validate_composed_surface_member(
                 return Err(CatalogError::Validation(format!(
                     "binding {:?} cannot feed {} surface {:?}",
                     binding.id,
-                    if surface.kind == SurfaceKind::DotenvFile {
+                    if surface.kind == SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)) {
                         "dotenv"
                     } else {
                         "direnv"
@@ -1180,7 +1180,7 @@ fn validate_composed_surface_member(
                 )));
             }
         }
-        SurfaceKind::IniFile => {
+        SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Ini)) => {
             let compatible = resource.kind == ResourceKind::EnvFile
                 && resource.shape == ValueShape::KeyValueSet
                 && resource.codec == ResourceCodec::Ini
@@ -1194,7 +1194,7 @@ fn validate_composed_surface_member(
                 )));
             }
         }
-        SurfaceKind::LinesFile => {
+        SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Lines)) => {
             let compatible = resource.shape == ValueShape::Scalar
                 && resource.codec == ResourceCodec::Opaque
                 && binding.key_override.is_none()
@@ -1233,7 +1233,9 @@ fn validate_composed_surface_member(
                 )));
             }
         }
-        _ => unreachable!("only composed surfaces call member validation"),
+        SurfaceKind::File(FileBacking::EnvFileDirect) => {
+            unreachable!("only composed surfaces call member validation")
+        }
     }
     Ok(())
 }
@@ -1936,7 +1938,7 @@ mod tests {
         let error = migrate(&mut conn).unwrap_err();
         assert!(matches!(
             error,
-            CatalogError::UnsupportedSchema { found: 1, expected: 9 }
+            CatalogError::UnsupportedSchema { found: 1, expected: 10 }
         ));
     }
 
@@ -1946,7 +1948,7 @@ mod tests {
         let path = dir.path().join("catalog.sqlite");
 
         let catalog = Catalog::open(&path).unwrap();
-        assert_eq!(catalog.schema_version(), 9);
+        assert_eq!(catalog.schema_version(), 10);
         drop(catalog);
 
         let reopened = Catalog::open(&path).unwrap();
@@ -1955,7 +1957,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(persisted, 9);
+        assert_eq!(persisted, 10);
     }
 
     #[test]
@@ -2063,7 +2065,7 @@ mod tests {
                 id: "fixture-dotenv".to_string(),
                 environment_id: "development".to_string(),
                 name: ".env".to_string(),
-                kind: SurfaceKind::DotenvFile,
+                kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
                 path: PathBuf::from("/workspace/floria/.env"),
                 input: SurfaceInput::Bindings {
                     binding_ids: vec!["fixture-ini-binding".to_string()],
@@ -2079,7 +2081,7 @@ mod tests {
             id: "fixture-ini-output".to_string(),
             environment_id: "development".to_string(),
             name: "credentials.ini".to_string(),
-            kind: SurfaceKind::IniFile,
+            kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Ini)),
             path: PathBuf::from("/workspace/floria/credentials.ini"),
             input: SurfaceInput::Bindings {
                 binding_ids: vec!["fixture-ini-binding".to_string()],
@@ -2134,7 +2136,7 @@ mod tests {
                 id: "dotenv".to_string(),
                 environment_id: "development".to_string(),
                 name: ".env".to_string(),
-                kind: SurfaceKind::DotenvFile,
+                kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
                 path: PathBuf::from("/workspace/floria/.env"),
                 input: SurfaceInput::Bindings {
                     binding_ids: vec!["common-cloudflare".to_string()],
@@ -2207,7 +2209,7 @@ mod tests {
             id: "fixture-dotenv".to_string(),
             environment_id: "development".to_string(),
             name: ".config/dev.env".to_string(),
-            kind: SurfaceKind::DotenvFile,
+            kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
             path: PathBuf::from("/workspace/floria/.config/dev.env"),
             input: SurfaceInput::Bindings { binding_ids: Vec::new() },
             enforcement: Enforcement::Prompt,
@@ -2268,7 +2270,7 @@ mod tests {
                     id: id.to_string(),
                     environment_id: environment_id.to_string(),
                     name: ".env".to_string(),
-                    kind: SurfaceKind::DotenvFile,
+                    kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
                     path: PathBuf::from(path),
                     input: SurfaceInput::Bindings {
                         binding_ids: vec!["fixture-common".to_string()],
@@ -2302,7 +2304,7 @@ mod tests {
                 id: "fixture-dotenv".to_string(),
                 environment_id: "development".to_string(),
                 name: ".env".to_string(),
-                kind: SurfaceKind::DotenvFile,
+                kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
                 path: PathBuf::from("/workspace/other/.env"),
                 input: SurfaceInput::Bindings { binding_ids: vec![] },
                 enforcement: Enforcement::Prompt,
@@ -2320,7 +2322,7 @@ mod tests {
                 id: "../fixture-dotenv".to_string(),
                 environment_id: "development".to_string(),
                 name: ".env".to_string(),
-                kind: SurfaceKind::DotenvFile,
+                kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
                 path: PathBuf::from("/workspace/floria/.env"),
                 input: SurfaceInput::Bindings { binding_ids: vec![] },
                 enforcement: Enforcement::Prompt,
@@ -2340,7 +2342,7 @@ mod tests {
                 id: "fixture-direct-env".to_string(),
                 environment_id: "development".to_string(),
                 name: ".env.local".to_string(),
-                kind: SurfaceKind::EnvFileDirect,
+                kind: SurfaceKind::File(FileBacking::EnvFileDirect),
                 path: PathBuf::from("/workspace/floria/.env.local"),
                 input: SurfaceInput::Resource { resource_id: resource.id.clone() },
                 enforcement: Enforcement::Prompt,
@@ -2368,7 +2370,7 @@ mod tests {
             id: "fixture-direct-env".to_string(),
             environment_id: "development".to_string(),
             name: ".env.local".to_string(),
-            kind: SurfaceKind::EnvFileDirect,
+            kind: SurfaceKind::File(FileBacking::EnvFileDirect),
             path: PathBuf::from("/workspace/floria/.env.local"),
             input: SurfaceInput::Bindings { binding_ids: vec![] },
             enforcement: Enforcement::Prompt,
@@ -2409,7 +2411,7 @@ mod tests {
             id: "fixture-dotenv".to_string(),
             environment_id: "development".to_string(),
             name: ".env".to_string(),
-            kind: SurfaceKind::DotenvFile,
+            kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
             path: PathBuf::from("/workspace/floria/.env"),
             input: SurfaceInput::Bindings {
                 binding_ids: vec!["first-binding".to_string()],
@@ -2453,13 +2455,13 @@ mod tests {
                 "first-surface",
                 ".env.first",
                 "first-binding",
-                SurfaceKind::DotenvFile,
+                SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
             ),
             (
                 "second-surface",
                 ".envrc",
                 "second-binding",
-                SurfaceKind::DirenvFile,
+                SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Direnv)),
             ),
         ] {
             catalog
@@ -2493,7 +2495,7 @@ mod tests {
             id: "fixture-dotenv".to_string(),
             environment_id: "development".to_string(),
             name: ".env".to_string(),
-            kind: SurfaceKind::DotenvFile,
+            kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
             path: PathBuf::from("/workspace/floria/.env"),
             input: SurfaceInput::Bindings {
                 binding_ids: vec!["missing-binding".to_string()],

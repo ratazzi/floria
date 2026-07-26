@@ -148,14 +148,7 @@ pub fn remove_file_surface_link(
 }
 
 fn is_file_surface(kind: SurfaceKind) -> bool {
-    matches!(
-        kind,
-        SurfaceKind::DotenvFile
-            | SurfaceKind::DirenvFile
-            | SurfaceKind::IniFile
-            | SurfaceKind::EnvFileDirect
-            | SurfaceKind::LinesFile
-    )
+    kind.is_file()
 }
 
 fn validate_surface_id(id: &str) -> SurfaceResult<()> {
@@ -230,7 +223,8 @@ fn link_conflict(path: &Path, expected: &Path, reason: impl Into<String>) -> Sur
 mod tests {
     use super::*;
     use accessfs_catalog::{
-        CatalogSnapshot, Environment, Project, ProjectCheckout, ProjectCheckoutKind, SurfaceInput,
+        CatalogSnapshot, Environment, FileBacking, Project, ProjectCheckout, ProjectCheckoutKind,
+        SurfaceFormat, SurfaceInput,
     };
     use std::path::PathBuf;
 
@@ -239,7 +233,7 @@ mod tests {
             id: "fixture-dotenv".to_string(),
             environment_id: "fixture-development".to_string(),
             name: ".env".to_string(),
-            kind: SurfaceKind::DotenvFile,
+            kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
             path,
             input: SurfaceInput::Bindings { binding_ids: Vec::new() },
             enforcement: accessfs_core::authz::Enforcement::Prompt,

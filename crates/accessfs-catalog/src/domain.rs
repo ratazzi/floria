@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use accessfs_core::authz::Enforcement;
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 pub use accessfs_core::metadata::{ItemLink, ItemMetadata};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,42 +271,89 @@ fn enabled_by_default() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SurfaceKind {
-    DotenvFile,
-    DirenvFile,
-    IniFile,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceFormat {
+    Dotenv,
+    Direnv,
+    Ini,
+    Lines,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileBacking {
+    /// Rendered from bindings on every open.
+    Composed(SurfaceFormat),
+    /// Raw passthrough of one env_file resource.
     EnvFileDirect,
-    LinesFile,
-    RegularFile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SurfaceKind {
+    File(FileBacking),
     UnixSocket,
 }
 
 impl SurfaceKind {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
-            SurfaceKind::DotenvFile => "dotenv_file",
-            SurfaceKind::DirenvFile => "direnv_file",
-            SurfaceKind::IniFile => "ini_file",
-            SurfaceKind::EnvFileDirect => "env_file_direct",
-            SurfaceKind::LinesFile => "lines_file",
-            SurfaceKind::RegularFile => "regular_file",
+            SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)) => "dotenv_file",
+            SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Direnv)) => "direnv_file",
+            SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Ini)) => "ini_file",
+            SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Lines)) => "lines_file",
+            SurfaceKind::File(FileBacking::EnvFileDirect) => "env_file_direct",
             SurfaceKind::UnixSocket => "unix_socket",
         }
     }
 
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
-            "dotenv_file" => Some(SurfaceKind::DotenvFile),
-            "direnv_file" => Some(SurfaceKind::DirenvFile),
-            "ini_file" => Some(SurfaceKind::IniFile),
-            "env_file_direct" => Some(SurfaceKind::EnvFileDirect),
-            "lines_file" => Some(SurfaceKind::LinesFile),
-            "regular_file" => Some(SurfaceKind::RegularFile),
+            "dotenv_file" => Some(SurfaceKind::File(FileBacking::Composed(
+                SurfaceFormat::Dotenv,
+            ))),
+            "direnv_file" => Some(SurfaceKind::File(FileBacking::Composed(
+                SurfaceFormat::Direnv,
+            ))),
+            "ini_file" => Some(SurfaceKind::File(FileBacking::Composed(
+                SurfaceFormat::Ini,
+            ))),
+            "env_file_direct" => Some(SurfaceKind::File(FileBacking::EnvFileDirect)),
+            "lines_file" => Some(SurfaceKind::File(FileBacking::Composed(
+                SurfaceFormat::Lines,
+            ))),
             "unix_socket" => Some(SurfaceKind::UnixSocket),
             _ => None,
         }
+    }
+
+    pub const fn is_file(self) -> bool {
+        matches!(self, SurfaceKind::File(_))
+    }
+
+    pub const fn composed_format(self) -> Option<SurfaceFormat> {
+        match self {
+            SurfaceKind::File(FileBacking::Composed(format)) => Some(format),
+            SurfaceKind::File(FileBacking::EnvFileDirect) | SurfaceKind::UnixSocket => None,
+        }
+    }
+}
+
+impl Serialize for SurfaceKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for SurfaceKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        SurfaceKind::parse(&value)
+            .ok_or_else(|| D::Error::custom(format!("unknown surface kind {value:?}")))
     }
 }
 
@@ -410,17 +457,31 @@ pub struct ResourceUsage {
 
 #[cfg(test)]
 mod tests {
-    use super::SurfaceKind;
+    use super::{FileBacking, SurfaceFormat, SurfaceKind};
 
     #[test]
     fn surface_kind_round_trips_database_and_flat_json_names() {
         let cases = [
-            (SurfaceKind::DotenvFile, "dotenv_file"),
-            (SurfaceKind::DirenvFile, "direnv_file"),
-            (SurfaceKind::IniFile, "ini_file"),
-            (SurfaceKind::EnvFileDirect, "env_file_direct"),
-            (SurfaceKind::LinesFile, "lines_file"),
-            (SurfaceKind::RegularFile, "regular_file"),
+            (
+                SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
+                "dotenv_file",
+            ),
+            (
+                SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Direnv)),
+                "direnv_file",
+            ),
+            (
+                SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Ini)),
+                "ini_file",
+            ),
+            (
+                SurfaceKind::File(FileBacking::EnvFileDirect),
+                "env_file_direct",
+            ),
+            (
+                SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Lines)),
+                "lines_file",
+            ),
             (SurfaceKind::UnixSocket, "unix_socket"),
         ];
 
@@ -433,5 +494,6 @@ mod tests {
             assert_eq!(serde_json::from_str::<SurfaceKind>(&encoded).unwrap(), kind);
         }
         assert_eq!(SurfaceKind::parse("unknown"), None);
+        assert_eq!(SurfaceKind::parse("regular_file"), None);
     }
 }

@@ -17,8 +17,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use accessfs_catalog::{
-    Binding, CatalogSnapshot, EntrySelection, Resource, ResourceKind, ResourceSource, SurfaceInput,
-    SurfaceKind, SshRouteSpec, ValueShape,
+    Binding, CatalogSnapshot, EntrySelection, Resource, ResourceKind, ResourceSource, SshRouteSpec,
+    SurfaceInput, SurfaceKind, ValueShape,
 };
 use accessfs_core::audit::{AuditLog, SshSessionAudit};
 use accessfs_core::authz::{
