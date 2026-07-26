@@ -733,7 +733,10 @@ mod tests {
     };
     use accessfs_store::{NewSecret, SecretOrigin, SecretRecord, StoreResult, VersionRecord};
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    };
     use zeroize::Zeroizing;
 
     const TOKEN_ID: &str = "00000000-0000-0000-0000-000000000001";
@@ -844,6 +847,84 @@ mod tests {
         }
         fn delete(&self, _id: &SecretId) -> StoreResult<()> {
             unimplemented!()
+        }
+    }
+
+    struct AdvancingStore {
+        inner: FixtureStore,
+        advanced: AtomicBool,
+        events: Mutex<Vec<String>>,
+    }
+
+    impl AdvancingStore {
+        fn new() -> Self {
+            AdvancingStore {
+                inner: FixtureStore::new(),
+                advanced: AtomicBool::new(false),
+                events: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl SecretStore for AdvancingStore {
+        fn get_version(&self, id: &SecretId, version: u32) -> StoreResult<Zeroizing<Vec<u8>>> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("get_version:{id}:{version}"));
+            if !self.advanced.swap(true, Ordering::SeqCst) {
+                let mut entries = self.inner.entries.lock().unwrap();
+                let (head, versions) = entries.get_mut(ENV_FILE_ID).unwrap();
+                versions.push(b"API_HOST=http://advanced.invalid\nLOG_LEVEL=trace\n".to_vec());
+                *head = versions.len() as u32;
+            }
+            self.inner.get_version(id, version)
+        }
+
+        fn record(&self, id: &SecretId) -> StoreResult<Option<SecretRecord>> {
+            self.events.lock().unwrap().push(format!("record:{id}"));
+            self.inner.record(id)
+        }
+
+        fn get(&self, id: &SecretId) -> StoreResult<Zeroizing<Vec<u8>>> {
+            self.inner.get(id)
+        }
+
+        fn put(&self, meta: NewSecret, plaintext: &[u8]) -> StoreResult<SecretId> {
+            self.inner.put(meta, plaintext)
+        }
+
+        fn append_version(&self, id: &SecretId, plaintext: &[u8]) -> StoreResult<u32> {
+            self.inner.append_version(id, plaintext)
+        }
+
+        fn history(&self, id: &SecretId) -> StoreResult<Vec<VersionRecord>> {
+            self.inner.history(id)
+        }
+
+        fn set_head(&self, id: &SecretId, version: u32) -> StoreResult<()> {
+            self.inner.set_head(id, version)
+        }
+
+        fn list(&self) -> StoreResult<Vec<SecretRecord>> {
+            self.inner.list()
+        }
+
+        fn get_by_path(&self, source_path: &Path) -> StoreResult<Option<SecretRecord>> {
+            self.inner.get_by_path(source_path)
+        }
+
+        fn update_settings(
+            &self,
+            id: &SecretId,
+            metadata: accessfs_core::metadata::ItemMetadata,
+            enforcement: accessfs_core::authz::Enforcement,
+        ) -> StoreResult<()> {
+            self.inner.update_settings(id, metadata, enforcement)
+        }
+
+        fn delete(&self, id: &SecretId) -> StoreResult<()> {
+            self.inner.delete(id)
         }
     }
 
@@ -1056,7 +1137,61 @@ mod tests {
             std::str::from_utf8(&direnv.bytes).unwrap(),
             "export SERVICE_TOKEN='fixture-token-value'\nexport API_HOST='http://127.0.0.1:8787'\nexport LOG_LEVEL='debug'\nexport APP_ENV='development'\n"
         );
+        assert_eq!(
+            direnv.versions,
+            vec![
+                FrozenResourceVersion {
+                    resource_id: "fixture-token".to_string(),
+                    secret_id: TOKEN_ID.to_string(),
+                    version: 2,
+                },
+                FrozenResourceVersion {
+                    resource_id: "fixture-env-file".to_string(),
+                    secret_id: ENV_FILE_ID.to_string(),
+                    version: 1,
+                },
+            ]
+        );
         assert_eq!(direnv.audit_dependencies().len(), 4);
+    }
+
+    #[test]
+    fn freezes_all_resource_heads_before_reading_any_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = fixture_catalog(&dir.path().join("catalog.sqlite"));
+        let store = Arc::new(AdvancingStore::new());
+        let resolver = SurfaceResolver::new(catalog, Arc::clone(&store) as Arc<dyn SecretStore>);
+
+        let snapshot = resolver.render_dotenv_surface("fixture-dotenv").unwrap();
+
+        assert_eq!(
+            snapshot.bytes,
+            b"SERVICE_TOKEN=fixture-token-value\nAPI_HOST=http://127.0.0.1:8787\nLOG_LEVEL=debug\nAPP_ENV=development\n"
+        );
+        assert_eq!(
+            snapshot.versions,
+            vec![
+                FrozenResourceVersion {
+                    resource_id: "fixture-token".to_string(),
+                    secret_id: TOKEN_ID.to_string(),
+                    version: 2,
+                },
+                FrozenResourceVersion {
+                    resource_id: "fixture-env-file".to_string(),
+                    secret_id: ENV_FILE_ID.to_string(),
+                    version: 1,
+                },
+            ]
+        );
+        let events = store.events.lock().unwrap();
+        let first_read = events
+            .iter()
+            .position(|event| event.starts_with("get_version:"))
+            .unwrap();
+        assert_eq!(
+            &events[..first_read],
+            &[format!("record:{TOKEN_ID}"), format!("record:{ENV_FILE_ID}")]
+        );
     }
 
     #[test]
