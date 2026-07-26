@@ -261,9 +261,10 @@ final class ControlProtocolTests: XCTestCase {
                 CatalogEntry(
                     address: "ssh/sha256/fixture-address", label: "Fixture key", key: nil,
                     sensitive: false)
-            ], source: .socket("/private/tmp/fixture-agent.sock"), enforcement: "prompt",
-            metadata: .empty)
-        let upsert = try ControlCommand.resourceUpsert(resource)
+            ], source: .socket, enforcement: "prompt",
+            metadata: .empty, origin: nil)
+        let upsert = try ControlCommand.resourceUpsert(
+            resource, endpoint: "/private/tmp/fixture-agent.sock")
             .requestData(requestID: 73, encoder: encoder)
         let upsertValue = try XCTUnwrap(
             JSONSerialization.jsonObject(with: upsert) as? [String: Any])
@@ -271,8 +272,9 @@ final class ControlProtocolTests: XCTestCase {
             (upsertValue["params"] as? [String: Any])?["resource"] as? [String: Any])
         XCTAssertEqual(upsertValue["method"] as? String, "resource_upsert")
         XCTAssertEqual(encodedResource["kind"] as? String, "ssh_agent")
+        XCTAssertNil((encodedResource["source"] as? [String: Any])?["endpoint"])
         XCTAssertEqual(
-            (encodedResource["source"] as? [String: Any])?["endpoint"] as? String,
+            (upsertValue["params"] as? [String: Any])?["endpoint"] as? String,
             "/private/tmp/fixture-agent.sock")
 
         let response = try JSONDecoder().decode(

@@ -24,7 +24,7 @@ pub fn compile_source(
             Arc::new(LiteralSource::new(Arc::new(value.as_bytes().to_vec())))
         }
         ResourceSource::Command { argv } => Arc::new(CommandSource::new(argv.clone())),
-        ResourceSource::Socket { .. } => {
+        ResourceSource::Socket => {
             return Err(SurfaceError::IncompatibleResource {
                 resource_id: "<resource-source>".to_string(),
                 reason: "socket source is not byte content".to_string(),
@@ -41,7 +41,7 @@ mod tests {
     use accessfs_store::{
         NewSecret, SecretRecord, StoreResult, VersionRecord,
     };
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use zeroize::Zeroizing;
 
     struct UnusedStore;
@@ -148,9 +148,7 @@ mod tests {
     fn rejects_socket_sources_as_non_byte_content() {
         assert!(matches!(
             compile_source(
-                &ResourceSource::Socket {
-                    endpoint: PathBuf::from("/fixture/agent.sock"),
-                },
+                &ResourceSource::Socket,
                 &store(),
             ),
             Err(SurfaceError::IncompatibleResource { .. })

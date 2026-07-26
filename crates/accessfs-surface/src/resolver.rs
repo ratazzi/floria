@@ -1023,9 +1023,9 @@ mod tests {
                 },
             ),
         );
-        add_resource(
-            &catalog,
-            Resource {
+        catalog
+            .upsert_socket_resource(
+                &Resource {
                 id: "fixture-socket".to_string(),
                 name: "fixture-socket".to_string(),
                 kind: ResourceKind::SshAgent,
@@ -1033,14 +1033,14 @@ mod tests {
                 codec: ResourceCodec::Opaque,
                 default_env_key: None,
                 entries: Vec::new(),
-                source: ResourceSource::Socket {
-                    endpoint: PathBuf::from("/fixture/agent.sock"),
-                },
+                source: ResourceSource::Socket,
                 enforcement: Default::default(),
                 metadata: Default::default(),
                 origin: Default::default(),
             },
-        );
+                Path::new("/fixture/agent.sock"),
+            )
+            .unwrap();
         let snapshot = catalog.snapshot().unwrap();
         let resolver =
             SurfaceResolver::new(catalog, Arc::new(FixtureStore::new()) as Arc<dyn SecretStore>);

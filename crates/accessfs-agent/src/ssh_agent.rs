@@ -285,7 +285,7 @@ fn compile_surface_specs(
             let resource = resources
                 .get(binding.resource_id.as_str())
                 .ok_or_else(|| invalid(format!("missing resource {:?}", binding.resource_id)))?;
-            let provider = ssh_provider(resource)?;
+            let provider = ssh_provider(resource, &snapshot.endpoints)?;
             if let ProviderSpec::ExternalAgent { endpoint, .. } = &provider {
                 if endpoint == &socket_path || endpoint == &surface.path {
                     return Err(invalid(format!(
@@ -396,7 +396,10 @@ fn ssh_config_quote(value: &Path) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\""))
 }
 
-fn ssh_provider(resource: &Resource) -> io::Result<ProviderSpec> {
+fn ssh_provider(
+    resource: &Resource,
+    endpoints: &HashMap<String, PathBuf>,
+) -> io::Result<ProviderSpec> {
     match (&resource.kind, &resource.shape, &resource.source) {
         (
             ResourceKind::SshIdentity,
@@ -409,10 +412,15 @@ fn ssh_provider(resource: &Resource) -> io::Result<ProviderSpec> {
         (
             ResourceKind::SshAgent,
             ValueShape::Socket,
-            ResourceSource::Socket { endpoint },
+            ResourceSource::Socket,
         ) => Ok(ProviderSpec::ExternalAgent {
             resource_id: resource.id.clone(),
-            endpoint: endpoint.clone(),
+            endpoint: endpoints.get(&resource.id).cloned().ok_or_else(|| {
+                invalid(format!(
+                    "SSH agent resource {:?} has no machine-local endpoint",
+                    resource.id
+                ))
+            })?,
         }),
         _ => Err(invalid(format!(
             "resource {:?} is not an SSH identity provider",
@@ -1575,11 +1583,15 @@ mod tests {
                         sensitive: false,
                     },
                 ],
-                source: ResourceSource::Socket { endpoint: upstream.to_path_buf() },
+                source: ResourceSource::Socket,
                 enforcement: Enforcement::Prompt,
                 metadata: Default::default(),
                 origin: Default::default(),
             }],
+            endpoints: HashMap::from([(
+                "fixture-upstream".to_string(),
+                upstream.to_path_buf(),
+            )]),
             bindings: vec![Binding {
                 id: "fixture-binding".to_string(),
                 project_id: "fixture-project".to_string(),
@@ -1643,6 +1655,7 @@ mod tests {
             metadata: Default::default(),
             origin: Default::default(),
         }];
+        snapshot.endpoints.clear();
         snapshot.bindings[0].resource_id = "fixture-managed-identity".to_string();
         snapshot.bindings[0].selection = EntrySelection::Entries {
             addresses: vec![identity.address.clone()],
@@ -1951,6 +1964,18 @@ mod tests {
         let audit = fs::read_to_string(audit_path).unwrap();
         assert!(audit.contains("\"result\":\"signed\""));
         assert!(!audit.contains("fixture managed SSH user-auth payload"));
+    }
+
+    #[test]
+    fn external_agent_resource_requires_a_machine_local_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let mut snapshot =
+            snapshot(&project, Path::new("/fixture/missing-upstream-agent.sock"));
+        snapshot.endpoints.clear();
+
+        let error = compile_surface_specs(&snapshot, dir.path()).unwrap_err();
+        assert!(error.to_string().contains("has no machine-local endpoint"));
     }
 
     #[cfg(target_os = "macos")]

@@ -145,7 +145,11 @@ pub enum ControlCommand {
     ProjectRemove { id: String },
     EnvironmentUpsert { environment: Environment },
     EnvironmentRemove { id: String },
-    ResourceUpsert { resource: Resource },
+    ResourceUpsert {
+        resource: Resource,
+        #[serde(default)]
+        endpoint: Option<PathBuf>,
+    },
     ResourceRemove { id: String },
     BindingUpsert { binding: Binding },
     BindingRemove { id: String },
@@ -441,6 +445,7 @@ pub(crate) fn read_msg<R: Read, T: DeserializeOwned>(reader: &mut R) -> io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use accessfs_catalog::{EntrySpec, ResourceKind, ResourceSource, ValueShape};
 
     #[test]
     fn request_wire_shape_is_stable_for_swift_client() {
@@ -731,6 +736,46 @@ mod tests {
 
         assert_eq!(value["method"], "ssh_agent_discover");
         assert_eq!(value["params"]["endpoint"], "/private/tmp/fixture-agent.sock");
+    }
+
+    #[test]
+    fn socket_resource_upsert_keeps_endpoint_out_of_syncable_source_data() {
+        let request = ControlRequest {
+            request_id: 18,
+            command: ControlCommand::ResourceUpsert {
+                resource: Resource {
+                    id: "fixture-agent".to_string(),
+                    name: "Fixture Agent".to_string(),
+                    kind: ResourceKind::SshAgent,
+                    shape: ValueShape::Socket,
+                    codec: ResourceCodec::Opaque,
+                    default_env_key: None,
+                    entries: vec![EntrySpec {
+                        address:
+                            "ssh/sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                        label: "Fixture key".to_string(),
+                        key: None,
+                        sensitive: false,
+                    }],
+                    source: ResourceSource::Socket,
+                    enforcement: Enforcement::Prompt,
+                    metadata: Default::default(),
+                    origin: Default::default(),
+                },
+                endpoint: Some(PathBuf::from("/private/tmp/fixture-agent.sock")),
+            },
+        };
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["method"], "resource_upsert");
+        assert_eq!(
+            value["params"]["endpoint"],
+            "/private/tmp/fixture-agent.sock"
+        );
+        assert_eq!(
+            value["params"]["resource"]["source"],
+            serde_json::json!({ "type": "socket" })
+        );
     }
 
     #[test]

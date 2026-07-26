@@ -90,6 +90,18 @@ pub(super) fn snapshot_from(conn: &Connection) -> CatalogResult<CatalogSnapshot>
         values
     };
 
+    let endpoints = {
+        let mut stmt = conn.prepare(
+            "SELECT resource_id, endpoint FROM resource_endpoints ORDER BY resource_id",
+        )?;
+        let values = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, PathBuf::from(row.get::<_, String>(1)?)))
+            })?
+            .collect::<Result<HashMap<_, _>, _>>()?;
+        values
+    };
+
     let bindings = {
         let mut stmt = conn.prepare(
             "SELECT id, project_id, environment_id, resource_id, key_override,
@@ -151,7 +163,15 @@ pub(super) fn snapshot_from(conn: &Connection) -> CatalogResult<CatalogSnapshot>
         values
     };
 
-    Ok(CatalogSnapshot { projects, checkouts, environments, resources, bindings, surfaces })
+    Ok(CatalogSnapshot {
+        projects,
+        checkouts,
+        environments,
+        resources,
+        endpoints,
+        bindings,
+        surfaces,
+    })
 }
 
 pub fn resolve_catalog_snapshot(
@@ -527,7 +547,7 @@ pub(super) fn validate_composed_surface_member(
                 ) | (
                     ResourceKind::SshAgent,
                     ValueShape::Socket,
-                    ResourceSource::Socket { .. }
+                    ResourceSource::Socket
                 )
             ) && resource.codec == ResourceCodec::Opaque
                 && binding.key_override.is_none()

@@ -300,8 +300,8 @@ final class ControlClient: @unchecked Sendable {
                 metadata: metadata))
     }
 
-    func upsertResource(_ resource: CatalogResource) async throws {
-        try await requestEmpty(.resourceUpsert(resource))
+    func upsertResource(_ resource: CatalogResource, endpoint: String? = nil) async throws {
+        try await requestEmpty(.resourceUpsert(resource, endpoint: endpoint))
     }
 
     func removeResource(_ id: String) async throws {

@@ -15,7 +15,7 @@ use crate::domain::{
 };
 use crate::error::{CatalogError, CatalogResult};
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 #[derive(Debug, Clone)]
 pub struct Catalog {
@@ -164,6 +164,27 @@ mod tests {
         }
     }
 
+    fn socket_resource(id: &str) -> Resource {
+        Resource {
+            id: id.to_string(),
+            name: id.to_string(),
+            kind: ResourceKind::SshAgent,
+            shape: ValueShape::Socket,
+            codec: ResourceCodec::Opaque,
+            default_env_key: None,
+            entries: vec![EntrySpec {
+                address: "ssh/sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+                label: "Fleet key".to_string(),
+                key: None,
+                sensitive: false,
+            }],
+            source: ResourceSource::Socket,
+            enforcement: Enforcement::Prompt,
+            metadata: Default::default(),
+            origin: Default::default(),
+        }
+    }
+
     fn binding(id: &str, resource_id: &str, scope: BindingScope) -> Binding {
         Binding {
             id: id.to_string(),
@@ -194,7 +215,10 @@ mod tests {
         let error = migrate(&mut conn).unwrap_err();
         assert!(matches!(
             error,
-            CatalogError::UnsupportedSchema { found: 1, expected: 10 }
+            CatalogError::UnsupportedSchema {
+                found: 1,
+                expected: SCHEMA_VERSION
+            }
         ));
     }
 
@@ -204,7 +228,7 @@ mod tests {
         let path = dir.path().join("catalog.sqlite");
 
         let catalog = Catalog::open(&path).unwrap();
-        assert_eq!(catalog.schema_version(), 10);
+        assert_eq!(catalog.schema_version(), SCHEMA_VERSION);
         drop(catalog);
 
         let reopened = Catalog::open(&path).unwrap();
@@ -213,7 +237,7 @@ mod tests {
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(persisted, 10);
+        assert_eq!(persisted, SCHEMA_VERSION);
     }
 
     #[test]
@@ -839,31 +863,90 @@ mod tests {
     }
 
     #[test]
+    fn socket_endpoint_is_machine_local_and_tracks_resource_atomically() {
+        let (_dir, catalog) = catalog();
+        let socket = socket_resource("fixture-agent-provider");
+
+        assert!(matches!(
+            catalog.upsert_resource(&socket),
+            Err(CatalogError::Validation(message))
+                if message.contains("machine-local endpoint")
+        ));
+        catalog
+            .upsert_socket_resource(&socket, Path::new("/fixture/upstream-agent.sock"))
+            .unwrap();
+
+        let snapshot = catalog.snapshot().unwrap();
+        assert_eq!(snapshot.resources, vec![socket.clone()]);
+        assert_eq!(
+            snapshot.endpoints.get(&socket.id).map(PathBuf::as_path),
+            Some(Path::new("/fixture/upstream-agent.sock"))
+        );
+        let source_json: String = catalog
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT source_json FROM resources WHERE id = ?1",
+                [&socket.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(source_json, r#"{"type":"socket"}"#);
+
+        let scalar = scalar_resource(&socket.id, "FIXTURE_TOKEN");
+        catalog.upsert_resource(&scalar).unwrap();
+        let snapshot = catalog.snapshot().unwrap();
+        assert_eq!(snapshot.resources, vec![scalar]);
+        assert!(!snapshot.endpoints.contains_key(&socket.id));
+    }
+
+    #[test]
+    fn concurrent_snapshots_never_observe_a_socket_without_its_endpoint() {
+        let (_dir, catalog) = catalog();
+        let resource_id = "fixture-switching-provider";
+        catalog
+            .upsert_resource(&scalar_resource(resource_id, "FIXTURE_TOKEN"))
+            .unwrap();
+
+        let writer = catalog.clone();
+        let writer_thread = std::thread::spawn(move || {
+            for _ in 0..30 {
+                writer
+                    .upsert_socket_resource(
+                        &socket_resource(resource_id),
+                        Path::new("/fixture/upstream-agent.sock"),
+                    )
+                    .unwrap();
+                writer
+                    .upsert_resource(&scalar_resource(resource_id, "FIXTURE_TOKEN"))
+                    .unwrap();
+            }
+        });
+        for _ in 0..100 {
+            let snapshot = catalog.snapshot().unwrap();
+            let resource = snapshot
+                .resources
+                .iter()
+                .find(|resource| resource.id == resource_id)
+                .unwrap();
+            assert_eq!(
+                resource.source == ResourceSource::Socket,
+                snapshot.endpoints.contains_key(resource_id)
+            );
+        }
+        writer_thread.join().unwrap();
+    }
+
+    #[test]
     fn ssh_agent_surface_composes_managed_and_external_identity_bindings() {
         let (_dir, catalog) = catalog();
         let address =
             "ssh/sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string();
+        let mut external = socket_resource("fixture-agent-provider");
+        external.name = "Fixture Agent".to_string();
+        external.entries[0].address = address.clone();
         catalog
-            .upsert_resource(&Resource {
-                id: "fixture-agent-provider".to_string(),
-                name: "Fixture Agent".to_string(),
-                kind: ResourceKind::SshAgent,
-                shape: ValueShape::Socket,
-                codec: ResourceCodec::Opaque,
-                default_env_key: None,
-                entries: vec![EntrySpec {
-                    address: address.clone(),
-                    label: "Fleet key".to_string(),
-                    key: None,
-                    sensitive: false,
-                }],
-                source: ResourceSource::Socket {
-                    endpoint: PathBuf::from("/fixture/upstream-agent.sock"),
-                },
-                enforcement: Enforcement::Prompt,
-                metadata: Default::default(),
-                origin: Default::default(),
-            })
+            .upsert_socket_resource(&external, Path::new("/fixture/upstream-agent.sock"))
             .unwrap();
         let mut selected = binding(
             "fixture-agent-binding",

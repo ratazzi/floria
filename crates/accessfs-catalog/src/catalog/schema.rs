@@ -63,6 +63,12 @@ pub(super) fn migrate(conn: &mut Connection) -> CatalogResult<()> {
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
+        CREATE TABLE resource_endpoints (
+            resource_id TEXT PRIMARY KEY REFERENCES resources(id) ON DELETE CASCADE,
+            endpoint TEXT NOT NULL,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE TABLE bindings (
             id TEXT PRIMARY KEY,
             project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -92,7 +98,7 @@ pub(super) fn migrate(conn: &mut Connection) -> CatalogResult<()> {
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         CREATE INDEX surfaces_environment_idx ON surfaces(environment_id, position);
-        PRAGMA user_version = 10;",
+        PRAGMA user_version = 11;",
     )?;
     tx.commit()?;
     Ok(())

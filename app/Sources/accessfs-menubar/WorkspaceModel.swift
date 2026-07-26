@@ -1213,9 +1213,10 @@ final class WorkspaceStore {
                         label: comment.isEmpty ? identity.fingerprint : comment,
                         key: nil, sensitive: false)
                 },
-                source: .socket(endpoint), enforcement: WorkspaceSecurityLevel.confirmation.rawValue,
+                source: .socket, enforcement: WorkspaceSecurityLevel.confirmation.rawValue,
                 metadata: metadata,
-                origin: CatalogResourceOrigin(kind: "manual", sources: [])))
+                origin: CatalogResourceOrigin(kind: "manual", sources: [])),
+            endpoint: endpoint)
         apply(try await controlClient.snapshot())
         lastError = nil
         return resourceID
@@ -1821,7 +1822,7 @@ final class WorkspaceStore {
             let preview: String
             switch resource.source.type {
             case "literal": preview = resource.source.value ?? ""
-            case "socket": preview = resource.source.endpoint ?? ""
+            case "socket": preview = snapshot.endpoints[resource.id] ?? ""
             default: preview = "••••••••••••"
             }
             let entries = resource.entries.map {

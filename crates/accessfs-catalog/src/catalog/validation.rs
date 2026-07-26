@@ -159,8 +159,7 @@ pub(super) fn validate_resource(resource: &Resource) -> CatalogResult<()> {
             ValueShape::Scalar | ValueShape::KeyValueSet | ValueShape::Bytes,
             ResourceSource::Command { argv },
         ) if !argv.is_empty() => {}
-        (ResourceKind::SshAgent, ValueShape::Socket, ResourceSource::Socket { endpoint }) => {
-            require_absolute_path(endpoint, "ssh agent endpoint")?;
+        (ResourceKind::SshAgent, ValueShape::Socket, ResourceSource::Socket) => {
             if resource.default_env_key.is_some()
                 || resource
                     .entries

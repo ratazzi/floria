@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use accessfs_core::authz::Enforcement;
@@ -185,7 +186,7 @@ pub enum ResourceSource {
     SecretRef { secret_id: String },
     Literal { value: String },
     Command { argv: Vec<String> },
-    Socket { endpoint: PathBuf },
+    Socket,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -472,6 +473,9 @@ pub struct CatalogSnapshot {
     pub checkouts: Vec<ProjectCheckout>,
     pub environments: Vec<Environment>,
     pub resources: Vec<Resource>,
+    /// Machine-local endpoints keyed by socket resource id. This table is excluded from sync.
+    #[serde(default)]
+    pub endpoints: HashMap<String, PathBuf>,
     pub bindings: Vec<Binding>,
     pub surfaces: Vec<Surface>,
 }
@@ -515,8 +519,8 @@ pub struct ResourceUsage {
 #[cfg(test)]
 mod tests {
     use super::{
-        FileBacking, FormatInputModel, ResourceCodec, ResourceKind, SurfaceFormat, SurfaceKind,
-        ValueShape,
+        FileBacking, FormatInputModel, ResourceCodec, ResourceKind, ResourceSource, SurfaceFormat,
+        SurfaceKind, ValueShape,
     };
 
     #[test]
@@ -586,5 +590,18 @@ mod tests {
         }
         assert_eq!(SurfaceKind::parse("unknown"), None);
         assert_eq!(SurfaceKind::parse("regular_file"), None);
+    }
+
+    #[test]
+    fn legacy_socket_source_json_ignores_the_embedded_endpoint() {
+        let source: ResourceSource = serde_json::from_str(
+            r#"{"type":"socket","endpoint":"/fixture/legacy-agent.sock"}"#,
+        )
+        .unwrap();
+        assert_eq!(source, ResourceSource::Socket);
+        assert_eq!(
+            serde_json::to_string(&source).unwrap(),
+            r#"{"type":"socket"}"#
+        );
     }
 }

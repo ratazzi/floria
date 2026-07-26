@@ -735,10 +735,25 @@ fn dispatch(
             catalog.remove_environment(&id)?;
             Ok(ControlResult::Empty)
         }
-        ControlCommand::ResourceUpsert { resource } => {
+        ControlCommand::ResourceUpsert { resource, endpoint } => {
             catalog.validate_resource(&resource)?;
             validate_resource_value(catalog, store, &resource)?;
-            catalog.upsert_resource(&resource)?;
+            match (&resource.source, endpoint) {
+                (ResourceSource::Socket, Some(endpoint)) => {
+                    catalog.upsert_socket_resource(&resource, &endpoint)?;
+                }
+                (ResourceSource::Socket, None) => {
+                    return Err(DispatchError::Validation(
+                        "socket resource requires a machine-local endpoint".to_string(),
+                    ));
+                }
+                (_, Some(_)) => {
+                    return Err(DispatchError::Validation(
+                        "machine-local endpoint is only valid for a socket resource".to_string(),
+                    ));
+                }
+                (_, None) => catalog.upsert_resource(&resource)?,
+            }
             Ok(ControlResult::Empty)
         }
         ControlCommand::ResourceRemove { id } => {
@@ -1411,7 +1426,7 @@ impl Drop for DiscoveryMutationGuard<'_> {
                     ResourceSource::SecretRef { secret_id } => secret_id.parse::<SecretId>().ok(),
                     ResourceSource::Literal { .. }
                     | ResourceSource::Command { .. }
-                    | ResourceSource::Socket { .. } => None,
+                    | ResourceSource::Socket => None,
                 });
             if let Err(error) = self.catalog.remove_resource(resource_id) {
                 tracing::warn!(%resource_id, %error, "discovery rollback could not remove resource");
@@ -2701,7 +2716,21 @@ fn update_resource_metadata(
     if resource.kind == ResourceKind::SharedSecret && resource.entries.len() == 1 {
         resource.entries[0].label = resource.name.clone();
     }
-    catalog.upsert_resource(&resource)?;
+    if resource.source == ResourceSource::Socket {
+        let endpoint = catalog
+            .snapshot()?
+            .endpoints
+            .get(resource_id)
+            .cloned()
+            .ok_or_else(|| {
+                DispatchError::Validation(format!(
+                    "socket resource {resource_id:?} has no machine-local endpoint"
+                ))
+            })?;
+        catalog.upsert_socket_resource(&resource, &endpoint)?;
+    } else {
+        catalog.upsert_resource(&resource)?;
+    }
     Ok(ControlResult::Empty)
 }
 
@@ -4171,7 +4200,7 @@ mod tests {
         let mut client = ControlClient::connect(&socket).unwrap();
         assert_eq!(
             client.request(ControlCommand::Ping).unwrap(),
-            ControlResult::Pong { schema_version: 10 }
+            ControlResult::Pong { schema_version: 11 }
         );
         client
             .request(ControlCommand::ProjectUpsert {
@@ -4727,6 +4756,7 @@ mod tests {
                     metadata: Default::default(),
                     origin: Default::default(),
                 },
+                endpoint: None,
             })
             .unwrap();
         let restore_error = client

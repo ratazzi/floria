@@ -131,17 +131,15 @@ struct CatalogResourceSource: Codable, Sendable {
     let secretID: String?
     let value: String?
     let argv: [String]?
-    let endpoint: String?
 
     enum CodingKeys: String, CodingKey {
-        case type, value, argv, endpoint
+        case type, value, argv
         case secretID = "secret_id"
     }
 
-
-    static func socket(_ endpoint: String) -> CatalogResourceSource {
+    static var socket: CatalogResourceSource {
         CatalogResourceSource(
-            type: "socket", secretID: nil, value: nil, argv: nil, endpoint: endpoint)
+            type: "socket", secretID: nil, value: nil, argv: nil)
     }
 }
 
@@ -319,11 +317,12 @@ struct CatalogSnapshot: Codable, Sendable {
     let checkouts: [CatalogProjectCheckout]
     let environments: [CatalogEnvironment]
     let resources: [CatalogResource]
+    let endpoints: [String: String]
     let bindings: [CatalogBinding]
     let surfaces: [CatalogSurface]
 
     private enum CodingKeys: String, CodingKey {
-        case projects, checkouts, environments, resources, bindings, surfaces
+        case projects, checkouts, environments, resources, endpoints, bindings, surfaces
     }
 
     init(from decoder: Decoder) throws {
@@ -333,6 +332,8 @@ struct CatalogSnapshot: Codable, Sendable {
             try container.decodeIfPresent([CatalogProjectCheckout].self, forKey: .checkouts) ?? []
         environments = try container.decode([CatalogEnvironment].self, forKey: .environments)
         resources = try container.decode([CatalogResource].self, forKey: .resources)
+        endpoints =
+            try container.decodeIfPresent([String: String].self, forKey: .endpoints) ?? [:]
         bindings = try container.decode([CatalogBinding].self, forKey: .bindings)
         surfaces = try container.decode([CatalogSurface].self, forKey: .surfaces)
     }
@@ -343,6 +344,7 @@ struct CatalogSnapshot: Codable, Sendable {
         try container.encode(checkouts, forKey: .checkouts)
         try container.encode(environments, forKey: .environments)
         try container.encode(resources, forKey: .resources)
+        try container.encode(endpoints, forKey: .endpoints)
         try container.encode(bindings, forKey: .bindings)
         try container.encode(surfaces, forKey: .surfaces)
     }
@@ -648,7 +650,7 @@ enum ControlCommand: Sendable {
         enforcement: String, metadata: ItemMetadata)
     case resourceMetadataUpdate(
         resourceID: String, name: String, enforcement: String, metadata: ItemMetadata)
-    case resourceUpsert(CatalogResource)
+    case resourceUpsert(CatalogResource, endpoint: String?)
     case resourceRemove(String)
     case projectCreate(CatalogProject, CatalogEnvironment, CatalogSurface)
     case projectUpsert(CatalogProject)
@@ -836,11 +838,11 @@ enum ControlCommand: Sendable {
                     params: ResourceMetadataUpdateParams(
                         resourceID: resourceID, name: name, enforcement: enforcement,
                         metadata: metadata)))
-        case .resourceUpsert(let resource):
+        case .resourceUpsert(let resource, let endpoint):
             return try encoder.encode(
                 ControlRequest(
                     requestID: requestID, method: method,
-                    params: ResourceUpsertParams(resource: resource)))
+                    params: ResourceUpsertParams(resource: resource, endpoint: endpoint)))
         case .projectCreate(let project, let environment, let surface):
             return try encoder.encode(
                 ControlRequest(
@@ -970,7 +972,10 @@ private struct ResourceMetadataUpdateParams: Encodable {
     let metadata: ItemMetadata
 }
 
-private struct ResourceUpsertParams: Encodable { let resource: CatalogResource }
+private struct ResourceUpsertParams: Encodable {
+    let resource: CatalogResource
+    let endpoint: String?
+}
 
 private struct ProjectUpsertParams: Encodable { let project: CatalogProject }
 private struct RemoveParams: Encodable { let id: String }

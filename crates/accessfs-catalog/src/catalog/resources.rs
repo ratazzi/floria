@@ -3,33 +3,45 @@ use super::*;
 impl Catalog {
     pub fn upsert_resource(&self, resource: &Resource) -> CatalogResult<()> {
         validate_resource(resource)?;
+        if resource.source == ResourceSource::Socket {
+            return Err(CatalogError::Validation(
+                "socket resources require an atomic machine-local endpoint".to_string(),
+            ));
+        }
         let mut conn = self.connection()?;
         let tx = conn.transaction()?;
+        upsert_resource_row(&tx, resource)?;
         tx.execute(
-            "INSERT INTO resources
-                (id, name, kind, shape, codec, default_env_key, entries_json, source_json, enforcement, metadata_json, origin_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-             ON CONFLICT(id) DO UPDATE SET name = excluded.name, kind = excluded.kind,
-                 shape = excluded.shape, codec = excluded.codec,
-                 default_env_key = excluded.default_env_key,
-                 entries_json = excluded.entries_json,
-                 source_json = excluded.source_json, enforcement = excluded.enforcement,
-                 metadata_json = excluded.metadata_json,
-                 origin_json = excluded.origin_json,
+            "DELETE FROM resource_endpoints WHERE resource_id = ?1",
+            [&resource.id],
+        )?;
+        validate_snapshot_conflicts(&snapshot_from(&tx)?)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Atomically persist a syncable socket resource and its machine-local endpoint.
+    pub fn upsert_socket_resource(
+        &self,
+        resource: &Resource,
+        endpoint: &Path,
+    ) -> CatalogResult<()> {
+        validate_resource(resource)?;
+        if resource.source != ResourceSource::Socket {
+            return Err(CatalogError::Validation(
+                "machine-local endpoints are only valid for socket resources".to_string(),
+            ));
+        }
+        require_absolute_path(endpoint, "ssh agent endpoint")?;
+        let mut conn = self.connection()?;
+        let tx = conn.transaction()?;
+        upsert_resource_row(&tx, resource)?;
+        tx.execute(
+            "INSERT INTO resource_endpoints (resource_id, endpoint)
+             VALUES (?1, ?2)
+             ON CONFLICT(resource_id) DO UPDATE SET endpoint = excluded.endpoint,
                  updated_at = CURRENT_TIMESTAMP",
-            params![
-                resource.id,
-                resource.name,
-                resource.kind.as_str(),
-                resource.shape.as_str(),
-                resource.codec.as_str(),
-                resource.default_env_key,
-                serde_json::to_string(&resource.entries)?,
-                serde_json::to_string(&resource.source)?,
-                resource.enforcement.as_str(),
-                serde_json::to_string(&resource.metadata)?,
-                serde_json::to_string(&resource.origin)?,
-            ],
+            params![resource.id, path_string(endpoint)],
         )?;
         validate_snapshot_conflicts(&snapshot_from(&tx)?)?;
         tx.commit()?;
@@ -67,6 +79,11 @@ impl Catalog {
 
     pub fn create_resource(&self, resource: &Resource) -> CatalogResult<()> {
         validate_resource(resource)?;
+        if resource.source == ResourceSource::Socket {
+            return Err(CatalogError::Validation(
+                "socket resources require an atomic machine-local endpoint".to_string(),
+            ));
+        }
         let mut conn = self.connection()?;
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let exists = tx
@@ -180,4 +197,37 @@ impl Catalog {
         Ok(ResourceUsage { resource_id: id.to_string(), bindings, direct_surface_ids })
     }
 
+}
+
+fn upsert_resource_row(
+    tx: &rusqlite::Transaction<'_>,
+    resource: &Resource,
+) -> CatalogResult<()> {
+    tx.execute(
+        "INSERT INTO resources
+            (id, name, kind, shape, codec, default_env_key, entries_json, source_json, enforcement, metadata_json, origin_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(id) DO UPDATE SET name = excluded.name, kind = excluded.kind,
+             shape = excluded.shape, codec = excluded.codec,
+             default_env_key = excluded.default_env_key,
+             entries_json = excluded.entries_json,
+             source_json = excluded.source_json, enforcement = excluded.enforcement,
+             metadata_json = excluded.metadata_json,
+             origin_json = excluded.origin_json,
+             updated_at = CURRENT_TIMESTAMP",
+        params![
+            resource.id,
+            resource.name,
+            resource.kind.as_str(),
+            resource.shape.as_str(),
+            resource.codec.as_str(),
+            resource.default_env_key,
+            serde_json::to_string(&resource.entries)?,
+            serde_json::to_string(&resource.source)?,
+            resource.enforcement.as_str(),
+            serde_json::to_string(&resource.metadata)?,
+            serde_json::to_string(&resource.origin)?,
+        ],
+    )?;
+    Ok(())
 }
