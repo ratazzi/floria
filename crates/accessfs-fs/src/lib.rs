@@ -523,12 +523,12 @@ impl Shared {
                     tracing::warn!(path = %target.virtual_path, "surface resolver is unavailable");
                     return Err(errno(libc::EIO));
                 };
-                match surfaces.resolver.render_dotenv_surface(surface_id) {
+                match surfaces.resolver.render_surface(surface_id) {
                     Ok(snapshot) => {
                         tracing::debug!(
                             path = %target.virtual_path,
                             resources = snapshot.versions.len(),
-                            exports = snapshot.exports.len(),
+                            exports = snapshot.entries.len(),
                             "dotenv surface resolved"
                         );
                         GeneratedRead {
@@ -547,12 +547,12 @@ impl Shared {
                     tracing::warn!(path = %target.virtual_path, "surface resolver is unavailable");
                     return Err(errno(libc::EIO));
                 };
-                match surfaces.resolver.render_direnv_surface(surface_id) {
+                match surfaces.resolver.render_surface(surface_id) {
                     Ok(snapshot) => {
                         tracing::debug!(
                             path = %target.virtual_path,
                             resources = snapshot.versions.len(),
-                            exports = snapshot.exports.len(),
+                            exports = snapshot.entries.len(),
                             "direnv surface resolved"
                         );
                         GeneratedRead {
@@ -571,7 +571,7 @@ impl Shared {
                     tracing::warn!(path = %target.virtual_path, "surface resolver is unavailable");
                     return Err(errno(libc::EIO));
                 };
-                match surfaces.resolver.render_ini_surface(surface_id) {
+                match surfaces.resolver.render_surface(surface_id) {
                     Ok(snapshot) => {
                         tracing::debug!(
                             path = %target.virtual_path,
@@ -595,7 +595,7 @@ impl Shared {
                     tracing::warn!(path = %target.virtual_path, "surface resolver is unavailable");
                     return Err(errno(libc::EIO));
                 };
-                match surfaces.resolver.render_lines_surface(surface_id) {
+                match surfaces.resolver.render_surface(surface_id) {
                     Ok(snapshot) => {
                         tracing::debug!(
                             path = %target.virtual_path,

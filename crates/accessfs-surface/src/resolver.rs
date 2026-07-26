@@ -2,19 +2,19 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use accessfs_catalog::{
-    resolve_catalog_surface, BindingScope, Catalog, CatalogSnapshot, EntrySelection, FileBacking,
-    Resource, ResourceCodec, ResourceKind, ResourceSource, SurfaceFormat, SurfaceInput,
-    SurfaceKind, ValueShape,
+    resolve_catalog_surface, Binding, BindingScope, Catalog, CatalogSnapshot, EntrySelection,
+    FileBacking, FormatInputModel, FormatSpec, Resource, ResourceSource, SurfaceInput, SurfaceKind,
+    ValueShape,
 };
 use accessfs_core::audit::AuditDependency;
 use accessfs_store::{SecretId, SecretStore};
 
 use crate::codec::{codec_capabilities, decode_resource as decode_resource_bytes, DecodedEntry};
-use crate::direnv::render_direnv_refs;
-use crate::dotenv::render_dotenv_refs;
 use crate::error::{SurfaceError, SurfaceResult};
-use crate::ini::render_ini_refs;
-use crate::lines::render_lines_refs;
+use crate::render::{
+    renderer_for, ResolvedBindingEntry, ResolvedDocument, ResolvedEntryMeta,
+    ResolvedEnvironmentEntry,
+};
 
 type FrozenSecretVersions = HashMap<String, (SecretId, u32)>;
 
@@ -25,14 +25,13 @@ pub struct FrozenResourceVersion {
     pub version: u32,
 }
 
+/// The immutable result of resolving one composed surface for a process access session.
 #[derive(Debug)]
-pub struct DotenvSnapshot {
+pub struct SurfaceSnapshot {
     pub bytes: Vec<u8>,
     pub versions: Vec<FrozenResourceVersion>,
-    pub exports: Vec<accessfs_catalog::ResolvedExport>,
+    pub entries: Vec<ResolvedEntryMeta>,
 }
-
-pub type DirenvSnapshot = DotenvSnapshot;
 
 #[derive(Debug)]
 pub struct DirectEnvFileSnapshot {
@@ -43,37 +42,7 @@ pub struct DirectEnvFileSnapshot {
     pub keys: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedLineEntry {
-    pub address: String,
-    pub binding_id: String,
-    pub resource_id: String,
-}
-
-#[derive(Debug)]
-pub struct LinesSnapshot {
-    pub bytes: Vec<u8>,
-    pub versions: Vec<FrozenResourceVersion>,
-    pub entries: Vec<ResolvedLineEntry>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedIniEntry {
-    pub address: String,
-    pub section: Option<String>,
-    pub key: String,
-    pub binding_id: String,
-    pub resource_id: String,
-}
-
-#[derive(Debug)]
-pub struct IniSnapshot {
-    pub bytes: Vec<u8>,
-    pub versions: Vec<FrozenResourceVersion>,
-    pub entries: Vec<ResolvedIniEntry>,
-}
-
-impl IniSnapshot {
+impl SurfaceSnapshot {
     pub fn audit_dependencies(&self) -> Vec<AuditDependency> {
         let versions: HashMap<&str, &FrozenResourceVersion> = self
             .versions
@@ -85,30 +54,7 @@ impl IniSnapshot {
             .map(|entry| {
                 let version = versions.get(entry.resource_id.as_str()).copied();
                 AuditDependency {
-                    key: entry.address.clone(),
-                    binding_id: entry.binding_id.clone(),
-                    resource_id: entry.resource_id.clone(),
-                    secret_id: version.map(|version| version.secret_id.clone()),
-                    version: version.map(|version| version.version),
-                }
-            })
-            .collect()
-    }
-}
-
-impl LinesSnapshot {
-    pub fn audit_dependencies(&self) -> Vec<AuditDependency> {
-        let versions: HashMap<&str, &FrozenResourceVersion> = self
-            .versions
-            .iter()
-            .map(|version| (version.resource_id.as_str(), version))
-            .collect();
-        self.entries
-            .iter()
-            .map(|entry| {
-                let version = versions.get(entry.resource_id.as_str()).copied();
-                AuditDependency {
-                    key: entry.address.clone(),
+                    key: entry.audit_key.clone(),
                     binding_id: entry.binding_id.clone(),
                     resource_id: entry.resource_id.clone(),
                     secret_id: version.map(|version| version.secret_id.clone()),
@@ -146,29 +92,6 @@ struct DirectEnvFileTarget {
     secret_id: String,
 }
 
-impl DotenvSnapshot {
-    pub fn audit_dependencies(&self) -> Vec<AuditDependency> {
-        let versions: HashMap<&str, &FrozenResourceVersion> = self
-            .versions
-            .iter()
-            .map(|version| (version.resource_id.as_str(), version))
-            .collect();
-        self.exports
-            .iter()
-            .map(|export| {
-                let version = versions.get(export.resource_id.as_str()).copied();
-                AuditDependency {
-                    key: export.key.clone(),
-                    binding_id: export.binding_id.clone(),
-                    resource_id: export.resource_id.clone(),
-                    secret_id: version.map(|version| version.secret_id.clone()),
-                    version: version.map(|version| version.version),
-                }
-            })
-            .collect()
-    }
-}
-
 #[derive(Clone)]
 pub struct SurfaceResolver {
     catalog: Catalog,
@@ -180,29 +103,54 @@ impl SurfaceResolver {
         SurfaceResolver { catalog, store }
     }
 
-    /// Resolve one catalog DotenvFile into a process access-session byte snapshot. All referenced secret
-    /// heads are captured before any decryption, and `get_version` reads those immutable heads.
-    pub fn render_dotenv_surface(&self, surface_id: &str) -> SurfaceResult<DotenvSnapshot> {
+    /// Resolve any composed file surface into one process access-session snapshot. Every
+    /// referenced secret head is frozen before the first secret is decrypted.
+    pub fn render_surface(&self, surface_id: &str) -> SurfaceResult<SurfaceSnapshot> {
         let snapshot = self.catalog.snapshot()?;
         let surface = snapshot
             .surfaces
             .iter()
             .find(|surface| surface.id == surface_id)
             .ok_or_else(|| SurfaceError::NotFound(surface_id.to_string()))?;
-        if surface.kind != SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)) {
+        let SurfaceKind::File(FileBacking::Composed(format)) = surface.kind else {
             return Err(SurfaceError::UnsupportedSurface {
                 surface_id: surface_id.to_string(),
                 kind: format!("{:?}", surface.kind),
             });
-        }
-        let exports = resolve_catalog_surface(&snapshot, surface_id)?;
+        };
+        let spec = format.spec();
+        let (document, versions) = match spec.input {
+            FormatInputModel::EnvironmentProjection => {
+                self.resolve_environment_document(&snapshot, surface_id)?
+            }
+            FormatInputModel::StructuredEntries { .. }
+            | FormatInputModel::KeylessScalars { .. } => {
+                self.resolve_binding_document(&snapshot, surface, spec)?
+            }
+        };
+        let rendered = renderer_for(format).render(document)?;
+        Ok(SurfaceSnapshot {
+            bytes: rendered.bytes,
+            versions,
+            entries: rendered.entries,
+        })
+    }
+
+    fn resolve_environment_document(
+        &self,
+        snapshot: &CatalogSnapshot,
+        surface_id: &str,
+    ) -> SurfaceResult<(ResolvedDocument, Vec<FrozenResourceVersion>)> {
+        let exports = resolve_catalog_surface(snapshot, surface_id)?;
         let resources: HashMap<&str, &Resource> = snapshot
             .resources
             .iter()
             .map(|resource| (resource.id.as_str(), resource))
             .collect();
-
-        let (frozen, versions) = self.freeze_versions(&snapshot, &exports)?;
+        let (frozen, versions) = self.freeze_versions(
+            snapshot,
+            exports.iter().map(|export| export.resource_id.as_str()),
+        )?;
         let mut resource_values: HashMap<String, Vec<DecodedEntry>> = HashMap::new();
         for export in &exports {
             if resource_values.contains_key(&export.resource_id) {
@@ -215,8 +163,8 @@ impl SurfaceResolver {
             resource_values.insert(resource.id.clone(), values);
         }
 
-        let mut ordered = Vec::with_capacity(exports.len());
-        for export in &exports {
+        let mut entries = Vec::with_capacity(exports.len());
+        for export in exports {
             let value = resource_values
                 .get(&export.resource_id)
                 .and_then(|values| {
@@ -226,95 +174,41 @@ impl SurfaceResolver {
                     resource_id: export.resource_id.clone(),
                     key: export.source_key.clone(),
                 })?;
-            ordered.push((export.key.as_str(), value.value.as_str()));
-        }
-        let bytes = render_dotenv_refs(ordered)?;
-        Ok(DotenvSnapshot { bytes, versions, exports })
-    }
-
-    /// Resolve a keyed environment projection as inert `export` statements. Values are always
-    /// shell-quoted by the renderer; resources cannot contribute executable shell fragments.
-    pub fn render_direnv_surface(&self, surface_id: &str) -> SurfaceResult<DirenvSnapshot> {
-        let snapshot = self.catalog.snapshot()?;
-        let surface = snapshot
-            .surfaces
-            .iter()
-            .find(|surface| surface.id == surface_id)
-            .ok_or_else(|| SurfaceError::NotFound(surface_id.to_string()))?;
-        if surface.kind != SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Direnv)) {
-            return Err(SurfaceError::UnsupportedSurface {
-                surface_id: surface_id.to_string(),
-                kind: format!("{:?}", surface.kind),
+            entries.push(ResolvedEnvironmentEntry {
+                export_key: export.key,
+                source_address: export.source_key,
+                binding_id: export.binding_id,
+                resource_id: export.resource_id,
+                value: value.value.clone(),
             });
         }
-        let exports = resolve_catalog_surface(&snapshot, surface_id)?;
-        let resources: HashMap<&str, &Resource> = snapshot
-            .resources
-            .iter()
-            .map(|resource| (resource.id.as_str(), resource))
-            .collect();
-
-        let (frozen, versions) = self.freeze_versions(&snapshot, &exports)?;
-        let mut resource_values: HashMap<String, Vec<DecodedEntry>> = HashMap::new();
-        for export in &exports {
-            if resource_values.contains_key(&export.resource_id) {
-                continue;
-            }
-            let resource = resources
-                .get(export.resource_id.as_str())
-                .ok_or_else(|| SurfaceError::NotFound(format!("resource {}", export.resource_id)))?;
-            let values = self.decode_resource(resource, frozen.get(&resource.id))?;
-            resource_values.insert(resource.id.clone(), values);
-        }
-
-        let mut ordered = Vec::with_capacity(exports.len());
-        for export in &exports {
-            let value = resource_values
-                .get(&export.resource_id)
-                .and_then(|values| {
-                    values.iter().find(|entry| entry.address == export.source_key)
-                })
-                .ok_or_else(|| SurfaceError::MissingKey {
-                    resource_id: export.resource_id.clone(),
-                    key: export.source_key.clone(),
-                })?;
-            ordered.push((export.key.as_str(), value.value.as_str()));
-        }
-        let bytes = render_direnv_refs(ordered)?;
-        Ok(DirenvSnapshot { bytes, versions, exports })
+        Ok((ResolvedDocument::Environment(entries), versions))
     }
 
-    /// Compose selected entries from ordered INI resources. Root entries are canonicalized
-    /// before sectioned entries so multiple bindings cannot alter their INI scope.
-    pub fn render_ini_surface(&self, surface_id: &str) -> SurfaceResult<IniSnapshot> {
-        let snapshot = self.catalog.snapshot()?;
-        let surface = snapshot
-            .surfaces
-            .iter()
-            .find(|surface| surface.id == surface_id)
-            .ok_or_else(|| SurfaceError::NotFound(surface_id.to_string()))?;
-        if surface.kind != SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Ini)) {
-            return Err(SurfaceError::UnsupportedSurface {
-                surface_id: surface_id.to_string(),
-                kind: format!("{:?}", surface.kind),
-            });
-        }
+    fn resolve_binding_document(
+        &self,
+        snapshot: &CatalogSnapshot,
+        surface: &accessfs_catalog::Surface,
+        spec: FormatSpec,
+    ) -> SurfaceResult<(ResolvedDocument, Vec<FrozenResourceVersion>)> {
         let environment = snapshot
             .environments
             .iter()
             .find(|environment| environment.id == surface.environment_id)
-            .ok_or_else(|| SurfaceError::NotFound(format!("environment {}", surface.environment_id)))?;
+            .ok_or_else(|| {
+                SurfaceError::NotFound(format!("environment {}", surface.environment_id))
+            })?;
         let SurfaceInput::Bindings { binding_ids } = &surface.input else {
             return Err(SurfaceError::IncompatibleResource {
                 resource_id: "<surface-input>".to_string(),
-                reason: "INI surface requires explicit binding input".to_string(),
+                reason: "composed file surface requires explicit binding input".to_string(),
             });
         };
-        let resources = snapshot
+        let resources: HashMap<&str, &Resource> = snapshot
             .resources
             .iter()
             .map(|resource| (resource.id.as_str(), resource))
-            .collect::<HashMap<_, _>>();
+            .collect();
         let mut bindings = Vec::new();
         for binding_id in binding_ids {
             let binding = snapshot
@@ -341,17 +235,7 @@ impl SurfaceResolver {
             let resource = resources.get(binding.resource_id.as_str()).ok_or_else(|| {
                 SurfaceError::NotFound(format!("resource {}", binding.resource_id))
             })?;
-            if resource.kind != ResourceKind::EnvFile
-                || resource.shape != ValueShape::KeyValueSet
-                || resource.codec != ResourceCodec::Ini
-                || !matches!(resource.source, ResourceSource::SecretRef { .. })
-                || binding.key_override.is_some()
-            {
-                return Err(SurfaceError::IncompatibleResource {
-                    resource_id: resource.id.clone(),
-                    reason: format!("binding {binding_id:?} does not expose an INI resource"),
-                });
-            }
+            validate_binding_input(spec, binding, resource)?;
             bindings.push(binding);
         }
         bindings.sort_by_key(|binding| {
@@ -362,33 +246,14 @@ impl SurfaceResolver {
             (scope_order, binding.position, binding.id.as_str())
         });
 
-        let mut frozen = HashMap::new();
-        let mut versions = Vec::new();
-        for binding in &bindings {
-            if frozen.contains_key(&binding.resource_id) {
-                continue;
-            }
-            let resource = resources.get(binding.resource_id.as_str()).ok_or_else(|| {
-                SurfaceError::NotFound(format!("resource {}", binding.resource_id))
-            })?;
-            let ResourceSource::SecretRef { secret_id } = &resource.source else {
-                unreachable!("INI compatibility requires a stored secret");
-            };
-            let id: SecretId = secret_id.parse()?;
-            let record = self
-                .store
-                .record(&id)?
-                .ok_or_else(|| SurfaceError::NotFound(format!("secret {secret_id}")))?;
-            frozen.insert(resource.id.clone(), (id, record.current_version));
-            versions.push(FrozenResourceVersion {
-                resource_id: resource.id.clone(),
-                secret_id: secret_id.clone(),
-                version: record.current_version,
-            });
-        }
-
+        let (frozen, versions) = self.freeze_versions(
+            snapshot,
+            bindings
+                .iter()
+                .map(|binding| binding.resource_id.as_str()),
+        )?;
         let mut decoded_resources = HashMap::new();
-        let mut values = Vec::new();
+        let mut entries = Vec::new();
         for binding in bindings {
             let resource = resources.get(binding.resource_id.as_str()).ok_or_else(|| {
                 SurfaceError::NotFound(format!("resource {}", binding.resource_id))
@@ -400,175 +265,21 @@ impl SurfaceResolver {
             let decoded = decoded_resources.get(&resource.id).ok_or_else(|| {
                 SurfaceError::NotFound(format!("decoded resource {}", resource.id))
             })?;
-            let selected = |address: &str| match &binding.selection {
-                EntrySelection::All => true,
-                EntrySelection::Entries { addresses } => addresses.iter().any(|item| item == address),
-            };
-            for entry in decoded.iter().filter(|entry| selected(&entry.address)) {
-                let key = entry.key.clone().ok_or_else(|| SurfaceError::MissingKey {
-                    resource_id: resource.id.clone(),
-                    key: entry.address.clone(),
-                })?;
-                values.push((
-                    ResolvedIniEntry {
-                        address: entry.address.clone(),
-                        section: entry.section.clone(),
-                        key,
-                        binding_id: binding.id.clone(),
-                        resource_id: resource.id.clone(),
-                    },
-                    entry.value.clone(),
-                ));
-            }
-        }
-        let (roots, sectioned): (Vec<_>, Vec<_>) = values
-            .into_iter()
-            .partition(|(entry, _)| entry.section.is_none());
-        let values = roots.into_iter().chain(sectioned).collect::<Vec<_>>();
-        let bytes = render_ini_refs(values.iter().map(|(entry, value)| {
-            (entry.section.as_deref(), entry.key.as_str(), value.as_str())
-        }))?;
-        let entries = values.into_iter().map(|(entry, _)| entry).collect();
-        Ok(IniSnapshot { bytes, versions, entries })
-    }
-
-    /// Compose selected keyless scalar values in binding order. The projection treats each
-    /// secret as an opaque line and has no vendor-specific knowledge of its contents.
-    pub fn render_lines_surface(&self, surface_id: &str) -> SurfaceResult<LinesSnapshot> {
-        let snapshot = self.catalog.snapshot()?;
-        let surface = snapshot
-            .surfaces
-            .iter()
-            .find(|surface| surface.id == surface_id)
-            .ok_or_else(|| SurfaceError::NotFound(surface_id.to_string()))?;
-        if surface.kind != SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Lines)) {
-            return Err(SurfaceError::UnsupportedSurface {
-                surface_id: surface_id.to_string(),
-                kind: format!("{:?}", surface.kind),
-            });
-        }
-        let environment = snapshot
-            .environments
-            .iter()
-            .find(|environment| environment.id == surface.environment_id)
-            .ok_or_else(|| SurfaceError::NotFound(format!("environment {}", surface.environment_id)))?;
-        let SurfaceInput::Bindings { binding_ids } = &surface.input else {
-            return Err(SurfaceError::IncompatibleResource {
-                resource_id: "<surface-input>".to_string(),
-                reason: "lines surface requires explicit binding input".to_string(),
-            });
-        };
-        let resources: HashMap<&str, &Resource> = snapshot
-            .resources
-            .iter()
-            .map(|resource| (resource.id.as_str(), resource))
-            .collect();
-        let mut bindings = Vec::new();
-        for binding_id in binding_ids {
-            let binding = snapshot
-                .bindings
+            for entry in decoded
                 .iter()
-                .find(|binding| binding.id == *binding_id)
-                .ok_or_else(|| SurfaceError::NotFound(format!("binding {binding_id}")))?;
-            let applies = binding.project_id == environment.project_id
-                && match &binding.scope {
-                    BindingScope::Common => true,
-                    BindingScope::Environment { environment_id } => {
-                        environment_id == &environment.id
-                    }
-                };
-            if !applies {
-                return Err(SurfaceError::IncompatibleResource {
-                    resource_id: binding.resource_id.clone(),
-                    reason: format!("binding {binding_id:?} does not apply to this surface"),
-                });
-            }
-            if !binding.enabled {
-                continue;
-            }
-            let resource = resources.get(binding.resource_id.as_str()).ok_or_else(|| {
-                SurfaceError::NotFound(format!("resource {}", binding.resource_id))
-            })?;
-            if resource.shape != ValueShape::Scalar
-                || resource.codec != ResourceCodec::Opaque
-                || resource.entries.len() != 1
-                || resource.entries[0].key.is_some()
-                || binding.key_override.is_some()
+                .filter(|entry| selection_contains(&binding.selection, &entry.address))
             {
-                return Err(SurfaceError::IncompatibleResource {
+                entries.push(ResolvedBindingEntry {
+                    address: entry.address.clone(),
+                    key: entry.key.clone(),
+                    section: entry.section.clone(),
+                    binding_id: binding.id.clone(),
                     resource_id: resource.id.clone(),
-                    reason: format!(
-                        "binding {binding_id:?} does not expose one keyless scalar"
-                    ),
+                    value: entry.value.clone(),
                 });
             }
-            let selected = match &binding.selection {
-                EntrySelection::All => true,
-                EntrySelection::Entries { addresses } => {
-                    addresses.contains(&resource.entries[0].address)
-                }
-            };
-            if !selected {
-                return Err(SurfaceError::IncompatibleResource {
-                    resource_id: resource.id.clone(),
-                    reason: format!("binding {binding_id:?} does not select its scalar entry"),
-                });
-            }
-            bindings.push(binding);
         }
-        bindings.sort_by_key(|binding| {
-            let scope_order = match binding.scope {
-                BindingScope::Common => 0,
-                BindingScope::Environment { .. } => 1,
-            };
-            (scope_order, binding.position, binding.id.as_str())
-        });
-
-        let mut frozen = HashMap::new();
-        let mut versions = Vec::new();
-        for binding in &bindings {
-            if frozen.contains_key(&binding.resource_id) {
-                continue;
-            }
-            let resource = resources.get(binding.resource_id.as_str()).ok_or_else(|| {
-                SurfaceError::NotFound(format!("resource {}", binding.resource_id))
-            })?;
-            let ResourceSource::SecretRef { secret_id } = &resource.source else { continue };
-            let id: SecretId = secret_id.parse()?;
-            let record = self
-                .store
-                .record(&id)?
-                .ok_or_else(|| SurfaceError::NotFound(format!("secret {secret_id}")))?;
-            frozen.insert(resource.id.clone(), (id, record.current_version));
-            versions.push(FrozenResourceVersion {
-                resource_id: resource.id.clone(),
-                secret_id: secret_id.clone(),
-                version: record.current_version,
-            });
-        }
-
-        let mut values = Vec::new();
-        let mut entries = Vec::new();
-        for binding in bindings {
-            let resource = resources.get(binding.resource_id.as_str()).ok_or_else(|| {
-                SurfaceError::NotFound(format!("resource {}", binding.resource_id))
-            })?;
-            let mut decoded = self.decode_resource(resource, frozen.get(&resource.id))?;
-            let value = decoded.pop().ok_or_else(|| SurfaceError::MissingKey {
-                resource_id: resource.id.clone(),
-                key: resource.entries[0].address.clone(),
-            })?;
-            values.push((resource.id.clone(), value.value));
-            entries.push(ResolvedLineEntry {
-                address: resource.entries[0].address.clone(),
-                binding_id: binding.id.clone(),
-                resource_id: resource.id.clone(),
-            });
-        }
-        let bytes = render_lines_refs(
-            values.iter().map(|(resource_id, value)| (resource_id.as_str(), value.as_str())),
-        )?;
-        Ok(LinesSnapshot { bytes, versions, entries })
+        Ok((ResolvedDocument::Bindings(entries), versions))
     }
 
     /// Read one directly linked EnvFile from an immutable store version. Unlike a composed
@@ -612,10 +323,10 @@ impl SurfaceResolver {
         })
     }
 
-    fn freeze_versions(
+    fn freeze_versions<'a>(
         &self,
         snapshot: &CatalogSnapshot,
-        exports: &[accessfs_catalog::ResolvedExport],
+        resource_ids: impl IntoIterator<Item = &'a str>,
     ) -> SurfaceResult<(FrozenSecretVersions, Vec<FrozenResourceVersion>)> {
         let resources: HashMap<&str, &Resource> = snapshot
             .resources
@@ -625,13 +336,13 @@ impl SurfaceResolver {
         let mut seen = HashSet::new();
         let mut frozen = HashMap::new();
         let mut versions = Vec::new();
-        for export in exports {
-            if !seen.insert(export.resource_id.as_str()) {
+        for resource_id in resource_ids {
+            if !seen.insert(resource_id) {
                 continue;
             }
             let resource = resources
-                .get(export.resource_id.as_str())
-                .ok_or_else(|| SurfaceError::NotFound(format!("resource {}", export.resource_id)))?;
+                .get(resource_id)
+                .ok_or_else(|| SurfaceError::NotFound(format!("resource {resource_id}")))?;
             let ResourceSource::SecretRef { secret_id } = &resource.source else {
                 continue;
             };
@@ -672,6 +383,61 @@ impl SurfaceResolver {
                 reason: "source cannot be decoded by a file projection".to_string(),
             }),
         }
+    }
+}
+
+fn validate_binding_input(
+    spec: FormatSpec,
+    binding: &Binding,
+    resource: &Resource,
+) -> SurfaceResult<()> {
+    let compatible = match spec.input {
+        FormatInputModel::EnvironmentProjection => false,
+        FormatInputModel::StructuredEntries {
+            required_kind,
+            required_shape,
+            required_codec,
+            stored_only,
+        } => {
+            resource.kind == required_kind
+                && resource.shape == required_shape
+                && resource.codec == required_codec
+                && (spec.allow_key_override || binding.key_override.is_none())
+                && (!stored_only || matches!(resource.source, ResourceSource::SecretRef { .. }))
+        }
+        FormatInputModel::KeylessScalars {
+            required_codec,
+            allow_literal,
+        } => {
+            resource.shape == ValueShape::Scalar
+                && resource.codec == required_codec
+                && resource.entries.len() == 1
+                && resource.entries[0].key.is_none()
+                && (spec.allow_key_override || binding.key_override.is_none())
+                && selection_contains(&binding.selection, &resource.entries[0].address)
+                && matches!(
+                    (&resource.source, allow_literal),
+                    (ResourceSource::SecretRef { .. }, _)
+                        | (ResourceSource::Literal { .. }, true)
+                )
+        }
+    };
+    if !compatible {
+        return Err(SurfaceError::IncompatibleResource {
+            resource_id: resource.id.clone(),
+            reason: format!(
+                "binding {:?} does not satisfy the surface format input contract",
+                binding.id
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn selection_contains(selection: &EntrySelection, address: &str) -> bool {
+    match selection {
+        EntrySelection::All => true,
+        EntrySelection::Entries { addresses } => addresses.iter().any(|item| item == address),
     }
 }
 
@@ -730,7 +496,7 @@ mod tests {
     use super::*;
     use accessfs_catalog::{
         Binding, BindingScope, EntrySelection, EntrySpec, Environment, Project,
-        ResourceKind, Surface,
+        ResourceCodec, ResourceKind, Surface, SurfaceFormat,
     };
     use accessfs_store::{NewSecret, SecretOrigin, SecretRecord, StoreResult, VersionRecord};
     use std::path::{Path, PathBuf};
@@ -1116,7 +882,7 @@ mod tests {
         let store = Arc::new(FixtureStore::new());
         let resolver = SurfaceResolver::new(catalog, Arc::clone(&store) as Arc<dyn SecretStore>);
 
-        let snapshot = resolver.render_dotenv_surface("fixture-dotenv").unwrap();
+        let snapshot = resolver.render_surface("fixture-dotenv").unwrap();
         assert_eq!(
             std::str::from_utf8(&snapshot.bytes).unwrap(),
             "SERVICE_TOKEN=fixture-token-value\nAPI_HOST=http://127.0.0.1:8787\nLOG_LEVEL=debug\nAPP_ENV=development\n"
@@ -1146,7 +912,7 @@ mod tests {
         assert_eq!(dependencies.last().unwrap().resource_id, "fixture-mode");
         assert_eq!(dependencies.last().unwrap().version, None);
 
-        let direnv = resolver.render_direnv_surface("fixture-direnv").unwrap();
+        let direnv = resolver.render_surface("fixture-direnv").unwrap();
         assert_eq!(
             std::str::from_utf8(&direnv.bytes).unwrap(),
             "export SERVICE_TOKEN='fixture-token-value'\nexport API_HOST='http://127.0.0.1:8787'\nexport LOG_LEVEL='debug'\nexport APP_ENV='development'\n"
@@ -1176,7 +942,7 @@ mod tests {
         let store = Arc::new(AdvancingStore::new());
         let resolver = SurfaceResolver::new(catalog, Arc::clone(&store) as Arc<dyn SecretStore>);
 
-        let snapshot = resolver.render_dotenv_surface("fixture-dotenv").unwrap();
+        let snapshot = resolver.render_surface("fixture-dotenv").unwrap();
 
         assert_eq!(
             snapshot.bytes,
@@ -1209,26 +975,14 @@ mod tests {
     }
 
     #[test]
-    fn render_entrypoints_reject_the_wrong_surface_kind() {
+    fn render_entrypoint_rejects_non_composed_surfaces() {
         let dir = tempfile::tempdir().unwrap();
         let catalog = fixture_catalog(&dir.path().join("catalog.sqlite"));
         let resolver =
             SurfaceResolver::new(catalog, Arc::new(FixtureStore::new()) as Arc<dyn SecretStore>);
 
         assert!(matches!(
-            resolver.render_dotenv_surface("fixture-direct-env"),
-            Err(SurfaceError::UnsupportedSurface { .. })
-        ));
-        assert!(matches!(
-            resolver.render_direnv_surface("fixture-dotenv"),
-            Err(SurfaceError::UnsupportedSurface { .. })
-        ));
-        assert!(matches!(
-            resolver.render_ini_surface("fixture-dotenv"),
-            Err(SurfaceError::UnsupportedSurface { .. })
-        ));
-        assert!(matches!(
-            resolver.render_lines_surface("fixture-dotenv"),
+            resolver.render_surface("fixture-direct-env"),
             Err(SurfaceError::UnsupportedSurface { .. })
         ));
         assert!(matches!(
@@ -1435,18 +1189,21 @@ mod tests {
 
         let store = Arc::new(FixtureStore::new());
         let resolver = SurfaceResolver::new(catalog, Arc::clone(&store) as Arc<dyn SecretStore>);
-        let snapshot = resolver.render_dotenv_surface("fixture-ini-dotenv").unwrap();
+        let snapshot = resolver.render_surface("fixture-ini-dotenv").unwrap();
 
         assert_eq!(snapshot.bytes, b"REGION=fixture-region-two\nOUTPUT=fixture-text\n");
         assert!(!std::str::from_utf8(&snapshot.bytes).unwrap().contains("fixture-region-one"));
 
-        let snapshot = resolver.render_ini_surface("fixture-ini-output").unwrap();
+        let snapshot = resolver.render_surface("fixture-ini-output").unwrap();
         assert_eq!(
             snapshot.bytes,
             b"[fixture-staging]\nREGION = fixture-region-two\nOUTPUT = fixture-text\n"
         );
         assert_eq!(snapshot.entries.len(), 2);
-        assert_eq!(snapshot.entries[0].section.as_deref(), Some("fixture-staging"));
+        assert_eq!(
+            snapshot.entries[0].audit_key,
+            "sections/fixture-staging/keys/REGION"
+        );
         let dependencies = snapshot.audit_dependencies();
         assert_eq!(dependencies[0].key, "sections/fixture-staging/keys/REGION");
         assert_eq!(dependencies[0].secret_id.as_deref(), Some(INI_FILE_ID));
@@ -1543,7 +1300,7 @@ mod tests {
         let resolver =
             SurfaceResolver::new(catalog, Arc::new(FixtureStore::new()) as Arc<dyn SecretStore>);
         assert!(matches!(
-            resolver.render_lines_surface(&multiline_surface.id),
+            resolver.render_surface(&multiline_surface.id),
             Err(SurfaceError::InvalidLineValue { .. })
         ));
     }
@@ -1723,7 +1480,7 @@ mod tests {
         let resolver =
             SurfaceResolver::new(catalog, Arc::new(FixtureStore::new()) as Arc<dyn SecretStore>);
         let common_first = resolver
-            .render_ini_surface("fixture-common-first-ini")
+            .render_surface("fixture-common-first-ini")
             .unwrap();
         assert_eq!(
             common_first.bytes,
@@ -1735,14 +1492,17 @@ mod tests {
         );
 
         let root_first = resolver
-            .render_ini_surface("fixture-root-first-ini")
+            .render_surface("fixture-root-first-ini")
             .unwrap();
         assert_eq!(
             root_first.bytes,
             b"ROOT = root-value\n\n[fixture-development]\nREGION = fixture-region-one\n"
         );
-        assert!(root_first.entries[0].section.is_none());
-        assert_eq!(root_first.entries[1].section.as_deref(), Some("fixture-development"));
+        assert_eq!(root_first.entries[0].audit_key, "root/keys/ROOT");
+        assert_eq!(
+            root_first.entries[1].audit_key,
+            "sections/fixture-development/keys/REGION"
+        );
     }
 
     #[test]
@@ -1824,7 +1584,7 @@ mod tests {
         let resolver =
             SurfaceResolver::new(catalog, Arc::new(FixtureStore::new()) as Arc<dyn SecretStore>);
         let snapshot = resolver
-            .render_lines_surface("fixture-common-first-lines")
+            .render_surface("fixture-common-first-lines")
             .unwrap();
         assert_eq!(snapshot.bytes, b"common-line\nenvironment-line\n");
         assert_eq!(snapshot.entries[0].binding_id, common_binding.id);
@@ -1904,7 +1664,7 @@ mod tests {
         let store = Arc::new(FixtureStore::new());
         let resolver = SurfaceResolver::new(catalog, Arc::clone(&store) as Arc<dyn SecretStore>);
 
-        let snapshot = resolver.render_lines_surface("fixture-lines").unwrap();
+        let snapshot = resolver.render_surface("fixture-lines").unwrap();
         assert_eq!(
             snapshot.bytes,
             b"db-one.fixture.invalid|5432|app|fixture-user|fixture-pass-one\ndb-two.fixture.invalid|5432|app|fixture-user|fixture-pass-two\n"
@@ -1924,13 +1684,13 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(snapshot.entries[0].address, "value");
+        assert_eq!(snapshot.entries[0].audit_key, "value");
         let dependencies = snapshot.audit_dependencies();
         assert_eq!(dependencies[0].binding_id, "fixture-line-one-binding");
         assert_eq!(dependencies[0].version, Some(1));
 
         assert_eq!(
-            resolver.render_lines_surface("fixture-other-lines").unwrap().bytes,
+            resolver.render_surface("fixture-other-lines").unwrap().bytes,
             b"db-two.fixture.invalid|5432|app|fixture-user|fixture-pass-two\n"
         );
     }

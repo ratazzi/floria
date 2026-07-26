@@ -30,6 +30,6 @@ pub use render::{
 };
 pub use registry::{RegisteredSurface, SurfaceBacking, SurfaceRegistry};
 pub use resolver::{
-    DirectEnvFileCommit, DirectEnvFileSnapshot, DirenvSnapshot, DotenvSnapshot,
-    FrozenResourceVersion, IniSnapshot, LinesSnapshot, ResolvedIniEntry, SurfaceResolver,
+    DirectEnvFileCommit, DirectEnvFileSnapshot, FrozenResourceVersion, SurfaceResolver,
+    SurfaceSnapshot,
 };
