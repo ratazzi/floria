@@ -7,10 +7,11 @@ use accessfs_core::authz::Enforcement;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::domain::{
-    Binding, BindingScope, CatalogSnapshot, EntrySelection, Environment, FileBacking, OriginSource,
-    Project, ProjectCheckout, ProjectCheckoutKind, ResolvedEnvironment, ResolvedExport, Resource,
-    ResourceBindingUsage, ResourceCodec, ResourceKind, ResourceOrigin, ResourceSource,
-    ResourceUsage, Surface, SurfaceFormat, SurfaceInput, SurfaceKind, ValueShape,
+    Binding, BindingScope, CatalogSnapshot, EntrySelection, Environment, FileBacking,
+    FormatInputModel, OriginSource, Project, ProjectCheckout, ProjectCheckoutKind,
+    ResolvedEnvironment, ResolvedExport, Resource, ResourceBindingUsage, ResourceCodec,
+    ResourceKind, ResourceOrigin, ResourceSource, ResourceUsage, Surface, SurfaceFormat,
+    SurfaceInput, SurfaceKind, ValueShape,
 };
 use crate::error::{CatalogError, CatalogResult};
 
@@ -1142,76 +1143,71 @@ fn validate_composed_surface_member(
         EntrySelection::All => true,
         EntrySelection::Entries { addresses } => addresses.contains(&entry.address),
     });
-    match surface.kind {
-        SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)) | SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Direnv)) => {
-            let compatible_source = matches!(
-                (&resource.shape, &resource.codec, &resource.source),
-                (
-                    ValueShape::Scalar,
-                    ResourceCodec::Opaque,
-                    ResourceSource::SecretRef { .. } | ResourceSource::Literal { .. }
-                ) | (
-                    ValueShape::KeyValueSet,
-                    ResourceCodec::Dotenv | ResourceCodec::Ini,
-                    ResourceSource::SecretRef { .. }
-                )
-            );
-            if !compatible_source
-                || entries.into_iter().any(|entry| {
-                    resource.shape != ValueShape::Scalar && entry.key.is_none()
-                        || resource.shape == ValueShape::Scalar
-                            && binding.key_override.as_ref().or(entry.key.as_ref()).is_none()
-                        || binding
-                            .key_override
-                            .as_ref()
-                            .or(entry.key.as_ref())
-                            .is_some_and(|key| require_env_key(key).is_err())
-                })
-            {
-                return Err(CatalogError::Validation(format!(
-                    "binding {:?} cannot feed {} surface {:?}",
-                    binding.id,
-                    if surface.kind == SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)) {
-                        "dotenv"
-                    } else {
-                        "direnv"
-                    },
-                    surface.id
-                )));
-            }
-        }
-        SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Ini)) => {
-            let compatible = resource.kind == ResourceKind::EnvFile
-                && resource.shape == ValueShape::KeyValueSet
-                && resource.codec == ResourceCodec::Ini
-                && binding.key_override.is_none()
-                && entries.into_iter().all(|entry| entry.key.is_some())
-                && matches!(resource.source, ResourceSource::SecretRef { .. });
-            if !compatible {
-                return Err(CatalogError::Validation(format!(
-                    "binding {:?} cannot feed INI surface {:?}",
-                    binding.id, surface.id
-                )));
-            }
-        }
-        SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Lines)) => {
-            let compatible = resource.shape == ValueShape::Scalar
-                && resource.codec == ResourceCodec::Opaque
-                && binding.key_override.is_none()
-                && entries.into_iter().all(|entry| entry.key.is_none())
-                && matches!(
-                    resource.source,
-                    ResourceSource::SecretRef { .. } | ResourceSource::Literal { .. }
-                );
-            if !compatible {
-                return Err(CatalogError::Validation(format!(
-                    "binding {:?} cannot feed lines surface {:?}",
-                    binding.id, surface.id
-                )));
+    let compatible = match surface.kind {
+        SurfaceKind::File(FileBacking::Composed(format)) => {
+            let spec = format.spec();
+            match spec.input {
+                FormatInputModel::EnvironmentProjection => {
+                    let compatible_source = matches!(
+                        (&resource.shape, &resource.codec, &resource.source),
+                        (
+                            ValueShape::Scalar,
+                            ResourceCodec::Opaque,
+                            ResourceSource::SecretRef { .. } | ResourceSource::Literal { .. }
+                        ) | (
+                            ValueShape::KeyValueSet,
+                            ResourceCodec::Dotenv | ResourceCodec::Ini,
+                            ResourceSource::SecretRef { .. }
+                        )
+                    );
+                    compatible_source
+                        && entries.into_iter().all(|entry| {
+                            !(resource.shape != ValueShape::Scalar && entry.key.is_none()
+                                || resource.shape == ValueShape::Scalar
+                                    && binding
+                                        .key_override
+                                        .as_ref()
+                                        .or(entry.key.as_ref())
+                                        .is_none()
+                                || binding
+                                    .key_override
+                                    .as_ref()
+                                    .or(entry.key.as_ref())
+                                    .is_some_and(|key| require_env_key(key).is_err()))
+                        })
+                }
+                FormatInputModel::StructuredEntries {
+                    required_kind,
+                    required_shape,
+                    required_codec,
+                    stored_only,
+                } => {
+                    resource.kind == required_kind
+                        && resource.shape == required_shape
+                        && resource.codec == required_codec
+                        && (spec.allow_key_override || binding.key_override.is_none())
+                        && entries.into_iter().all(|entry| entry.key.is_some())
+                        && (!stored_only
+                            || matches!(resource.source, ResourceSource::SecretRef { .. }))
+                }
+                FormatInputModel::KeylessScalars {
+                    required_codec,
+                    allow_literal,
+                } => {
+                    resource.shape == ValueShape::Scalar
+                        && resource.codec == required_codec
+                        && (spec.allow_key_override || binding.key_override.is_none())
+                        && entries.into_iter().all(|entry| entry.key.is_none())
+                        && matches!(
+                            (&resource.source, allow_literal),
+                            (ResourceSource::SecretRef { .. }, _)
+                                | (ResourceSource::Literal { .. }, true)
+                        )
+                }
             }
         }
         SurfaceKind::UnixSocket => {
-            let compatible = matches!(
+            matches!(
                 (&resource.kind, &resource.shape, &resource.source),
                 (
                     ResourceKind::SshIdentity,
@@ -1222,20 +1218,21 @@ fn validate_composed_surface_member(
                     ValueShape::Socket,
                     ResourceSource::Socket { .. }
                 )
-            )
-                && resource.codec == ResourceCodec::Opaque
+            ) && resource.codec == ResourceCodec::Opaque
                 && binding.key_override.is_none()
-                && entries.into_iter().all(|entry| entry.key.is_none());
-            if !compatible {
-                return Err(CatalogError::Validation(format!(
-                    "binding {:?} cannot feed SSH agent surface {:?}",
-                    binding.id, surface.id
-                )));
-            }
+                && entries.into_iter().all(|entry| entry.key.is_none())
         }
         SurfaceKind::File(FileBacking::EnvFileDirect) => {
-            unreachable!("only composed surfaces call member validation")
+            unreachable!("direct file surfaces do not have binding members")
         }
+    };
+    if !compatible {
+        return Err(CatalogError::Validation(format!(
+            "binding {:?} cannot feed {} surface {:?}",
+            binding.id,
+            surface.kind.as_str(),
+            surface.id
+        )));
     }
     Ok(())
 }

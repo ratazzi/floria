@@ -7,6 +7,7 @@ mod error;
 mod ini;
 mod links;
 mod lines;
+mod render;
 mod registry;
 mod resolver;
 
@@ -23,6 +24,10 @@ pub use links::{
     SurfaceLinkRemoval, SurfaceLinkState,
 };
 pub use lines::LINES_MAX_SIZE;
+pub use render::{
+    renderer_for, RenderedSurface, Renderer, ResolvedBindingEntry, ResolvedDocument,
+    ResolvedEntryMeta, ResolvedEnvironmentEntry,
+};
 pub use registry::{RegisteredSurface, SurfaceBacking, SurfaceRegistry};
 pub use resolver::{
     DirectEnvFileCommit, DirectEnvFileSnapshot, DirenvSnapshot, DotenvSnapshot,

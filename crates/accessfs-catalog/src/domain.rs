@@ -279,6 +279,63 @@ pub enum SurfaceFormat {
     Lines,
 }
 
+/// The catalog-side document shape accepted by one composed surface format.
+///
+/// This is domain compatibility data, not byte-layout behavior. The catalog uses it while
+/// validating writes and the surface resolver uses the same value to choose its resolution
+/// pipeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FormatInputModel {
+    /// A resolved environment projection with override, conflict, and environment-key semantics.
+    EnvironmentProjection,
+    /// Ordered key/value entries, optionally carrying structural metadata such as an INI section.
+    StructuredEntries {
+        required_kind: ResourceKind,
+        required_shape: ValueShape,
+        required_codec: ResourceCodec,
+        stored_only: bool,
+    },
+    /// Ordered scalar values whose selected entries must not expose keys.
+    KeylessScalars {
+        required_codec: ResourceCodec,
+        allow_literal: bool,
+    },
+}
+
+/// The complete catalog compatibility contract for one composed output format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FormatSpec {
+    pub input: FormatInputModel,
+    pub allow_key_override: bool,
+}
+
+impl SurfaceFormat {
+    pub const fn spec(self) -> FormatSpec {
+        match self {
+            SurfaceFormat::Dotenv | SurfaceFormat::Direnv => FormatSpec {
+                input: FormatInputModel::EnvironmentProjection,
+                allow_key_override: true,
+            },
+            SurfaceFormat::Ini => FormatSpec {
+                input: FormatInputModel::StructuredEntries {
+                    required_kind: ResourceKind::EnvFile,
+                    required_shape: ValueShape::KeyValueSet,
+                    required_codec: ResourceCodec::Ini,
+                    stored_only: true,
+                },
+                allow_key_override: false,
+            },
+            SurfaceFormat::Lines => FormatSpec {
+                input: FormatInputModel::KeylessScalars {
+                    required_codec: ResourceCodec::Opaque,
+                    allow_literal: true,
+                },
+                allow_key_override: false,
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileBacking {
     /// Rendered from bindings on every open.
@@ -457,7 +514,41 @@ pub struct ResourceUsage {
 
 #[cfg(test)]
 mod tests {
-    use super::{FileBacking, SurfaceFormat, SurfaceKind};
+    use super::{
+        FileBacking, FormatInputModel, ResourceCodec, ResourceKind, SurfaceFormat, SurfaceKind,
+        ValueShape,
+    };
+
+    #[test]
+    fn surface_formats_declare_their_catalog_input_contract() {
+        for format in [SurfaceFormat::Dotenv, SurfaceFormat::Direnv] {
+            let spec = format.spec();
+            assert_eq!(spec.input, FormatInputModel::EnvironmentProjection);
+            assert!(spec.allow_key_override);
+        }
+
+        let ini = SurfaceFormat::Ini.spec();
+        assert_eq!(
+            ini.input,
+            FormatInputModel::StructuredEntries {
+                required_kind: ResourceKind::EnvFile,
+                required_shape: ValueShape::KeyValueSet,
+                required_codec: ResourceCodec::Ini,
+                stored_only: true,
+            }
+        );
+        assert!(!ini.allow_key_override);
+
+        let lines = SurfaceFormat::Lines.spec();
+        assert_eq!(
+            lines.input,
+            FormatInputModel::KeylessScalars {
+                required_codec: ResourceCodec::Opaque,
+                allow_literal: true,
+            }
+        );
+        assert!(!lines.allow_key_override);
+    }
 
     #[test]
     fn surface_kind_round_trips_database_and_flat_json_names() {
