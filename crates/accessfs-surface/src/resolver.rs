@@ -7,6 +7,8 @@ use accessfs_catalog::{
     ValueShape,
 };
 use accessfs_core::audit::AuditDependency;
+use accessfs_core::authz::Operation;
+use accessfs_core::source::{ContentSource, PinnedContent, SourceCtx, StorageDisposition};
 use accessfs_store::{SecretId, SecretStore};
 
 use crate::codec::{codec_capabilities, decode_resource as decode_resource_bytes, DecodedEntry};
@@ -15,8 +17,9 @@ use crate::render::{
     renderer_for, ResolvedBindingEntry, ResolvedDocument, ResolvedEntryMeta,
     ResolvedEnvironmentEntry,
 };
+use crate::source::compile_source;
 
-type FrozenSecretVersions = HashMap<String, (SecretId, u32)>;
+type DecodedResources = HashMap<String, Vec<DecodedEntry>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FrozenResourceVersion {
@@ -142,26 +145,11 @@ impl SurfaceResolver {
         surface_id: &str,
     ) -> SurfaceResult<(ResolvedDocument, Vec<FrozenResourceVersion>)> {
         let exports = resolve_catalog_surface(snapshot, surface_id)?;
-        let resources: HashMap<&str, &Resource> = snapshot
-            .resources
-            .iter()
-            .map(|resource| (resource.id.as_str(), resource))
-            .collect();
-        let (frozen, versions) = self.freeze_versions(
+        let (resource_values, versions) = self.resolve_resources(
             snapshot,
             exports.iter().map(|export| export.resource_id.as_str()),
+            surface_id,
         )?;
-        let mut resource_values: HashMap<String, Vec<DecodedEntry>> = HashMap::new();
-        for export in &exports {
-            if resource_values.contains_key(&export.resource_id) {
-                continue;
-            }
-            let resource = resources
-                .get(export.resource_id.as_str())
-                .ok_or_else(|| SurfaceError::NotFound(format!("resource {}", export.resource_id)))?;
-            let values = self.decode_resource(resource, frozen.get(&resource.id))?;
-            resource_values.insert(resource.id.clone(), values);
-        }
 
         let mut entries = Vec::with_capacity(exports.len());
         for export in exports {
@@ -246,22 +234,18 @@ impl SurfaceResolver {
             (scope_order, binding.position, binding.id.as_str())
         });
 
-        let (frozen, versions) = self.freeze_versions(
+        let (decoded_resources, versions) = self.resolve_resources(
             snapshot,
             bindings
                 .iter()
                 .map(|binding| binding.resource_id.as_str()),
+            &surface.id,
         )?;
-        let mut decoded_resources = HashMap::new();
         let mut entries = Vec::new();
         for binding in bindings {
             let resource = resources.get(binding.resource_id.as_str()).ok_or_else(|| {
                 SurfaceError::NotFound(format!("resource {}", binding.resource_id))
             })?;
-            if !decoded_resources.contains_key(&resource.id) {
-                let decoded = self.decode_resource(resource, frozen.get(&resource.id))?;
-                decoded_resources.insert(resource.id.clone(), decoded);
-            }
             let decoded = decoded_resources.get(&resource.id).ok_or_else(|| {
                 SurfaceError::NotFound(format!("decoded resource {}", resource.id))
             })?;
@@ -327,19 +311,19 @@ impl SurfaceResolver {
         })
     }
 
-    fn freeze_versions<'a>(
+    fn resolve_resources<'a>(
         &self,
         snapshot: &CatalogSnapshot,
         resource_ids: impl IntoIterator<Item = &'a str>,
-    ) -> SurfaceResult<(FrozenSecretVersions, Vec<FrozenResourceVersion>)> {
+        virtual_path: &str,
+    ) -> SurfaceResult<(DecodedResources, Vec<FrozenResourceVersion>)> {
         let resources: HashMap<&str, &Resource> = snapshot
             .resources
             .iter()
             .map(|resource| (resource.id.as_str(), resource))
             .collect();
         let mut seen = HashSet::new();
-        let mut frozen = HashMap::new();
-        let mut versions = Vec::new();
+        let mut compiled: Vec<(&Resource, Arc<dyn ContentSource>)> = Vec::new();
         for resource_id in resource_ids {
             if !seen.insert(resource_id) {
                 continue;
@@ -347,46 +331,58 @@ impl SurfaceResolver {
             let resource = resources
                 .get(resource_id)
                 .ok_or_else(|| SurfaceError::NotFound(format!("resource {resource_id}")))?;
-            let ResourceSource::SecretRef { secret_id } = &resource.source else {
-                continue;
-            };
-            let id: SecretId = secret_id.parse()?;
-            let record = self
-                .store
-                .record(&id)?
-                .ok_or_else(|| SurfaceError::NotFound(format!("secret {secret_id}")))?;
-            frozen.insert(resource.id.clone(), (id, record.current_version));
-            versions.push(FrozenResourceVersion {
-                resource_id: resource.id.clone(),
-                secret_id: secret_id.clone(),
-                version: record.current_version,
-            });
-        }
-        Ok((frozen, versions))
-    }
-
-    fn decode_resource(
-        &self,
-        resource: &Resource,
-        frozen: Option<&(SecretId, u32)>,
-    ) -> SurfaceResult<Vec<DecodedEntry>> {
-        match &resource.source {
-            ResourceSource::SecretRef { .. } => {
-                let (id, version) = frozen.ok_or_else(|| {
-                    SurfaceError::NotFound(format!(
-                        "frozen version for resource {}",
-                        resource.id
-                    ))
-                })?;
-                let plaintext = self.store.get_version(id, *version)?;
-                decode_resource_bytes(resource, &plaintext)
+            let source = compile_source(&resource.source, &self.store).map_err(|error| {
+                with_resource_id(error, &resource.id)
+            })?;
+            if source.storage_disposition() == StorageDisposition::Computed {
+                return Err(SurfaceError::IncompatibleResource {
+                    resource_id: resource.id.clone(),
+                    reason: "source cannot be decoded by a file projection".to_string(),
+                });
             }
-            ResourceSource::Literal { value } => decode_resource_bytes(resource, value.as_bytes()),
-            _ => Err(SurfaceError::IncompatibleResource {
-                resource_id: resource.id.clone(),
-                reason: "source cannot be decoded by a file projection".to_string(),
-            }),
+            compiled.push((resource, source));
         }
+
+        let ctx = SourceCtx {
+            virtual_path,
+            request_uid: 0,
+            request_pid: 0,
+            operation: Operation::Read,
+        };
+        let mut pinned: Vec<(&Resource, Box<dyn PinnedContent>)> =
+            Vec::with_capacity(compiled.len());
+        let mut versions = Vec::new();
+        for (resource, source) in compiled {
+            let content = source.pin(&ctx)?;
+            if let Some(version) = content.pinned_version() {
+                versions.push(FrozenResourceVersion {
+                    resource_id: resource.id.clone(),
+                    secret_id: version.secret_id.clone(),
+                    version: version.version,
+                });
+            }
+            pinned.push((resource, content));
+        }
+
+        let mut decoded = HashMap::new();
+        for (resource, content) in pinned {
+            let source_snapshot = content.read()?;
+            let entries = decode_resource_bytes(resource, &source_snapshot.bytes)?;
+            decoded.insert(resource.id.clone(), entries);
+        }
+        Ok((decoded, versions))
+    }
+}
+
+fn with_resource_id(error: SurfaceError, resource_id: &str) -> SurfaceError {
+    match error {
+        SurfaceError::IncompatibleResource { reason, .. } => {
+            SurfaceError::IncompatibleResource {
+                resource_id: resource_id.to_string(),
+                reason,
+            }
+        }
+        error => error,
     }
 }
 
@@ -999,8 +995,6 @@ mod tests {
     fn executable_and_socket_sources_are_not_file_projection_inputs() {
         let dir = tempfile::tempdir().unwrap();
         let catalog = fixture_catalog(&dir.path().join("catalog.sqlite"));
-        let resolver =
-            SurfaceResolver::new(catalog, Arc::new(FixtureStore::new()) as Arc<dyn SecretStore>);
         let resource = |id: &str, source| Resource {
             id: id.to_string(),
             name: id.to_string(),
@@ -1020,22 +1014,44 @@ mod tests {
             origin: Default::default(),
         };
 
-        for resource in [
+        add_resource(
+            &catalog,
             resource(
                 "fixture-command",
                 ResourceSource::Command {
                     argv: vec!["/fixture/command".to_string()],
                 },
             ),
-            resource(
-                "fixture-socket",
-                ResourceSource::Socket {
+        );
+        add_resource(
+            &catalog,
+            Resource {
+                id: "fixture-socket".to_string(),
+                name: "fixture-socket".to_string(),
+                kind: ResourceKind::SshAgent,
+                shape: ValueShape::Socket,
+                codec: ResourceCodec::Opaque,
+                default_env_key: None,
+                entries: Vec::new(),
+                source: ResourceSource::Socket {
                     endpoint: PathBuf::from("/fixture/agent.sock"),
                 },
-            ),
-        ] {
+                enforcement: Default::default(),
+                metadata: Default::default(),
+                origin: Default::default(),
+            },
+        );
+        let snapshot = catalog.snapshot().unwrap();
+        let resolver =
+            SurfaceResolver::new(catalog, Arc::new(FixtureStore::new()) as Arc<dyn SecretStore>);
+
+        for resource_id in ["fixture-command", "fixture-socket"] {
             assert!(matches!(
-                resolver.decode_resource(&resource, None),
+                resolver.resolve_resources(
+                    &snapshot,
+                    std::iter::once(resource_id),
+                    "fixture-surface",
+                ),
                 Err(SurfaceError::IncompatibleResource { .. })
             ));
         }

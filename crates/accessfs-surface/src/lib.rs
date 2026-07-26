@@ -10,6 +10,7 @@ mod lines;
 mod render;
 mod registry;
 mod resolver;
+mod source;
 
 pub use codec::{
     codec_capabilities, commit_secret_version, decode_resource, decode_source,
@@ -33,3 +34,4 @@ pub use resolver::{
     DirectEnvFileCommit, DirectEnvFileSnapshot, FrozenResourceVersion, SurfaceResolver,
     SurfaceSnapshot,
 };
+pub use source::compile_source;

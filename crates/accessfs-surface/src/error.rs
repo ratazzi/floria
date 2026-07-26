@@ -7,6 +7,9 @@ pub type SurfaceResult<T> = Result<T, SurfaceError>;
 #[derive(Debug, Error)]
 pub enum SurfaceError {
     #[error(transparent)]
+    Core(#[from] accessfs_core::CoreError),
+
+    #[error(transparent)]
     Catalog(#[from] accessfs_catalog::CatalogError),
 
     #[error("secret store error: {0}")]
