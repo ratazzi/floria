@@ -1323,7 +1323,7 @@ private struct ProjectCheckoutsSheet: View {
             managed?.environmentID != selectedEnvironmentID && !selectedEnvironmentID.isEmpty
 
         return HStack(spacing: 14) {
-            Image(systemName: candidate.gitPrimary ? "folder.fill" : "folder")
+            Image(systemName: candidate.gitPrimary ? "folder" : "arrow.triangle.branch")
                 .font(.system(size: 19))
                 .foregroundStyle(candidate.gitPrimary ? Color.accentColor : Color.blue.opacity(0.78))
                 .frame(width: 34, height: 34)
