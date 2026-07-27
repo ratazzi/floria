@@ -1075,7 +1075,11 @@ private struct CompactProjectDetailView: View {
                 VStack(spacing: 0) {
                     ForEach(Array(filteredSurfaces.enumerated()), id: \.element.id) {
                         index, surface in
-                        CompactSurfaceRow(surface: surface, openAdvanced: openAdvanced)
+                        CompactSurfaceRow(
+                            state: state,
+                            surface: surface,
+                            bindings: bindings(for: surface),
+                            openAdvanced: openAdvanced)
                         if index != filteredSurfaces.count - 1 {
                             Divider().padding(.leading, 58)
                         }
@@ -1123,31 +1127,35 @@ private struct CompactProjectDetailView: View {
             }
         }
     }
+
+    // Bindings feeding an output render nested under it; this section only
+    // lists bindings no output references yet.
+    @ViewBuilder
     private var bindingsSection: some View {
-        DashboardSection(title: "Bindings") {
-            Text("\(activeBindings.filter(\.isEnabled).count) enabled")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        } content: {
-            if filteredBindings.isEmpty {
-                CompactEmptyRow(
-                    icon: search.isEmpty ? "link.badge.plus" : "magnifyingglass",
-                    title: search.isEmpty ? "No bindings in this environment" : "No matching bindings",
-                    detail: search.isEmpty
-                        ? "Choose Manage Project to compose resources into this project."
-                        : "Try a different search.")
-            } else {
-                VStack(spacing: 0) {
-                    ForEach(Array(filteredBindings.enumerated()), id: \.element.id) {
-                        index, binding in
-                        CompactBindingRow(
-                            state: state,
-                            binding: binding,
-                            resource: state.workspace.resource(binding.resourceID),
-                            scope: bindingScope(binding),
-                            openAdvanced: openAdvanced)
-                        if index != filteredBindings.count - 1 {
-                            Divider().padding(.leading, 58)
+        if !orphanBindings.isEmpty {
+            DashboardSection(title: "Unattached Bindings") {
+                Text("\(orphanBindings.filter(\.isEnabled).count) enabled")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } content: {
+                if filteredOrphanBindings.isEmpty {
+                    CompactEmptyRow(
+                        icon: "magnifyingglass",
+                        title: "No matching bindings",
+                        detail: "Try a different search.")
+                } else {
+                    VStack(spacing: 0) {
+                        ForEach(Array(filteredOrphanBindings.enumerated()), id: \.element.id) {
+                            index, binding in
+                            CompactBindingRow(
+                                state: state,
+                                binding: binding,
+                                resource: state.workspace.resource(binding.resourceID),
+                                scope: bindingScope(binding),
+                                openAdvanced: openAdvanced)
+                            if index != filteredOrphanBindings.count - 1 {
+                                Divider().padding(.leading, 58)
+                            }
                         }
                     }
                 }
@@ -1194,25 +1202,37 @@ private struct CompactProjectDetailView: View {
         project.commonBindings + (selectedEnvironment?.bindings ?? [])
     }
 
-    private var filteredSurfaces: [WorkspaceSurface] {
-        guard !search.isEmpty else { return surfaces }
-        return surfaces.filter {
-            [$0.name, $0.path, $0.kind.title, $0.securityLevel.title]
-                .joined(separator: " ")
-                .localizedCaseInsensitiveContains(search)
+    private func bindings(for surface: WorkspaceSurface) -> [WorkspaceBinding] {
+        surface.bindingIDs.compactMap { id in
+            activeBindings.first { $0.id == id }
         }
     }
 
-    private var filteredBindings: [WorkspaceBinding] {
-        guard !search.isEmpty else { return activeBindings }
-        return activeBindings.filter { binding in
-            guard let resource = state.workspace.resource(binding.resourceID) else { return false }
-            return [
-                resource.name, resource.kind.title, resource.exportSummary,
-                bindingScope(binding),
-            ]
-            .joined(separator: " ")
-            .localizedCaseInsensitiveContains(search)
+    private var orphanBindings: [WorkspaceBinding] {
+        let attached = Set(surfaces.flatMap(\.bindingIDs))
+        return activeBindings.filter { !attached.contains($0.id) }
+    }
+
+    private func bindingMatchesSearch(_ binding: WorkspaceBinding) -> Bool {
+        guard let resource = state.workspace.resource(binding.resourceID) else { return false }
+        return [
+            resource.name, resource.kind.title, resource.exportSummary,
+            bindingScope(binding),
+        ]
+        .joined(separator: " ")
+        .localizedCaseInsensitiveContains(search)
+    }
+
+    private var filteredSurfaces: [WorkspaceSurface] {
+        guard !search.isEmpty else { return surfaces }
+        return surfaces.filter { surface in
+            [surface.name, surface.path, surface.kind.title, surface.securityLevel.title]
+                .joined(separator: " ")
+                .localizedCaseInsensitiveContains(search)
+                || bindings(for: surface).contains(where: bindingMatchesSearch)
+        }
+    }
+
     private var projectProtectedFiles: [WorkspaceProtectedFile] {
         // Opaque protected files live on the workspace, keyed only by path; a
         // project owns the ones under its directory.
@@ -1227,6 +1247,11 @@ private struct CompactProjectDetailView: View {
                 .joined(separator: " ")
                 .localizedCaseInsensitiveContains(search)
         }
+    }
+
+    private var filteredOrphanBindings: [WorkspaceBinding] {
+        guard !search.isEmpty else { return orphanBindings }
+        return orphanBindings.filter(bindingMatchesSearch)
     }
 
     private var projectIsHealthy: Bool {
@@ -1559,8 +1584,34 @@ private struct ProjectCheckoutsSheet: View {
 }
 
 private struct CompactSurfaceRow: View {
+    @Bindable var state: AppState
     let surface: WorkspaceSurface
+    let bindings: [WorkspaceBinding]
     let openAdvanced: () -> Void
+
+    private var enabledBindings: [WorkspaceBinding] {
+        bindings.filter(\.isEnabled)
+    }
+
+    // A linked output whose bindings are all disabled composes to an empty
+    // file; surface that as "Paused" instead of a healthy status.
+    private var isPaused: Bool {
+        !bindings.isEmpty && enabledBindings.isEmpty
+    }
+
+    private var sourceSummary: String? {
+        if bindings.count == 1,
+            let resource = state.workspace.resource(bindings[0].resourceID)
+        {
+            return [resource.kind.title, resource.exportSummary]
+                .compactMap { $0 }
+                .joined(separator: " · ")
+        }
+        if bindings.count > 1 {
+            return "\(bindings.count) sources · \(enabledBindings.count) enabled"
+        }
+        return nil
+    }
 
     var body: some View {
         HStack(spacing: 12) {
@@ -1583,18 +1634,54 @@ private struct CompactSurfaceRow: View {
 
             Spacer()
 
-            Label(
-                surface.status.rawValue,
-                systemImage: surface.status.isHealthy
-                    ? "checkmark.circle" : "exclamationmark.circle")
-                .font(.caption.weight(.medium))
-                .foregroundStyle(surface.status.isHealthy ? Color.green : Color.orange)
-                .frame(width: 82, alignment: .leading)
+            if let sourceSummary {
+                Text(sourceSummary)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+
+            if isPaused {
+                Label("Paused", systemImage: "pause.circle")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(Color.orange)
+                    .frame(width: 82, alignment: .leading)
+            } else {
+                Label(
+                    surface.status.rawValue,
+                    systemImage: surface.status.isHealthy
+                        ? "checkmark.circle" : "exclamationmark.circle")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(surface.status.isHealthy ? Color.green : Color.orange)
+                    .frame(width: 82, alignment: .leading)
+            }
 
             Label(surface.securityLevel.compactTitle, systemImage: surface.securityLevel.systemImage)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .frame(width: 78, alignment: .leading)
+
+            if !bindings.isEmpty {
+                Toggle(
+                    "",
+                    isOn: Binding(
+                        get: { !enabledBindings.isEmpty },
+                        set: { enabled in
+                            let toFlip = bindings.filter { $0.isEnabled != enabled }
+                            guard !toFlip.isEmpty else { return }
+                            Task {
+                                for binding in toFlip {
+                                    await state.workspace.toggleBinding(binding.id)
+                                }
+                            }
+                        })
+                )
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .accessibilityLabel("Enable \(surface.name)")
+                .accessibilityValue(enabledBindings.isEmpty ? "Paused" : "Enabled")
+            }
 
             Menu {
                 Button("Open in Finder", systemImage: "folder") {
