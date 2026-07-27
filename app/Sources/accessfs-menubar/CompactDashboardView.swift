@@ -3058,8 +3058,10 @@ private struct DiscoveryFileCard: View {
         case .direnv, .mise: "terminal"
         case .awsCredentials: "cloud.fill"
         case .pgpass: "cylinder.fill"
-        case .sshPrivateKey: "key.fill"
-        case .protectedFile: "doc.fill"
+        case .sshPrivateKey, .privateKey: "key.fill"
+        case .certificate: "checkmark.seal.fill"
+        case .publicKey: "key"
+        case .protectedFile, .unknown: "doc.fill"
         }
     }
 
@@ -3102,7 +3104,10 @@ private extension DiscoveredFileKind {
         case .awsCredentials: "AWS credentials"
         case .pgpass: "PostgreSQL password file"
         case .sshPrivateKey: "SSH private key"
-        case .protectedFile: "Opaque file · unchanged"
+        case .privateKey: "Private key"
+        case .certificate: "X.509 certificate"
+        case .publicKey: "Public key"
+        case .protectedFile, .unknown: "Opaque file · unchanged"
         }
     }
 }

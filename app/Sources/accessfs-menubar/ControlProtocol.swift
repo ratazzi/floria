@@ -537,7 +537,18 @@ enum DiscoveredFileKind: String, Codable, Hashable, Sendable {
     case awsCredentials = "aws_credentials"
     case pgpass
     case sshPrivateKey = "ssh_private_key"
+    case privateKey = "private_key"
+    case certificate
+    case publicKey = "public_key"
     case protectedFile = "protected_file"
+    /// Forward compatibility: a kind this app version does not know yet. Decoding must not
+    /// fail when the daemon learns a new file type before the app does.
+    case unknown
+
+    init(from decoder: Decoder) throws {
+        let raw = try decoder.singleValueContainer().decode(String.self)
+        self = DiscoveredFileKind(rawValue: raw) ?? .unknown
+    }
 }
 
 enum DiscoveredFileAction: String, Codable, Hashable, Sendable {
