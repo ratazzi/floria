@@ -1680,7 +1680,7 @@ private struct CompactSurfaceRow: View {
             }
 
             Menu {
-                Button("Open in Finder", systemImage: "folder") {
+                Button("Reveal in Finder", systemImage: "folder") {
                     NSWorkspace.shared.activateFileViewerSelecting([
                         URL(fileURLWithPath: surface.path)
                     ])
@@ -1739,7 +1739,7 @@ private struct CompactProtectedFileRow: View {
                 .frame(width: 34, alignment: .leading)
 
             Menu {
-                Button("Open in Finder", systemImage: "folder") {
+                Button("Reveal in Finder", systemImage: "folder") {
                     NSWorkspace.shared.activateFileViewerSelecting([
                         URL(fileURLWithPath: file.path)
                     ])
