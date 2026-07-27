@@ -934,7 +934,13 @@ private struct CompactProjectDetailView: View {
                             URL(fileURLWithPath: project.path)
                         ])
                     } label: {
-                        Label("Finder", systemImage: "folder")
+                        Label {
+                            Text("Finder")
+                        } icon: {
+                            Image(nsImage: ExeIcon.lookup("/System/Library/CoreServices/Finder.app"))
+                                .resizable()
+                                .frame(width: 16, height: 16)
+                        }
                     }
                     .buttonStyle(.bordered)
 
