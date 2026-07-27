@@ -61,6 +61,13 @@ struct DashboardView: View {
                         project: selectedProject,
                         search: search,
                         recentAccess: visibleAccess,
+                        selectProject: { projectID in
+                            if let projectID {
+                                state.workspace.selectProject(projectID)
+                            }
+                            selectedProjectID = projectID
+                            search = ""
+                        },
                         openAdvanced: {
                             workspacePresentation = WorkspacePresentation(
                                 selection: .project(selectedProject.id))
@@ -89,6 +96,7 @@ struct DashboardView: View {
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .ignoresSafeArea(.container, edges: .top)
         .sheet(item: $state.macFuseSetupStage) { stage in
             MacFuseSetupView(state: state, stage: stage)
         }
@@ -137,18 +145,10 @@ struct DashboardView: View {
         }
     }
 
+    // Occupies the hidden-titlebar strip: traffic lights on the left, then
+    // app-level chrome. Project identity lives in the content header below.
     private var header: some View {
         HStack(spacing: 12) {
-            HStack(spacing: 8) {
-                FloriaMark()
-                    .frame(width: 26, height: 26)
-                Text("Floria")
-                    .font(.title3.weight(.semibold))
-            }
-            .fixedSize()
-
-            projectMenu
-
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass")
                     .foregroundStyle(.tertiary)
@@ -234,60 +234,8 @@ struct DashboardView: View {
         }
         .padding(.leading, 82)
         .padding(.trailing, 16)
-        .frame(height: 58)
-    }
-
-    private var projectMenu: some View {
-        Menu {
-            Button {
-                selectedProjectID = nil
-                search = ""
-            } label: {
-                if selectedProjectID == nil {
-                    Label("All Projects", systemImage: "checkmark")
-                } else {
-                    Text("All Projects")
-                }
-            }
-            if !state.workspace.projects.isEmpty {
-                Divider()
-                ForEach(state.workspace.projects) { project in
-                    Button {
-                        state.workspace.selectProject(project.id)
-                        selectedProjectID = project.id
-                        search = ""
-                    } label: {
-                        if selectedProjectID == project.id {
-                            Label(project.name, systemImage: "checkmark")
-                        } else {
-                            Text(project.name)
-                        }
-                    }
-                }
-            }
-        } label: {
-            HStack(spacing: 8) {
-                Text(selectedProject?.name ?? "All Projects")
-                    .lineLimit(1)
-                Spacer(minLength: 4)
-                Image(systemName: "chevron.down")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-            .font(.callout.weight(.medium))
-            .padding(.horizontal, 11)
-            .frame(width: 142, height: 34)
-            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
-            .overlay {
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(Color.secondary.opacity(0.18), lineWidth: 1)
-            }
-        }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .focusable(false)
-        .accessibilityLabel("Project filter")
-        .accessibilityValue(selectedProject?.name ?? "All Projects")
+        .frame(height: 52)
+        .gesture(WindowDragGesture())
     }
 
     private var policyMenu: some View {
@@ -927,6 +875,7 @@ private struct CompactProjectDetailView: View {
     let project: WorkspaceProject
     let search: String
     let recentAccess: [RecentAccessGroup]
+    let selectProject: (WorkspaceProject.ID?) -> Void
     let openAdvanced: () -> Void
     @State private var showingWorktrees = false
 
@@ -958,8 +907,7 @@ private struct CompactProjectDetailView: View {
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 10) {
-                    Text(project.name)
-                        .font(.title2.bold())
+                    projectSwitcher
                     environmentMenu
                     Label(
                         projectIsHealthy ? "Healthy" : "Needs attention",
@@ -1021,39 +969,79 @@ private struct CompactProjectDetailView: View {
         }
     }
 
-    private var environmentMenu: some View {
-        Menu {
-            ForEach(project.environments) { environment in
-                Button {
-                    state.workspace.selectEnvironment(environment.id)
-                } label: {
-                    if environment.id == selectedEnvironment?.id {
-                        Label(environment.name, systemImage: "checkmark")
-                    } else {
-                        Text(environment.name)
+    // macOS flattens a borderless Menu's custom label (icons forced leading,
+    // backgrounds dropped), so only the text lives inside the Menu; the
+    // switcher chevron is drawn next to it.
+    private var projectSwitcher: some View {
+        HStack(spacing: 5) {
+            Menu {
+                Button("All Projects") { selectProject(nil) }
+                if !state.workspace.projects.isEmpty {
+                    Divider()
+                    ForEach(state.workspace.projects) { candidate in
+                        Button {
+                            selectProject(candidate.id)
+                        } label: {
+                            if candidate.id == project.id {
+                                Label(candidate.name, systemImage: "checkmark")
+                            } else {
+                                Text(candidate.name)
+                            }
+                        }
                     }
                 }
+            } label: {
+                Text(project.name)
+                    .font(.title2.bold())
+                    .foregroundStyle(.primary)
             }
-        } label: {
-            HStack(spacing: 7) {
-                Text(selectedEnvironment?.name ?? "No environment")
-                    .lineLimit(1)
-                Image(systemName: "chevron.down")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-            .font(.caption.weight(.medium))
-            .padding(.horizontal, 8)
-            .frame(height: 24)
-            .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 7))
-            .overlay {
-                RoundedRectangle(cornerRadius: 7)
-                    .stroke(Color.secondary.opacity(0.16), lineWidth: 1)
-            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+
+            Image(systemName: "chevron.up.chevron.down")
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(.tertiary)
+                .padding(.top, 3)
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .disabled(project.environments.isEmpty)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Project")
+        .accessibilityValue(project.name)
+    }
+
+    private var environmentMenu: some View {
+        HStack(spacing: 5) {
+            Menu {
+                ForEach(project.environments) { environment in
+                    Button {
+                        state.workspace.selectEnvironment(environment.id)
+                    } label: {
+                        if environment.id == selectedEnvironment?.id {
+                            Label(environment.name, systemImage: "checkmark")
+                        } else {
+                            Text(environment.name)
+                        }
+                    }
+                }
+            } label: {
+                Text(selectedEnvironment?.name ?? "No environment")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .disabled(project.environments.isEmpty)
+
+            Image(systemName: "chevron.down")
+                .font(.system(size: 8, weight: .semibold))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 9)
+        .frame(height: 22)
+        .background(Color.secondary.opacity(0.09), in: Capsule())
+        .accessibilityElement(children: .contain)
         .accessibilityLabel("Environment")
         .accessibilityValue(selectedEnvironment?.name ?? "No environment")
     }
