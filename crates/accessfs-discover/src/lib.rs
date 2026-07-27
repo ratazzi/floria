@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use accessfs_catalog::ResourceCodec;
 use accessfs_surface::decode_source;
@@ -271,6 +271,20 @@ pub struct DiscoveredFile {
     pub entries: Vec<DiscoveredEntry>,
     pub warnings: Vec<DiscoveryWarning>,
     pub action: DiscoveredFileAction,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<PlacementCaution>,
+}
+
+/// A location that is legitimate to scan but implausible for a long-lived credential.
+///
+/// Scanning and selection are separate decisions: skipping such a directory would silently
+/// drop the very files most worth protecting, so discovery still reports them and only asks
+/// the user to confirm. See `docs/design/discovery-ignore-boundaries-research.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlacementCaution {
+    /// Below a `tmp` / `temp` directory, whose contents are conventionally disposable.
+    TemporaryDirectory,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -725,6 +739,7 @@ impl Discovery {
                 entries,
                 warnings: file.warnings.clone(),
                 action: file.action,
+                placement: placement_caution(&file.relative_path),
             });
         }
         let entries = files.iter().map(|file| file.entries.len()).sum();
@@ -1049,6 +1064,26 @@ fn ecosystems_for_entries(
         }
     }
     ecosystems
+}
+
+/// Flag a credential sitting below a conventionally disposable directory.
+///
+/// Keyed on the path relative to the scan root, so a root the user pointed at explicitly is
+/// never itself suspect: scanning `~/tmp` on purpose reports its contents without caution.
+fn placement_caution(relative_path: &Path) -> Option<PlacementCaution> {
+    let mut directories = relative_path.components().collect::<Vec<_>>();
+    directories.pop();
+    directories
+        .iter()
+        .any(|component| match component {
+            Component::Normal(name) => name
+                .to_str()
+                .is_some_and(|name| {
+                    name.eq_ignore_ascii_case("tmp") || name.eq_ignore_ascii_case("temp")
+                }),
+            _ => false,
+        })
+        .then_some(PlacementCaution::TemporaryDirectory)
 }
 
 fn is_ignored_directory(path: &Path, ecosystems: EcosystemContext) -> bool {
@@ -2265,6 +2300,56 @@ mod tests {
 
         assert_eq!(plan.summary.files, 1);
         assert_eq!(plan.files[0].relative_path, Path::new(".env"));
+    }
+
+    #[test]
+    fn reports_credentials_below_temporary_directories_as_needing_confirmation() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        fs::create_dir_all(root.join("tmp/secrets")).unwrap();
+        fs::write(
+            root.join("tmp/secrets/customs.key.pem"),
+            "-----BEGIN FIXTURE MATERIAL-----\nfixture\n-----END FIXTURE MATERIAL-----\n",
+        )
+        .unwrap();
+        fs::write(root.join(".env"), "VISIBLE=fixture\n").unwrap();
+
+        let plan = discover(root).unwrap().plan(&[]);
+
+        // Scanning is unaffected: the key is still discovered, only flagged for confirmation.
+        let key = plan
+            .files
+            .iter()
+            .find(|file| file.relative_path == Path::new("tmp/secrets/customs.key.pem"))
+            .expect("a credential below tmp is still discovered");
+        assert_eq!(key.placement, Some(PlacementCaution::TemporaryDirectory));
+
+        let env = plan
+            .files
+            .iter()
+            .find(|file| file.relative_path == Path::new(".env"))
+            .expect("the ordinary file is discovered");
+        assert_eq!(env.placement, None);
+    }
+
+    #[test]
+    fn temporary_placement_matches_whole_segments_only() {
+        for cautioned in ["tmp/x.pem", "TMP/x.pem", "temp/nested/x.pem", "a/tmp/x.pem"] {
+            assert_eq!(
+                placement_caution(Path::new(cautioned)),
+                Some(PlacementCaution::TemporaryDirectory),
+                "{cautioned} should be flagged"
+            );
+        }
+        // A file *named* tmp, a directory merely containing the substring, and the scan root
+        // itself must not be flagged.
+        for plain in ["tmp.env", "contemporary/x.pem", "tmpfiles/x.pem", ".env"] {
+            assert_eq!(
+                placement_caution(Path::new(plain)),
+                None,
+                "{plain} should not be flagged"
+            );
+        }
     }
 
     #[test]
