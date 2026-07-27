@@ -762,12 +762,15 @@ private struct ProjectRow: View {
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
                 .frame(width: 78, alignment: .leading)
-            Label(
-                healthy ? "Healthy" : "Attention",
-                systemImage: healthy ? "checkmark.circle" : "exclamationmark.circle")
-                .font(.callout.weight(.medium))
-                .foregroundStyle(healthy ? Color.green : Color.orange)
-                .frame(width: 92, alignment: .leading)
+            // Healthy is the default state and stays silent; only problems earn a badge.
+            if healthy {
+                Color.clear.frame(width: 92, height: 1)
+            } else {
+                Label("Attention", systemImage: "exclamationmark.circle")
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(Color.orange)
+                    .frame(width: 92, alignment: .leading)
+            }
             Image(systemName: "chevron.right")
                 .font(.callout.weight(.medium))
                 .foregroundStyle(.tertiary)
@@ -909,12 +912,11 @@ private struct CompactProjectDetailView: View {
                 HStack(spacing: 10) {
                     projectSwitcher
                     environmentMenu
-                    Label(
-                        projectIsHealthy ? "Healthy" : "Needs attention",
-                        systemImage: projectIsHealthy
-                            ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
-                        .font(.callout.weight(.medium))
-                        .foregroundStyle(projectIsHealthy ? Color.green : Color.orange)
+                    if !projectIsHealthy {
+                        Label("Needs attention", systemImage: "exclamationmark.circle.fill")
+                            .font(.callout.weight(.medium))
+                            .foregroundStyle(Color.orange)
+                    }
                 }
                 Text((project.path as NSString).abbreviatingWithTildeInPath)
                     .font(.callout)
