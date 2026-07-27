@@ -5,7 +5,7 @@ import XCTest
 final class PromptPresenterTests: XCTestCase {
     @MainActor
     func testBiometricReasonIdentifiesTheUserFacingFile() {
-        let sourcePath = NSHomeDirectory() + "/workspace/andrassy/.aws/credentials"
+        let sourcePath = NSHomeDirectory() + "/workspace/fixture-project/.aws/credentials"
         let prompt = PromptMsg(
             req_id: 1,
             path: "secrets/56115177-fdc2-406e-9541-7d4372f1bed1",
@@ -19,7 +19,7 @@ final class PromptPresenterTests: XCTestCase {
         let reason = PromptPresenter.biometricReason(for: prompt)
 
         XCTAssertEqual(
-            reason, "allow Python to read ~/workspace/andrassy/.aws/credentials")
+            reason, "allow Python to read ~/workspace/fixture-project/.aws/credentials")
         XCTAssertFalse(reason.contains("secrets/"))
     }
 }
