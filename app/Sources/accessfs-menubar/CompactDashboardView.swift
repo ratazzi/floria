@@ -936,6 +936,7 @@ private struct CompactProjectDetailView: View {
                 projectHeader
                 outputsSection
                 bindingsSection
+                protectedFilesSection
                 projectAccessSection
             }
             .padding(.horizontal, 28)
@@ -1013,10 +1014,7 @@ private struct CompactProjectDetailView: View {
                     }
                         .buttonStyle(.bordered)
                 }
-                Text(
-                    "\(activeBindings.count) binding\(activeBindings.count == 1 ? "" : "s")"
-                        + "  ·  "
-                        + "\(surfaces.count) output\(surfaces.count == 1 ? "" : "s")")
+                Text(headerCounts)
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -1087,6 +1085,44 @@ private struct CompactProjectDetailView: View {
         }
     }
 
+    private var headerCounts: String {
+        var parts = [
+            "\(activeBindings.count) binding\(activeBindings.count == 1 ? "" : "s")",
+            "\(surfaces.count) output\(surfaces.count == 1 ? "" : "s")",
+        ]
+        if !projectProtectedFiles.isEmpty {
+            parts.append("\(projectProtectedFiles.count) protected")
+        }
+        return parts.joined(separator: "  ·  ")
+    }
+
+    @ViewBuilder
+    private var protectedFilesSection: some View {
+        if !projectProtectedFiles.isEmpty {
+            DashboardSection(title: "Protected Files") {
+                Text("\(projectProtectedFiles.count)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            } content: {
+                if filteredProtectedFiles.isEmpty {
+                    CompactEmptyRow(
+                        icon: "magnifyingglass",
+                        title: "No matching protected files",
+                        detail: "Try a different search.")
+                } else {
+                    VStack(spacing: 0) {
+                        ForEach(Array(filteredProtectedFiles.enumerated()), id: \.element.id) {
+                            index, file in
+                            CompactProtectedFileRow(file: file)
+                            if index != filteredProtectedFiles.count - 1 {
+                                Divider().padding(.leading, 58)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     private var bindingsSection: some View {
         DashboardSection(title: "Bindings") {
             Text("\(activeBindings.filter(\.isEnabled).count) enabled")
@@ -1177,6 +1213,19 @@ private struct CompactProjectDetailView: View {
             ]
             .joined(separator: " ")
             .localizedCaseInsensitiveContains(search)
+    private var projectProtectedFiles: [WorkspaceProtectedFile] {
+        // Opaque protected files live on the workspace, keyed only by path; a
+        // project owns the ones under its directory.
+        let prefix = project.path.hasSuffix("/") ? project.path : project.path + "/"
+        return state.workspace.protectedFiles.filter { $0.path.hasPrefix(prefix) }
+    }
+
+    private var filteredProtectedFiles: [WorkspaceProtectedFile] {
+        guard !search.isEmpty else { return projectProtectedFiles }
+        return projectProtectedFiles.filter {
+            [$0.path, $0.kind.title]
+                .joined(separator: " ")
+                .localizedCaseInsensitiveContains(search)
         }
     }
 
@@ -1564,6 +1613,67 @@ private struct CompactSurfaceRow: View {
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
             .accessibilityLabel("\(surface.name) actions")
+        }
+        .padding(.horizontal, 14)
+        .frame(minHeight: 54)
+    }
+}
+
+private struct CompactProtectedFileRow: View {
+    let file: WorkspaceProtectedFile
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: file.kind.systemImage)
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(Color.blue.opacity(0.76))
+                .frame(width: 32, height: 32)
+                .background(Color.blue.opacity(0.07), in: RoundedRectangle(cornerRadius: 7))
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(URL(fileURLWithPath: file.path).lastPathComponent)
+                    .font(.callout.weight(.semibold))
+                    .lineLimit(1)
+                Text((file.path as NSString).abbreviatingWithTildeInPath)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+
+            Spacer()
+
+            Label(
+                file.linked ? "Protected" : "Stored only",
+                systemImage: file.linked ? "checkmark.shield" : "shield.slash")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(file.linked ? Color.blue : Color.orange)
+                .frame(width: 92, alignment: .leading)
+
+            Text("v\(file.currentVersion)")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: 34, alignment: .leading)
+
+            Menu {
+                Button("Open in Finder", systemImage: "folder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([
+                        URL(fileURLWithPath: file.path)
+                    ])
+                }
+                Button("Copy Path", systemImage: "doc.on.doc") {
+                    let pasteboard = NSPasteboard.general
+                    pasteboard.clearContents()
+                    pasteboard.setString(file.path, forType: .string)
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .frame(width: 26, height: 26)
+                    .contentShape(Rectangle())
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .accessibilityLabel("\(URL(fileURLWithPath: file.path).lastPathComponent) actions")
         }
         .padding(.horizontal, 14)
         .frame(minHeight: 54)
