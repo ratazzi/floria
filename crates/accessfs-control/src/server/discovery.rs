@@ -163,7 +163,7 @@ pub(super) fn apply_discovery(
                         .and_then(|value| value.to_str())
                         .unwrap_or("SSH identity")
                         .to_string();
-                    import_ssh_identity(
+                    let imported = import_ssh_identity(
                         catalog,
                         store,
                         resource_id,
@@ -183,17 +183,46 @@ pub(super) fn apply_discovery(
                                 imported_at: now_rfc3339(),
                             }],
                         },
-                    )?;
-                    result.imported_ssh_identities += 1;
-                    if import.source_disposition == DiscoverySourceDisposition::ProtectInPlace {
-                        protect_file(catalog, store, mount_path, &file.path)?;
-                        result.protected_files += 1;
+                    );
+                    match imported {
+                        Ok(_) => {
+                            result.imported_ssh_identities += 1;
+                            if import.source_disposition
+                                == DiscoverySourceDisposition::ProtectInPlace
+                            {
+                                protect_file(catalog, store, mount_path, &file.path)?;
+                                result.protected_files += 1;
+                            }
+                            result.files.push(DiscoveryAppliedFile {
+                                path: file.path,
+                                outcome: DiscoveryApplyOutcome::Imported,
+                                detail: "Imported as a managed SSH identity".to_string(),
+                            });
+                        }
+                        // The private-key heuristic can misread other PEM credentials (JWT/TLS
+                        // keys) as SSH keys; protect those as opaque files instead of failing
+                        // the file. An encrypted SSH key stays an error: it is importable once
+                        // the user supplies its passphrase.
+                        Err(DispatchError::SshKey(error))
+                            if !matches!(
+                                error,
+                                ManagedKeyError::PassphraseRequired
+                                    | ManagedKeyError::DecryptionFailed
+                            ) =>
+                        {
+                            protect_file(catalog, store, mount_path, &file.path)?;
+                            result.protected_files += 1;
+                            result.files.push(DiscoveryAppliedFile {
+                                path: file.path,
+                                outcome: DiscoveryApplyOutcome::Protected,
+                                detail: format!(
+                                    "Protected as a read-only audited file; \
+                                     not imported as an SSH identity ({error})"
+                                ),
+                            });
+                        }
+                        Err(error) => return Err(error),
                     }
-                    result.files.push(DiscoveryAppliedFile {
-                        path: file.path,
-                        outcome: DiscoveryApplyOutcome::Imported,
-                        detail: "Imported as a managed SSH identity".to_string(),
-                    });
                     Ok(Vec::new())
                 }
                 DiscoveredFileAction::Compose => match import.destination {

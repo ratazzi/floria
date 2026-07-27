@@ -106,6 +106,7 @@
                         | "Fixture Env File"
                         | "Fixture INI File"
                         | "Fixture SSH Identity"
+                        | "id_ed25519"
                         | "DISCOVERED_TOKEN"
                         | "OPTIONAL_NEW_TOKEN"
                         | "credentials"
@@ -1820,6 +1821,8 @@
             ),
         )
         .unwrap();
+        // Group/world-writable keys are rejected outright (not degraded to plain protection).
+        std::fs::set_permissions(&ssh_path, std::fs::Permissions::from_mode(0o666)).unwrap();
         let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
         let store = FixtureStore::new();
 
@@ -1861,6 +1864,127 @@
         let snapshot = catalog.snapshot().unwrap();
         assert_eq!(snapshot.resources.len(), 1);
         assert_eq!(snapshot.surfaces.len(), 1);
+    }
+
+    #[test]
+    fn discovery_apply_protects_files_that_fail_ssh_import() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("fixture-project");
+        let ssh_path = project_path.join(".ssh/id_fixture");
+        let mount_path = dir.path().join("mount");
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
+        std::fs::create_dir_all(ssh_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(mount_path.join(accessfs_core::config::SURFACES_DIR)).unwrap();
+        std::fs::write(
+            &ssh_path,
+            concat!(
+                "-----BEGIN OPENSSH ",
+                "PRIVATE KEY-----\ninvalid\n-----END OPENSSH ",
+                "PRIVATE KEY-----\n"
+            ),
+        )
+        .unwrap();
+        // protect_file replaces the source with a symlink, so canonicalize up front.
+        let canonical_ssh_path = ssh_path.canonicalize().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let store = FixtureStore::new();
+
+        let applied = dispatch(
+            &catalog,
+            DispatchServices {
+                store: Some(&store),
+                mount_path: Some(&mount_path),
+                ..DispatchServices::default()
+            },
+            ControlCommand::DiscoverApply {
+                paths: vec![project_path.clone()],
+                imports: Some(vec![library_import(
+                    &ssh_path,
+                    DiscoverySourceDisposition::LeaveUnchanged,
+                )]),
+                separate_entries: Vec::new(),
+                promote_entries: Vec::new(),
+                demote_entries: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let ControlResult::DiscoveryApplied(result) = applied else {
+            panic!("expected discovery apply result");
+        };
+        assert_eq!(result.files.len(), 1);
+        assert_eq!(result.files[0].outcome, DiscoveryApplyOutcome::Protected);
+        assert_eq!(result.imported_ssh_identities, 0);
+        assert_eq!(result.protected_files, 1);
+        assert!(store.get_by_path(&canonical_ssh_path).unwrap().is_some());
+        let snapshot = catalog.snapshot().unwrap();
+        assert!(snapshot.resources.is_empty());
+    }
+
+    #[test]
+    fn discovery_apply_imports_supported_ssh_keys_and_protects_unsupported_algorithms() {
+        use ssh_key::{Algorithm, EcdsaCurve, LineEnding, PrivateKey};
+
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("fixture-project");
+        let ssh_dir = project_path.join(".ssh");
+        let ed25519_path = ssh_dir.join("id_ed25519");
+        let ecdsa_path = ssh_dir.join("id_ecdsa");
+        let mount_path = dir.path().join("mount");
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+        std::fs::create_dir_all(mount_path.join(accessfs_core::config::SURFACES_DIR)).unwrap();
+        let ed25519 =
+            PrivateKey::random(&mut ssh_key::rand_core::OsRng, Algorithm::Ed25519).unwrap();
+        std::fs::write(&ed25519_path, ed25519.to_openssh(LineEnding::LF).unwrap()).unwrap();
+        let ecdsa = PrivateKey::random(
+            &mut ssh_key::rand_core::OsRng,
+            Algorithm::Ecdsa { curve: EcdsaCurve::NistP256 },
+        )
+        .unwrap();
+        std::fs::write(&ecdsa_path, ecdsa.to_openssh(LineEnding::LF).unwrap()).unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let store = FixtureStore::new();
+
+        let applied = dispatch(
+            &catalog,
+            DispatchServices {
+                store: Some(&store),
+                mount_path: Some(&mount_path),
+                ..DispatchServices::default()
+            },
+            ControlCommand::DiscoverApply {
+                paths: vec![project_path.clone()],
+                imports: Some(vec![
+                    library_import(&ed25519_path, DiscoverySourceDisposition::LeaveUnchanged),
+                    library_import(&ecdsa_path, DiscoverySourceDisposition::LeaveUnchanged),
+                ]),
+                separate_entries: Vec::new(),
+                promote_entries: Vec::new(),
+                demote_entries: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let ControlResult::DiscoveryApplied(result) = applied else {
+            panic!("expected discovery apply result");
+        };
+        assert_eq!(result.imported_ssh_identities, 1);
+        assert_eq!(result.protected_files, 1);
+        assert!(result
+            .files
+            .iter()
+            .any(|file| file.path == ed25519_path
+                && file.outcome == DiscoveryApplyOutcome::Imported));
+        assert!(result
+            .files
+            .iter()
+            .any(|file| file.path == ecdsa_path
+                && file.outcome == DiscoveryApplyOutcome::Protected
+                && file.detail.contains("not supported")));
+        let snapshot = catalog.snapshot().unwrap();
+        assert_eq!(snapshot.resources.len(), 1);
+        assert_eq!(snapshot.resources[0].kind, ResourceKind::SshIdentity);
     }
 
     #[test]
