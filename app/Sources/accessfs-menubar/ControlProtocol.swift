@@ -548,6 +548,19 @@ enum DiscoveredFileAction: String, Codable, Hashable, Sendable {
     case review
 }
 
+/// A location that is legitimate to scan but implausible for a long-lived credential. The file
+/// is still discovered; it just starts unselected so the user confirms it on purpose.
+enum PlacementCaution: String, Codable, Hashable, Sendable {
+    case temporaryDirectory = "temporary_directory"
+
+    var advice: String {
+        switch self {
+        case .temporaryDirectory:
+            return "In a temporary directory — confirm this is a long-lived credential"
+        }
+    }
+}
+
 struct DiscoveredFile: Codable, Hashable, Sendable, Identifiable {
     var id: String { path }
     let path: String
@@ -561,9 +574,11 @@ struct DiscoveredFile: Codable, Hashable, Sendable, Identifiable {
     let entries: [DiscoveredEntry]
     let warnings: [DiscoveryWarning]
     let action: DiscoveredFileAction
+    let placement: PlacementCaution?
 
     enum CodingKeys: String, CodingKey {
         case path, assignment, kind, codec, environment, tags, entries, warnings, action
+        case placement
         case relativePath = "relative_path"
         case managedSurfaceID = "managed_surface_id"
     }

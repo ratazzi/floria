@@ -2023,10 +2023,15 @@ private struct DiscoveryReviewSheet: View {
         self.apply = apply
         self.openProject = openProject
         let managedPaths = Set(plan.managedItems.map(\.path))
+        // Files in an implausible location are discovered but left unselected: the user
+        // confirms them deliberately instead of protecting a disposable copy by accident.
         _selectedFilePaths = State(
             initialValue: Set(
                 plan.files
-                    .filter { $0.canApplyDiscovery && !managedPaths.contains($0.path) }
+                    .filter {
+                        $0.canApplyDiscovery && !managedPaths.contains($0.path)
+                            && $0.placement == nil
+                    }
                     .map(\.path)))
         _destinations = State(
             initialValue: Dictionary(
@@ -2613,6 +2618,11 @@ private struct DiscoveryFileCard: View {
                     Text(detail)
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    if let placement = file.placement, result == nil {
+                        Label(placement.advice, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
                 }
                 Spacer()
                 if file.action == .compose {
@@ -2837,7 +2847,8 @@ private struct DiscoveryFileCard: View {
 
     private var statusTitle: String {
         guard let result else {
-            return selected ? "Will be protected" : "Not selected"
+            if selected { return "Will be protected" }
+            return file.placement == nil ? "Not selected" : "Needs confirmation"
         }
         return switch result.outcome {
         case "imported", "protected": "Protected"
