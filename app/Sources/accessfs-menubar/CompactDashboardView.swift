@@ -2010,6 +2010,7 @@ private struct DiscoveryReviewSheet: View {
     @State private var separateEntryIDs: Set<String> = []
     @State private var promotedEntryIDs: Set<String> = []
     @State private var demotedEntryIDs: Set<String> = []
+    @State private var protectedExpansion: [String: Bool] = [:]
 
     init(
         plan: DiscoveryPlan,
@@ -2189,9 +2190,16 @@ private struct DiscoveryReviewSheet: View {
                             .background(Color.green.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
                     }
                     ForEach(discoveryGroups) { group in
+                        let attentionItems = group.managedItems.filter { $0.status != .linked }
+                        let protectedItems = group.managedItems.filter { $0.status == .linked }
+                        // Collapse already-protected rows so actionable items lead; a group
+                        // with nothing actionable (pure status check) stays expanded.
+                        let protectedExpanded =
+                            protectedExpansion[group.id]
+                            ?? (group.files.isEmpty && attentionItems.isEmpty)
                         LazyVStack(alignment: .leading, spacing: 9) {
                             DiscoveryProjectHeader(group: group)
-                            ForEach(group.managedItems) { item in
+                            ForEach(attentionItems) { item in
                                 DiscoveryManagedItemCard(item: item)
                             }
                             ForEach(group.files) { file in
@@ -2217,6 +2225,46 @@ private struct DiscoveryReviewSheet: View {
                                     demotedEntryIDs: $demotedEntryIDs,
                                     sharedGroupCounts: cachedSharedGroupCounts,
                                     conflicts: cachedConflicts[file.path] ?? [])
+                            }
+                            if !protectedItems.isEmpty {
+                                Button {
+                                    withAnimation(.easeInOut(duration: 0.15)) {
+                                        protectedExpansion[group.id] = !protectedExpanded
+                                    }
+                                } label: {
+                                    HStack(spacing: 8) {
+                                        Image(systemName: "checkmark.shield.fill")
+                                            .foregroundStyle(.blue)
+                                        Text(
+                                            "\(protectedItems.count) already protected"
+                                        )
+                                        .font(.callout.weight(.medium))
+                                        .foregroundStyle(.secondary)
+                                        Spacer()
+                                        Image(systemName: "chevron.right")
+                                            .font(.caption.weight(.semibold))
+                                            .foregroundStyle(.tertiary)
+                                            .rotationEffect(
+                                                .degrees(protectedExpanded ? 90 : 0))
+                                    }
+                                    .padding(.horizontal, 14)
+                                    .padding(.vertical, 10)
+                                    .contentShape(Rectangle())
+                                }
+                                .buttonStyle(.plain)
+                                .background(
+                                    Color(nsColor: .controlBackgroundColor),
+                                    in: RoundedRectangle(cornerRadius: 12))
+                                .overlay {
+                                    RoundedRectangle(cornerRadius: 12)
+                                        .stroke(
+                                            Color.secondary.opacity(0.14), lineWidth: 1)
+                                }
+                                if protectedExpanded {
+                                    ForEach(protectedItems) { item in
+                                        DiscoveryManagedItemCard(item: item)
+                                    }
+                                }
                             }
                         }
                     }
