@@ -313,6 +313,13 @@ pub enum DiscoveredFileKind {
     AwsCredentials,
     Pgpass,
     SshPrivateKey,
+    /// A private key that is not an SSH identity (TLS/mTLS/JWT material): shown as a key,
+    /// protected as opaque bytes.
+    PrivateKey,
+    /// An X.509 certificate (or chain): not secret in itself, but part of a TLS keypair.
+    Certificate,
+    /// A standalone PEM public key.
+    PublicKey,
     ProtectedFile,
 }
 
@@ -1643,14 +1650,9 @@ fn discover_file(root: &Path, path: &Path) -> Result<Option<InternalFile>, Disco
             credential_file_tag(path),
         )));
     }
-    if looks_like_private_key(&bytes) {
-        return Ok(Some(opaque_file(
-            root,
-            path,
-            DiscoveredFileKind::SshPrivateKey,
-            DiscoveredFileAction::ImportSshIdentity,
-            "ssh",
-        )));
+    if let Some(credential) = classify_pem_credential(path, &bytes) {
+        let (kind, action, tag) = credential.discovery_route();
+        return Ok(Some(opaque_file(root, path, kind, action, tag)));
     }
     let mut dotenv_warnings = Vec::new();
     let entries = if looks_like_dotenv_assignments(&bytes) {
@@ -2019,6 +2021,9 @@ fn file_kind_tag(kind: DiscoveredFileKind) -> &'static str {
         DiscoveredFileKind::AwsCredentials => "aws",
         DiscoveredFileKind::Pgpass => "database",
         DiscoveredFileKind::SshPrivateKey => "ssh",
+        DiscoveredFileKind::PrivateKey => "key",
+        DiscoveredFileKind::Certificate => "certificate",
+        DiscoveredFileKind::PublicKey => "public-key",
         DiscoveredFileKind::ProtectedFile => "protected",
     }
 }
@@ -2034,17 +2039,83 @@ fn has_template_expression(value: &str) -> bool {
     value.contains("{{") || value.contains("${") || value.contains("$(") || value.contains('`')
 }
 
-fn looks_like_private_key(bytes: &[u8]) -> bool {
-    let prefix = bytes.get(..bytes.len().min(128)).unwrap_or(bytes);
-    let text = String::from_utf8_lossy(prefix);
-    [
-        concat!("-----BEGIN OPENSSH ", "PRIVATE KEY-----"),
-        concat!("-----BEGIN ", "PRIVATE KEY-----"),
-        concat!("-----BEGIN RSA ", "PRIVATE KEY-----"),
-        concat!("-----BEGIN EC ", "PRIVATE KEY-----"),
-    ]
-    .iter()
-    .any(|marker| text.contains(marker))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PemCredential {
+    SshPrivateKey,
+    PrivateKey,
+    Certificate,
+    PublicKey,
+}
+
+impl PemCredential {
+    /// The single place a PEM class maps to its discovery kind, default action, and tag.
+    fn discovery_route(self) -> (DiscoveredFileKind, DiscoveredFileAction, &'static str) {
+        match self {
+            PemCredential::SshPrivateKey => (
+                DiscoveredFileKind::SshPrivateKey,
+                DiscoveredFileAction::ImportSshIdentity,
+                "ssh",
+            ),
+            PemCredential::PrivateKey => {
+                (DiscoveredFileKind::PrivateKey, DiscoveredFileAction::Protect, "protected")
+            }
+            PemCredential::Certificate => {
+                (DiscoveredFileKind::Certificate, DiscoveredFileAction::Protect, "protected")
+            }
+            PemCredential::PublicKey => {
+                (DiscoveredFileKind::PublicKey, DiscoveredFileAction::Protect, "protected")
+            }
+        }
+    }
+}
+
+/// Classify a PEM credential by its armor labels (scanning the whole file so key+cert bundles
+/// count as keys) plus filesystem context. The armor label alone cannot separate an SSH RSA key
+/// from a TLS/mTLS/JWT one, so PKCS#1/PKCS#8 only counts as SSH when the file *looks* like an
+/// SSH identity — under `.ssh/`, named `id_*`, or paired with a sibling `.pub`. An OpenSSH
+/// container is definitive regardless of location.
+fn classify_pem_credential(path: &Path, bytes: &[u8]) -> Option<PemCredential> {
+    let text = String::from_utf8_lossy(bytes);
+    let has = |marker: &str| text.contains(marker);
+    if has(concat!("-----BEGIN OPENSSH ", "PRIVATE KEY-----")) {
+        return Some(PemCredential::SshPrivateKey);
+    }
+    if has(concat!("-----BEGIN ", "PRIVATE KEY-----"))
+        || has(concat!("-----BEGIN RSA ", "PRIVATE KEY-----"))
+    {
+        return Some(if has_ssh_identity_context(path) {
+            PemCredential::SshPrivateKey
+        } else {
+            PemCredential::PrivateKey
+        });
+    }
+    if has(concat!("-----BEGIN EC ", "PRIVATE KEY-----"))
+        || has(concat!("-----BEGIN ENCRYPTED ", "PRIVATE KEY-----"))
+        || has(concat!("-----BEGIN DSA ", "PRIVATE KEY-----"))
+    {
+        return Some(PemCredential::PrivateKey);
+    }
+    if has("-----BEGIN CERTIFICATE-----") {
+        return Some(PemCredential::Certificate);
+    }
+    if has(concat!("-----BEGIN ", "PUBLIC KEY-----"))
+        || has(concat!("-----BEGIN RSA ", "PUBLIC KEY-----"))
+    {
+        return Some(PemCredential::PublicKey);
+    }
+    None
+}
+
+fn has_ssh_identity_context(path: &Path) -> bool {
+    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+    if name.starts_with("id_") {
+        return true;
+    }
+    let Some(parent) = path.parent() else { return false };
+    if parent.file_name().and_then(|name| name.to_str()) == Some(".ssh") {
+        return true;
+    }
+    parent.join(format!("{name}.pub")).is_file()
 }
 
 fn looks_like_dotenv_assignments(bytes: &[u8]) -> bool {
@@ -2952,6 +3023,82 @@ mod tests {
                 && candidate.kind == DiscoveredFileKind::ProtectedFile
                 && candidate.action == DiscoveredFileAction::Protect
         }));
+    }
+
+    #[test]
+    fn pem_labels_route_between_ssh_import_and_plain_protection() {
+        let directory = tempdir().unwrap();
+        let root = directory.path();
+        const EC_KEY: &str = concat!(
+            "-----BEGIN EC ",
+            "PRIVATE KEY-----\nfixture\n-----END EC ",
+            "PRIVATE KEY-----\n"
+        );
+        const ENCRYPTED_PKCS8: &str = concat!(
+            "-----BEGIN ENCRYPTED ",
+            "PRIVATE KEY-----\nfixture\n-----END ENCRYPTED ",
+            "PRIVATE KEY-----\n"
+        );
+        const RSA_KEY: &str = concat!(
+            "-----BEGIN RSA ",
+            "PRIVATE KEY-----\nfixture\n-----END RSA ",
+            "PRIVATE KEY-----\n"
+        );
+        const PKCS8_KEY: &str = concat!(
+            "-----BEGIN ",
+            "PRIVATE KEY-----\nfixture\n-----END ",
+            "PRIVATE KEY-----\n"
+        );
+        const OPENSSH_KEY: &str = concat!(
+            "-----BEGIN OPENSSH ",
+            "PRIVATE KEY-----\nfixture\n-----END OPENSSH ",
+            "PRIVATE KEY-----\n"
+        );
+        const CERTIFICATE: &str =
+            "-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n";
+        const PUBLIC_KEY: &str = concat!(
+            "-----BEGIN ",
+            "PUBLIC KEY-----\nfixture\n-----END ",
+            "PUBLIC KEY-----\n"
+        );
+
+        fs::create_dir_all(root.join(".ssh")).unwrap();
+        fs::create_dir_all(root.join("ingress")).unwrap();
+        // (path, contents, expected kind, expected action)
+        let cases: &[(&str, String, DiscoveredFileKind, DiscoveredFileAction)] = &[
+            // Private keys without SSH context: TLS/mTLS/JWT material.
+            ("jwt_es256.pem", EC_KEY.into(), DiscoveredFileKind::PrivateKey, DiscoveredFileAction::Protect),
+            ("encrypted_pkcs8.pem", ENCRYPTED_PKCS8.into(), DiscoveredFileKind::PrivateKey, DiscoveredFileAction::Protect),
+            ("mtls_client_key.pem", RSA_KEY.into(), DiscoveredFileKind::PrivateKey, DiscoveredFileAction::Protect),
+            ("ingress/wildcard.key", PKCS8_KEY.into(), DiscoveredFileKind::PrivateKey, DiscoveredFileAction::Protect),
+            // A combined bundle counts as a private key even when the certificate comes first.
+            ("haproxy_bundle.pem", format!("{CERTIFICATE}{RSA_KEY}"), DiscoveredFileKind::PrivateKey, DiscoveredFileAction::Protect),
+            // Certificates and public keys: identified, still protected as opaque bytes.
+            ("mtls_client_cert.pem", CERTIFICATE.into(), DiscoveredFileKind::Certificate, DiscoveredFileAction::Protect),
+            ("service_rsa_public.pem", PUBLIC_KEY.into(), DiscoveredFileKind::PublicKey, DiscoveredFileAction::Protect),
+            // SSH identities: OpenSSH container anywhere; RSA PEM only with SSH context.
+            ("deploy_openssh.pem", OPENSSH_KEY.into(), DiscoveredFileKind::SshPrivateKey, DiscoveredFileAction::ImportSshIdentity),
+            (".ssh/id_rsa", RSA_KEY.into(), DiscoveredFileKind::SshPrivateKey, DiscoveredFileAction::ImportSshIdentity),
+            ("ec2_download.pem", RSA_KEY.into(), DiscoveredFileKind::SshPrivateKey, DiscoveredFileAction::ImportSshIdentity),
+        ];
+        for (name, contents, _, _) in cases {
+            fs::write(root.join(name), contents).unwrap();
+        }
+        // The sibling `.pub` is what gives ec2_download.pem its SSH context.
+        fs::write(root.join("ec2_download.pem.pub"), "ssh-rsa fixture\n").unwrap();
+
+        let plan = discover(root).unwrap().plan(&[]);
+
+        for (name, _, kind, action) in cases {
+            assert!(
+                plan.files.iter().any(|file| {
+                    file.relative_path == Path::new(name)
+                        && file.kind == *kind
+                        && file.action == *action
+                }),
+                "{name} should classify as {kind:?}/{action:?}, {plan:#?}"
+            );
+        }
     }
 
     #[test]
