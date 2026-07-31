@@ -23,6 +23,39 @@ private struct WorkspacePresentation: Identifiable {
     let selection: WorkspaceSidebarSelection
 }
 
+/// Matches access events to a project with pre-lowercased, pre-expanded
+/// strings so hot loops stay on plain Swift string operations (macOS paths
+/// are case-insensitive, so lowercased comparison is safe).
+private struct ProjectEventMatcher {
+    private let path: String
+    private let pathPrefix: String
+    private let namePattern: String
+
+    init(_ project: WorkspaceProject) {
+        path = (project.path as NSString).expandingTildeInPath.lowercased()
+        pathPrefix = path + "/"
+        namePattern = project.name.lowercased() + "/"
+    }
+
+    static func loweredCandidates(for event: RecentAccess) -> [String] {
+        [event.path, event.display, event.shownPath].compactMap { candidate in
+            guard let candidate else { return nil }
+            return (candidate as NSString).expandingTildeInPath.lowercased()
+        }
+    }
+
+    func matchesLowered(_ candidates: [String]) -> Bool {
+        candidates.contains { candidate in
+            candidate == path || candidate.hasPrefix(pathPrefix)
+                || candidate.contains(namePattern)
+        }
+    }
+
+    func matches(_ event: RecentAccess) -> Bool {
+        matchesLowered(Self.loweredCandidates(for: event))
+    }
+}
+
 private enum DashboardIssueAction {
     case reload
     case openWorkspace
@@ -300,7 +333,12 @@ struct DashboardView: View {
     }
 
     private var projectsSection: some View {
-        DashboardSection(title: "Recent Projects") {
+        // Scanning recents is expensive; do it once per render and share the
+        // result between the sort and the per-row relative times.
+        let activity = projectActivity
+        let projects = visibleProjects(activity: activity)
+        let now = Date()
+        return DashboardSection(title: "Recent Projects") {
             Button("View All") {
                 openWorkspace()
             }
@@ -308,7 +346,7 @@ struct DashboardView: View {
             .foregroundStyle(.blue)
             .font(.callout)
         } content: {
-            if visibleProjects.isEmpty {
+            if projects.isEmpty {
                 CompactEmptyRow(
                     icon: state.workspace.projects.isEmpty ? "folder.badge.plus" : "magnifyingglass",
                     title: state.workspace.projects.isEmpty ? "No projects yet" : "No matching projects",
@@ -317,18 +355,19 @@ struct DashboardView: View {
                         : "Try a different search or project scope.")
             } else {
                 VStack(spacing: 0) {
-                    ForEach(Array(visibleProjects.enumerated()), id: \.element.id) { index, project in
+                    ForEach(Array(projects.enumerated()), id: \.element.id) { index, project in
                         Button {
                             open(project)
                         } label: {
                             ProjectRow(
                                 project: project,
                                 detail: projectDetail(project),
-                                relativeTime: projectRelativeTime(project),
+                                relativeTime: activity[project.id]?.event
+                                    .relativeTime(relativeTo: now),
                                 healthy: projectIsHealthy(project))
                         }
                         .buttonStyle(.plain)
-                        if index != visibleProjects.count - 1 {
+                        if index != projects.count - 1 {
                             Divider().padding(.leading, 56)
                         }
                     }
@@ -481,14 +520,36 @@ struct DashboardView: View {
         return state.workspace.projects.first { $0.id == selectedProjectID }
     }
 
-    private var visibleProjects: [WorkspaceProject] {
+    // One pass over recents: the first (most recent) matching event per project.
+    // Everything is pre-lowercased so the inner loop is plain string compares —
+    // no ICU, no repeated tilde expansion.
+    private var projectActivity: [WorkspaceProject.ID: (index: Int, event: RecentAccess)] {
+        let projects = state.workspace.projects
+        guard !projects.isEmpty else { return [:] }
+        let matchers = projects.map { ($0.id, ProjectEventMatcher($0)) }
+        var result: [WorkspaceProject.ID: (index: Int, event: RecentAccess)] = [:]
+        for (index, event) in state.recents.enumerated() {
+            let candidates = ProjectEventMatcher.loweredCandidates(for: event)
+            for (id, matcher) in matchers where result[id] == nil {
+                if matcher.matchesLowered(candidates) {
+                    result[id] = (index, event)
+                }
+            }
+            if result.count == projects.count { break }
+        }
+        return result
+    }
+
+    private func visibleProjects(
+        activity: [WorkspaceProject.ID: (index: Int, event: RecentAccess)]
+    ) -> [WorkspaceProject] {
         var projects = state.workspace.projects
         if !search.isEmpty {
             projects = projects.filter(projectMatchesSearch)
         }
         projects.sort {
-            let lhs = projectActivityIndex($0) ?? Int.max
-            let rhs = projectActivityIndex($1) ?? Int.max
+            let lhs = activity[$0.id]?.index ?? Int.max
+            let rhs = activity[$1.id]?.index ?? Int.max
             return lhs == rhs
                 ? $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending
                 : lhs < rhs
@@ -497,8 +558,9 @@ struct DashboardView: View {
     }
 
     private var visibleAccess: [RecentAccessGroup] {
+        let matcher = selectedProject.map(ProjectEventMatcher.init)
         let recents = state.recents.filter { event in
-            (selectedProject.map { eventBelongs(event, to: $0) } ?? true)
+            (matcher?.matches(event) ?? true)
                 && (search.isEmpty || accessMatchesSearch(event))
         }
         return RecentAccessProjection.grouped(recents, maximumGroups: 3)
@@ -580,20 +642,6 @@ struct DashboardView: View {
             .localizedCaseInsensitiveContains(search)
     }
 
-    private func projectActivityIndex(_ project: WorkspaceProject) -> Int? {
-        state.recents.firstIndex { eventBelongs($0, to: project) }
-    }
-
-    private func eventBelongs(_ event: RecentAccess, to project: WorkspaceProject) -> Bool {
-        let projectPath = (project.path as NSString).expandingTildeInPath
-        let candidates = [event.path, event.display, event.shownPath].compactMap { $0 }
-        return candidates.contains { candidate in
-            let expanded = (candidate as NSString).expandingTildeInPath
-            return expanded == projectPath || expanded.hasPrefix(projectPath + "/")
-                || expanded.localizedCaseInsensitiveContains("/\(project.name)/")
-                || expanded.localizedCaseInsensitiveContains("\(project.name)/")
-        }
-    }
 
     private func projectDetail(_ project: WorkspaceProject) -> String {
         let environments = project.environments
@@ -613,13 +661,6 @@ struct DashboardView: View {
             parts.append("\(surfaces.count - 2) more")
         }
         return parts.joined(separator: "  ·  ")
-    }
-
-    private func projectRelativeTime(_ project: WorkspaceProject) -> String? {
-        guard let event = state.recents.first(where: { eventBelongs($0, to: project) }) else {
-            return nil
-        }
-        return event.relativeTime(relativeTo: Date())
     }
 
     private func projectIsHealthy(_ project: WorkspaceProject) -> Bool {
