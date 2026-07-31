@@ -153,6 +153,17 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertFalse(dashboard.contains(#""Ask every time""#))
     }
 
+    func testManagedRowsKeepTypeWithTheFileDescription() throws {
+        let dashboard = try source("CompactDashboardView.swift")
+
+        XCTAssertEqual(
+            dashboard.components(separatedBy: "CompactManagedItemSubtitle(").count - 1,
+            2)
+        XCTAssertTrue(dashboard.contains("Text(kind)"))
+        XCTAssertTrue(dashboard.contains("Text(path)"))
+        XCTAssertFalse(dashboard.contains(".frame(width: 126, alignment: .leading)"))
+    }
+
     private func source(_ name: String) throws -> String {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

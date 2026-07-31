@@ -1681,11 +1681,10 @@ private struct CompactSurfaceRow: View {
                         Text(URL(fileURLWithPath: surface.path).lastPathComponent)
                             .font(.callout.weight(.semibold))
                             .lineLimit(1)
-                        Text(compactManagedPath(surface.path, projectPath: projectPath))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
+                        CompactManagedItemSubtitle(
+                            kind: presentation.title,
+                            path: compactManagedPath(surface.path, projectPath: projectPath),
+                            needsAttention: needsAttention)
                     }
 
                     Spacer(minLength: 12)
@@ -1695,12 +1694,6 @@ private struct CompactSurfaceRow: View {
             .buttonStyle(.plain)
             .frame(maxWidth: .infinity)
             .accessibilityHint("Open details")
-
-            Text(needsAttention ? "Needs attention" : presentation.title)
-                .font(.caption.weight(needsAttention ? .medium : .regular))
-                .foregroundStyle(needsAttention ? Color.orange : Color.secondary)
-                .lineLimit(1)
-                .frame(width: 126, alignment: .leading)
 
             CompactSecurityLevelMenu(state: state, level: surface.securityLevel) { level in
                 try await state.workspace.updateSurfaceSecurityLevel(
@@ -1761,11 +1754,10 @@ private struct CompactProtectedFileRow: View {
                         Text(URL(fileURLWithPath: file.path).lastPathComponent)
                             .font(.callout.weight(.semibold))
                             .lineLimit(1)
-                        Text(compactManagedPath(file.path, projectPath: projectPath))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
+                        CompactManagedItemSubtitle(
+                            kind: file.kind.title,
+                            path: compactManagedPath(file.path, projectPath: projectPath),
+                            needsAttention: !file.linked)
                     }
 
                     Spacer(minLength: 12)
@@ -1775,12 +1767,6 @@ private struct CompactProtectedFileRow: View {
             .buttonStyle(.plain)
             .frame(maxWidth: .infinity)
             .accessibilityHint("Open details")
-
-            Text(file.linked ? file.kind.title : "Needs attention")
-                .font(.caption.weight(file.linked ? .regular : .medium))
-                .foregroundStyle(file.linked ? Color.secondary : Color.orange)
-                .lineLimit(1)
-                .frame(width: 126, alignment: .leading)
 
             CompactSecurityLevelMenu(state: state, level: file.securityLevel) { level in
                 try await state.workspace.updateProtectedFileMetadata(
@@ -1811,6 +1797,31 @@ private struct CompactProtectedFileRow: View {
         }
         .padding(.horizontal, 14)
         .frame(minHeight: 54)
+    }
+}
+
+private struct CompactManagedItemSubtitle: View {
+    let kind: String
+    let path: String
+    let needsAttention: Bool
+
+    var body: some View {
+        HStack(spacing: 5) {
+            if needsAttention {
+                Image(systemName: "exclamationmark.triangle.fill")
+                Text("Needs attention")
+                    .fontWeight(.medium)
+                Text("·")
+            }
+            Text(kind)
+                .fixedSize()
+            Text("·")
+            Text(path)
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+        .font(.caption)
+        .foregroundStyle(needsAttention ? Color.orange : Color.secondary)
     }
 }
 
