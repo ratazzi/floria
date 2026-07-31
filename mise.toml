@@ -59,6 +59,11 @@ fi
 echo "==> Installed: ${INSTALLED_APP}"
 '''
 
+[tasks.smoke-app]
+description = "Install Floria.app and verify cold-start and runtime daemon recovery"
+depends = ["install-app"]
+run = "scripts/smoke-daemon-recovery"
+
 [tasks.check-rust-fixtures]
 description = "Reject credential-shaped values from Rust sources and test fixtures"
 run = '''

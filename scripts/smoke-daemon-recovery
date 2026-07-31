@@ -1,0 +1,247 @@
+#!/bin/bash
+set -euo pipefail
+
+APP_PATH="${FLORIA_APP_PATH:-/Applications/Floria.app}"
+APP_NAME="Floria"
+DAEMON_PATH="${APP_PATH}/Contents/Resources/accessfs"
+INFO_PLIST="${APP_PATH}/Contents/Info.plist"
+RUNTIME_DIRECTORY="${HOME}/Library/Application Support/floria"
+CONFIG_PATH="${RUNTIME_DIRECTORY}/accessfs.toml"
+SERVICE_LABEL="dev.floria.hola.ac.daemon"
+SERVICE_TARGET="gui/$(id -u)/${SERVICE_LABEL}"
+LAUNCH_AGENT_PLIST="${HOME}/Library/LaunchAgents/${SERVICE_LABEL}.plist"
+WAIT_SECONDS="${FLORIA_SMOKE_WAIT_SECONDS:-20}"
+
+for required_path in "${APP_PATH}" "${DAEMON_PATH}" "${INFO_PLIST}" "${CONFIG_PATH}"; do
+    if [[ ! -e "${required_path}" ]]; then
+        echo "Missing required installed-app path: ${required_path}" >&2
+        exit 1
+    fi
+done
+
+if [[ ! -x "${DAEMON_PATH}" ]]; then
+    echo "Installed daemon is not executable: ${DAEMON_PATH}" >&2
+    exit 1
+fi
+
+app_version="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "${INFO_PLIST}")"
+app_build="$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "${INFO_PLIST}")"
+expected_revision="${app_version}+${app_build}"
+
+initial_app_running=0
+if pgrep -x "${APP_NAME}" >/dev/null; then
+    initial_app_running=1
+fi
+
+job_value() {
+    local key="$1"
+    /bin/launchctl print "${SERVICE_TARGET}" 2>/dev/null |
+        awk -v key="${key}" '
+            $1 == key && $2 == "=" {
+                $1 = ""
+                $2 = ""
+                sub(/^[[:space:]]+/, "")
+                print
+                exit
+            }
+        '
+}
+
+job_state() {
+    job_value state
+}
+
+job_runs() {
+    local value
+    value="$(job_value runs || true)"
+    if [[ "${value}" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "${value}"
+    else
+        printf '0\n'
+    fi
+}
+
+wait_for_job_state() {
+    local expected="$1"
+    local description="$2"
+    local deadline=$((SECONDS + WAIT_SECONDS))
+    local actual=""
+
+    while ((SECONDS < deadline)); do
+        actual="$(job_state || true)"
+        if [[ "${actual}" == "${expected}" ]]; then
+            return 0
+        fi
+        sleep 0.25
+    done
+
+    echo "Timed out waiting for ${description}; launchd state was '${actual:-unavailable}'" >&2
+    /bin/launchctl print "${SERVICE_TARGET}" >&2 || true
+    return 1
+}
+
+wait_for_job_restart() {
+    local runs_before="$1"
+    local description="$2"
+    local deadline=$((SECONDS + WAIT_SECONDS))
+    local actual_state=""
+    local actual_runs=0
+
+    while ((SECONDS < deadline)); do
+        actual_state="$(job_state || true)"
+        actual_runs="$(job_runs)"
+        if [[ "${actual_state}" == "running" ]] && ((actual_runs > runs_before)); then
+            return 0
+        fi
+        sleep 0.25
+    done
+
+    echo "Timed out waiting for ${description}" >&2
+    echo "launchd state='${actual_state:-unavailable}', runs before=${runs_before}, after=${actual_runs}" >&2
+    /bin/launchctl print "${SERVICE_TARGET}" >&2 || true
+    return 1
+}
+
+wait_for_current_definition() {
+    local deadline=$((SECONDS + WAIT_SECONDS))
+    local actual_program=""
+    local actual_revision=""
+
+    while ((SECONDS < deadline)); do
+        actual_program="$(
+            /usr/libexec/PlistBuddy -c "Print :Program" "${LAUNCH_AGENT_PLIST}" 2>/dev/null || true
+        )"
+        actual_revision="$(
+            /usr/libexec/PlistBuddy \
+                -c "Print :EnvironmentVariables:FLORIA_BUNDLE_REVISION" \
+                "${LAUNCH_AGENT_PLIST}" 2>/dev/null || true
+        )"
+        if [[ "${actual_program}" == "${DAEMON_PATH}" ]] &&
+            [[ "${actual_revision}" == "${expected_revision}" ]]; then
+            return 0
+        fi
+        sleep 0.25
+    done
+
+    echo "Timed out waiting for the installed LaunchAgent definition" >&2
+    echo "program expected='${DAEMON_PATH}', actual='${actual_program:-missing}'" >&2
+    echo "revision expected='${expected_revision}', actual='${actual_revision:-missing}'" >&2
+    return 1
+}
+
+wait_for_doctor() {
+    local description="$1"
+    local deadline=$((SECONDS + WAIT_SECONDS))
+
+    while ((SECONDS < deadline)); do
+        if "${DAEMON_PATH}" doctor --config "${CONFIG_PATH}" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.25
+    done
+
+    echo "Timed out waiting for ${description}" >&2
+    "${DAEMON_PATH}" doctor --config "${CONFIG_PATH}" >&2 || true
+    return 1
+}
+
+wait_for_app_state() {
+    local expected="$1"
+    local deadline=$((SECONDS + WAIT_SECONDS))
+
+    while ((SECONDS < deadline)); do
+        if pgrep -x "${APP_NAME}" >/dev/null; then
+            [[ "${expected}" == "running" ]] && return 0
+        else
+            [[ "${expected}" == "stopped" ]] && return 0
+        fi
+        sleep 0.25
+    done
+
+    echo "Timed out waiting for ${APP_NAME} to be ${expected}" >&2
+    return 1
+}
+
+stop_app() {
+    killall "${APP_NAME}" >/dev/null 2>&1 || true
+    wait_for_app_state stopped
+}
+
+request_app_start() {
+    local deadline=$((SECONDS + WAIT_SECONDS))
+    local output=""
+
+    while ((SECONDS < deadline)); do
+        if output="$(open -na "${APP_PATH}" 2>&1)"; then
+            return 0
+        fi
+        sleep 0.25
+    done
+
+    echo "Timed out asking LaunchServices to open ${APP_PATH}" >&2
+    [[ -n "${output}" ]] && echo "${output}" >&2
+    return 1
+}
+
+start_app() {
+    request_app_start
+    wait_for_app_state running
+    wait_for_current_definition
+    wait_for_job_state running "the Floria daemon to start"
+}
+
+stop_daemon() {
+    /bin/launchctl stop "${SERVICE_LABEL}"
+    wait_for_job_state "not running" "the Floria daemon to stop"
+}
+
+restore_environment() {
+    local test_status=$?
+    trap - EXIT INT TERM
+
+    if [[ "$(job_state || true)" != "running" ]]; then
+        request_app_start >/dev/null 2>&1 || true
+        wait_for_job_state running "the Floria daemon to recover during cleanup" || true
+    fi
+    wait_for_doctor "the Floria installation to recover during cleanup" || true
+
+    if ((initial_app_running == 0)); then
+        killall "${APP_NAME}" >/dev/null 2>&1 || true
+    fi
+
+    exit "${test_status}"
+}
+trap restore_environment EXIT INT TERM
+
+echo "==> Establishing installed-app baseline"
+stop_app
+start_app
+wait_for_doctor "the installed Floria app to become healthy"
+"${DAEMON_PATH}" doctor --config "${CONFIG_PATH}"
+
+echo "==> Verifying cold-start daemon recovery"
+cold_runs_before="$(job_runs)"
+stop_app
+stop_daemon
+start_app
+cold_runs_after="$(job_runs)"
+if ((cold_runs_after <= cold_runs_before)); then
+    echo "Cold-start recovery did not start the existing LaunchAgent" >&2
+    echo "runs before=${cold_runs_before}, after=${cold_runs_after}" >&2
+    exit 1
+fi
+
+echo "==> Verifying runtime daemon recovery"
+app_pid="$(pgrep -x "${APP_NAME}" | awk 'NR == 1 { first = $0 } END { print first }')"
+runtime_runs_before="$(job_runs)"
+/bin/launchctl stop "${SERVICE_LABEL}"
+wait_for_job_restart "${runtime_runs_before}" "the running app to recover its daemon"
+if ! kill -0 "${app_pid}" 2>/dev/null; then
+    echo "Runtime recovery restarted the Floria app instead of only its daemon" >&2
+    exit 1
+fi
+
+echo "==> Verifying recovered installation health"
+wait_for_doctor "the recovered Floria installation to become healthy"
+"${DAEMON_PATH}" doctor --config "${CONFIG_PATH}"
+echo "Floria installed-app smoke test passed"
