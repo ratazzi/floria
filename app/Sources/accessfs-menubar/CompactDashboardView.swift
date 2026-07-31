@@ -1256,7 +1256,7 @@ private struct ProjectCheckoutsSheet: View {
 
     private var sheetHeight: CGFloat {
         let rowCount = discovery?.checkouts.count ?? 1
-        return min(560, max(270, CGFloat(rowCount * 66 + 190)))
+        return min(580, max(300, CGFloat(rowCount * 62 + 240)))
     }
 
     // "" tags the manual mode; Picker tags must be non-optional.
@@ -1313,7 +1313,7 @@ private struct ProjectCheckoutsSheet: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                     Picker("New worktrees", selection: defaultEnvironmentSelection) {
-                        Text("Ask every time").tag("")
+                        Text("No Default").tag("")
                         ForEach(project?.environments ?? []) { environment in
                             Text(environment.name).tag(environment.id)
                         }
@@ -1344,22 +1344,19 @@ private struct ProjectCheckoutsSheet: View {
                     .foregroundStyle(.secondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if let discovery {
+        } else if let discovery, !discovery.checkouts.isEmpty {
             ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(Array(discovery.checkouts.enumerated()), id: \.element.id) {
-                        index, candidate in
-                        checkoutRow(candidate, commonDir: discovery.commonDir)
-                        if index != discovery.checkouts.count - 1 {
-                            Divider().padding(.leading, 58)
-                        }
+                LazyVStack(spacing: 18) {
+                    checkoutGroup(
+                        title: "Managed",
+                        candidates: enabledCheckouts(in: discovery),
+                        commonDir: discovery.commonDir)
+                    if !notManagedCheckouts(in: discovery).isEmpty {
+                        checkoutGroup(
+                            title: "Other Worktrees",
+                            candidates: notManagedCheckouts(in: discovery),
+                            commonDir: discovery.commonDir)
                     }
-                }
-                .background(Color(nsColor: .controlBackgroundColor))
-                .clipShape(RoundedRectangle(cornerRadius: 12))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 12)
-                        .stroke(Color.secondary.opacity(0.16), lineWidth: 1)
                 }
                 .padding(22)
             }
@@ -1380,6 +1377,67 @@ private struct ProjectCheckoutsSheet: View {
         }
     }
 
+    private func enabledCheckouts(
+        in discovery: ProjectCheckoutDiscovery
+    ) -> [ProjectCheckoutCandidate] {
+        sortedCheckouts(
+            discovery.checkouts.filter {
+                $0.gitPrimary || $0.managedCheckoutID != nil
+            })
+    }
+
+    private func notManagedCheckouts(
+        in discovery: ProjectCheckoutDiscovery
+    ) -> [ProjectCheckoutCandidate] {
+        sortedCheckouts(
+            discovery.checkouts.filter {
+                !$0.gitPrimary && $0.managedCheckoutID == nil
+            })
+    }
+
+    private func sortedCheckouts(
+        _ candidates: [ProjectCheckoutCandidate]
+    ) -> [ProjectCheckoutCandidate] {
+        candidates.sorted { left, right in
+            if left.gitPrimary != right.gitPrimary {
+                return left.gitPrimary
+            }
+            return left.path.localizedStandardCompare(right.path) == .orderedAscending
+        }
+    }
+
+    private func checkoutGroup(
+        title: String, candidates: [ProjectCheckoutCandidate], commonDir: String
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(title.uppercased())
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("\(candidates.count)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.tertiary)
+            }
+            .padding(.horizontal, 4)
+
+            VStack(spacing: 0) {
+                ForEach(Array(candidates.enumerated()), id: \.element.id) { index, candidate in
+                    checkoutRow(candidate, commonDir: commonDir)
+                    if index != candidates.count - 1 {
+                        Divider().padding(.leading, 58)
+                    }
+                }
+            }
+            .background(Color(nsColor: .controlBackgroundColor))
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .overlay {
+                RoundedRectangle(cornerRadius: 12)
+                    .stroke(Color.secondary.opacity(0.16), lineWidth: 1)
+            }
+        }
+    }
+
     private func checkoutRow(
         _ candidate: ProjectCheckoutCandidate, commonDir: String
     ) -> some View {
@@ -1390,10 +1448,16 @@ private struct ProjectCheckoutsSheet: View {
             get: {
                 environmentSelections[candidate.path] ?? managed?.environmentID ?? ""
             },
-            set: { environmentSelections[candidate.path] = $0 })
-        let selectedEnvironmentID = selection.wrappedValue
-        let selectionChanged =
-            managed?.environmentID != selectedEnvironmentID && !selectedEnvironmentID.isEmpty
+            set: { environmentID in
+                let currentEnvironmentID = managed?.environmentID ?? ""
+                guard environmentID != currentEnvironmentID else { return }
+                environmentSelections[candidate.path] = environmentID
+                Task {
+                    await setEnvironment(
+                        environmentID, for: candidate, commonDir: commonDir,
+                        managedCheckout: managed)
+                }
+            })
 
         return HStack(spacing: 14) {
             Image(systemName: candidate.gitPrimary ? "folder" : "arrow.triangle.branch")
@@ -1405,10 +1469,10 @@ private struct ProjectCheckoutsSheet: View {
                 HStack(spacing: 7) {
                     Text(displayName(for: candidate.path))
                         .font(.callout.weight(.semibold))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                     if candidate.gitPrimary {
                         checkoutBadge("Primary", color: .secondary)
-                    } else if managed != nil {
-                        checkoutBadge("Managed", color: .green)
                     }
                 }
                 Text((candidate.path as NSString).abbreviatingWithTildeInPath)
@@ -1417,8 +1481,26 @@ private struct ProjectCheckoutsSheet: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .layoutPriority(1)
 
-            Spacer(minLength: 16)
+            if candidate.gitPrimary {
+                Text(primaryEnvironmentTitle)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .frame(width: 160, alignment: .leading)
+            } else {
+                Picker("Environment", selection: selection) {
+                    Text("No Environment").tag("")
+                    ForEach(project?.environments ?? []) { environment in
+                        Text(environment.name).tag(environment.id)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 160)
+                .disabled(busyPath != nil)
+            }
 
             Button {
                 NSWorkspace.shared.open(URL(fileURLWithPath: candidate.path))
@@ -1427,51 +1509,7 @@ private struct ProjectCheckoutsSheet: View {
             }
             .buttonStyle(.borderless)
             .help("Open in Finder")
-
-            if candidate.gitPrimary {
-                Text("Uses project settings")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .frame(width: 160, alignment: .trailing)
-            } else {
-                Picker("Environment", selection: selection) {
-                    Text("Choose Environment").tag("")
-                    ForEach(project?.environments ?? []) { environment in
-                        Text(environment.name).tag(environment.id)
-                    }
-                }
-                .labelsHidden()
-                .frame(width: 160)
-                .disabled(busyPath != nil)
-
-                Button(managed == nil ? "Link" : "Update") {
-                    Task {
-                        await provision(
-                            candidate, commonDir: commonDir,
-                            environmentID: selectedEnvironmentID,
-                            checkoutID: managed?.id)
-                    }
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
-                .disabled(
-                    selectedEnvironmentID.isEmpty || busyPath != nil
-                        || (managed != nil && !selectionChanged))
-
-                if let managed {
-                    Button {
-                        Task { await remove(managed) }
-                    } label: {
-                        Image(systemName: "minus.circle")
-                    }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(.secondary)
-                    .disabled(busyPath != nil)
-                    .help("Stop managing this worktree")
-                } else {
-                    Color.clear.frame(width: 16, height: 16)
-                }
-            }
+            .frame(width: 24)
 
             Group {
                 if busyPath == candidate.path {
@@ -1484,7 +1522,7 @@ private struct ProjectCheckoutsSheet: View {
             .frame(width: 16, height: 16)
         }
         .padding(.horizontal, 16)
-        .frame(minHeight: 66)
+        .frame(minHeight: 62)
     }
 
     private var footer: some View {
@@ -1498,7 +1536,7 @@ private struct ProjectCheckoutsSheet: View {
             HStack(alignment: .center, spacing: 12) {
                 Image(systemName: "checkmark.shield")
                     .foregroundStyle(.green)
-                Text("Floria links the project's Managed files into each worktree. Files that differ from the managed version are never touched.")
+                Text("Managed worktrees receive this project's files. Existing local changes are never replaced.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -1524,6 +1562,14 @@ private struct ProjectCheckoutsSheet: View {
         return name.isEmpty ? path : name
     }
 
+    private var primaryEnvironmentTitle: String {
+        let environments = project?.environments ?? []
+        if environments.count == 1 {
+            return environments[0].name
+        }
+        return environments.isEmpty ? "No Environment" : "All Environments"
+    }
+
     @MainActor
     private func discover() async {
         isDiscovering = true
@@ -1540,11 +1586,30 @@ private struct ProjectCheckoutsSheet: View {
 
     private func apply(_ result: ProjectCheckoutDiscovery) {
         discovery = result
+        var selections: [String: WorkspaceEnvironment.ID] = [:]
         for candidate in result.checkouts {
             guard let id = candidate.managedCheckoutID,
                 let environmentID = store.checkouts.first(where: { $0.id == id })?.environmentID
             else { continue }
-            environmentSelections[candidate.path] = environmentID
+            selections[candidate.path] = environmentID
+        }
+        environmentSelections = selections
+    }
+
+    @MainActor
+    private func setEnvironment(
+        _ environmentID: WorkspaceEnvironment.ID,
+        for candidate: ProjectCheckoutCandidate,
+        commonDir: String,
+        managedCheckout: CatalogProjectCheckout?
+    ) async {
+        if environmentID.isEmpty {
+            guard let managedCheckout else { return }
+            await remove(managedCheckout)
+        } else {
+            await provision(
+                candidate, commonDir: commonDir,
+                environmentID: environmentID, checkoutID: managedCheckout?.id)
         }
     }
 
@@ -1564,6 +1629,9 @@ private struct ProjectCheckoutsSheet: View {
             await discover()
         } catch {
             errorMessage = error.localizedDescription
+            if let discovery {
+                apply(discovery)
+            }
         }
     }
 
@@ -1578,6 +1646,9 @@ private struct ProjectCheckoutsSheet: View {
             await discover()
         } catch {
             errorMessage = error.localizedDescription
+            if let discovery {
+                apply(discovery)
+            }
         }
     }
 }

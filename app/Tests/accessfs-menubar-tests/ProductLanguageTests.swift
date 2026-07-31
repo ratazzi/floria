@@ -133,7 +133,24 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertTrue(workspace.contains(#"InspectorSection(title: "Location")"#))
         XCTAssertTrue(workspace.contains(#"InspectorSection(title: "Contents")"#))
         XCTAssertTrue(workspace.contains(#""Values from this file""#))
-        XCTAssertTrue(dashboard.contains(#""Uses project settings""#))
+        XCTAssertFalse(dashboard.contains(#""Uses project settings""#))
+    }
+
+    func testWorktreesUseEnvironmentSelectionAsTheOnlyStateControl() throws {
+        let dashboard = try source("CompactDashboardView.swift")
+
+        XCTAssertTrue(dashboard.contains(#"title: "Managed""#))
+        XCTAssertTrue(dashboard.contains(#"title: "Other Worktrees""#))
+        XCTAssertTrue(dashboard.contains(#"Text("No Default").tag("")"#))
+        XCTAssertTrue(dashboard.contains(#"Text("No Environment").tag("")"#))
+        XCTAssertTrue(dashboard.contains("Text(primaryEnvironmentTitle)"))
+        XCTAssertTrue(dashboard.contains("await setEnvironment("))
+        XCTAssertTrue(dashboard.contains(".truncationMode(.middle)"))
+
+        XCTAssertFalse(dashboard.contains(#"checkoutBadge("Managed""#))
+        XCTAssertFalse(dashboard.contains(#"Button(managed == nil ? "Link" : "Update")"#))
+        XCTAssertFalse(dashboard.contains(#".help("Stop managing this worktree")"#))
+        XCTAssertFalse(dashboard.contains(#""Ask every time""#))
     }
 
     private func source(_ name: String) throws -> String {
