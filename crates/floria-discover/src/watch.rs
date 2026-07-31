@@ -247,6 +247,17 @@ fn filesystem_event_is_relevant(
 mod tests {
     use super::*;
 
+    // macOS serializes initial FSEvents stream registration across watchers in one process.
+    // Floria owns one checkout monitor in production, so keep these independent lifecycle
+    // tests from manufacturing a multi-monitor startup delay that the product never has.
+    static NATIVE_WATCHER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn native_watcher_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        NATIVE_WATCHER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     fn wait_for(
         monitor: &GitCheckoutMonitor,
         predicate: impl Fn(&GitCheckoutInventory) -> bool,
@@ -267,6 +278,7 @@ mod tests {
 
     #[test]
     fn refresh_rebuilds_inventory_from_git_metadata() {
+        let _watcher_guard = native_watcher_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("main");
         std::fs::create_dir_all(primary.join(".git")).unwrap();
@@ -307,6 +319,7 @@ mod tests {
 
     #[test]
     fn filesystem_event_rebuilds_inventory_without_an_explicit_refresh() {
+        let _watcher_guard = native_watcher_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("main");
         std::fs::create_dir_all(primary.join(".git")).unwrap();
@@ -342,6 +355,7 @@ mod tests {
 
     #[test]
     fn replacing_projects_removes_stale_inventory() {
+        let _watcher_guard = native_watcher_test_guard();
         let dir = tempfile::tempdir().unwrap();
         let primary = dir.path().join("main");
         std::fs::create_dir_all(primary.join(".git")).unwrap();
