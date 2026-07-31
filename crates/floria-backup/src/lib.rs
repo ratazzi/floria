@@ -4,6 +4,8 @@
 //! or verify an existing backup with the live store's key provider. The module owns temporary
 //! paths, SQLite snapshotting, ciphertext copying, checksums, permissions, and cleanup.
 
+mod activation;
+
 use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs::{DirBuilder, File, OpenOptions};
@@ -13,9 +15,13 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use floria_catalog::{Catalog, ResourceSource};
-use floria_store::{AgeDirStore, StoreVerification};
+use floria_store::{AgeDirStore, StoreMaintenanceGuard, StoreVerification};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+pub use activation::{
+    activate_restored_data, recover_interrupted_activation, ActivationReport,
+};
 
 const BACKUP_FORMAT: u32 = 1;
 const MANIFEST_FILE: &str = "manifest.json";
@@ -83,6 +89,16 @@ pub fn create(
     store: &AgeDirStore,
     destination: &Path,
 ) -> BackupResult<BackupReport> {
+    let store_lock = store.lock_for_maintenance()?;
+    create_with_locked_store(catalog, store, &store_lock, destination)
+}
+
+fn create_with_locked_store(
+    catalog: &Catalog,
+    store: &AgeDirStore,
+    store_lock: &StoreMaintenanceGuard,
+    destination: &Path,
+) -> BackupResult<BackupReport> {
     let destination = normalized_new_destination(destination)?;
     if destination.exists() {
         return Err(BackupError::Manifest(format!(
@@ -101,7 +117,7 @@ pub fn create(
 
     let mut temporary = TemporaryBackup::create(&destination)?;
     catalog.backup_to(&temporary.path().join(CATALOG_FILE))?;
-    store.backup_to(&temporary.path().join(STORE_DIRECTORY))?;
+    store_lock.backup_to(&temporary.path().join(STORE_DIRECTORY))?;
 
     let snapshot = Catalog::inspect_backup(&temporary.path().join(CATALOG_FILE))?;
     let store_report = store.verify_backup(&temporary.path().join(STORE_DIRECTORY))?;
@@ -242,6 +258,29 @@ pub fn restore(
     Ok(BackupReport { path: destination, files: verified.files, ..verified })
 }
 
+/// Verify a standalone restored data directory without trusting an earlier restore result.
+pub fn verify_restored_data(
+    restored: &Path,
+    store: &AgeDirStore,
+) -> BackupResult<BackupReport> {
+    check_private_directory(restored)?;
+    let path =
+        std::fs::canonicalize(restored).map_err(|source| BackupError::io(restored, source))?;
+    let snapshot = Catalog::inspect_backup(&path.join(CATALOG_FILE))?;
+    let store_report = store.verify_backup(&path.join(STORE_DIRECTORY))?;
+    validate_catalog_store_references(&snapshot, &store_report)?;
+    Ok(BackupReport {
+        files: inventory_files(&path)?.len(),
+        path,
+        catalog_schema: Catalog::current_schema_version(),
+        projects: snapshot.projects.len(),
+        resources: snapshot.resources.len(),
+        secrets: store_report.secrets,
+        versions: store_report.versions,
+        plaintext_bytes: store_report.plaintext_bytes,
+    })
+}
+
 fn validate_catalog_store_references(
     snapshot: &floria_catalog::CatalogSnapshot,
     store: &StoreVerification,
@@ -364,7 +403,9 @@ fn copy_private_directory(source: &Path, destination: &Path) -> BackupResult<()>
             )));
         }
     }
-    Ok(())
+    File::open(destination)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| BackupError::io(destination, error))
 }
 
 fn copy_private_file(source: &Path, destination: &Path) -> BackupResult<()> {
@@ -376,8 +417,17 @@ fn copy_private_file(source: &Path, destination: &Path) -> BackupResult<()> {
             source.display()
         )));
     }
-    std::fs::copy(source, destination).map_err(|error| BackupError::io(destination, error))?;
-    std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o600))
+    let mut input = File::open(source).map_err(|error| BackupError::io(source, error))?;
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(destination)
+        .map_err(|error| BackupError::io(destination, error))?;
+    std::io::copy(&mut input, &mut output)
+        .map_err(|error| BackupError::io(destination, error))?;
+    output
+        .sync_all()
         .map_err(|error| BackupError::io(destination, error))
 }
 

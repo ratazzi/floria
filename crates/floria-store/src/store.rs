@@ -212,6 +212,23 @@ pub struct AgeDirStore {
     keys: Arc<dyn KeyProvider>,
 }
 
+/// Holds the store's cross-process mutation lock for a maintenance operation.
+///
+/// The guard intentionally exposes no mutation methods. While it is alive, normal store writes
+/// block, allowing a caller to verify and atomically replace the store directory as one
+/// maintenance transaction.
+pub struct StoreMaintenanceGuard {
+    _lock: std::fs::File,
+    root: PathBuf,
+}
+
+impl StoreMaintenanceGuard {
+    /// Copy the locked store without trying to acquire the same lock again.
+    pub fn backup_to(&self, destination: &Path) -> StoreResult<()> {
+        copy_store_directory(&self.root, destination)
+    }
+}
+
 impl AgeDirStore {
     /// Open (creating the root directory, mode 0700, if needed).
     pub fn open(root: PathBuf, keys: Arc<dyn KeyProvider>) -> StoreResult<Self> {
@@ -294,6 +311,13 @@ impl AgeDirStore {
             keys: Arc::clone(&self.keys),
         }
         .verify_all()
+    }
+
+    pub fn lock_for_maintenance(&self) -> StoreResult<StoreMaintenanceGuard> {
+        Ok(StoreMaintenanceGuard {
+            _lock: self.lock_exclusive()?,
+            root: self.root.clone(),
+        })
     }
 
     /// Take the store-wide exclusive lock (blocking), serializing mutations across processes —

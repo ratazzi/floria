@@ -159,6 +159,13 @@ enum BackupCmd {
         #[arg(short, long, default_value = "floria.toml")]
         config: PathBuf,
     },
+    /// Activate a standalone restored data directory after taking a safety backup.
+    Activate {
+        /// Standalone data directory created by `backup restore`.
+        restored: PathBuf,
+        #[arg(short, long, default_value = "floria.toml")]
+        config: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -262,6 +269,9 @@ fn main() -> Result<()> {
             BackupCmd::Verify { backup, config } => cmd_backup_verify(&backup, &config),
             BackupCmd::Restore { backup, destination, config } => {
                 cmd_backup_restore(&backup, &destination, &config)
+            }
+            BackupCmd::Activate { restored, config } => {
+                cmd_backup_activate(&restored, &config)
             }
         },
         Cmd::Keys { command } => match command {
@@ -367,9 +377,54 @@ fn cmd_backup_restore(backup: &Path, destination: &Path, config: &Path) -> Resul
     Ok(())
 }
 
+fn cmd_backup_activate(restored: &Path, config: &Path) -> Result<()> {
+    let cfg = load(config)?;
+    let support = support_dir(&cfg)?.to_path_buf();
+    let _instance = DaemonInstance::acquire(&support)
+        .context("stopping concurrent daemon startup during restore activation")?;
+    if let Some(mount) = exact_mount(&cfg.mount_path)? {
+        anyhow::bail!(
+            "refusing to activate restored data while {} is mounted by {:?} ({:?}); \
+             quit Floria and unmount it first",
+            cfg.mount_path.display(),
+            mount.source,
+            mount.fs_type
+        );
+    }
+
+    let catalog_path = support.join("catalog.sqlite");
+    let store = open_store(&cfg)?;
+    let backups = support.join("backups");
+    std::fs::create_dir_all(&backups)
+        .with_context(|| format!("creating backup directory {}", backups.display()))?;
+    std::fs::set_permissions(&backups, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("securing backup directory {}", backups.display()))?;
+    let safety_backup = backups.join(format!(
+        "pre-restore-{}-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("system clock is before the Unix epoch")?
+            .as_secs(),
+        std::process::id()
+    ));
+    let report = floria_backup::activate_restored_data(
+        restored,
+        &catalog_path,
+        &store,
+        &safety_backup,
+    )
+    .with_context(|| format!("activating restored data from {}", restored.display()))?;
+    print_backup_report("activated and verified", &report.active);
+    println!(
+        "previous data is preserved in verified backup {}",
+        report.safety_backup.path.display()
+    );
+    Ok(())
+}
+
 fn print_backup_report(action: &str, report: &floria_backup::BackupReport) {
     println!(
-        "{action} {}: {} projects, {} resources, {} secrets, {} versions, {} backup files",
+        "{action} {}: {} projects, {} resources, {} secrets, {} versions, {} files",
         report.path.display(),
         report.projects,
         report.resources,
@@ -693,6 +748,19 @@ fn cmd_mount(config: &Path) -> Result<()> {
     let _instance = DaemonInstance::acquire(&support_dir)?;
     initialize_store_key_if_needed(&cfg)?;
     recover_stale_mount(&cfg.mount_path)?;
+    let catalog_path = support_dir.join("catalog.sqlite");
+    let store = open_store(&cfg)?;
+    if catalog_path.exists() {
+        if let Some(report) =
+            floria_backup::recover_interrupted_activation(&catalog_path, &store)
+                .context("recovering an interrupted data restore")?
+        {
+            tracing::warn!(
+                safety_backup = %report.safety_backup.path.display(),
+                "finished an interrupted data restore"
+            );
+        }
+    }
     let daemon_executable =
         std::env::current_exe().context("resolving daemon executable for peer policy")?;
     let gui_executable = trusted_gui_executable(&daemon_executable)?;
@@ -709,7 +777,6 @@ fn cmd_mount(config: &Path) -> Result<()> {
         daemon = %daemon_executable.display(),
         "loaded local socket code-signing policy"
     );
-    let catalog_path = support_dir.join("catalog.sqlite");
     let control_path = support_dir.join("control.sock");
     let catalog = Catalog::open(&catalog_path)
         .with_context(|| format!("opening catalog at {}", catalog_path.display()))?;
@@ -721,7 +788,7 @@ fn cmd_mount(config: &Path) -> Result<()> {
     let surface_registry = Arc::new(SurfaceRegistry::from_snapshot(&snapshot));
     let linked_file_surfaces =
         file_surface_instances(&snapshot).context("materializing project checkout links")?;
-    let store: Arc<dyn SecretStore> = Arc::new(open_store(&cfg)?);
+    let store: Arc<dyn SecretStore> = Arc::new(store);
     let records = store.list()?;
     release_protected_links_for_file_surfaces(
         &snapshot,
@@ -1632,6 +1699,19 @@ mod tests {
                 assert_eq!(config, PathBuf::from("floria.toml"));
             }
             _ => panic!("expected backup restore"),
+        }
+
+        let activate =
+            Cli::try_parse_from(["floria", "backup", "activate", "/tmp/floria-restored"])
+                .unwrap();
+        match activate.command {
+            Cmd::Backup {
+                command: BackupCmd::Activate { restored, config },
+            } => {
+                assert_eq!(restored, PathBuf::from("/tmp/floria-restored"));
+                assert_eq!(config, PathBuf::from("floria.toml"));
+            }
+            _ => panic!("expected backup activate"),
         }
     }
 
