@@ -150,6 +150,15 @@ enum BackupCmd {
         #[arg(short, long, default_value = "floria.toml")]
         config: PathBuf,
     },
+    /// Restore a verified backup into a new standalone data directory.
+    Restore {
+        /// Existing backup directory.
+        backup: PathBuf,
+        /// New standalone data directory. Existing paths are never overwritten.
+        destination: PathBuf,
+        #[arg(short, long, default_value = "floria.toml")]
+        config: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -251,6 +260,9 @@ fn main() -> Result<()> {
                 cmd_backup_create(&destination, &config)
             }
             BackupCmd::Verify { backup, config } => cmd_backup_verify(&backup, &config),
+            BackupCmd::Restore { backup, destination, config } => {
+                cmd_backup_restore(&backup, &destination, &config)
+            }
         },
         Cmd::Keys { command } => match command {
             KeysCmd::Import { remove_file, config } => cmd_keys_import(remove_file, &config),
@@ -337,6 +349,21 @@ fn cmd_backup_verify(backup: &Path, config: &Path) -> Result<()> {
     let report = floria_backup::verify(backup, &store)
         .with_context(|| format!("verifying backup at {}", backup.display()))?;
     print_backup_report("verified", &report);
+    Ok(())
+}
+
+fn cmd_backup_restore(backup: &Path, destination: &Path, config: &Path) -> Result<()> {
+    let cfg = load(config)?;
+    let store = open_store(&cfg)?;
+    let report = floria_backup::restore(backup, &store, destination).with_context(|| {
+        format!(
+            "restoring backup {} into {}",
+            backup.display(),
+            destination.display()
+        )
+    })?;
+    print_backup_report("restored and verified", &report);
+    println!("active Floria data was not changed");
     Ok(())
 }
 
@@ -1586,6 +1613,25 @@ mod tests {
                 assert_eq!(config, PathBuf::from("floria.toml"));
             }
             _ => panic!("expected backup verify"),
+        }
+
+        let restore = Cli::try_parse_from([
+            "floria",
+            "backup",
+            "restore",
+            "/tmp/floria-backup",
+            "/tmp/floria-restored",
+        ])
+        .unwrap();
+        match restore.command {
+            Cmd::Backup {
+                command: BackupCmd::Restore { backup, destination, config },
+            } => {
+                assert_eq!(backup, PathBuf::from("/tmp/floria-backup"));
+                assert_eq!(destination, PathBuf::from("/tmp/floria-restored"));
+                assert_eq!(config, PathBuf::from("floria.toml"));
+            }
+            _ => panic!("expected backup restore"),
         }
     }
 

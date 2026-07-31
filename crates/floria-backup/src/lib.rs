@@ -178,6 +178,70 @@ pub fn verify(backup: &Path, store: &AgeDirStore) -> BackupResult<BackupReport> 
     })
 }
 
+/// Restore a verified backup into a newly created standalone data directory.
+///
+/// The restored directory contains `catalog.sqlite` and `store/`, ready for a later active-data
+/// switch. The destination is never overwritten, and no partially restored directory is
+/// published.
+pub fn restore(
+    backup: &Path,
+    store: &AgeDirStore,
+    destination: &Path,
+) -> BackupResult<BackupReport> {
+    let verified = verify(backup, store)?;
+    let destination = normalized_new_destination(destination)?;
+    if destination.exists() {
+        return Err(BackupError::Manifest(format!(
+            "restore destination already exists: {}",
+            destination.display()
+        )));
+    }
+    let backup_root =
+        std::fs::canonicalize(backup).map_err(|source| BackupError::io(backup, source))?;
+    if destination.starts_with(&backup_root) {
+        return Err(BackupError::Manifest(format!(
+            "restore destination cannot be inside the backup: {}",
+            backup_root.display()
+        )));
+    }
+    let store_root = std::fs::canonicalize(store.root())
+        .map_err(|source| BackupError::io(store.root(), source))?;
+    if destination.starts_with(&store_root) {
+        return Err(BackupError::Manifest(format!(
+            "restore destination cannot be inside the active encrypted store: {}",
+            store_root.display()
+        )));
+    }
+
+    let mut temporary = TemporaryBackup::create(&destination)?;
+    copy_private_file(
+        &backup_root.join(CATALOG_FILE),
+        &temporary.path().join(CATALOG_FILE),
+    )?;
+    copy_private_directory(
+        &backup_root.join(STORE_DIRECTORY),
+        &temporary.path().join(STORE_DIRECTORY),
+    )?;
+
+    let snapshot = Catalog::inspect_backup(&temporary.path().join(CATALOG_FILE))?;
+    let restored_store = store.verify_backup(&temporary.path().join(STORE_DIRECTORY))?;
+    validate_catalog_store_references(&snapshot, &restored_store)?;
+    if snapshot.projects.len() != verified.projects
+        || snapshot.resources.len() != verified.resources
+        || restored_store.secrets != verified.secrets
+        || restored_store.versions != verified.versions
+        || restored_store.plaintext_bytes != verified.plaintext_bytes
+    {
+        return Err(BackupError::Manifest(
+            "restored data does not match the verified backup".to_string(),
+        ));
+    }
+
+    publish_without_overwrite(temporary.path(), &destination)?;
+    temporary.publish();
+    Ok(BackupReport { path: destination, files: verified.files, ..verified })
+}
+
 fn validate_catalog_store_references(
     snapshot: &floria_catalog::CatalogSnapshot,
     store: &StoreVerification,
@@ -267,6 +331,54 @@ fn write_manifest(root: &Path, manifest: &BackupManifest) -> BackupResult<()> {
         .map_err(|source| BackupError::io(&path, source))?;
     file.write_all(&bytes).map_err(|source| BackupError::io(&path, source))?;
     file.sync_all().map_err(|source| BackupError::io(&path, source))
+}
+
+fn copy_private_directory(source: &Path, destination: &Path) -> BackupResult<()> {
+    let metadata =
+        std::fs::symlink_metadata(source).map_err(|error| BackupError::io(source, error))?;
+    if !metadata.is_dir() {
+        return Err(BackupError::Manifest(format!(
+            "backup entry is not a directory: {}",
+            source.display()
+        )));
+    }
+    DirBuilder::new()
+        .mode(0o700)
+        .create(destination)
+        .map_err(|error| BackupError::io(destination, error))?;
+    let entries = std::fs::read_dir(source).map_err(|error| BackupError::io(source, error))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| BackupError::io(source, error))?;
+        let from = entry.path();
+        let to = destination.join(entry.file_name());
+        let metadata =
+            std::fs::symlink_metadata(&from).map_err(|error| BackupError::io(&from, error))?;
+        if metadata.is_dir() {
+            copy_private_directory(&from, &to)?;
+        } else if metadata.is_file() {
+            copy_private_file(&from, &to)?;
+        } else {
+            return Err(BackupError::Manifest(format!(
+                "backup contains unsupported filesystem entry: {}",
+                from.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn copy_private_file(source: &Path, destination: &Path) -> BackupResult<()> {
+    let metadata =
+        std::fs::symlink_metadata(source).map_err(|error| BackupError::io(source, error))?;
+    if !metadata.is_file() {
+        return Err(BackupError::Manifest(format!(
+            "backup entry is not a file: {}",
+            source.display()
+        )));
+    }
+    std::fs::copy(source, destination).map_err(|error| BackupError::io(destination, error))?;
+    std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| BackupError::io(destination, error))
 }
 
 fn check_private_directory(path: &Path) -> BackupResult<()> {
@@ -573,6 +685,56 @@ mod tests {
         let error = create(&catalog, &store, &destination).unwrap_err();
 
         assert!(error.to_string().contains("inside the encrypted store"));
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn restores_verified_data_into_a_new_standalone_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite")).unwrap();
+        catalog
+            .upsert_project(&Project {
+                id: "fixture-project".to_string(),
+                name: "Fixture".to_string(),
+                path: directory.path().join("project"),
+                default_environment_id: None,
+            })
+            .unwrap();
+        let store = fixture_store(&directory.path().join("store"));
+        let id = store.put(NewSecret::managed("Fixture"), b"fixture-value").unwrap();
+        catalog.create_resource(&fixture_resource(id.to_string())).unwrap();
+        let backup = directory.path().join("backup");
+        create(&catalog, &store, &backup).unwrap();
+        let destination = directory.path().join("restored");
+
+        let report = restore(&backup, &store, &destination).unwrap();
+
+        assert_eq!(report.path, std::fs::canonicalize(&destination).unwrap());
+        let snapshot = Catalog::inspect_backup(&destination.join(CATALOG_FILE)).unwrap();
+        assert_eq!(snapshot.projects.len(), 1);
+        assert_eq!(snapshot.resources.len(), 1);
+        let restored = store.verify_backup(&destination.join(STORE_DIRECTORY)).unwrap();
+        assert_eq!(restored.secrets, 1);
+        assert_eq!(restored.versions, 1);
+        assert!(!destination.join(MANIFEST_FILE).exists());
+    }
+
+    #[test]
+    fn failed_restore_never_publishes_a_partial_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite")).unwrap();
+        let store = fixture_store(&directory.path().join("store"));
+        let id = store.put(NewSecret::managed("Fixture"), b"fixture-value").unwrap();
+        let backup = directory.path().join("backup");
+        create(&catalog, &store, &backup).unwrap();
+        let blob = backup
+            .join(STORE_DIRECTORY)
+            .join(id.to_string())
+            .join("v/0001.age");
+        std::fs::write(blob, b"tampered").unwrap();
+        let destination = directory.path().join("restored");
+
+        assert!(restore(&backup, &store, &destination).is_err());
         assert!(!destination.exists());
     }
 }
