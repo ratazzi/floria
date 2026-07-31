@@ -18,11 +18,6 @@ private struct DiscoveryPresentation: Identifiable {
     let paths: [String]
 }
 
-private struct WorkspacePresentation: Identifiable {
-    let id = UUID()
-    let selection: WorkspaceSidebarSelection
-}
-
 /// Matches access events to a project with pre-lowercased, pre-expanded
 /// strings so hot loops stay on plain Swift string operations (macOS paths
 /// are case-insensitive, so lowercased comparison is safe).
@@ -77,11 +72,11 @@ struct DashboardView: View {
     @State private var isDropTargeted = false
     @State private var isDiscovering = false
     @State private var discovery: DiscoveryPresentation?
-    @State private var workspacePresentation: WorkspacePresentation?
     @State private var showingAccessLog = false
     @State private var pendingAuditWindow: AuditOnlyWindow?
     @State private var showingAuditConfirmation = false
     @FocusState private var searchIsFocused: Bool
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         ZStack {
@@ -102,8 +97,7 @@ struct DashboardView: View {
                             search = ""
                         },
                         openAdvanced: {
-                            workspacePresentation = WorkspacePresentation(
-                                selection: .project(selectedProject.id))
+                            openWorkspace(.project(selectedProject.id))
                         })
                 } else {
                     ScrollView {
@@ -152,10 +146,6 @@ struct DashboardView: View {
                     selectedProjectID = projectID
                     search = ""
                 })
-        }
-        .sheet(item: $workspacePresentation) { presentation in
-            AdvancedWorkspaceView(state: state, initialSelection: presentation.selection)
-                .frame(minWidth: 1080, minHeight: 680)
         }
         .sheet(isPresented: $showingAccessLog) {
             AccessLogView(state: state)
@@ -674,7 +664,9 @@ struct DashboardView: View {
     }
 
     private func openWorkspace(_ selection: WorkspaceSidebarSelection = .projects) {
-        workspacePresentation = WorkspacePresentation(selection: selection)
+        state.workspaceWindowSelection = selection
+        state.workspaceWindowToken = UUID()
+        openWindow(id: "workspace")
     }
 
     private func handle(_ action: DashboardIssueAction) {

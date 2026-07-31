@@ -78,6 +78,10 @@ final class AppState {
     var activeGrants: [ActiveGrant] = []
     var activeGrantsError: String?
     var accessHistoryLoading = false
+    /// Where the library window should land when opened; the token forces the
+    /// window content to re-navigate when a new request targets an open window.
+    var workspaceWindowSelection: WorkspaceSidebarSelection = .projects
+    var workspaceWindowToken = UUID()
 
     @ObservationIgnored private var client: AgentClient!
     @ObservationIgnored private let controlClient: ControlClient

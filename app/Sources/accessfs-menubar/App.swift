@@ -95,5 +95,14 @@ struct FloriaMenuBarApp: App {
         .commands {
             DashboardCommands()
         }
+
+        // Detailed inventory management as its own window (not a sheet): the
+        // full-size view layered over the compact dashboard reads as a glitch.
+        Window("Floria Library", id: "workspace") {
+            AdvancedWorkspaceView(state: state, initialSelection: state.workspaceWindowSelection)
+                .id(state.workspaceWindowToken)
+                .frame(minWidth: 1080, minHeight: 680)
+        }
+        .defaultSize(width: 1180, height: 760)
     }
 }
