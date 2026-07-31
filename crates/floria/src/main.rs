@@ -1213,9 +1213,16 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
         ControlCmd::SshDiscover { endpoint } => ControlCommand::SshAgentDiscover { endpoint },
     };
     match client.request(command)? {
-        ControlResult::Pong { protocol_version, daemon_version, schema_version } => {
+        ControlResult::Pong {
+            protocol_version,
+            daemon_version,
+            schema_version,
+            minimum_schema_version,
+            store_format_version,
+            minimum_store_format_version,
+        } => {
             println!(
-                "daemon v{daemon_version} ready; control protocol v{protocol_version}; catalog schema v{schema_version}"
+                "daemon v{daemon_version} ready; control protocol v{protocol_version}; catalog schema v{schema_version} (supports {minimum_schema_version}..={schema_version}); store format v{store_format_version} (supports {minimum_store_format_version}..={store_format_version})"
             );
         }
         ControlResult::PolicyMode(status) => {

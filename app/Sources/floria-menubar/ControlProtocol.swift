@@ -6,11 +6,17 @@ struct ControlServerInfo: Decodable, Equatable, Sendable {
     let protocolVersion: UInt32?
     let daemonVersion: String?
     let schemaVersion: Int64
+    let minimumSchemaVersion: Int64
+    let storeFormatVersion: UInt32
+    let minimumStoreFormatVersion: UInt32
 
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol_version"
         case daemonVersion = "daemon_version"
         case schemaVersion = "schema_version"
+        case minimumSchemaVersion = "minimum_schema_version"
+        case storeFormatVersion = "store_format_version"
+        case minimumStoreFormatVersion = "minimum_store_format_version"
     }
 }
 

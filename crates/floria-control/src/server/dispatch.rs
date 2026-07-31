@@ -23,6 +23,9 @@ pub(super) fn dispatch(
             protocol_version: crate::protocol::CONTROL_PROTOCOL_VERSION,
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             schema_version: catalog.schema_version(),
+            minimum_schema_version: floria_catalog::Catalog::minimum_supported_schema_version(),
+            store_format_version: floria_store::STORE_FORMAT_VERSION,
+            minimum_store_format_version: floria_store::MIN_SUPPORTED_STORE_FORMAT_VERSION,
         }),
         ControlCommand::PolicyModeGet => policy
             .map(|controller| ControlResult::PolicyMode(controller.policy_mode()))

@@ -2663,6 +2663,9 @@
                 protocol_version: crate::protocol::CONTROL_PROTOCOL_VERSION,
                 daemon_version: env!("CARGO_PKG_VERSION").to_string(),
                 schema_version: 12,
+                minimum_schema_version: 12,
+                store_format_version: 2,
+                minimum_store_format_version: 1,
             }
         );
         client

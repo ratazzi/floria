@@ -75,6 +75,10 @@ impl Catalog {
         SCHEMA_VERSION
     }
 
+    pub fn minimum_supported_schema_version() -> i64 {
+        SCHEMA_VERSION
+    }
+
     pub fn snapshot(&self) -> CatalogResult<CatalogSnapshot> {
         let mut conn = self.connection()?;
         let tx = conn.transaction()?;

@@ -196,6 +196,9 @@ pub enum ControlResult {
         protocol_version: u32,
         daemon_version: String,
         schema_version: i64,
+        minimum_schema_version: i64,
+        store_format_version: u32,
+        minimum_store_format_version: u32,
     },
     PolicyMode(PolicyModeStatus),
     ActiveGrants(Vec<ActiveGrant>),
@@ -668,6 +671,9 @@ mod tests {
             protocol_version: CONTROL_PROTOCOL_VERSION,
             daemon_version: "0.1.0".to_string(),
             schema_version: 12,
+            minimum_schema_version: 12,
+            store_format_version: 2,
+            minimum_store_format_version: 1,
         };
         let value = serde_json::to_value(result).unwrap();
 
@@ -675,6 +681,9 @@ mod tests {
         assert_eq!(value["value"]["protocol_version"], CONTROL_PROTOCOL_VERSION);
         assert_eq!(value["value"]["daemon_version"], "0.1.0");
         assert_eq!(value["value"]["schema_version"], 12);
+        assert_eq!(value["value"]["minimum_schema_version"], 12);
+        assert_eq!(value["value"]["store_format_version"], 2);
+        assert_eq!(value["value"]["minimum_store_format_version"], 1);
     }
 
     #[test]

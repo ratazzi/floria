@@ -22,7 +22,8 @@ use crate::keys::KeyProvider;
 
 /// Current on-disk layout. Format 2 adds managed (non-file) origins; format 1 file entries remain
 /// readable and are updated in place without rewriting their origin metadata.
-const STORE_FORMAT: u32 = 2;
+pub const STORE_FORMAT_VERSION: u32 = 2;
+pub const MIN_SUPPORTED_STORE_FORMAT_VERSION: u32 = 1;
 
 /// Stable secret identifier (a v4 UUID string). Immutable for the life of an entry.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -189,7 +190,7 @@ pub trait SecretStore: Send + Sync {
 /// On-disk `<id>/meta.toml`: entry-level metadata plus the head pointer.
 #[derive(Serialize, Deserialize)]
 struct MetaFile {
-    /// See [`STORE_FORMAT`]. `default` so a pre-format entry reads as 0 and fails the check.
+    /// See [`STORE_FORMAT_VERSION`]. `default` so a pre-format entry reads as 0 and fails the check.
     #[serde(default)]
     format: u32,
     id: String,
@@ -381,12 +382,12 @@ impl AgeDirStore {
             id: id.to_string(),
             reason: format!("meta.toml: {e}"),
         })?;
-        if !matches!(meta.format, 1 | STORE_FORMAT) {
+        if !(MIN_SUPPORTED_STORE_FORMAT_VERSION..=STORE_FORMAT_VERSION).contains(&meta.format) {
             return Err(StoreError::Corrupt {
                 id: id.to_string(),
                 reason: format!(
                     "store format {} but this build supports 1 through {}; migrate or delete the entry",
-                    meta.format, STORE_FORMAT
+                    meta.format, STORE_FORMAT_VERSION
                 ),
             });
         }
@@ -603,7 +604,7 @@ impl SecretStore for AgeDirStore {
         self.write_meta(
             &id,
             &MetaFile {
-                format: STORE_FORMAT,
+            format: STORE_FORMAT_VERSION,
                 id: id.to_string(),
                 source_path,
                 managed_label,
