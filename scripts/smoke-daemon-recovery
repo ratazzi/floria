@@ -85,11 +85,39 @@ socket_inode() {
 assert_daemon_owns_socket() {
     local pid="$1"
     local path="$2"
+    local deadline=$((SECONDS + WAIT_SECONDS))
+    local open_unix_files=""
 
-    if ! /usr/sbin/lsof -n -Fn -a -p "${pid}" "${path}" 2>/dev/null |
-        awk -v path="${path}" '$0 == "n" path { found = 1 } END { exit !found }'; then
-        echo "Daemon ${pid} does not own runtime socket ${path}" >&2
-        /usr/sbin/lsof -n -U -a -p "${pid}" >&2 || true
+    while ((SECONDS < deadline)); do
+        open_unix_files="$(/usr/sbin/lsof -n -Fn -U -a -p "${pid}" 2>/dev/null || true)"
+        if awk -v path="${path}" \
+            '$0 == "n" path { found = 1 } END { exit !found }' <<<"${open_unix_files}"; then
+            return 0
+        fi
+        sleep 0.05
+    done
+
+    echo "Timed out waiting for daemon ${pid} to own runtime socket ${path}" >&2
+    [[ -n "${open_unix_files}" ]] && echo "${open_unix_files}" >&2
+    return 1
+}
+
+assert_untrusted_socket_rejected() {
+    local path="$1"
+    local description="$2"
+
+    if ! /bin/zsh -c '
+        zmodload zsh/net/socket || exit 91
+        zmodload zsh/system || exit 92
+        zsocket "$1" || exit 93
+        socket_fd=$REPLY
+        reply=""
+        sysread -i "${socket_fd}" -t 2 -s 1 reply
+        read_status=$?
+        exec {socket_fd}>&-
+        [[ "${read_status}" == "5" && "${#reply}" == "0" ]]
+    ' -- "${path}"; then
+        echo "Untrusted system shell was not rejected by ${description}: ${path}" >&2
         return 1
     fi
 }
@@ -313,6 +341,10 @@ wait_for_job_state running "install-app to start the current Floria daemon"
 wait_for_doctor "the installed Floria app to become healthy"
 "${DAEMON_PATH}" doctor --config "${CONFIG_PATH}"
 
+echo "==> Verifying local socket code-signing policy"
+assert_untrusted_socket_rejected "${AGENT_SOCKET}" "the agent socket"
+assert_untrusted_socket_rejected "${CONTROL_SOCKET}" "the control socket"
+
 echo "==> Verifying cold-start daemon recovery"
 cold_runs_before="$(job_runs)"
 stop_app
@@ -348,6 +380,9 @@ if [[ "${new_daemon_pid}" == "0" || "${new_daemon_pid}" == "${old_daemon_pid}" ]
 fi
 wait_for_process_exit "${old_daemon_pid}" "the previous Floria daemon"
 
+assert_daemon_owns_socket "${new_daemon_pid}" "${AGENT_SOCKET}"
+assert_daemon_owns_socket "${new_daemon_pid}" "${CONTROL_SOCKET}"
+
 new_agent_inode="$(socket_inode "${AGENT_SOCKET}")"
 new_control_inode="$(socket_inode "${CONTROL_SOCKET}")"
 if [[ -z "${new_agent_inode}" ]]; then
@@ -358,8 +393,6 @@ if [[ -z "${new_control_inode}" ]]; then
     echo "Control socket is missing after daemon recovery" >&2
     exit 1
 fi
-assert_daemon_owns_socket "${new_daemon_pid}" "${AGENT_SOCKET}"
-assert_daemon_owns_socket "${new_daemon_pid}" "${CONTROL_SOCKET}"
 
 # Give any delayed cleanup from the old generation a chance to run. The new daemon must retain
 # both pathname identities and ownership throughout the handoff.
