@@ -6,10 +6,10 @@ import os
 /// The manager is only active in a packaged app; `swift run` keeps using a manually
 /// started daemon so development does not mutate launchd state.
 struct DaemonManager: Sendable {
-    static let bundleIdentifier = "dev.floria.hola.ac"
+    static let bundleIdentifier = ProductIdentity.bundleIdentifier
 
     private static let log = Logger(subsystem: bundleIdentifier, category: "daemon")
-    private let serviceLabel = "dev.floria.hola.ac.daemon"
+    private let serviceLabel = ProductIdentity.daemonServiceLabel
 
     static var isProductionApp: Bool {
         Bundle.main.bundleIdentifier == bundleIdentifier

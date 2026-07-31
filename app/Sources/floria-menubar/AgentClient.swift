@@ -5,7 +5,7 @@ import os
 /// Persistent Unix-socket client to the daemon. Runs a background read loop and
 /// auto-reconnects. Callbacks fire on the read thread; the UI layer re-dispatches to main.
 final class AgentClient {
-    static let log = Logger(subsystem: "dev.floria.hola.ac", category: "socket")
+    static let log = Logger(subsystem: ProductIdentity.bundleIdentifier, category: "socket")
 
     private let socketPath: String
     /// Guarded by `writeLock`: the reconnect thread closes/replaces it while the main thread

@@ -3,7 +3,8 @@ import Foundation
 
 final class ControlClient: @unchecked Sendable {
     private let socketPath: String
-    private let queue = DispatchQueue(label: "dev.floria.hola.ac.control", qos: .userInitiated)
+    private let queue = DispatchQueue(
+        label: ProductIdentity.controlQueueLabel, qos: .userInitiated)
     private var nextRequestID: UInt64 = 1
 
     init(socketPath: String) {

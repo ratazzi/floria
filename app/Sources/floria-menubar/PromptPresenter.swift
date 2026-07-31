@@ -9,7 +9,8 @@ import SwiftUI
 /// re-activate it once the decision (including the async Touch ID leg) is settled.
 @MainActor
 final class PromptPresenter {
-    private static let log = Logger(subsystem: "dev.floria.hola.ac", category: "prompt")
+    private static let log = Logger(
+        subsystem: ProductIdentity.bundleIdentifier, category: "prompt")
 
     func show(_ p: PromptMsg, send: @escaping (DecisionMsg) -> Void) {
         Self.log.info("showing authorization window req_id=\(p.req_id) path=\(p.path)")

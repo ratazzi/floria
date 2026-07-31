@@ -85,7 +85,7 @@ impl KeyProvider for SshKeyProvider {
 /// the user's login keychain holds the *decrypted* OpenSSH ed25519 private key, generated on first
 /// installed-app mount or written by `floria keys import`. Reading it needs no passphrase or KDF;
 /// macOS gates access per binary signature instead.
-pub const KEYCHAIN_SERVICE: &str = "dev.floria.hola.ac.store";
+pub const KEYCHAIN_SERVICE: &str = "floria.hola.ac.store";
 pub const KEYCHAIN_ACCOUNT: &str = "store-ssh-key";
 
 /// Decrypt with the OpenSSH key held in the macOS login Keychain.

@@ -9,7 +9,7 @@ final class DaemonManagerTests: XCTestCase {
 
     func testLaunchAgentStateIsRunningWhenLaunchdReportsRunning() {
         let output = """
-        gui/501/dev.floria.hola.ac.daemon = {
+        gui/501/floria.hola.ac.daemon = {
             active count = 1
             state = running
             pid = 945
@@ -21,7 +21,7 @@ final class DaemonManagerTests: XCTestCase {
 
     func testLaunchAgentStateIsLoadedWhenJobHasNoRunningProcess() {
         let output = """
-        gui/501/dev.floria.hola.ac.daemon = {
+        gui/501/floria.hola.ac.daemon = {
             active count = 0
             state = waiting
             runs = 3
@@ -34,7 +34,7 @@ final class DaemonManagerTests: XCTestCase {
 
     func testLaunchAgentStateIsLoadedWhenLaunchdOmitsState() {
         let output = """
-        gui/501/dev.floria.hola.ac.daemon = {
+        gui/501/floria.hola.ac.daemon = {
             active count = 0
             runs = 1
         }
