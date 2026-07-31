@@ -888,6 +888,7 @@ private struct CompactProjectDetailView: View {
     let selectProject: (WorkspaceProject.ID?) -> Void
     let openAdvanced: () -> Void
     @State private var showingWorktrees = false
+    @State private var selectedManagedItem: LibraryCatalogItem?
 
     var body: some View {
         ScrollView {
@@ -903,6 +904,23 @@ private struct CompactProjectDetailView: View {
         .background(Color(nsColor: .windowBackgroundColor))
         .sheet(isPresented: $showingWorktrees) {
             ProjectCheckoutsSheet(store: state.workspace, projectID: project.id)
+        }
+        .sheet(item: $selectedManagedItem) { item in
+            switch item {
+            case .file(let file):
+                LibraryItemDetailSheet(
+                    store: state.workspace,
+                    item: item,
+                    configureProtectedFile: file.kind.isConfigurable
+                        ? {
+                            try await state.workspace.configureManagedFile(
+                                file.id, projectID: project.id,
+                                environmentID: selectedEnvironment?.id)
+                        }
+                        : nil)
+            case .resource, .surface:
+                LibraryItemDetailSheet(store: state.workspace, item: item)
+            }
         }
     }
 
@@ -1080,16 +1098,16 @@ private struct CompactProjectDetailView: View {
                                 surface: surface,
                                 bindings: bindings(for: surface),
                                 projectPath: project.path,
-                                openAdvanced: openAdvanced)
+                                showDetails: {
+                                    selectedManagedItem = .surface(surface)
+                                })
                         case .file(let file):
                             CompactProtectedFileRow(
                                 state: state,
                                 file: file,
                                 projectPath: project.path,
-                                configure: {
-                                    try await state.workspace.configureManagedFile(
-                                        file.id, projectID: project.id,
-                                        environmentID: selectedEnvironment?.id)
+                                showDetails: {
+                                    selectedManagedItem = .file(file)
                                 })
                         }
                         if index != filteredManagedItems.count - 1 {
@@ -1569,7 +1587,7 @@ private struct CompactSurfaceRow: View {
     let surface: WorkspaceSurface
     let bindings: [WorkspaceBinding]
     let projectPath: String
-    let openAdvanced: () -> Void
+    let showDetails: () -> Void
 
     private var needsAttention: Bool {
         !surface.status.isHealthy
@@ -1609,15 +1627,15 @@ private struct CompactSurfaceRow: View {
             }
 
             Menu {
+                Button("Details…", systemImage: "info.circle") {
+                    showDetails()
+                }
+                Divider()
                 Button("Reveal in Finder", systemImage: "folder") {
                     NSWorkspace.shared.activateFileViewerSelecting([
                         URL(fileURLWithPath: surface.path)
                     ])
                 }
-                Button("Configure…", systemImage: "slider.horizontal.3") {
-                    openAdvanced()
-                }
-                Divider()
                 Button("Copy Path", systemImage: "doc.on.doc") {
                     copyManagedPath(surface.path)
                 }
@@ -1644,10 +1662,7 @@ private struct CompactProtectedFileRow: View {
     @Bindable var state: AppState
     let file: WorkspaceProtectedFile
     let projectPath: String
-    let configure: () async throws -> Void
-
-    @State private var confirmingConfiguration = false
-    @State private var isConfiguring = false
+    let showDetails: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
@@ -1682,17 +1697,15 @@ private struct CompactProtectedFileRow: View {
             }
 
             Menu {
+                Button("Details…", systemImage: "info.circle") {
+                    showDetails()
+                }
+                Divider()
                 Button("Reveal in Finder", systemImage: "folder") {
                     NSWorkspace.shared.activateFileViewerSelecting([
                         URL(fileURLWithPath: file.path)
                     ])
                 }
-                if file.kind.isConfigurable {
-                    Button("Configure…", systemImage: "slider.horizontal.3") {
-                        confirmingConfiguration = true
-                    }
-                }
-                Divider()
                 Button("Copy Path", systemImage: "doc.on.doc") {
                     copyManagedPath(file.path)
                 }
@@ -1703,38 +1716,10 @@ private struct CompactProtectedFileRow: View {
             }
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
-            .disabled(isConfiguring)
             .accessibilityLabel("\(URL(fileURLWithPath: file.path).lastPathComponent) actions")
-
-            if isConfiguring {
-                ProgressView()
-                    .controlSize(.small)
-                    .frame(width: 16, height: 16)
-            }
         }
         .padding(.horizontal, 14)
         .frame(minHeight: 54)
-        .alert(
-            "Configure \(URL(fileURLWithPath: file.path).lastPathComponent)?",
-            isPresented: $confirmingConfiguration
-        ) {
-            Button("Cancel", role: .cancel) {}
-            Button("Configure") {
-                Task {
-                    isConfiguring = true
-                    defer { isConfiguring = false }
-                    do {
-                        try await configure()
-                    } catch {
-                        state.workspace.lastError = error.localizedDescription
-                    }
-                }
-            }
-        } message: {
-            Text(
-                "Floria will keep this path, parse its values, and make its contents configurable. Existing encrypted versions are reused."
-            )
-        }
     }
 }
 

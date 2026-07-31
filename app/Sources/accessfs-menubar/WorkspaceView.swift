@@ -1504,6 +1504,7 @@ private struct SurfaceFooter: View {
 private struct ManageSurfaceSheet: View {
     @Bindable var store: WorkspaceStore
     let surface: WorkspaceSurface
+    let onRemoved: () -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var isWorking = false
@@ -1518,9 +1519,13 @@ private struct ManageSurfaceSheet: View {
     @State private var sshPort: String
     @State private var sshForwardAgent: Bool
 
-    init(store: WorkspaceStore, surface: WorkspaceSurface) {
+    init(
+        store: WorkspaceStore, surface: WorkspaceSurface,
+        onRemoved: @escaping () -> Void = {}
+    ) {
         self.store = store
         self.surface = surface
+        self.onRemoved = onRemoved
         _fileName = State(initialValue: surface.name)
         _selectedKind = State(initialValue: surface.kind)
         _sshHostPatterns = State(
@@ -1567,14 +1572,15 @@ private struct ManageSurfaceSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 4) {
-                Text(isSocketSurface ? "Edit SSH Agent Socket" : "Edit Output").font(.title2.bold())
+                Text("Configure \(URL(fileURLWithPath: surface.path).lastPathComponent)")
+                    .font(.title2.bold())
                 Text(linkSummary)
                     .font(.callout)
                     .foregroundStyle(actualTarget == expectedTarget ? Color.green : Color.orange)
             }
 
             if isManagedSurface {
-                InspectorSection(title: "Output") {
+                InspectorSection(title: isSocketSurface ? "Socket" : "File") {
                     TextField("File name", text: $fileName)
                         .textFieldStyle(.roundedBorder)
                         .font(.body.monospaced())
@@ -1601,7 +1607,7 @@ private struct ManageSurfaceSheet: View {
             }
 
             if isComposedSurface {
-                InspectorSection(title: "Included bindings") {
+                InspectorSection(title: "Included content") {
                     ForEach(bindingCandidates) { binding in
                         Toggle(
                             store.resource(binding.resourceID)?.name ?? binding.resourceID,
@@ -1639,7 +1645,7 @@ private struct ManageSurfaceSheet: View {
             }
 
             if isManagedSurface {
-                InspectorSection(title: "Mounted target") {
+                InspectorSection(title: "Managed path") {
                     Text(expectedTarget)
                         .font(.callout.monospaced())
                         .textSelection(.enabled)
@@ -1679,11 +1685,11 @@ private struct ManageSurfaceSheet: View {
 
             Divider()
             HStack {
-                Text("Removing an output keeps its resources and bindings.")
+                Text("Removing this configuration keeps its reusable content.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
-                Button("Remove Output", systemImage: "trash", role: .destructive) {
+                Button("Remove Configuration", systemImage: "trash", role: .destructive) {
                     confirmingRemoval = true
                 }
                 .disabled(isWorking)
@@ -1693,19 +1699,27 @@ private struct ManageSurfaceSheet: View {
         .frame(width: 620)
         .onAppear {
             selectedBindingIDs = Set(surface.bindingIDs)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                for window in NSApp.windows {
+                    guard let editor = window.firstResponder as? NSTextView else { continue }
+                    editor.setSelectedRange(
+                        NSRange(location: editor.string.utf16.count, length: 0))
+                    window.makeFirstResponder(nil)
+                }
+            }
         }
         .onChange(of: selectedKind) { _, kind in
             let allowed = Set(store.compatibleBindings(for: kind).map(\.id))
             selectedBindingIDs.formIntersection(allowed)
         }
-        .alert("Remove output?", isPresented: $confirmingRemoval) {
+        .alert("Remove configuration?", isPresented: $confirmingRemoval) {
             Button("Cancel", role: .cancel) { }
             Button("Remove", role: .destructive, action: removeSurface)
         } message: {
-            Text("Floria removes only a link that still points to this exact managed surface.")
+            Text("Floria removes only the managed link. Reusable content stays in the Library.")
         }
         .alert(
-            "Could not manage output",
+            "Could not update item",
             isPresented: Binding(
                 get: { errorMessage != nil },
                 set: { if !$0 { errorMessage = nil } })
@@ -1782,6 +1796,7 @@ private struct ManageSurfaceSheet: View {
             defer { isWorking = false }
             do {
                 try await store.deleteSurface(surface.id)
+                onRemoved()
                 dismiss()
             } catch {
                 errorMessage = error.localizedDescription
@@ -1901,6 +1916,8 @@ private enum LibraryCatalogFilter: String, CaseIterable, Identifiable {
         switch (self, item) {
         case (.all, _), (.files, .file):
             true
+        case (.files, .surface):
+            true
         case (.files, .resource(let resource)):
             resource.kind == .envFile
         case (.secrets, .resource(let resource)):
@@ -1913,14 +1930,16 @@ private enum LibraryCatalogFilter: String, CaseIterable, Identifiable {
     }
 }
 
-private enum LibraryCatalogItem: Identifiable {
+enum LibraryCatalogItem: Identifiable {
     case file(WorkspaceProtectedFile)
     case resource(WorkspaceResource)
+    case surface(WorkspaceSurface)
 
     var id: String {
         switch self {
         case .file(let file): "file:\(file.id)"
         case .resource(let resource): "resource:\(resource.id)"
+        case .surface(let surface): "surface:\(surface.id)"
         }
     }
 
@@ -1930,6 +1949,8 @@ private enum LibraryCatalogItem: Identifiable {
             URL(fileURLWithPath: file.path).lastPathComponent
         case .resource(let resource):
             resource.name
+        case .surface(let surface):
+            URL(fileURLWithPath: surface.path).lastPathComponent
         }
     }
 
@@ -1944,15 +1965,17 @@ private enum LibraryCatalogItem: Identifiable {
             return resource.usageCount == 0
                 ? "Not used by a project"
                 : "Used by \(resource.usageCount) project\(resource.usageCount == 1 ? "" : "s")"
+        case .surface(let surface):
+            return (surface.path as NSString).abbreviatingWithTildeInPath
         }
     }
 
     var typeTitle: String {
         switch self {
         case .file(let file):
-            file.kind.title
+            return file.kind.title
         case .resource(let resource):
-            switch resource.kind {
+            return switch resource.kind {
             case .sharedSecret, .secret: "Secret"
             case .envFile:
                 resource.originSources.first.map {
@@ -1963,6 +1986,9 @@ private enum LibraryCatalogItem: Identifiable {
             case .literal: "Value"
             case .command: "Command"
             }
+        case .surface(let surface):
+            let recognized = WorkspaceProtectedFileKind.infer(from: surface.path)
+            return recognized == .file ? surface.kind.managedTitle : recognized.title
         }
     }
 
@@ -1974,6 +2000,9 @@ private enum LibraryCatalogItem: Identifiable {
                 return WorkspaceProtectedFileKind.infer(from: source.path).systemImage
             }
             return resource.kind.systemImage
+        case .surface(let surface):
+            let recognized = WorkspaceProtectedFileKind.infer(from: surface.path)
+            return recognized == .file ? surface.kind.systemImage : recognized.systemImage
         }
     }
 
@@ -1981,6 +2010,7 @@ private enum LibraryCatalogItem: Identifiable {
         switch self {
         case .file(let file): file.securityLevel
         case .resource(let resource): resource.securityLevel
+        case .surface(let surface): surface.securityLevel
         }
     }
 
@@ -1990,6 +2020,7 @@ private enum LibraryCatalogItem: Identifiable {
         switch self {
         case .file(let file): metadata = file.metadata
         case .resource(let resource): metadata = resource.metadata
+        case .surface: metadata = .empty
         }
         return title.localizedCaseInsensitiveContains(search)
             || detail.localizedCaseInsensitiveContains(search)
@@ -2133,22 +2164,37 @@ private struct LibraryCatalogView: View {
             try await store.updateResourceMetadata(
                 resource.id, name: resource.name,
                 securityLevel: level, metadata: resource.metadata)
+        case .surface(let surface):
+            try await store.updateSurfaceSecurityLevel(
+                surface.id, securityLevel: level)
         }
     }
 }
 
-private struct LibraryItemDetailSheet: View {
+struct LibraryItemDetailSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Bindable var store: WorkspaceStore
     let item: LibraryCatalogItem
+    let configureProtectedFile: (() async throws -> Void)?
 
     @State private var editingFile: WorkspaceProtectedFile?
     @State private var editingSharedSecret: WorkspaceResource?
     @State private var editingResource: WorkspaceResource?
+    @State private var editingSurface: WorkspaceSurface?
     @State private var historyFile: WorkspaceProtectedFile?
+    @State private var confirmingConfiguration = false
     @State private var confirmingRemoval = false
     @State private var isWorking = false
     @State private var errorMessage: String?
+
+    init(
+        store: WorkspaceStore, item: LibraryCatalogItem,
+        configureProtectedFile: (() async throws -> Void)? = nil
+    ) {
+        self.store = store
+        self.item = item
+        self.configureProtectedFile = configureProtectedFile
+    }
 
     private var currentItem: LibraryCatalogItem {
         switch item {
@@ -2158,6 +2204,8 @@ private struct LibraryItemDetailSheet: View {
         case .resource(let resource):
             return store.resources.first(where: { $0.id == resource.id })
                 .map(LibraryCatalogItem.resource) ?? item
+        case .surface(let surface):
+            return store.surface(surface.id).map(LibraryCatalogItem.surface) ?? item
         }
     }
 
@@ -2165,6 +2213,7 @@ private struct LibraryItemDetailSheet: View {
         switch currentItem {
         case .file(let file): file.metadata
         case .resource(let resource): resource.metadata
+        case .surface: .empty
         }
     }
 
@@ -2228,6 +2277,14 @@ private struct LibraryItemDetailSheet: View {
                                         .textSelection(.enabled)
                                 }
                             }
+                        case .surface(let surface):
+                            LabeledContent("Path") {
+                                Text((surface.path as NSString).abbreviatingWithTildeInPath)
+                                    .textSelection(.enabled)
+                            }
+                            LabeledContent(
+                                "Status",
+                                value: surface.status.isHealthy ? "Ready" : "Needs attention")
                         }
                     }
 
@@ -2251,12 +2308,16 @@ private struct LibraryItemDetailSheet: View {
 
                     InspectorSection(title: "Actions") {
                         HStack(spacing: 10) {
-                            Button("Edit…", systemImage: "pencil") {
-                                editCurrentItem()
-                            }
-
                             switch currentItem {
                             case .file(let file):
+                                Button("Edit Info…", systemImage: "pencil") {
+                                    editCurrentItem()
+                                }
+                                if configureProtectedFile != nil, file.kind.isConfigurable {
+                                    Button("Configure…", systemImage: "slider.horizontal.3") {
+                                        confirmingConfiguration = true
+                                    }
+                                }
                                 Button("History", systemImage: "clock.arrow.circlepath") {
                                     historyFile = file
                                 }
@@ -2269,12 +2330,27 @@ private struct LibraryItemDetailSheet: View {
                                     copyToPasteboard(file.path)
                                 }
                             case .resource(let resource):
+                                Button("Edit Info…", systemImage: "pencil") {
+                                    editCurrentItem()
+                                }
                                 if let source = resource.originSources.first {
                                     Button("Reveal Source", systemImage: "folder") {
                                         NSWorkspace.shared.activateFileViewerSelecting([
                                             URL(fileURLWithPath: source.path)
                                         ])
                                     }
+                                }
+                            case .surface(let surface):
+                                Button("Configure…", systemImage: "slider.horizontal.3") {
+                                    editingSurface = surface
+                                }
+                                Button("Reveal in Finder", systemImage: "folder") {
+                                    NSWorkspace.shared.activateFileViewerSelecting([
+                                        URL(fileURLWithPath: surface.path)
+                                    ])
+                                }
+                                Button("Copy Path", systemImage: "doc.on.doc") {
+                                    copyToPasteboard(surface.path)
                                 }
                             }
                         }
@@ -2326,8 +2402,26 @@ private struct LibraryItemDetailSheet: View {
         .sheet(item: $editingResource) { resource in
             EditResourceMetadataSheet(store: store, resource: resource)
         }
+        .sheet(item: $editingSurface) { surface in
+            ManageSurfaceSheet(
+                store: store, surface: surface,
+                onRemoved: { dismiss() })
+        }
         .sheet(item: $historyFile) { file in
             ProtectedFileHistorySheet(store: store, file: file)
+        }
+        .alert(
+            "Configure \(currentItem.title)?",
+            isPresented: $confirmingConfiguration
+        ) {
+            Button("Cancel", role: .cancel) {}
+            Button("Configure") {
+                configureCurrentFile()
+            }
+        } message: {
+            Text(
+                "Floria will keep this path, parse its values, and make its contents configurable. Existing encrypted versions are reused."
+            )
         }
         .alert(removalConfirmationTitle, isPresented: $confirmingRemoval) {
             Button("Cancel", role: .cancel) {}
@@ -2366,6 +2460,8 @@ private struct LibraryItemDetailSheet: View {
             resource.kind == .sshIdentity ? "Delete this SSH identity" : "Disconnect this SSH agent"
         case .resource:
             nil
+        case .surface:
+            nil
         }
     }
 
@@ -2379,6 +2475,8 @@ private struct LibraryItemDetailSheet: View {
             "The external agent is not changed."
         case .resource:
             "This permanently removes the encrypted value and version history."
+        case .surface:
+            ""
         }
     }
 
@@ -2387,6 +2485,7 @@ private struct LibraryItemDetailSheet: View {
         case .file: "Stop Protecting…"
         case .resource(let resource) where resource.kind == .sshAgent: "Disconnect…"
         case .resource: "Delete…"
+        case .surface: ""
         }
     }
 
@@ -2394,6 +2493,7 @@ private struct LibraryItemDetailSheet: View {
         switch currentItem {
         case .file(let file): !file.linked
         case .resource(let resource): resource.usageCount > 0
+        case .surface: true
         }
     }
 
@@ -2406,6 +2506,8 @@ private struct LibraryItemDetailSheet: View {
             "Delete SSH identity?"
         case .resource:
             "Delete secret?"
+        case .surface:
+            "Remove managed item?"
         }
     }
 
@@ -2419,6 +2521,8 @@ private struct LibraryItemDetailSheet: View {
             "Floria removes only its saved identity metadata. The external agent is not changed."
         case .resource:
             "This permanently removes the encrypted value and version history."
+        case .surface:
+            ""
         }
     }
 
@@ -2430,6 +2534,8 @@ private struct LibraryItemDetailSheet: View {
             editingSharedSecret = resource
         case .resource(let resource):
             editingResource = resource
+        case .surface(let surface):
+            editingSurface = surface
         }
     }
 
@@ -2442,6 +2548,23 @@ private struct LibraryItemDetailSheet: View {
             try await store.updateResourceMetadata(
                 resource.id, name: resource.name,
                 securityLevel: level, metadata: resource.metadata)
+        case .surface(let surface):
+            try await store.updateSurfaceSecurityLevel(
+                surface.id, securityLevel: level)
+        }
+    }
+
+    private func configureCurrentFile() {
+        guard let configureProtectedFile else { return }
+        isWorking = true
+        Task {
+            defer { isWorking = false }
+            do {
+                try await configureProtectedFile()
+                dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
         }
     }
 
@@ -2464,6 +2587,8 @@ private struct LibraryItemDetailSheet: View {
                 where resource.kind == .sshIdentity || resource.kind == .sshAgent:
                     try await store.removeSshAgentResource(resource.id)
                 case .resource:
+                    return
+                case .surface:
                     return
                 }
                 dismiss()

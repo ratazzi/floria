@@ -797,6 +797,17 @@ final class WorkspaceStore {
         resources.first { $0.id == id }
     }
 
+    func surface(_ id: WorkspaceSurface.ID) -> WorkspaceSurface? {
+        for project in projects {
+            for environment in project.environments {
+                if let surface = environment.surfaces.first(where: { $0.id == id }) {
+                    return surface
+                }
+            }
+        }
+        return nil
+    }
+
     func selectProject(_ id: WorkspaceProject.ID) {
         guard let project = projects.first(where: { $0.id == id }) else { return }
         selectedProjectID = id

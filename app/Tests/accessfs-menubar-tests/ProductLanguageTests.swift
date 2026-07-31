@@ -78,6 +78,20 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertFalse(workspace.contains(#""More Details…""#))
     }
 
+    func testProjectManagedItemsShareTheLibraryDetailSheet() throws {
+        let workspace = try source("WorkspaceView.swift")
+        let dashboard = try source("CompactDashboardView.swift")
+
+        XCTAssertTrue(workspace.contains("case surface(WorkspaceSurface)"))
+        XCTAssertTrue(workspace.contains("ManageSurfaceSheet(store: store, surface: surface)"))
+        XCTAssertTrue(dashboard.contains("@State private var selectedManagedItem"))
+        XCTAssertTrue(dashboard.contains("selectedManagedItem = .file(file)"))
+        XCTAssertTrue(dashboard.contains("selectedManagedItem = .surface(surface)"))
+        XCTAssertTrue(dashboard.contains(#"Button("Details…", systemImage: "info.circle")"#))
+        XCTAssertFalse(workspace.contains(#""Edit Output""#))
+        XCTAssertFalse(workspace.contains(#""Remove Output""#))
+    }
+
     private func source(_ name: String) throws -> String {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
