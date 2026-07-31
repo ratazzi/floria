@@ -69,6 +69,13 @@ enum Cmd {
         #[arg(short, long, default_value = "floria.toml")]
         config: PathBuf,
     },
+    /// Restore a protected file as plaintext and delete its encrypted history.
+    Unprotect {
+        /// Original path of the protected file, or its id.
+        target: String,
+        #[arg(short, long, default_value = "floria.toml")]
+        config: PathBuf,
+    },
     /// Decrypt a protected secret to stdout (or a file with --to). Accepts a source path or an id.
     Reveal {
         /// Original path of the protected file, or its store id.
@@ -246,6 +253,7 @@ fn main() -> Result<()> {
         Cmd::Unmount { path, config } => cmd_unmount(path, &config),
         Cmd::Doctor { config } => cmd_doctor(&config),
         Cmd::Protect { path, config } => cmd_protect(&path, &config),
+        Cmd::Unprotect { target, config } => cmd_unprotect(&target, &config),
         Cmd::Reveal { target, version, to, config } => cmd_reveal(&target, version, to, &config),
         Cmd::History { target, config } => cmd_history(&target, &config),
         Cmd::Rollback { target, version, config } => cmd_rollback(&target, version, &config),
@@ -564,6 +572,26 @@ fn cmd_protect(path: &Path, config: &Path) -> Result<()> {
             Ok(())
         }
         result => anyhow::bail!("daemon returned an unexpected protect result: {result:?}"),
+    }
+}
+
+fn cmd_unprotect(target: &str, config: &Path) -> Result<()> {
+    let cfg = load(config)?;
+    let mut client = connect_control(&cfg)?;
+    let file = resolve_protected_file(&mut client, target)?;
+    match client.request(ControlCommand::FileRestore { id: file.id })? {
+        ControlResult::FileRestored { path, storage_deleted: true } => {
+            println!("restored plaintext and stopped protecting {}", path.display());
+            Ok(())
+        }
+        ControlResult::FileRestored { path, storage_deleted: false } => {
+            anyhow::bail!(
+                "restored plaintext at {}, but encrypted history could not be deleted; \
+                 check the daemon log",
+                path.display()
+            )
+        }
+        result => anyhow::bail!("daemon returned an unexpected unprotect result: {result:?}"),
     }
 }
 
@@ -1682,6 +1710,18 @@ mod tests {
 
         for flag in ["--link", "--remove", "--force"] {
             assert!(Cli::try_parse_from(["floria", "protect", "/tmp/.env", flag]).is_err());
+        }
+    }
+
+    #[test]
+    fn unprotect_is_an_explicit_plaintext_restore_command() {
+        let unprotect = Cli::try_parse_from(["floria", "unprotect", "/tmp/.env"]).unwrap();
+        match unprotect.command {
+            Cmd::Unprotect { target, config } => {
+                assert_eq!(target, "/tmp/.env");
+                assert_eq!(config, PathBuf::from("floria.toml"));
+            }
+            _ => panic!("expected unprotect"),
         }
     }
 
