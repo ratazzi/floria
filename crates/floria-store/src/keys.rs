@@ -107,6 +107,47 @@ impl KeychainKeyProvider {
             })
     }
 
+    pub fn export_private_key() -> StoreResult<Zeroizing<Vec<u8>>> {
+        Self::read_key()
+    }
+
+    /// Import a recovery key without ever replacing an unrelated key or orphaning store data.
+    pub fn import_recovery_key(private_key: &[u8], store_root: &Path) -> StoreResult<bool> {
+        validate_private_key(private_key, "recovery import")?;
+        match security_framework::passwords::get_generic_password(
+            KEYCHAIN_SERVICE,
+            KEYCHAIN_ACCOUNT,
+        ) {
+            Ok(existing) => {
+                let existing = Zeroizing::new(existing);
+                if existing.as_slice() == private_key {
+                    Ok(false)
+                } else {
+                    Err(StoreError::Key(format!(
+                        "Keychain item {KEYCHAIN_SERVICE}/{KEYCHAIN_ACCOUNT} already contains a \
+                         different key; refusing to replace it"
+                    )))
+                }
+            }
+            Err(error)
+                if error.code() == security_framework_sys::base::errSecItemNotFound =>
+            {
+                if store_root_has_data(store_root)? {
+                    return Err(StoreError::Key(format!(
+                        "encrypted store data already exists at {}; import the recovery key \
+                         before restoring data",
+                        store_root.display()
+                    )));
+                }
+                Self::import(private_key)?;
+                Ok(true)
+            }
+            Err(error) => Err(StoreError::Key(format!(
+                "inspect Keychain item {KEYCHAIN_SERVICE}/{KEYCHAIN_ACCOUNT}: {error}"
+            ))),
+        }
+    }
+
     /// Create a dedicated Floria ed25519 key when the Keychain item is genuinely absent.
     ///
     /// Existing encrypted data makes generation fail closed: a replacement key could never
@@ -202,6 +243,10 @@ impl KeyProvider for KeychainKeyProvider {
         let data = Self::read_key()?;
         parse_identity(&data, "keychain")
     }
+}
+
+pub(crate) fn validate_private_key(data: &[u8], context: &str) -> StoreResult<()> {
+    parse_identity(data, context).map(|_| ())
 }
 
 fn parse_identity(data: &[u8], context: &str) -> StoreResult<Box<dyn age::Identity>> {

@@ -164,6 +164,20 @@ enum KeysCmd {
         #[arg(short, long, default_value = "floria.toml")]
         config: PathBuf,
     },
+    /// Export the active store key into a password-encrypted recovery file.
+    ExportRecovery {
+        /// New recovery-key file. Existing paths are never overwritten.
+        destination: PathBuf,
+        #[arg(short, long, default_value = "floria.toml")]
+        config: PathBuf,
+    },
+    /// Import a password-encrypted recovery key into an empty Keychain-backed store.
+    ImportRecovery {
+        /// Recovery-key file created by `keys export-recovery`.
+        source: PathBuf,
+        #[arg(short, long, default_value = "floria.toml")]
+        config: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -240,6 +254,12 @@ fn main() -> Result<()> {
         },
         Cmd::Keys { command } => match command {
             KeysCmd::Import { remove_file, config } => cmd_keys_import(remove_file, &config),
+            KeysCmd::ExportRecovery { destination, config } => {
+                cmd_keys_export_recovery(&destination, &config)
+            }
+            KeysCmd::ImportRecovery { source, config } => {
+                cmd_keys_import_recovery(&source, &config)
+            }
         },
     }
 }
@@ -334,25 +354,17 @@ fn print_backup_report(action: &str, report: &floria_backup::BackupReport) {
 
 fn cmd_keys_import(remove_file: bool, config: &Path) -> Result<()> {
     let cfg = load(config)?;
+    if matches!(cfg.store_key_source, StoreKeySource::Keychain)
+        || matches!(cfg.store_key_source, StoreKeySource::Auto) && !cfg.store_ssh_key.exists()
+    {
+        anyhow::bail!("the configured store already reads its key from Keychain");
+    }
     let key_path = &cfg.store_ssh_key;
-    let data = std::fs::read(key_path)
-        .with_context(|| format!("reading ssh private key {}", key_path.display()))?;
-    let key = ssh_key::PrivateKey::from_openssh(&data[..])
-        .with_context(|| format!("parsing ssh private key {}", key_path.display()))?;
-    let key = if key.is_encrypted() {
-        let passphrase = std::env::var("FLORIA_KEY_PASSPHRASE").context(
-            "the key is passphrase-protected; set FLORIA_KEY_PASSPHRASE for the import",
-        )?;
-        let passphrase = zeroize::Zeroizing::new(passphrase);
-        key.decrypt(passphrase.as_bytes())
-            .context("decrypting ssh private key (wrong FLORIA_KEY_PASSPHRASE?)")?
-    } else {
-        key
-    };
-    let decrypted = key
-        .to_openssh(ssh_key::LineEnding::LF)
-        .context("re-encoding decrypted ssh private key")?;
-    KeychainKeyProvider::import(decrypted.as_bytes())?;
+    let decrypted = read_ssh_private_key(key_path)?;
+    open_store(&cfg)?
+        .verify_all()
+        .context("verifying that the configured SSH key decrypts every store version")?;
+    KeychainKeyProvider::import(&decrypted)?;
 
     // Verify the roundtrip end to end before touching the file: the Keychain copy must decrypt
     // exactly like the file-based provider encrypts.
@@ -379,6 +391,90 @@ fn cmd_keys_import(remove_file: bool, config: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn read_ssh_private_key(key_path: &Path) -> Result<zeroize::Zeroizing<Vec<u8>>> {
+    let data = std::fs::read(key_path)
+        .with_context(|| format!("reading ssh private key {}", key_path.display()))?;
+    let key = ssh_key::PrivateKey::from_openssh(&data[..])
+        .with_context(|| format!("parsing ssh private key {}", key_path.display()))?;
+    let key = if key.is_encrypted() {
+        let passphrase = std::env::var("FLORIA_KEY_PASSPHRASE").context(
+            "the key is passphrase-protected; set FLORIA_KEY_PASSPHRASE for the import",
+        )?;
+        let passphrase = zeroize::Zeroizing::new(passphrase);
+        key.decrypt(passphrase.as_bytes())
+            .context("decrypting ssh private key (wrong FLORIA_KEY_PASSPHRASE?)")?
+    } else {
+        key
+    };
+    let decrypted = key
+        .to_openssh(ssh_key::LineEnding::LF)
+        .context("re-encoding decrypted ssh private key")?;
+    Ok(zeroize::Zeroizing::new(decrypted.as_bytes().to_vec()))
+}
+
+fn cmd_keys_export_recovery(destination: &Path, config: &Path) -> Result<()> {
+    let cfg = load(config)?;
+    open_store(&cfg)?
+        .verify_all()
+        .context("verifying that the active key decrypts every store version")?;
+    let private_key = match cfg.store_key_source {
+        StoreKeySource::Ssh => read_ssh_private_key(&cfg.store_ssh_key)?,
+        StoreKeySource::Auto if cfg.store_ssh_key.exists() => {
+            read_ssh_private_key(&cfg.store_ssh_key)?
+        }
+        StoreKeySource::Auto | StoreKeySource::Keychain => {
+            KeychainKeyProvider::export_private_key().context("reading the store key from Keychain")?
+        }
+    };
+    let passphrase = recovery_passphrase(true)?;
+    let path = floria_store::export_recovery_key(&private_key, &passphrase, destination)
+        .with_context(|| format!("exporting recovery key to {}", destination.display()))?;
+    println!("exported password-encrypted recovery key to {}", path.display());
+    println!("store this file and its passphrase separately from the Mac");
+    Ok(())
+}
+
+fn cmd_keys_import_recovery(source: &Path, config: &Path) -> Result<()> {
+    let cfg = load(config)?;
+    if matches!(cfg.store_key_source, StoreKeySource::Ssh)
+        || matches!(cfg.store_key_source, StoreKeySource::Auto) && cfg.store_ssh_key.exists()
+    {
+        anyhow::bail!(
+            "this config uses the SSH key file at {}; recovery import targets a \
+             Keychain-backed store",
+            cfg.store_ssh_key.display()
+        );
+    }
+    let passphrase = recovery_passphrase(false)?;
+    let private_key = floria_store::decrypt_recovery_key(source, &passphrase)
+        .with_context(|| format!("decrypting recovery key {}", source.display()))?;
+    let imported = KeychainKeyProvider::import_recovery_key(&private_key, &cfg.store_root)
+        .context("importing the recovery key into Keychain")?;
+    let provider = KeychainKeyProvider;
+    floria_store::KeyProvider::identity(&provider)?;
+    floria_store::KeyProvider::recipients(&provider)?;
+    let action = if imported { "imported" } else { "already installed" };
+    println!("{action} recovery key in the login Keychain");
+    Ok(())
+}
+
+fn recovery_passphrase(confirm: bool) -> Result<zeroize::Zeroizing<String>> {
+    let passphrase = zeroize::Zeroizing::new(
+        std::env::var("FLORIA_RECOVERY_PASSPHRASE")
+            .context("set FLORIA_RECOVERY_PASSPHRASE for this operation")?,
+    );
+    if confirm {
+        let confirmation = zeroize::Zeroizing::new(
+            std::env::var("FLORIA_RECOVERY_PASSPHRASE_CONFIRM")
+                .context("set FLORIA_RECOVERY_PASSPHRASE_CONFIRM when exporting")?,
+        );
+        if *passphrase != *confirmation {
+            anyhow::bail!("recovery passphrase confirmation does not match");
+        }
+    }
+    Ok(passphrase)
 }
 
 fn cmd_protect(path: &Path, link: bool, remove: bool, force: bool, config: &Path) -> Result<()> {
@@ -1490,6 +1586,35 @@ mod tests {
                 assert_eq!(config, PathBuf::from("floria.toml"));
             }
             _ => panic!("expected backup verify"),
+        }
+    }
+
+    #[test]
+    fn recovery_key_commands_use_explicit_files_and_the_standard_config() {
+        let export =
+            Cli::try_parse_from(["floria", "keys", "export-recovery", "/tmp/recovery.age"])
+                .unwrap();
+        match export.command {
+            Cmd::Keys {
+                command: KeysCmd::ExportRecovery { destination, config },
+            } => {
+                assert_eq!(destination, PathBuf::from("/tmp/recovery.age"));
+                assert_eq!(config, PathBuf::from("floria.toml"));
+            }
+            _ => panic!("expected recovery export"),
+        }
+
+        let import =
+            Cli::try_parse_from(["floria", "keys", "import-recovery", "/tmp/recovery.age"])
+                .unwrap();
+        match import.command {
+            Cmd::Keys {
+                command: KeysCmd::ImportRecovery { source, config },
+            } => {
+                assert_eq!(source, PathBuf::from("/tmp/recovery.age"));
+                assert_eq!(config, PathBuf::from("floria.toml"));
+            }
+            _ => panic!("expected recovery import"),
         }
     }
 

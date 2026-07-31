@@ -7,6 +7,7 @@
 
 mod error;
 mod keys;
+mod recovery;
 mod source;
 mod store;
 
@@ -14,6 +15,7 @@ pub use error::{StoreError, StoreResult};
 pub use keys::{
     KeyProvider, KeychainKeyProvider, SshKeyProvider, KEYCHAIN_ACCOUNT, KEYCHAIN_SERVICE,
 };
+pub use recovery::{decrypt_recovery_key, export_recovery_key};
 pub use source::StoreSource;
 pub use store::{
     AgeDirStore, NewSecret, SecretId, SecretOrigin, SecretRecord, SecretStore, StoreVerification,
