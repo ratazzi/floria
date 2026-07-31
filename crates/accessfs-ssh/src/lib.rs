@@ -12,6 +12,21 @@ use signature::{SignatureEncoding, Signer, Verifier};
 use ssh_key::{Algorithm, Certificate, HashAlg, LineEnding, PrivateKey, PublicKey, Signature};
 use zeroize::Zeroizing;
 
+const RUNTIME_SOCKET_HASH_BYTES: usize = 12;
+
+/// Return the short, deterministic Unix socket path used by one managed SSH Agent Surface.
+///
+/// Keeping this derivation in the SSH domain crate gives the runtime and control plane one source
+/// of truth without exposing the runtime's listener implementation.
+pub fn agent_runtime_socket_path(
+    runtime_dir: &std::path::Path,
+    surface_id: &str,
+) -> std::path::PathBuf {
+    let digest = Sha256::digest(surface_id.as_bytes());
+    let name = URL_SAFE_NO_PAD.encode(&digest[..RUNTIME_SOCKET_HASH_BYTES]);
+    runtime_dir.join(format!("{name}.sock"))
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ManagedKeyError {
     #[error("invalid SSH private key: {0}")]
@@ -335,6 +350,20 @@ fn put_string(buffer: &mut Vec<u8>, value: &[u8]) {
 mod tests {
     use super::*;
     use ssh_key::rand_core::OsRng;
+
+    #[test]
+    fn managed_agent_socket_path_is_stable_and_short() {
+        let runtime_dir = std::path::Path::new(
+            "/Users/fixture-account/Library/Application Support/floria/runtime/sockets",
+        );
+        let path = agent_runtime_socket_path(
+            runtime_dir,
+            "ssh-agent-d56d57b2-3503-40e9-86d0-48a6ca9168fd",
+        );
+
+        assert_eq!(path.file_name().unwrap(), "3YUjhPR-lx4my6EW.sock");
+        assert!(path.as_os_str().len() < 104);
+    }
 
     #[test]
     fn imports_and_signs_generated_ed25519_key_without_source_fixture() {

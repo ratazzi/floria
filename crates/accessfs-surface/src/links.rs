@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::CString;
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -24,6 +24,141 @@ pub enum SurfaceLinkRemoval {
     Missing,
     Removed,
     Preserved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedLinkStatus {
+    Ready,
+    Missing,
+    Replaced,
+}
+
+/// One desired project-facing symbolic link.
+///
+/// Callers only identify the path they care about. Target derivation, health
+/// inspection, and safe repair remain behind this module's interface.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ManagedSymlink {
+    path: PathBuf,
+    expected: PathBuf,
+}
+
+enum ManagedLinkInspection {
+    Ready,
+    Missing,
+    ForeignSymlink(PathBuf),
+    Occupied,
+}
+
+impl ManagedSymlink {
+    pub fn new(path: impl Into<PathBuf>, expected: impl Into<PathBuf>) -> Self {
+        Self { path: path.into(), expected: expected.into() }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn expected_target(&self) -> &Path {
+        &self.expected
+    }
+
+    pub fn status(&self) -> SurfaceResult<ManagedLinkStatus> {
+        Ok(match self.inspect()? {
+            ManagedLinkInspection::Ready => ManagedLinkStatus::Ready,
+            ManagedLinkInspection::Missing => ManagedLinkStatus::Missing,
+            ManagedLinkInspection::ForeignSymlink(_) | ManagedLinkInspection::Occupied => {
+                ManagedLinkStatus::Replaced
+            }
+        })
+    }
+
+    pub fn is_ready(&self) -> SurfaceResult<bool> {
+        self.status().map(|status| status == ManagedLinkStatus::Ready)
+    }
+
+    fn ensure(&self) -> SurfaceResult<SurfaceLinkState> {
+        match self.inspect()? {
+            ManagedLinkInspection::Ready => Ok(SurfaceLinkState::Ready),
+            ManagedLinkInspection::Missing => create_link(&self.path, &self.expected),
+            ManagedLinkInspection::ForeignSymlink(actual) => Err(link_conflict(
+                &self.path,
+                &self.expected,
+                format!("existing symlink points to {}", actual.display()),
+            )),
+            ManagedLinkInspection::Occupied => Err(link_conflict(
+                &self.path,
+                &self.expected,
+                "an existing non-symlink occupies the path",
+            )),
+        }
+    }
+
+    /// Repair this explicitly selected link without ever replacing a regular file.
+    pub fn repair(&self) -> SurfaceResult<SurfaceLinkState> {
+        match self.inspect()? {
+            ManagedLinkInspection::Ready => Ok(SurfaceLinkState::Ready),
+            ManagedLinkInspection::Missing => {
+                if let Some(parent) = self.path.parent() {
+                    if !parent.is_dir() {
+                        return Err(link_conflict(
+                            &self.path,
+                            &self.expected,
+                            format!(
+                                "the containing directory {} does not exist; create it before repairing",
+                                parent.display()
+                            ),
+                        ));
+                    }
+                }
+                create_link(&self.path, &self.expected)
+            }
+            ManagedLinkInspection::ForeignSymlink(_) => {
+                replace_file_with_symlink(&self.path, &self.expected).map_err(|source| {
+                    SurfaceError::LinkIo {
+                        operation: "repairing",
+                        path: self.path.clone(),
+                        source,
+                    }
+                })?;
+                Ok(SurfaceLinkState::Created)
+            }
+            ManagedLinkInspection::Occupied => Err(link_conflict(
+                &self.path,
+                &self.expected,
+                "an existing file occupies the path; move it aside before repairing",
+            )),
+        }
+    }
+
+    fn inspect(&self) -> SurfaceResult<ManagedLinkInspection> {
+        let metadata = match std::fs::symlink_metadata(&self.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(ManagedLinkInspection::Missing);
+            }
+            Err(source) => {
+                return Err(SurfaceError::LinkIo {
+                    operation: "inspecting",
+                    path: self.path.clone(),
+                    source,
+                });
+            }
+        };
+        if !metadata.file_type().is_symlink() {
+            return Ok(ManagedLinkInspection::Occupied);
+        }
+        let actual = std::fs::read_link(&self.path).map_err(|source| SurfaceError::LinkIo {
+            operation: "reading",
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(if actual == self.expected {
+            ManagedLinkInspection::Ready
+        } else {
+            ManagedLinkInspection::ForeignSymlink(actual)
+        })
+    }
 }
 
 /// Materialize each configured file Surface at the primary checkout and every provisioned
@@ -96,18 +231,7 @@ pub fn ensure_file_surface_link(
     }
     validate_surface_id(&surface.id)?;
     let expected = mount_path.join(SURFACES_DIR).join(&surface.id);
-
-    match std::fs::symlink_metadata(&surface.path) {
-        Ok(metadata) => validate_existing_link(&surface.path, &expected, metadata),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            create_link(&surface.path, &expected)
-        }
-        Err(source) => Err(SurfaceError::LinkIo {
-            operation: "inspecting",
-            path: surface.path.clone(),
-            source,
-        }),
-    }
+    ManagedSymlink::new(&surface.path, expected).ensure()
 }
 
 /// Remove a project-facing link only when it still points to this exact mounted surface.
@@ -176,44 +300,13 @@ fn create_link(path: &Path, expected: &Path) -> SurfaceResult<SurfaceLinkState> 
         // Another process may have created the path after the lstat. Re-inspect it and only
         // accept the exact link we wanted.
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            let metadata = std::fs::symlink_metadata(path).map_err(|source| {
-                SurfaceError::LinkIo {
-                    operation: "inspecting concurrently-created",
-                    path: path.to_path_buf(),
-                    source,
-                }
-            })?;
-            validate_existing_link(path, expected, metadata)
+            ManagedSymlink::new(path, expected).ensure()
         }
         Err(source) => Err(SurfaceError::LinkIo {
             operation: "creating",
             path: path.to_path_buf(),
             source,
         }),
-    }
-}
-
-fn validate_existing_link(
-    path: &Path,
-    expected: &Path,
-    metadata: std::fs::Metadata,
-) -> SurfaceResult<SurfaceLinkState> {
-    if !metadata.file_type().is_symlink() {
-        return Err(link_conflict(path, expected, "an existing non-symlink occupies the path"));
-    }
-    let actual = std::fs::read_link(path).map_err(|source| SurfaceError::LinkIo {
-        operation: "reading",
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if actual == expected {
-        Ok(SurfaceLinkState::Ready)
-    } else {
-        Err(link_conflict(
-            path,
-            expected,
-            format!("existing symlink points to {}", actual.display()),
-        ))
     }
 }
 
@@ -250,6 +343,62 @@ pub fn protected_checkout_links(
     protected_checkout_links_excluding(snapshot, records, mount_path, &configured_paths)
 }
 
+/// Resolve every file-backed Managed item's desired project-facing link.
+///
+/// This is the single source of truth used by health reporting, worktree
+/// inspection, and explicit repair.
+pub fn managed_file_links(
+    snapshot: &CatalogSnapshot,
+    records: &[SecretRecord],
+    mount_path: &Path,
+) -> SurfaceResult<Vec<ManagedSymlink>> {
+    let surfaces = file_surface_instances(snapshot)?;
+    let configured_secret_ids = snapshot.file_surface_secret_ids();
+    let mut links = BTreeMap::<PathBuf, PathBuf>::new();
+
+    for surface in surfaces {
+        insert_managed_link(
+            &mut links,
+            surface.path,
+            mount_path.join(SURFACES_DIR).join(surface.id),
+        )?;
+    }
+    for record in records.iter().filter(|record| {
+        !configured_secret_ids.contains(record.id.as_str()) && record.source_path().is_some()
+    }) {
+        insert_managed_link(
+            &mut links,
+            record.source_path().expect("filtered file origin").to_path_buf(),
+            mount_path.join(SECRETS_DIR).join(record.id.to_string()),
+        )?;
+    }
+    for link in protected_checkout_links(snapshot, records, mount_path) {
+        insert_managed_link(&mut links, link.path, link.target)?;
+    }
+
+    Ok(links
+        .into_iter()
+        .map(|(path, expected)| ManagedSymlink::new(path, expected))
+        .collect())
+}
+
+fn insert_managed_link(
+    links: &mut BTreeMap<PathBuf, PathBuf>,
+    path: PathBuf,
+    expected: PathBuf,
+) -> SurfaceResult<()> {
+    if let Some(existing) = links.insert(path.clone(), expected.clone()) {
+        if existing != expected {
+            return Err(link_conflict(
+                &path,
+                &expected,
+                format!("catalog also resolves this path to {}", existing.display()),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Inspect every project-facing file that a managed worktree should expose.
 /// This is read-only: foreign links, divergent files, and missing paths are
 /// reported to callers instead of being replaced.
@@ -263,99 +412,16 @@ pub fn checkout_link_issues(
         return Ok(Vec::new());
     }
 
-    let mut issues = BTreeSet::new();
-    for surface in file_surface_instances(snapshot)?
+    let mut issues = Vec::new();
+    for link in managed_file_links(snapshot, records, mount_path)?
         .into_iter()
-        .filter(|surface| surface.path.starts_with(&checkout.path))
+        .filter(|link| link.path().starts_with(&checkout.path))
     {
-        let expected = mount_path.join(SURFACES_DIR).join(&surface.id);
-        if !is_exact_symlink(&surface.path, &expected).map_err(|source| {
-            SurfaceError::LinkIo {
-                operation: "inspecting checkout",
-                path: surface.path.clone(),
-                source,
-            }
-        })? {
-            issues.insert(surface.path);
+        if !link.is_ready()? {
+            issues.push(link.path);
         }
     }
-    for link in protected_checkout_links(snapshot, records, mount_path)
-        .into_iter()
-        .filter(|link| link.path.starts_with(&checkout.path))
-    {
-        if !is_exact_symlink(&link.path, &link.target).map_err(|source| {
-            SurfaceError::LinkIo {
-                operation: "inspecting checkout",
-                path: link.path.clone(),
-                source,
-            }
-        })? {
-            issues.insert(link.path);
-        }
-    }
-    Ok(issues.into_iter().collect())
-}
-
-/// Repair one explicitly selected managed worktree link.
-///
-/// Missing paths and foreign symlinks may be replaced because this function is
-/// only reached through an explicit user action. Regular files and other
-/// filesystem objects are preserved so a repair cannot discard local work.
-pub fn repair_checkout_link(
-    snapshot: &CatalogSnapshot,
-    records: &[SecretRecord],
-    mount_path: &Path,
-    checkout: &ProjectCheckout,
-    path: &Path,
-) -> SurfaceResult<SurfaceLinkState> {
-    if checkout.kind != ProjectCheckoutKind::Worktree {
-        return Err(SurfaceError::NotFound(format!(
-            "managed worktree link {}",
-            path.display()
-        )));
-    }
-
-    let surface_target = file_surface_instances(snapshot)?
-        .into_iter()
-        .find(|surface| surface.path == path && surface.path.starts_with(&checkout.path))
-        .map(|surface| mount_path.join(SURFACES_DIR).join(surface.id));
-    let protected_target = protected_checkout_links(snapshot, records, mount_path)
-        .into_iter()
-        .find(|link| link.path == path && link.path.starts_with(&checkout.path))
-        .map(|link| link.target);
-    let expected = surface_target.or(protected_target).ok_or_else(|| {
-        SurfaceError::NotFound(format!("managed worktree link {}", path.display()))
-    })?;
-
-    match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => create_link(path, &expected),
-        Err(source) => Err(SurfaceError::LinkIo {
-            operation: "inspecting before repair",
-            path: path.to_path_buf(),
-            source,
-        }),
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            let actual = std::fs::read_link(path).map_err(|source| SurfaceError::LinkIo {
-                operation: "reading before repair",
-                path: path.to_path_buf(),
-                source,
-            })?;
-            if actual == expected {
-                return Ok(SurfaceLinkState::Ready);
-            }
-            replace_file_with_symlink(path, &expected).map_err(|source| SurfaceError::LinkIo {
-                operation: "repairing",
-                path: path.to_path_buf(),
-                source,
-            })?;
-            Ok(SurfaceLinkState::Created)
-        }
-        Ok(_) => Err(link_conflict(
-            path,
-            &expected,
-            "an existing file occupies the path; move it aside before repairing",
-        )),
-    }
+    Ok(issues)
 }
 
 fn protected_checkout_links_excluding(
@@ -1017,16 +1083,43 @@ mod tests {
         let expected = mount.join(SURFACES_DIR).join("fixture-dotenv");
         symlink("../project/.env", &path).unwrap();
 
-        repair_checkout_link(&snapshot, &[], &mount, &checkout, &path).unwrap();
+        managed_file_links(&snapshot, &[], &mount)
+            .unwrap()
+            .into_iter()
+            .find(|link| link.path() == path)
+            .unwrap()
+            .repair()
+            .unwrap();
         assert_eq!(std::fs::read_link(&path).unwrap(), expected);
 
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, b"FIXTURE=local\n").unwrap();
         assert!(matches!(
-            repair_checkout_link(&snapshot, &[], &mount, &checkout, &path),
+            managed_file_links(&snapshot, &[], &mount)
+                .unwrap()
+                .into_iter()
+                .find(|link| link.path() == path)
+                .unwrap()
+                .repair(),
             Err(SurfaceError::LinkConflict { .. })
         ));
         assert_eq!(std::fs::read(&path).unwrap(), b"FIXTURE=local\n");
+    }
+
+    #[test]
+    fn explicit_repair_explains_when_the_containing_directory_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("missing");
+        let path = parent.join(".env");
+        let expected = dir.path().join("mount/surfaces/fixture-dotenv");
+
+        let error = ManagedSymlink::new(&path, &expected).repair().unwrap_err();
+        assert!(matches!(error, SurfaceError::LinkConflict { .. }));
+        assert!(error.to_string().contains(&format!(
+            "the containing directory {} does not exist; create it before repairing",
+            parent.display()
+        )));
+        assert!(!parent.exists());
     }
 
     #[test]

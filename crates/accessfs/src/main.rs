@@ -538,9 +538,10 @@ fn cmd_mount(config: &Path) -> Result<()> {
     let managed_keys: Arc<dyn accessfs_agent::ManagedKeyReader> =
         Arc::new(StoreManagedKeyReader { store: Arc::clone(&store) });
     let generated_ssh_config = support_dir.join("ssh/config");
+    let ssh_runtime_dir = support_dir.join("runtime/sockets");
     let ssh_runtime = Arc::new(
         accessfs_agent::SshAgentRuntime::new(
-            support_dir.join("runtime/sockets"),
+            ssh_runtime_dir.clone(),
             &generated_ssh_config,
             ssh_authorizer,
             Arc::clone(&audit),
@@ -582,6 +583,7 @@ fn cmd_mount(config: &Path) -> Result<()> {
             ssh_discovery,
             ssh_config,
             audit_log: cfg.audit_log.clone(),
+            ssh_runtime_dir,
             peer_verifier: control_peer_verifier,
         },
     )

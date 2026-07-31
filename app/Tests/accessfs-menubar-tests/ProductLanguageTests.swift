@@ -88,8 +88,10 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertTrue(workspace.contains("case surface(WorkspaceSurface)"))
         XCTAssertTrue(workspace.contains("ManageSurfaceSheet(store: store, surface: surface)"))
         XCTAssertTrue(dashboard.contains("@State private var selectedManagedItem"))
-        XCTAssertTrue(dashboard.contains("selectedManagedItem = .file(file)"))
-        XCTAssertTrue(dashboard.contains("selectedManagedItem = .surface(surface)"))
+        XCTAssertTrue(dashboard.contains("selectedManagedItem = item.libraryItem"))
+        XCTAssertTrue(dashboard.contains("private struct CompactManagedItemRow: View"))
+        XCTAssertFalse(dashboard.contains("private struct CompactSurfaceRow: View"))
+        XCTAssertFalse(dashboard.contains("private struct CompactProtectedFileRow: View"))
         XCTAssertTrue(dashboard.contains(#"Button("Details…", systemImage: "info.circle")"#))
         XCTAssertFalse(workspace.contains(#""Edit Output""#))
         XCTAssertFalse(workspace.contains(#""Remove Output""#))
@@ -102,7 +104,7 @@ final class ProductLanguageTests: XCTestCase {
         let workspace = try source("WorkspaceView.swift")
         let dashboard = try source("CompactDashboardView.swift")
 
-        XCTAssertEqual(dashboard.components(separatedBy: "Button(action: showDetails)").count - 1, 2)
+        XCTAssertEqual(dashboard.components(separatedBy: "Button(action: showDetails)").count - 1, 1)
         XCTAssertTrue(workspace.contains(#".accessibilityHint("Open details")"#))
         XCTAssertTrue(dashboard.contains(#".accessibilityHint("Open details")"#))
     }
@@ -159,9 +161,22 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertTrue(dashboard.contains("reviewWorktreeIssuesButton"))
         XCTAssertTrue(dashboard.contains("expandedIssuePaths"))
         XCTAssertTrue(dashboard.contains("worktreeIssueDetails("))
-        XCTAssertTrue(dashboard.contains("repairWorktreeLink("))
+        XCTAssertTrue(dashboard.contains("repairManagedLink("))
         XCTAssertTrue(dashboard.contains("\"Repair Link\""))
         XCTAssertTrue(dashboard.contains("revealWorktreeIssue("))
+    }
+
+    func testEveryManagedPathUsesTheSharedRepairAction() throws {
+        let dashboard = try source("CompactDashboardView.swift")
+        let workspace = try source("WorkspaceView.swift")
+        let model = try source("WorkspaceModel.swift")
+        let protocolSource = try source("ControlProtocol.swift")
+
+        XCTAssertTrue(dashboard.contains("repairManagedLink("))
+        XCTAssertTrue(workspace.contains("repairManagedLink("))
+        XCTAssertTrue(model.contains("func repairManagedLink(at path: String)"))
+        XCTAssertTrue(protocolSource.contains("case managedLinkRepair(path: String)"))
+        XCTAssertFalse(protocolSource.contains("projectCheckoutLinkRepair"))
     }
 
     func testManagedRowsKeepTypeWithTheFileDescription() throws {
@@ -169,7 +184,7 @@ final class ProductLanguageTests: XCTestCase {
 
         XCTAssertEqual(
             dashboard.components(separatedBy: "CompactManagedItemSubtitle(").count - 1,
-            2)
+            1)
         XCTAssertTrue(dashboard.contains("Text(kind)"))
         XCTAssertTrue(dashboard.contains("Text(path)"))
         XCTAssertFalse(dashboard.contains(".frame(width: 126, alignment: .leading)"))
@@ -186,6 +201,20 @@ final class ProductLanguageTests: XCTestCase {
 
         XCTAssertTrue(menu.contains(".frame(width: 108, alignment: .leading)"))
         XCTAssertFalse(menu.contains(".frame(width: 78, alignment: .leading)"))
+    }
+
+    func testManagedLinkKnowledgeComesFromOneWorkspaceModel() throws {
+        let model = try source("WorkspaceModel.swift")
+        let dashboard = try source("CompactDashboardView.swift")
+        let workspace = try source("WorkspaceView.swift")
+
+        XCTAssertTrue(model.contains("struct WorkspaceManagedLink"))
+        XCTAssertTrue(model.contains("let managedLink: WorkspaceManagedLink"))
+        XCTAssertFalse(model.contains("enum SshAgentRuntimeSocket"))
+        XCTAssertFalse(model.contains("enum WorkspaceSurfaceStatus"))
+        XCTAssertFalse(workspace.contains("expectedLinkTarget"))
+        XCTAssertFalse(workspace.contains("destinationOfSymbolicLink"))
+        XCTAssertTrue(dashboard.contains("item.managedLink.needsAttention"))
     }
 
     func testLibraryWindowDoesNotAddATitleBarAboveItsOwnNavigation() throws {

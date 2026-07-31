@@ -86,8 +86,8 @@ pub enum ControlCommand {
     ProjectCheckoutInventory,
     ProjectCheckoutDiscover { project_id: String },
     ProjectCheckoutUpsert { checkout: ProjectCheckout },
-    ProjectCheckoutLinkRepair { checkout_id: String, path: PathBuf },
     ProjectCheckoutRemove { id: String },
+    ManagedLinkRepair { path: PathBuf },
     SshAgentDiscover { endpoint: PathBuf },
     SshIdentityImport {
         resource_id: String,
@@ -190,7 +190,7 @@ pub enum ControlResult {
     PolicyMode(PolicyModeStatus),
     ActiveGrants(Vec<ActiveGrant>),
     AccessHistory(Vec<AccessHistoryEvent>),
-    Snapshot(CatalogSnapshot),
+    Snapshot(WorkspaceSnapshot),
     Discovery(DiscoveryReviewPlan),
     DiscoveryJob(DiscoveryJobStatus),
     DiscoveryApplied(DiscoveryApplyResult),
@@ -212,6 +212,42 @@ pub enum ControlResult {
     SharedSecretRotated { resource_id: String, version: u32 },
     EnvFileCreated { resource: Resource, version: u32 },
     Empty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceSnapshot {
+    #[serde(flatten)]
+    pub catalog: CatalogSnapshot,
+    #[serde(default)]
+    pub managed_links: Vec<ManagedLink>,
+}
+
+impl Deref for WorkspaceSnapshot {
+    type Target = CatalogSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.catalog
+    }
+}
+
+impl DerefMut for WorkspaceSnapshot {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.catalog
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedLink {
+    pub path: PathBuf,
+    pub status: ManagedLinkStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedLinkStatus {
+    Linked,
+    Missing,
+    Replaced,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -400,7 +436,7 @@ pub struct DiscoveryManagedItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub environment: Option<String>,
     pub kind: DiscoveryManagedItemKind,
-    pub status: DiscoveryManagedItemStatus,
+    pub status: ManagedLinkStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -408,14 +444,6 @@ pub struct DiscoveryManagedItem {
 pub enum DiscoveryManagedItemKind {
     Surface,
     ProtectedFile,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DiscoveryManagedItemStatus {
-    Linked,
-    Missing,
-    Replaced,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -792,14 +820,12 @@ mod tests {
 
         let repair = serde_json::to_value(ControlRequest {
             request_id: 33,
-            command: ControlCommand::ProjectCheckoutLinkRepair {
-                checkout_id: "fixture-worktree".to_string(),
+            command: ControlCommand::ManagedLinkRepair {
                 path: PathBuf::from("/workspace/fixture-worktree/.envrc"),
             },
         })
         .unwrap();
-        assert_eq!(repair["method"], "project_checkout_link_repair");
-        assert_eq!(repair["params"]["checkout_id"], "fixture-worktree");
+        assert_eq!(repair["method"], "managed_link_repair");
         assert_eq!(
             repair["params"]["path"],
             "/workspace/fixture-worktree/.envrc"

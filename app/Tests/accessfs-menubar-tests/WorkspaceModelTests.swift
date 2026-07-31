@@ -100,7 +100,7 @@ final class WorkspaceModelTests: XCTestCase {
             keyOverride: nil, isEnabled: true)
         let surface = WorkspaceSurface(
             id: "fixture-surface", name: ".env", kind: .dotenvFile,
-            path: path, status: .linked, input: .bindings([binding.id]))
+            path: path, linkStatus: .linked, input: .bindings([binding.id]))
         let store = WorkspaceStore(
             projects: [
                 WorkspaceProject(
@@ -168,7 +168,7 @@ final class WorkspaceModelTests: XCTestCase {
             ], surfaces: [
                 WorkspaceSurface(
                     id: "fixture-dotenv", name: ".env", kind: .dotenvFile,
-                    path: "/tmp/fixture/.env", status: .linked,
+                    path: "/tmp/fixture/.env", linkStatus: .linked,
                     input: .bindings(["fixture-binding"]))
             ])
         let project = WorkspaceProject(
@@ -216,7 +216,7 @@ final class WorkspaceModelTests: XCTestCase {
             surfaces: [
                 WorkspaceSurface(
                     id: "fixture-ini-output", name: "credentials.ini", kind: .iniFile,
-                    path: "/tmp/fixture/credentials.ini", status: .linked,
+                    path: "/tmp/fixture/credentials.ini", linkStatus: .linked,
                     input: .bindings([selected.id]))
             ])
         let projected = WorkspaceStore(
@@ -265,17 +265,12 @@ final class WorkspaceModelTests: XCTestCase {
         XCTAssertFalse(store.bindingIsCompatible(binding, with: .dotenvFile))
         XCTAssertEqual(resource.exportSummary, "1 identity")
 
-        let preview = WorkspaceStore.preview()
-        preview.selectedSurfaceID = "floria-dev-ssh-socket"
-        let socket = preview.selectedSurface!
-        XCTAssertTrue(preview.expectedLinkTarget(for: socket).hasSuffix(".sock"))
-
         let route = WorkspaceSshRoute(
             hostPatterns: ["ec2-*", "bastion"], hostname: nil, user: "ubuntu",
             port: nil, forwardAgent: true)
         let routed = WorkspaceSurface(
             id: "routed", name: "agent.sock", kind: .unixSocket,
-            path: "/tmp/fixture/agent.sock", status: .listening,
+            path: "/tmp/fixture/agent.sock", linkStatus: .linked,
             input: .sshAgent([binding.id], route))
         XCTAssertEqual(routed.bindingIDs, [binding.id])
         XCTAssertEqual(routed.sshRoute?.hostPatterns, ["ec2-*", "bastion"])
@@ -297,26 +292,13 @@ final class WorkspaceModelTests: XCTestCase {
         XCTAssertEqual(managed.exportSummary, "1 identity")
     }
 
-    func testSshAgentRuntimeSocketPathMatchesDaemonAndFitsMacOSAddress() {
-        let surfaceID = "ssh-agent-d56d57b2-3503-40e9-86d0-48a6ca9168fd"
-
-        XCTAssertEqual(
-            SshAgentRuntimeSocket.fileName(for: surfaceID),
-            "3YUjhPR-lx4my6EW.sock")
-        XCTAssertLessThan(
-            SshAgentRuntimeSocket.path(
-                for: surfaceID, homeDirectory: "/Users/fixture-account"
-            ).utf8.count,
-            104)
-    }
-
     func testEmptySshAgentSocketCanBeReusedForANewIdentityBinding() throws {
         let route = WorkspaceSshRoute(
             hostPatterns: ["ec2-*.example.invalid"], hostname: nil,
             user: "fixture-user", port: nil, forwardAgent: false)
         let emptySocket = WorkspaceSurface(
             id: "fixture-agent", name: "agent.sock", kind: .unixSocket,
-            path: "/tmp/fixture-project/agent.sock", status: .listening,
+            path: "/tmp/fixture-project/agent.sock", linkStatus: .linked,
             input: .sshAgent([], route), securityLevel: .touchID)
         let store = WorkspaceStore(
             projects: [
@@ -378,11 +360,11 @@ final class WorkspaceModelTests: XCTestCase {
             surfaces: [
                 WorkspaceSurface(
                     id: "first-surface", name: ".env.first", kind: .dotenvFile,
-                    path: "/tmp/fixture/.env.first", status: .linked,
+                    path: "/tmp/fixture/.env.first", linkStatus: .linked,
                     input: .bindings(["first-binding"])),
                 WorkspaceSurface(
                     id: "second-surface", name: ".env.second", kind: .dotenvFile,
-                    path: "/tmp/fixture/.env.second", status: .linked,
+                    path: "/tmp/fixture/.env.second", linkStatus: .linked,
                     input: .bindings(["second-binding"])),
             ])
         let store = WorkspaceStore(

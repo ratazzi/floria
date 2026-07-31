@@ -14,6 +14,7 @@ pub(super) fn dispatch(
         ssh_config,
         checkout_monitor,
         audit_log,
+        ssh_runtime_dir,
         discovery_jobs,
     } = services;
     match command {
@@ -81,7 +82,9 @@ pub(super) fn dispatch(
             })?,
             limit.min(500),
         ),
-        ControlCommand::Snapshot => Ok(ControlResult::Snapshot(catalog.snapshot()?)),
+        ControlCommand::Snapshot => {
+            workspace_snapshot(catalog, store, mount_path, ssh_runtime_dir)
+        }
         ControlCommand::Discover { paths } => {
             let store = store.ok_or(DispatchError::StoreUnavailable)?;
             let discovery = discover_many(&paths)
@@ -160,12 +163,12 @@ pub(super) fn dispatch(
             catalog.upsert_checkout(&checkout)?;
             Ok(ControlResult::Empty)
         }
-        ControlCommand::ProjectCheckoutLinkRepair { checkout_id, path } => {
-            repair_project_checkout_link(catalog, store, mount_path, &checkout_id, &path)
-        }
         ControlCommand::ProjectCheckoutRemove { id } => {
             catalog.remove_checkout(&id)?;
             Ok(ControlResult::Empty)
+        }
+        ControlCommand::ManagedLinkRepair { path } => {
+            repair_managed_path_link(catalog, store, mount_path, ssh_runtime_dir, &path)
         }
         ControlCommand::SshAgentDiscover { endpoint } => {
             if !endpoint.is_absolute() {

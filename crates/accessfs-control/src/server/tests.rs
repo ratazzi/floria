@@ -507,8 +507,7 @@
                 mount_path: Some(&mount),
                 ..DispatchServices::default()
             },
-            ControlCommand::ProjectCheckoutLinkRepair {
-                checkout_id: "fixture-worktree".to_string(),
+            ControlCommand::ManagedLinkRepair {
                 path: worktree.join(".envrc"),
             },
         )
@@ -542,6 +541,79 @@
             .unwrap()
             .link_issues
             .is_empty());
+    }
+
+    #[test]
+    fn repairs_a_managed_ssh_agent_socket_link_by_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        catalog
+            .upsert_project(&Project {
+                id: "fixture-project".to_string(),
+                name: "Fixture Project".to_string(),
+                path: project.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+        catalog
+            .upsert_environment(&Environment {
+                id: "fixture-environment".to_string(),
+                project_id: "fixture-project".to_string(),
+                name: "Development".to_string(),
+                position: 0,
+            })
+            .unwrap();
+        let link = project.join("agent.sock");
+        catalog
+            .upsert_surface(&Surface {
+                id: "fixture-agent".to_string(),
+                environment_id: "fixture-environment".to_string(),
+                name: "agent.sock".to_string(),
+                kind: SurfaceKind::UnixSocket,
+                path: link.clone(),
+                input: SurfaceInput::Bindings { binding_ids: Vec::new() },
+                enforcement: Enforcement::Prompt,
+                position: 0,
+            })
+            .unwrap();
+        symlink("../foreign/agent.sock", &link).unwrap();
+        let runtime_dir = dir.path().join("runtime/sockets");
+        let services = || DispatchServices {
+            ssh_runtime_dir: Some(&runtime_dir),
+            ..DispatchServices::default()
+        };
+
+        let ControlResult::Snapshot(snapshot) =
+            dispatch(&catalog, services(), ControlCommand::Snapshot).unwrap()
+        else {
+            panic!("expected workspace snapshot")
+        };
+        assert_eq!(
+            snapshot.managed_links,
+            vec![ManagedLink { path: link.clone(), status: ManagedLinkStatus::Replaced }]
+        );
+
+        assert_eq!(
+            dispatch(
+                &catalog,
+                services(),
+                ControlCommand::ManagedLinkRepair { path: link.clone() },
+            )
+            .unwrap(),
+            ControlResult::Empty
+        );
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            accessfs_ssh::agent_runtime_socket_path(&runtime_dir, "fixture-agent")
+        );
+        let ControlResult::Snapshot(snapshot) =
+            dispatch(&catalog, services(), ControlCommand::Snapshot).unwrap()
+        else {
+            panic!("expected workspace snapshot")
+        };
+        assert_eq!(snapshot.managed_links[0].status, ManagedLinkStatus::Linked);
     }
 
     #[test]
@@ -1056,7 +1128,7 @@
         assert_eq!(plan.managed_items[0].kind, DiscoveryManagedItemKind::Surface);
         assert_eq!(
             plan.managed_items[0].status,
-            DiscoveryManagedItemStatus::Linked
+            ManagedLinkStatus::Linked
         );
 
         let repeated_apply = dispatch(
@@ -1104,7 +1176,7 @@
         };
         assert_eq!(
             missing.managed_items[0].status,
-            DiscoveryManagedItemStatus::Missing
+            ManagedLinkStatus::Missing
         );
 
         std::fs::write(&source_path, "DISCOVERED_TOKEN=fixture-local-replacement\n").unwrap();
@@ -1121,7 +1193,7 @@
         };
         assert_eq!(
             replaced.managed_items[0].status,
-            DiscoveryManagedItemStatus::Replaced
+            ManagedLinkStatus::Replaced
         );
         assert_eq!(
             catalog.snapshot().unwrap().resources.len(),
@@ -1219,7 +1291,7 @@
         );
         assert_eq!(
             plan.managed_items[0].status,
-            DiscoveryManagedItemStatus::Linked
+            ManagedLinkStatus::Linked
         );
 
         let repeated_apply = dispatch(
@@ -2912,6 +2984,18 @@
             std::fs::read_link(&source).unwrap(),
             mount.join(accessfs_core::config::SECRETS_DIR).join(FIXTURE_SECRET_ID)
         );
+        std::fs::remove_file(&source).unwrap();
+        symlink("../foreign/.envrc", &source).unwrap();
+        assert_eq!(
+            client
+                .request(ControlCommand::ManagedLinkRepair { path: source.clone() })
+                .unwrap(),
+            ControlResult::Empty
+        );
+        assert_eq!(
+            std::fs::read_link(&source).unwrap(),
+            mount.join(accessfs_core::config::SECRETS_DIR).join(FIXTURE_SECRET_ID)
+        );
         symlink(
             mount.join(accessfs_core::config::SECRETS_DIR).join(FIXTURE_SECRET_ID),
             worktree.join(".envrc"),
@@ -2990,7 +3074,7 @@
         assert_eq!(file.current_version, 1);
         assert_eq!(
             observer.notifications.load(Ordering::Relaxed),
-            4,
+            5,
             "rolling back a protected-file head must refresh managed runtime policy"
         );
 

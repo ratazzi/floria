@@ -19,13 +19,14 @@ use accessfs_discover::{
     ExistingSurface, GitCheckoutDiscovery, GitCheckoutMonitor, KeyClass, MonitoredGitCheckout,
 };
 use accessfs_platform::SocketPeerVerifier;
-use accessfs_ssh::ManagedKeyError;
+use accessfs_ssh::{agent_runtime_socket_path, ManagedKeyError};
 use accessfs_store::{NewSecret, SecretId, SecretOrigin, SecretRecord, SecretStore, StoreError};
 use accessfs_surface::{
     checkout_link_issues, decode_source, ensure_file_surface_link, file_surface_instances,
-    repair_checkout_link, replace_regular_file_with_symlink_if_matches,
+    managed_file_links, replace_regular_file_with_symlink_if_matches,
     replace_symlink_with_file_if_target, restore_protected_checkout_links,
-    validate_secret_bytes, SurfaceResolver,
+    validate_secret_bytes, ManagedLinkStatus as SurfaceManagedLinkStatus, ManagedSymlink,
+    SurfaceResolver,
 };
 
 use crate::protocol::{
@@ -34,10 +35,10 @@ use crate::protocol::{
     ControlResponse, ControlResult, DiscoveryAppliedFile, DiscoveryApplyOutcome, DiscoveryApplyResult,
     DiscoveryImport, DiscoveryImportDestination, DiscoveryJobPhase, DiscoveryJobProgress,
     DiscoveryJobState, DiscoveryJobStatus, DiscoveryManagedItem, DiscoveryManagedItemKind,
-    DiscoveryManagedItemStatus, DiscoveryReferenceResolution, DiscoveryReferenceSource,
-    DiscoveryReviewPlan, DiscoverySourceDisposition,
+    DiscoveryReferenceResolution, DiscoveryReferenceSource, DiscoveryReviewPlan,
+    DiscoverySourceDisposition, ManagedLink, ManagedLinkStatus,
     ProjectCheckoutCandidate, ProjectCheckoutDiscovery, ProjectCheckoutInventory, ProtectedFile,
-    ProtectedFileVersion, SecretValue, SshConfigStatus, SshIdentity,
+    ProtectedFileVersion, SecretValue, SshConfigStatus, SshIdentity, WorkspaceSnapshot,
 };
 
 pub struct ControlServer {
@@ -82,6 +83,7 @@ pub struct ControlRuntimeServices {
     pub ssh_discovery: Arc<dyn SshIdentityDiscovery>,
     pub ssh_config: Arc<dyn SshConfigManager>,
     pub audit_log: PathBuf,
+    pub ssh_runtime_dir: PathBuf,
     pub peer_verifier: Arc<dyn SocketPeerVerifier>,
 }
 
@@ -95,6 +97,7 @@ struct ControlDependencies {
     ssh_discovery: Option<Arc<dyn SshIdentityDiscovery>>,
     ssh_config: Option<Arc<dyn SshConfigManager>>,
     audit_log: Option<PathBuf>,
+    ssh_runtime_dir: Option<PathBuf>,
     discovery_jobs: Option<Arc<DiscoveryJobManager>>,
 }
 
@@ -186,6 +189,7 @@ impl ControlServer {
                 ssh_discovery: Some(services.ssh_discovery),
                 ssh_config: Some(services.ssh_config),
                 audit_log: Some(services.audit_log),
+                ssh_runtime_dir: Some(services.ssh_runtime_dir),
                 discovery_jobs: None,
             },
             services.peer_verifier,
@@ -295,6 +299,7 @@ fn handle_connection(
             ssh_config: dependencies.ssh_config.as_deref(),
             checkout_monitor: dependencies.checkout_monitor.as_deref(),
             audit_log: dependencies.audit_log.as_deref(),
+            ssh_runtime_dir: dependencies.ssh_runtime_dir.as_deref(),
             discovery_jobs: dependencies.discovery_jobs.as_deref(),
         };
         let outcome = match dispatch(&catalog, services, request.command) {
@@ -377,6 +382,7 @@ struct DispatchServices<'a> {
     ssh_config: Option<&'a dyn SshConfigManager>,
     checkout_monitor: Option<&'a GitCheckoutMonitor>,
     audit_log: Option<&'a Path>,
+    ssh_runtime_dir: Option<&'a Path>,
     discovery_jobs: Option<&'a DiscoveryJobManager>,
 }
 
@@ -445,6 +451,7 @@ mod discovery_jobs;
 mod discovery_reference;
 mod dispatch;
 mod history;
+mod managed_links;
 mod projects;
 mod protected_files;
 mod resources;
@@ -456,6 +463,7 @@ use discovery_jobs::*;
 use discovery_reference::*;
 use dispatch::*;
 use history::*;
+use managed_links::*;
 use projects::*;
 use protected_files::*;
 use resources::*;

@@ -1,25 +1,6 @@
-import CryptoKit
 import Darwin
 import Foundation
 import Observation
-
-enum SshAgentRuntimeSocket {
-    private static let hashByteCount = 12
-
-    static func fileName(for surfaceID: String) -> String {
-        let digest = SHA256.hash(data: Data(surfaceID.utf8))
-        let prefix = Data(digest.prefix(hashByteCount)).base64EncodedString()
-            .replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "=", with: "")
-        return "\(prefix).sock"
-    }
-
-    static func path(for surfaceID: String, homeDirectory: String = NSHomeDirectory()) -> String {
-        (homeDirectory as NSString).appendingPathComponent(
-            "Library/Application Support/floria/runtime/sockets/\(fileName(for: surfaceID))")
-    }
-}
 
 enum WorkspaceSecurityLevel: String, CaseIterable, Hashable, Sendable {
     case auditOnly = "allow"
@@ -392,13 +373,27 @@ enum WorkspaceSurfaceKind: String, CaseIterable, Sendable {
     }
 }
 
-enum WorkspaceSurfaceStatus: String, Sendable {
-    case linked = "Linked"
-    case listening = "Listening"
-    case ready = "Ready"
-    case stopped = "Stopped"
+struct WorkspaceManagedLink: Hashable, Sendable {
+    let path: String
+    let status: ManagedLinkStatus
 
-    var isHealthy: Bool { self != .stopped }
+    var isReady: Bool { status == .linked }
+    var needsAttention: Bool { !isReady }
+
+    var statusTitle: String {
+        isReady ? "Ready" : "Needs attention"
+    }
+
+    var issueDescription: String? {
+        switch status {
+        case .linked:
+            nil
+        case .missing:
+            "This path is not linked. Repair it to restore access."
+        case .replaced:
+            "Another file or symbolic link occupies this path. Floria will not replace a regular file."
+        }
+    }
 }
 
 struct WorkspaceSurface: Identifiable, Hashable, Sendable {
@@ -406,20 +401,20 @@ struct WorkspaceSurface: Identifiable, Hashable, Sendable {
     let name: String
     let kind: WorkspaceSurfaceKind
     let path: String
-    let status: WorkspaceSurfaceStatus
+    let managedLink: WorkspaceManagedLink
     let input: WorkspaceSurfaceInput
     let securityLevel: WorkspaceSecurityLevel
 
     init(
         id: String, name: String, kind: WorkspaceSurfaceKind, path: String,
-        status: WorkspaceSurfaceStatus, input: WorkspaceSurfaceInput,
+        linkStatus: ManagedLinkStatus, input: WorkspaceSurfaceInput,
         securityLevel: WorkspaceSecurityLevel = .confirmation
     ) {
         self.id = id
         self.name = name
         self.kind = kind
         self.path = path
-        self.status = status
+        managedLink = WorkspaceManagedLink(path: path, status: linkStatus)
         self.input = input
         self.securityLevel = securityLevel
     }
@@ -554,7 +549,7 @@ struct WorkspaceProtectedFile: Identifiable, Hashable, Sendable {
     let mode: UInt32
     let size: UInt64
     let currentVersion: UInt32
-    let linked: Bool
+    let managedLink: WorkspaceManagedLink
     let securityLevel: WorkspaceSecurityLevel
     let metadata: ItemMetadata
 
@@ -587,6 +582,7 @@ final class WorkspaceStore {
 
     @ObservationIgnored private let controlClient: ControlClient?
     @ObservationIgnored private var autoProvisionAttempted: Set<String> = []
+    @ObservationIgnored private var managedLinkStatuses: [String: ManagedLinkStatus] = [:]
 
     init(
         projects: [WorkspaceProject], resources: [WorkspaceResource],
@@ -867,7 +863,7 @@ final class WorkspaceStore {
             async let catalog = controlClient.snapshot()
             async let files = controlClient.protectedFiles()
             apply(try await catalog)
-            protectedFiles = try await files.map(WorkspaceProtectedFile.init)
+            protectedFiles = protectedFileModels(try await files)
             lastError = nil
         } catch {
             if reportErrors { lastError = error.localizedDescription }
@@ -950,7 +946,7 @@ final class WorkspaceStore {
             promoteEntries: standardized(promoteEntries),
             demoteEntries: standardized(demoteEntries))
         apply(try await controlClient.snapshot(), selectingProject: result.projectID)
-        protectedFiles = try await controlClient.protectedFiles().map(WorkspaceProtectedFile.init)
+        protectedFiles = protectedFileModels(try await controlClient.protectedFiles())
         lastError = nil
         return result
     }
@@ -1077,22 +1073,18 @@ final class WorkspaceStore {
         lastError = nil
     }
 
-    func repairProjectCheckoutLink(
-        checkoutID: CatalogProjectCheckout.ID, path: String
-    ) async throws {
+    func repairManagedLink(at path: String) async throws {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
-        guard checkouts.contains(where: { $0.id == checkoutID && $0.kind == .worktree }) else {
-            throw WorkspaceStoreError.invalid("Choose a managed worktree first")
-        }
-        try await controlClient.repairProjectCheckoutLink(
-            checkoutID: checkoutID, path: path)
+        try await controlClient.repairManagedLink(at: path)
+        apply(try await controlClient.snapshot())
+        protectedFiles = protectedFileModels(try await controlClient.protectedFiles())
         lastError = nil
     }
 
     func protectFile(at path: String) async throws {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
         let file = try await controlClient.protectFile(at: path)
-        let protected = WorkspaceProtectedFile(file)
+        let protected = protectedFileModels([file])[0]
         if let index = protectedFiles.firstIndex(where: { $0.id == protected.id }) {
             protectedFiles[index] = protected
         } else {
@@ -1113,8 +1105,9 @@ final class WorkspaceStore {
 
     func rollbackProtectedFile(_ id: String, to version: UInt32) async throws {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
-        let file = WorkspaceProtectedFile(
-            try await controlClient.rollbackProtectedFile(id, to: version))
+        let file = protectedFileModels([
+            try await controlClient.rollbackProtectedFile(id, to: version)
+        ])[0]
         if let index = protectedFiles.firstIndex(where: { $0.id == id }) {
             protectedFiles[index] = file
         }
@@ -1132,7 +1125,7 @@ final class WorkspaceStore {
         try await controlClient.updateProtectedFileMetadata(
             id, enforcement: securityLevel.rawValue, metadata: metadata)
         if let files = try? await controlClient.protectedFiles() {
-            protectedFiles = files.map(WorkspaceProtectedFile.init)
+            protectedFiles = protectedFileModels(files)
         }
         lastError = nil
     }
@@ -1148,7 +1141,7 @@ final class WorkspaceStore {
         _ = try await controlClient.configureManagedFile(
             id, projectID: projectID, environmentID: environmentID)
         apply(try await controlClient.snapshot(), selectingProject: projectID)
-        protectedFiles = try await controlClient.protectedFiles().map(WorkspaceProtectedFile.init)
+        protectedFiles = protectedFileModels(try await controlClient.protectedFiles())
         lastError = nil
     }
 
@@ -1158,7 +1151,7 @@ final class WorkspaceStore {
         if storageDeleted {
             protectedFiles.removeAll { $0.id == id }
         } else if let files = try? await controlClient.protectedFiles() {
-            protectedFiles = files.map(WorkspaceProtectedFile.init)
+            protectedFiles = protectedFileModels(files)
         }
         lastError = nil
         return storageDeleted
@@ -1168,7 +1161,7 @@ final class WorkspaceStore {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
         try await controlClient.restoreManagedFile(id)
         apply(try await controlClient.snapshot())
-        protectedFiles = try await controlClient.protectedFiles().map(WorkspaceProtectedFile.init)
+        protectedFiles = protectedFileModels(try await controlClient.protectedFiles())
         lastError = nil
     }
 
@@ -1889,41 +1882,6 @@ final class WorkspaceStore {
         lastError = nil
     }
 
-    func repairSurfaceLink(_ id: WorkspaceSurface.ID) async throws {
-        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
-        guard let environment = selectedEnvironment,
-            let position = environment.surfaces.firstIndex(where: { $0.id == id }),
-            let surface = environment.surfaces.first(where: { $0.id == id })
-        else {
-            throw WorkspaceStoreError.invalid("Select an output surface first")
-        }
-        try await controlClient.upsertSurface(
-            CatalogSurface(
-                id: surface.id, environmentID: environment.id, name: surface.name,
-                kind: surface.kind.catalogValue, path: surface.path,
-                input: surface.input.catalogInput,
-                enforcement: surface.securityLevel.rawValue, position: Int64(position)))
-        apply(try await controlClient.snapshot())
-        selectedSurfaceID = id
-        guard managedLinkTarget(for: surface) == expectedLinkTarget(for: surface) else {
-            throw WorkspaceStoreError.invalid(
-                "The path is occupied by another file or link. Floria did not replace it.")
-        }
-        lastError = nil
-    }
-
-    func expectedLinkTarget(for surface: WorkspaceSurface) -> String {
-        if surface.kind == .unixSocket {
-            return SshAgentRuntimeSocket.path(for: surface.id)
-        }
-        return (NSHomeDirectory() as NSString).appendingPathComponent(
-            ".accessfs/surfaces/\(surface.id)")
-    }
-
-    func managedLinkTarget(for surface: WorkspaceSurface) -> String? {
-        try? FileManager.default.destinationOfSymbolicLink(atPath: surface.path)
-    }
-
     private func newSurfaceOutput(
         fileName: String, in project: WorkspaceProject,
         excludingSurfaceID: WorkspaceSurface.ID? = nil
@@ -2000,7 +1958,8 @@ final class WorkspaceStore {
         projects[projectIndex].environments[environmentIndex].surfaces[surfaceIndex] =
             WorkspaceSurface(
                 id: surface.id, name: surface.name, kind: surface.kind, path: surface.path,
-                status: surface.status, input: .bindings(surface.bindingIDs + [binding.id]))
+                linkStatus: surface.managedLink.status,
+                input: .bindings(surface.bindingIDs + [binding.id]))
     }
 
     private func apply(_ snapshot: CatalogSnapshot, selectingProject: String? = nil) {
@@ -2009,6 +1968,8 @@ final class WorkspaceStore {
         let previousSurfaceID = selectedSurfaceID
         let projectUsage = Dictionary(grouping: snapshot.bindings, by: \.resourceID)
             .mapValues { Set($0.map(\.projectID)).count }
+        managedLinkStatuses = Dictionary(
+            uniqueKeysWithValues: snapshot.managedLinks.map { ($0.path, $0.status) })
 
         checkouts = snapshot.checkouts
         resources = snapshot.resources.compactMap { resource in
@@ -2058,7 +2019,10 @@ final class WorkspaceStore {
                         .map(WorkspaceBinding.init)
                     let environmentSurfaces = (surfaces[environment.id] ?? [])
                         .sorted { $0.position < $1.position }
-                        .compactMap(WorkspaceSurface.init)
+                        .compactMap {
+                            WorkspaceSurface(
+                                $0, linkStatus: managedLinkStatuses[$0.path] ?? .missing)
+                        }
                     return WorkspaceEnvironment(
                         id: environment.id, name: environment.name,
                         bindings: environmentBindings, surfaces: environmentSurfaces)
@@ -2079,6 +2043,17 @@ final class WorkspaceStore {
             $0.id == previousSurfaceID
         }) ?? selectedEnvironment?.surfaces.first
         selectedSurfaceID = selectedSurface?.id ?? ""
+    }
+
+    private func protectedFileModels(
+        _ files: [CatalogProtectedFile]
+    ) -> [WorkspaceProtectedFile] {
+        files.map { file in
+            WorkspaceProtectedFile(
+                file,
+                linkStatus: managedLinkStatuses[file.sourcePath]
+                    ?? (file.linked ? .linked : .missing))
+        }
     }
 
     private static func newID(_ prefix: String) -> String {
@@ -2157,17 +2132,18 @@ private extension WorkspaceBindingScope {
 }
 
 private extension WorkspaceProtectedFile {
-    init(_ file: CatalogProtectedFile) {
+    init(_ file: CatalogProtectedFile, linkStatus: ManagedLinkStatus) {
         self.init(
             id: file.id, path: file.sourcePath, mode: file.mode, size: file.size,
-            currentVersion: file.currentVersion, linked: file.linked,
+            currentVersion: file.currentVersion,
+            managedLink: WorkspaceManagedLink(path: file.sourcePath, status: linkStatus),
             securityLevel: WorkspaceSecurityLevel(catalogValue: file.enforcement),
             metadata: file.metadata)
     }
 }
 
 private extension WorkspaceSurface {
-    init?(_ surface: CatalogSurface) {
+    init?(_ surface: CatalogSurface, linkStatus: ManagedLinkStatus) {
         guard let kind = WorkspaceSurfaceKind(catalogValue: surface.kind) else { return nil }
         let input: WorkspaceSurfaceInput
         switch surface.input.type {
@@ -2181,16 +2157,9 @@ private extension WorkspaceSurface {
             input = .resource(resourceID)
         default: return nil
         }
-        let expectedTarget = kind == .unixSocket
-            ? SshAgentRuntimeSocket.path(for: surface.id)
-            : (NSHomeDirectory() as NSString).appendingPathComponent(
-                ".accessfs/surfaces/\(surface.id)")
-        let linkTarget = try? FileManager.default.destinationOfSymbolicLink(atPath: surface.path)
-        let status: WorkspaceSurfaceStatus = linkTarget == expectedTarget
-            ? (kind == .unixSocket ? .listening : .linked) : .stopped
         self.init(
             id: surface.id, name: surface.name, kind: kind, path: surface.path,
-            status: status, input: input,
+            linkStatus: linkStatus, input: input,
             securityLevel: WorkspaceSecurityLevel(catalogValue: surface.enforcement))
     }
 }
@@ -2362,7 +2331,7 @@ extension WorkspaceStore {
         ) -> WorkspaceSurface {
             WorkspaceSurface(
                 id: "\(prefix)-dotenv", name: ".env", kind: .dotenvFile,
-                path: "~/workspace/\(project)/.env", status: .linked,
+                path: "~/workspace/\(project)/.env", linkStatus: .linked,
                 input: .bindings(bindingIDs))
         }
 
@@ -2389,7 +2358,7 @@ extension WorkspaceStore {
                             ]),
                         WorkspaceSurface(
                             id: "floria-dev-ssh-socket", name: "SSH Agent", kind: .unixSocket,
-                            path: socketPath, status: .listening,
+                            path: socketPath, linkStatus: .linked,
                             input: .resource("developer-ssh-agent")),
                     ]),
                 WorkspaceEnvironment(

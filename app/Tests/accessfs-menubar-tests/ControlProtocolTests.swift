@@ -697,18 +697,14 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(encodedCheckout["environment_id"] as? String, "fixture-development")
         XCTAssertEqual(encodedCheckout["kind"] as? String, "worktree")
 
-        let repair = try ControlCommand.projectCheckoutLinkRepair(
-            checkoutID: "fixture-worktree",
+        let repair = try ControlCommand.managedLinkRepair(
             path: "/tmp/fixture-worktree/.envrc"
         ).requestData(requestID: 33, encoder: encoder)
         let repairValue = try XCTUnwrap(
             JSONSerialization.jsonObject(with: repair) as? [String: Any])
         XCTAssertEqual(
             repairValue["method"] as? String,
-            "project_checkout_link_repair")
-        XCTAssertEqual(
-            (repairValue["params"] as? [String: Any])?["checkout_id"] as? String,
-            "fixture-worktree")
+            "managed_link_repair")
         XCTAssertEqual(
             (repairValue["params"] as? [String: Any])?["path"] as? String,
             "/tmp/fixture-worktree/.envrc")
@@ -781,7 +777,7 @@ final class ControlProtocolTests: XCTestCase {
 
     func testDecodesCatalogForeignKeysFromRustSnapshot() throws {
         let data = Data(
-            #"{"projects":[],"checkouts":[{"id":"fixture-worktree","project_id":"fixture-project","path":"/tmp/fixture-worktree","environment_id":"fixture-development","kind":"worktree","git_common_dir":"/tmp/fixture/.git"}],"environments":[{"id":"fixture-development","project_id":"fixture-project","name":"Development","position":0}],"resources":[],"bindings":[],"surfaces":[{"id":"fixture-dotenv","environment_id":"fixture-development","name":".env","kind":"dotenv_file","path":"/tmp/fixture/.env","input":{"type":"bindings","binding_ids":[]},"enforcement":"allow","position":0}]}"#.utf8)
+            #"{"projects":[],"checkouts":[{"id":"fixture-worktree","project_id":"fixture-project","path":"/tmp/fixture-worktree","environment_id":"fixture-development","kind":"worktree","git_common_dir":"/tmp/fixture/.git"}],"environments":[{"id":"fixture-development","project_id":"fixture-project","name":"Development","position":0}],"resources":[],"bindings":[],"surfaces":[{"id":"fixture-dotenv","environment_id":"fixture-development","name":".env","kind":"dotenv_file","path":"/tmp/fixture/.env","input":{"type":"bindings","binding_ids":[]},"enforcement":"allow","position":0}],"managed_links":[{"path":"/tmp/fixture/.env","status":"replaced"}]}"#.utf8)
         let decoder = JSONDecoder()
 
         let snapshot = try decoder.decode(CatalogSnapshot.self, from: data)
@@ -792,6 +788,8 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(snapshot.checkouts.first?.kind, .worktree)
         XCTAssertEqual(snapshot.surfaces.first?.environmentID, "fixture-development")
         XCTAssertEqual(snapshot.surfaces.first?.enforcement, "allow")
+        XCTAssertEqual(snapshot.managedLinks.first?.path, "/tmp/fixture/.env")
+        XCTAssertEqual(snapshot.managedLinks.first?.status, .replaced)
     }
 
     func testDecodesDirectEnvFileSurfaceFromRustSnapshot() throws {

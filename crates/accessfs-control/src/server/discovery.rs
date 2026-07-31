@@ -1543,21 +1543,21 @@ fn discovery_normalized_path(path: &Path) -> PathBuf {
 fn discovery_managed_path_status(
     path: &Path,
     expected_target: Option<&Path>,
-) -> DiscoveryManagedItemStatus {
+) -> ManagedLinkStatus {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             let target = std::fs::read_link(path).ok();
             if expected_target.is_none_or(|expected| target.as_deref() == Some(expected)) {
-                DiscoveryManagedItemStatus::Linked
+                ManagedLinkStatus::Linked
             } else {
-                DiscoveryManagedItemStatus::Replaced
+                ManagedLinkStatus::Replaced
             }
         }
-        Ok(_) => DiscoveryManagedItemStatus::Replaced,
+        Ok(_) => ManagedLinkStatus::Replaced,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            DiscoveryManagedItemStatus::Missing
+            ManagedLinkStatus::Missing
         }
-        Err(_) => DiscoveryManagedItemStatus::Replaced,
+        Err(_) => ManagedLinkStatus::Replaced,
     }
 }
 

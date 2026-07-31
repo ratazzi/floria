@@ -543,7 +543,7 @@ struct DashboardView: View {
         let projects = selectedProject.map { [$0] } ?? state.workspace.projects
         for project in projects {
             let stopped = project.environments.flatMap(\.surfaces).filter {
-                !$0.status.isHealthy
+                $0.managedLink.needsAttention
             }
             if let surface = stopped.first {
                 result.append(
@@ -555,7 +555,9 @@ struct DashboardView: View {
             }
         }
 
-        let unlinked = state.workspace.protectedFiles.filter { !$0.linked }
+        let unlinked = state.workspace.protectedFiles.filter {
+            $0.managedLink.needsAttention
+        }
         if let file = unlinked.first {
             result.append(
                 DashboardIssue(
@@ -616,7 +618,13 @@ struct DashboardView: View {
     }
 
     private func projectIsHealthy(_ project: WorkspaceProject) -> Bool {
-        project.environments.flatMap(\.surfaces).allSatisfy(\.status.isHealthy)
+        let prefix = project.path.hasSuffix("/") ? project.path : project.path + "/"
+        return project.environments.flatMap(\.surfaces).allSatisfy {
+            $0.managedLink.isReady
+        }
+            && state.workspace.protectedFiles
+                .filter { $0.path.hasPrefix(prefix) }
+                .allSatisfy { $0.managedLink.isReady }
             && !(state.workspace.checkoutDiscoveries[project.id]?.checkouts.contains {
                 $0.needsAttention
             } ?? false)
@@ -926,12 +934,10 @@ private struct CompactProjectDetailView: View {
                 HStack(spacing: 10) {
                     projectSwitcher
                     environmentMenu
-                    if projectHasWorktreeIssues {
+                    if let item = firstManagedLinkIssue {
+                        reviewManagedItemButton(item)
+                    } else if projectHasWorktreeIssues {
                         reviewWorktreeIssuesButton
-                    } else if !projectIsHealthy {
-                        Label("Needs attention", systemImage: "exclamationmark.circle.fill")
-                            .font(.callout.weight(.medium))
-                            .foregroundStyle(Color.orange)
                     }
                 }
                 Text((project.path as NSString).abbreviatingWithTildeInPath)
@@ -1084,25 +1090,14 @@ private struct CompactProjectDetailView: View {
                 VStack(spacing: 0) {
                     ForEach(Array(filteredManagedItems.enumerated()), id: \.element.id) {
                         index, item in
-                        switch item {
-                        case .surface(let surface):
-                            CompactSurfaceRow(
-                                state: state,
-                                surface: surface,
-                                bindings: bindings(for: surface),
-                                projectPath: project.path,
-                                showDetails: {
-                                    selectedManagedItem = .surface(surface)
-                                })
-                        case .file(let file):
-                            CompactProtectedFileRow(
-                                state: state,
-                                file: file,
-                                projectPath: project.path,
-                                showDetails: {
-                                    selectedManagedItem = .file(file)
-                                })
-                        }
+                        CompactManagedItemRow(
+                            state: state,
+                            item: item,
+                            bindings: item.surface.map { bindings(for: $0) } ?? [],
+                            projectPath: project.path,
+                            showDetails: {
+                                selectedManagedItem = item.libraryItem
+                            })
                         if index != filteredManagedItems.count - 1 {
                             Divider().padding(.leading, 58)
                         }
@@ -1175,6 +1170,23 @@ private struct CompactProjectDetailView: View {
         }
     }
 
+    private var allProjectManagedItems: [CompactManagedItem] {
+        let allSurfaces = project.environments.flatMap(\.surfaces)
+        let surfacePaths = Set(allSurfaces.map {
+            ($0.path as NSString).standardizingPath
+        })
+        return (
+            allSurfaces.map(CompactManagedItem.surface)
+                + projectProtectedFiles
+                    .filter {
+                        !surfacePaths.contains(($0.path as NSString).standardizingPath)
+                    }
+                    .map(CompactManagedItem.file)
+        ).sorted {
+            $0.path.localizedStandardCompare($1.path) == .orderedAscending
+        }
+    }
+
     private var filteredManagedItems: [CompactManagedItem] {
         guard !search.isEmpty else { return managedItems }
         return managedItems.filter { item in
@@ -1183,9 +1195,21 @@ private struct CompactProjectDetailView: View {
         }
     }
 
-    private var projectIsHealthy: Bool {
-        project.environments.flatMap(\.surfaces).allSatisfy(\.status.isHealthy)
-            && !projectHasWorktreeIssues
+    private var firstManagedLinkIssue: CompactManagedItem? {
+        allProjectManagedItems.first { $0.managedLink.needsAttention }
+    }
+
+    private func reviewManagedItemButton(_ item: CompactManagedItem) -> some View {
+        Button {
+            selectedManagedItem = item.libraryItem
+        } label: {
+            Label("Needs attention", systemImage: "exclamationmark.circle.fill")
+                .font(.callout.weight(.medium))
+                .foregroundStyle(Color.orange)
+        }
+        .buttonStyle(.borderless)
+        .help("Review \(URL(fileURLWithPath: item.path).lastPathComponent)")
+        .accessibilityHint("Open managed item details")
     }
 
     private var projectHasWorktreeIssues: Bool {
@@ -1228,6 +1252,46 @@ private enum CompactManagedItem: Identifiable {
         switch self {
         case .surface(let surface): surface.path
         case .file(let file): file.path
+        }
+    }
+
+    var managedLink: WorkspaceManagedLink {
+        switch self {
+        case .surface(let surface): surface.managedLink
+        case .file(let file): file.managedLink
+        }
+    }
+
+    var surface: WorkspaceSurface? {
+        guard case .surface(let surface) = self else { return nil }
+        return surface
+    }
+
+    var kindTitle: String {
+        switch self {
+        case .surface(let surface): CompactManagedKindPresentation(surface: surface).title
+        case .file(let file): file.kind.title
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .surface(let surface): CompactManagedKindPresentation(surface: surface).systemImage
+        case .file(let file): file.kind.systemImage
+        }
+    }
+
+    var securityLevel: WorkspaceSecurityLevel {
+        switch self {
+        case .surface(let surface): surface.securityLevel
+        case .file(let file): file.securityLevel
+        }
+    }
+
+    var libraryItem: LibraryCatalogItem {
+        switch self {
+        case .surface(let surface): .surface(surface)
+        case .file(let file): .file(file)
         }
     }
 
@@ -1602,7 +1666,7 @@ private struct ProjectCheckoutsSheet: View {
                             .controlSize(.small)
                     } else {
                         Button("Repair Link", systemImage: "wrench.and.screwdriver") {
-                            Task { await repairWorktreeLink(path, candidate: candidate) }
+                            Task { await repairManagedLink(path, candidate: candidate) }
                         }
                         .controlSize(.small)
                         Button("Show in Finder", systemImage: "folder") {
@@ -1627,16 +1691,14 @@ private struct ProjectCheckoutsSheet: View {
     }
 
     @MainActor
-    private func repairWorktreeLink(
+    private func repairManagedLink(
         _ path: String, candidate: ProjectCheckoutCandidate
     ) async {
-        guard let checkoutID = candidate.managedCheckoutID else { return }
         busyPath = candidate.path
         errorMessage = nil
         defer { busyPath = nil }
         do {
-            try await store.repairProjectCheckoutLink(
-                checkoutID: checkoutID, path: path)
+            try await store.repairManagedLink(at: path)
             await discover()
         } catch {
             errorMessage = error.localizedDescription
@@ -1803,15 +1865,17 @@ private struct ProjectCheckoutsSheet: View {
     }
 }
 
-private struct CompactSurfaceRow: View {
+private struct CompactManagedItemRow: View {
     @Bindable var state: AppState
-    let surface: WorkspaceSurface
+    let item: CompactManagedItem
     let bindings: [WorkspaceBinding]
     let projectPath: String
     let showDetails: () -> Void
+    @State private var repairError: String?
+    @State private var isRepairing = false
 
     private var needsAttention: Bool {
-        !surface.status.isHealthy
+        item.managedLink.needsAttention
             || (!bindings.isEmpty && bindings.allSatisfy { !$0.isEnabled })
     }
 
@@ -1819,7 +1883,7 @@ private struct CompactSurfaceRow: View {
         HStack(spacing: 12) {
             Button(action: showDetails) {
                 HStack(spacing: 12) {
-                    Image(systemName: presentation.systemImage)
+                    Image(systemName: item.systemImage)
                         .font(.system(size: 15, weight: .medium))
                         .foregroundStyle(Color.blue.opacity(0.76))
                         .frame(width: 32, height: 32)
@@ -1828,12 +1892,12 @@ private struct CompactSurfaceRow: View {
                             in: RoundedRectangle(cornerRadius: 7))
 
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(URL(fileURLWithPath: surface.path).lastPathComponent)
+                        Text(URL(fileURLWithPath: item.path).lastPathComponent)
                             .font(.callout.weight(.semibold))
                             .lineLimit(1)
                         CompactManagedItemSubtitle(
-                            kind: presentation.title,
-                            path: compactManagedPath(surface.path, projectPath: projectPath),
+                            kind: item.kindTitle,
+                            path: compactManagedPath(item.path, projectPath: projectPath),
                             needsAttention: needsAttention)
                     }
 
@@ -1845,96 +1909,28 @@ private struct CompactSurfaceRow: View {
             .frame(maxWidth: .infinity)
             .accessibilityHint("Open details")
 
-            CompactSecurityLevelMenu(state: state, level: surface.securityLevel) { level in
-                try await state.workspace.updateSurfaceSecurityLevel(
-                    surface.id, securityLevel: level)
+            CompactSecurityLevelMenu(state: state, level: item.securityLevel) { level in
+                try await updateSecurity(level)
             }
 
             Menu {
                 Button("Details…", systemImage: "info.circle") {
                     showDetails()
                 }
-                Divider()
-                Button("Reveal in Finder", systemImage: "folder") {
-                    NSWorkspace.shared.activateFileViewerSelecting([
-                        URL(fileURLWithPath: surface.path)
-                    ])
-                }
-                Button("Copy Path", systemImage: "doc.on.doc") {
-                    copyManagedPath(surface.path)
-                }
-            } label: {
-                Image(systemName: "ellipsis")
-                    .frame(width: 26, height: 26)
-                    .contentShape(Rectangle())
-            }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .accessibilityLabel(
-                "\(URL(fileURLWithPath: surface.path).lastPathComponent) actions")
-        }
-        .padding(.horizontal, 14)
-        .frame(minHeight: 54)
-    }
-
-    private var presentation: CompactManagedKindPresentation {
-        CompactManagedKindPresentation(surface: surface)
-    }
-}
-
-private struct CompactProtectedFileRow: View {
-    @Bindable var state: AppState
-    let file: WorkspaceProtectedFile
-    let projectPath: String
-    let showDetails: () -> Void
-
-    var body: some View {
-        HStack(spacing: 12) {
-            Button(action: showDetails) {
-                HStack(spacing: 12) {
-                    Image(systemName: file.kind.systemImage)
-                        .font(.system(size: 15, weight: .medium))
-                        .foregroundStyle(Color.blue.opacity(0.76))
-                        .frame(width: 32, height: 32)
-                        .background(
-                            Color.blue.opacity(0.07),
-                            in: RoundedRectangle(cornerRadius: 7))
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(URL(fileURLWithPath: file.path).lastPathComponent)
-                            .font(.callout.weight(.semibold))
-                            .lineLimit(1)
-                        CompactManagedItemSubtitle(
-                            kind: file.kind.title,
-                            path: compactManagedPath(file.path, projectPath: projectPath),
-                            needsAttention: !file.linked)
+                if item.managedLink.needsAttention {
+                    Button("Repair Link", systemImage: "wrench.and.screwdriver") {
+                        repairManagedLink()
                     }
-
-                    Spacer(minLength: 12)
-                }
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .frame(maxWidth: .infinity)
-            .accessibilityHint("Open details")
-
-            CompactSecurityLevelMenu(state: state, level: file.securityLevel) { level in
-                try await state.workspace.updateProtectedFileMetadata(
-                    file.id, securityLevel: level, metadata: file.metadata)
-            }
-
-            Menu {
-                Button("Details…", systemImage: "info.circle") {
-                    showDetails()
+                    .disabled(isRepairing)
                 }
                 Divider()
                 Button("Reveal in Finder", systemImage: "folder") {
                     NSWorkspace.shared.activateFileViewerSelecting([
-                        URL(fileURLWithPath: file.path)
+                        URL(fileURLWithPath: item.path)
                     ])
                 }
                 Button("Copy Path", systemImage: "doc.on.doc") {
-                    copyManagedPath(file.path)
+                    copyManagedPath(item.path)
                 }
             } label: {
                 Image(systemName: "ellipsis")
@@ -1943,10 +1939,43 @@ private struct CompactProtectedFileRow: View {
             }
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
-            .accessibilityLabel("\(URL(fileURLWithPath: file.path).lastPathComponent) actions")
+            .accessibilityLabel("\(URL(fileURLWithPath: item.path).lastPathComponent) actions")
         }
         .padding(.horizontal, 14)
         .frame(minHeight: 54)
+        .alert(
+            "Could not repair link",
+            isPresented: Binding(
+                get: { repairError != nil },
+                set: { if !$0 { repairError = nil } })
+        ) {
+            Button("OK") { repairError = nil }
+        } message: {
+            Text(repairError ?? "Unknown error")
+        }
+    }
+
+    private func updateSecurity(_ level: WorkspaceSecurityLevel) async throws {
+        switch item {
+        case .surface(let surface):
+            try await state.workspace.updateSurfaceSecurityLevel(
+                surface.id, securityLevel: level)
+        case .file(let file):
+            try await state.workspace.updateProtectedFileMetadata(
+                file.id, securityLevel: level, metadata: file.metadata)
+        }
+    }
+
+    private func repairManagedLink() {
+        Task {
+            isRepairing = true
+            defer { isRepairing = false }
+            do {
+                try await state.workspace.repairManagedLink(at: item.path)
+            } catch {
+                repairError = error.localizedDescription
+            }
+        }
     }
 }
 

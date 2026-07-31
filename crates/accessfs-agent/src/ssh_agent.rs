@@ -34,8 +34,6 @@ const MAX_AGENT_FRAME: usize = 1 << 20;
 const DOWNSTREAM_POLL: Duration = Duration::from_secs(1);
 const UPSTREAM_TIMEOUT: Duration = Duration::from_secs(60);
 const CONNECTION_THREADS: usize = 16;
-const RUNTIME_SOCKET_HASH_BYTES: usize = 12;
-
 const SSH_AGENT_FAILURE: u8 = 5;
 const SSH_AGENT_IDENTITIES_ANSWER: u8 = 12;
 const SSH_AGENTC_REQUEST_IDENTITIES: u8 = 11;
@@ -183,7 +181,7 @@ impl SshAgentRuntime {
     }
 
     pub fn socket_path(&self, surface_id: &str) -> PathBuf {
-        runtime_socket_path(&self.runtime_dir, surface_id)
+        accessfs_ssh::agent_runtime_socket_path(&self.runtime_dir, surface_id)
     }
 }
 
@@ -269,7 +267,7 @@ fn compile_surface_specs(
                 )))
             }
         };
-        let socket_path = runtime_socket_path(runtime_dir, &surface.id);
+        let socket_path = accessfs_ssh::agent_runtime_socket_path(runtime_dir, &surface.id);
         let mut providers = Vec::<ProviderSpec>::new();
         let mut provider_indexes = HashMap::<&str, usize>::new();
         let mut identities = Vec::new();
@@ -330,12 +328,6 @@ fn compile_surface_specs(
         });
     }
     Ok(specs)
-}
-
-fn runtime_socket_path(runtime_dir: &Path, surface_id: &str) -> PathBuf {
-    let digest = Sha256::digest(surface_id.as_bytes());
-    let name = URL_SAFE_NO_PAD.encode(&digest[..RUNTIME_SOCKET_HASH_BYTES]);
-    runtime_dir.join(format!("{name}.sock"))
 }
 
 fn write_generated_config(path: &Path, specs: &[SurfaceSpec]) -> io::Result<()> {
@@ -1403,7 +1395,7 @@ mod tests {
             "/Users/fixture-account/Library/Application Support/floria/runtime/sockets",
         );
         let surface_id = "ssh-agent-d56d57b2-3503-40e9-86d0-48a6ca9168fd";
-        let path = runtime_socket_path(runtime_dir, surface_id);
+        let path = accessfs_ssh::agent_runtime_socket_path(runtime_dir, surface_id);
         let address = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
 
         assert_eq!(path.file_name().unwrap(), "3YUjhPR-lx4my6EW.sock");

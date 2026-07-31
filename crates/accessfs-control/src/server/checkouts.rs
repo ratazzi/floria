@@ -70,29 +70,6 @@ pub(super) fn project_checkout_inventory(
     ))
 }
 
-pub(super) fn repair_project_checkout_link(
-    catalog: &Catalog,
-    store: Option<&dyn SecretStore>,
-    mount_path: Option<&Path>,
-    checkout_id: &str,
-    path: &Path,
-) -> Result<ControlResult, DispatchError> {
-    let store = store.ok_or(DispatchError::StoreUnavailable)?;
-    let mount_path = mount_path.ok_or_else(|| {
-        DispatchError::Validation("managed filesystem mount is unavailable".to_string())
-    })?;
-    let snapshot = catalog.snapshot()?;
-    let checkout = snapshot
-        .checkouts
-        .iter()
-        .find(|checkout| checkout.id == checkout_id)
-        .ok_or_else(|| CatalogError::NotFound(format!("checkout {checkout_id}")))?;
-    let records = store.list()?;
-    repair_checkout_link(&snapshot, &records, mount_path, checkout, path)
-        .map_err(|error| DispatchError::Validation(error.to_string()))?;
-    Ok(ControlResult::Empty)
-}
-
 pub(super) fn checkout_discovery(
     snapshot: &CatalogSnapshot,
     project_id: &str,

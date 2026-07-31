@@ -462,11 +462,9 @@ pub(super) fn protected_file(record: SecretRecord, mount_path: &Path) -> Option<
     let expected = mount_path
         .join(accessfs_core::config::SECRETS_DIR)
         .join(record.id.to_string());
-    let linked = std::fs::symlink_metadata(&source_path)
-        .ok()
-        .filter(|metadata| metadata.file_type().is_symlink())
-        .and_then(|_| std::fs::read_link(&source_path).ok())
-        .is_some_and(|target| target == expected);
+    let linked = ManagedSymlink::new(&source_path, expected)
+        .is_ready()
+        .unwrap_or(false);
     Some(ProtectedFile {
         id: record.id.to_string(),
         source_path,

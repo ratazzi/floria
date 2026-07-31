@@ -1150,7 +1150,9 @@ private struct SurfaceInspector: View {
                             .menuStyle(.borderlessButton)
                             .fixedSize()
                             .accessibilityLabel("Output actions")
-                            SurfaceStatusBadge(status: surface.status)
+                            SurfaceStatusBadge(
+                                link: surface.managedLink,
+                                readyTitle: surface.kind == .unixSocket ? "Listening" : "Ready")
                         }
                         HStack(spacing: 10) {
                             Text(surface.path)
@@ -1594,30 +1596,12 @@ private struct ManageSurfaceSheet: View {
         return store.resource(binding.resourceID)?.name ?? binding.resourceID
     }
 
-    private var expectedTarget: String {
-        store.expectedLinkTarget(for: surface)
-    }
-
-    private var actualTarget: String? {
-        store.managedLinkTarget(for: surface)
-    }
-
-    private var linkPathExists: Bool {
-        FileManager.default.fileExists(atPath: surface.path)
-    }
-
     private var linkCanBeRepaired: Bool {
-        actualTarget == nil && !linkPathExists
+        surface.managedLink.needsAttention
     }
 
     private var linkIssue: String? {
-        guard let actualTarget else {
-            return linkPathExists
-                ? "This path is occupied by another file. Floria will not replace it automatically."
-                : "This path is not linked. Repair it to restore access."
-        }
-        guard actualTarget != expectedTarget else { return nil }
-        return "This path points somewhere else. Floria will not replace it automatically."
+        surface.managedLink.issueDescription
     }
 
     var body: some View {
@@ -1696,14 +1680,6 @@ private struct ManageSurfaceSheet: View {
                 }
             }
 
-            if let actualTarget, actualTarget != expectedTarget {
-                InspectorSection(title: "Current destination") {
-                    Text(actualTarget)
-                        .font(.callout.monospaced())
-                        .textSelection(.enabled)
-                }
-            }
-
             HStack {
                 if isManagedSurface, linkCanBeRepaired {
                     Button("Repair Link", systemImage: "wrench.and.screwdriver", action: repairLink)
@@ -1756,7 +1732,7 @@ private struct ManageSurfaceSheet: View {
             isWorking = true
             defer { isWorking = false }
             do {
-                try await store.repairSurfaceLink(surface.id)
+                try await store.repairManagedLink(at: surface.path)
             } catch {
                 errorMessage = error.localizedDescription
             }
@@ -1814,18 +1790,19 @@ private struct ManageSurfaceSheet: View {
 }
 
 private struct SurfaceStatusBadge: View {
-    let status: WorkspaceSurfaceStatus
+    let link: WorkspaceManagedLink
+    let readyTitle: String
 
     var body: some View {
         HStack(spacing: 5) {
-            Image(systemName: status.isHealthy ? "checkmark.circle.fill" : "stop.circle")
-            Text(status.rawValue)
+            Image(systemName: link.isReady ? "checkmark.circle.fill" : "stop.circle")
+            Text(link.isReady ? readyTitle : "Needs attention")
         }
         .font(.caption.weight(.medium))
-        .foregroundStyle(status.isHealthy ? Color.green : Color.secondary)
+        .foregroundStyle(link.isReady ? Color.green : Color.orange)
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
-        .background((status.isHealthy ? Color.green : Color.secondary).opacity(0.1))
+        .background((link.isReady ? Color.green : Color.orange).opacity(0.1))
         .clipShape(Capsule())
     }
 }
@@ -2022,6 +1999,14 @@ enum LibraryCatalogItem: Identifiable {
         }
     }
 
+    var managedLink: WorkspaceManagedLink? {
+        switch self {
+        case .file(let file): file.managedLink
+        case .surface(let surface): surface.managedLink
+        case .resource: nil
+        }
+    }
+
     func matches(_ search: String) -> Bool {
         guard !search.isEmpty else { return true }
         let metadata: ItemMetadata
@@ -2048,6 +2033,7 @@ private struct LibraryCatalogView: View {
 
     @State private var filter = LibraryCatalogFilter.all
     @State private var selectedItem: LibraryCatalogItem?
+    @State private var errorMessage: String?
 
     private var items: [LibraryCatalogItem] {
         let surfaces = store.allSurfaces
@@ -2099,9 +2085,17 @@ private struct LibraryCatalogView: View {
                                 .clipShape(RoundedRectangle(cornerRadius: 8))
 
                             VStack(alignment: .leading, spacing: 3) {
-                                Text(item.title)
-                                    .font(.body.weight(.medium))
-                                    .lineLimit(1)
+                                HStack(spacing: 6) {
+                                    Text(item.title)
+                                        .font(.body.weight(.medium))
+                                        .lineLimit(1)
+                                    if item.managedLink?.needsAttention == true {
+                                        Image(systemName: "exclamationmark.triangle.fill")
+                                            .font(.caption)
+                                            .foregroundStyle(Color.orange)
+                                            .help("Managed link needs attention")
+                                    }
+                                }
                                 Text(item.detail)
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
@@ -2126,6 +2120,11 @@ private struct LibraryCatalogView: View {
                     Menu {
                         Button("Details…", systemImage: "info.circle") {
                             selectedItem = item
+                        }
+                        if item.managedLink?.needsAttention == true {
+                            Button("Repair Link", systemImage: "wrench.and.screwdriver") {
+                                repairManagedLink(item)
+                            }
                         }
                         switch item {
                         case .file(let file):
@@ -2183,6 +2182,16 @@ private struct LibraryCatalogView: View {
         .sheet(item: $selectedItem) { item in
             LibraryItemDetailSheet(store: store, item: item)
         }
+        .alert(
+            "Could not repair link",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } })
+        ) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
     }
 
     private func updateSecurity(
@@ -2199,6 +2208,17 @@ private struct LibraryCatalogView: View {
         case .surface(let surface):
             try await store.updateSurfaceSecurityLevel(
                 surface.id, securityLevel: level)
+        }
+    }
+
+    private func repairManagedLink(_ item: LibraryCatalogItem) {
+        guard let path = item.managedLink?.path else { return }
+        Task {
+            do {
+                try await store.repairManagedLink(at: path)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
         }
     }
 }
@@ -2314,6 +2334,9 @@ struct LibraryItemDetailSheet: View {
                                 Text((file.path as NSString).abbreviatingWithTildeInPath)
                                     .textSelection(.enabled)
                             }
+                            LabeledContent(
+                                "Status",
+                                value: file.managedLink.statusTitle)
                             LabeledContent("Current version", value: "v\(file.currentVersion)")
                             LabeledContent(
                                 "Size",
@@ -2341,7 +2364,7 @@ struct LibraryItemDetailSheet: View {
                             }
                             LabeledContent(
                                 "Status",
-                                value: surface.status.isHealthy ? "Ready" : "Needs attention")
+                                value: surface.managedLink.statusTitle)
                         }
                     }
 
@@ -2365,6 +2388,12 @@ struct LibraryItemDetailSheet: View {
 
                     InspectorSection(title: "Actions") {
                         HStack(spacing: 10) {
+                            if currentItem.managedLink?.needsAttention == true {
+                                Button("Repair Link", systemImage: "wrench.and.screwdriver") {
+                                    repairManagedLink()
+                                }
+                                .disabled(isWorking)
+                            }
                             switch currentItem {
                             case .file(let file):
                                 Button("Edit Info…", systemImage: "pencil") {
@@ -2556,7 +2585,7 @@ struct LibraryItemDetailSheet: View {
 
     private var removalIsBlocked: Bool {
         switch currentItem {
-        case .file(let file): !file.linked
+        case .file(let file): file.managedLink.needsAttention
         case .resource(let resource): resource.usageCount > 0
         case .surface: false
         }
@@ -2635,6 +2664,19 @@ struct LibraryItemDetailSheet: View {
             do {
                 try await configureProtectedFile()
                 dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func repairManagedLink() {
+        guard let path = currentItem.managedLink?.path else { return }
+        isWorking = true
+        Task {
+            defer { isWorking = false }
+            do {
+                try await store.repairManagedLink(at: path)
             } catch {
                 errorMessage = error.localizedDescription
             }
@@ -2747,12 +2789,18 @@ private struct ProtectedFilesView: View {
                             }
                         }
                         Text(
-                            "\(file.linked ? "Linked" : "Stored only") · v\(file.currentVersion) · \(ByteCountFormatter.string(fromByteCount: Int64(file.size), countStyle: .file)) · \(String(format: "%04o", file.mode))"
+                            "\(file.managedLink.statusTitle) · v\(file.currentVersion) · \(ByteCountFormatter.string(fromByteCount: Int64(file.size), countStyle: .file)) · \(String(format: "%04o", file.mode))"
                         )
                         .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(file.managedLink.isReady ? Color.secondary : Color.orange)
                     }
                     Menu {
+                        if file.managedLink.needsAttention {
+                            Button("Repair Link", systemImage: "wrench.and.screwdriver") {
+                                repairManagedLink(file.path)
+                            }
+                            Divider()
+                        }
                         Button("Version History", systemImage: "clock.arrow.circlepath") {
                             historyFile = file
                         }
@@ -2782,7 +2830,7 @@ private struct ProtectedFilesView: View {
                         Button("Stop Protecting…", systemImage: "lock.open", role: .destructive) {
                             restoreFile = file
                         }
-                        .disabled(!file.linked)
+                        .disabled(file.managedLink.needsAttention)
                     } label: {
                         Image(systemName: "ellipsis")
                             .frame(width: 28, height: 28)
@@ -2849,6 +2897,16 @@ private struct ProtectedFilesView: View {
                 if !deleted {
                     errorMessage = "The plaintext file was restored, but Floria could not delete its encrypted history. The stored copy remains listed for recovery."
                 }
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func repairManagedLink(_ path: String) {
+        Task {
+            do {
+                try await store.repairManagedLink(at: path)
             } catch {
                 errorMessage = error.localizedDescription
             }

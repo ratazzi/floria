@@ -326,9 +326,11 @@ struct CatalogSnapshot: Codable, Sendable {
     let endpoints: [String: String]
     let bindings: [CatalogBinding]
     let surfaces: [CatalogSurface]
+    let managedLinks: [CatalogManagedLink]
 
     private enum CodingKeys: String, CodingKey {
         case projects, checkouts, environments, resources, endpoints, bindings, surfaces
+        case managedLinks = "managed_links"
     }
 
     init(from decoder: Decoder) throws {
@@ -342,6 +344,8 @@ struct CatalogSnapshot: Codable, Sendable {
             try container.decodeIfPresent([String: String].self, forKey: .endpoints) ?? [:]
         bindings = try container.decode([CatalogBinding].self, forKey: .bindings)
         surfaces = try container.decode([CatalogSurface].self, forKey: .surfaces)
+        managedLinks =
+            try container.decodeIfPresent([CatalogManagedLink].self, forKey: .managedLinks) ?? []
     }
 
     func encode(to encoder: Encoder) throws {
@@ -353,7 +357,13 @@ struct CatalogSnapshot: Codable, Sendable {
         try container.encode(endpoints, forKey: .endpoints)
         try container.encode(bindings, forKey: .bindings)
         try container.encode(surfaces, forKey: .surfaces)
+        try container.encode(managedLinks, forKey: .managedLinks)
     }
+}
+
+struct CatalogManagedLink: Codable, Hashable, Sendable {
+    let path: String
+    let status: ManagedLinkStatus
 }
 
 struct ProjectCheckoutDiscovery: Codable, Hashable, Sendable {
@@ -488,7 +498,7 @@ struct DiscoveryManagedItem: Codable, Hashable, Identifiable, Sendable {
     let projectPath: String?
     let environment: String?
     let kind: DiscoveryManagedItemKind
-    let status: DiscoveryManagedItemStatus
+    let status: ManagedLinkStatus
 
     enum CodingKeys: String, CodingKey {
         case id, path, environment, kind, status
@@ -502,7 +512,7 @@ enum DiscoveryManagedItemKind: String, Codable, Hashable, Sendable {
     case protectedFile = "protected_file"
 }
 
-enum DiscoveryManagedItemStatus: String, Codable, Hashable, Sendable {
+enum ManagedLinkStatus: String, Codable, Hashable, Sendable {
     case linked
     case missing
     case replaced
@@ -885,8 +895,8 @@ enum ControlCommand: Sendable {
     case projectCheckoutInventory
     case projectCheckoutDiscover(projectID: String)
     case projectCheckoutUpsert(CatalogProjectCheckout)
-    case projectCheckoutLinkRepair(checkoutID: String, path: String)
     case projectCheckoutRemove(id: String)
+    case managedLinkRepair(path: String)
     case sshAgentDiscover(endpoint: String)
     case sshIdentityImport(
         resourceID: String, name: String, path: String, passphrase: String?,
@@ -948,8 +958,8 @@ enum ControlCommand: Sendable {
         case .projectCheckoutInventory: "project_checkout_inventory"
         case .projectCheckoutDiscover: "project_checkout_discover"
         case .projectCheckoutUpsert: "project_checkout_upsert"
-        case .projectCheckoutLinkRepair: "project_checkout_link_repair"
         case .projectCheckoutRemove: "project_checkout_remove"
+        case .managedLinkRepair: "managed_link_repair"
         case .sshAgentDiscover: "ssh_agent_discover"
         case .sshIdentityImport: "ssh_identity_import"
         case .sshIdentityRemove: "ssh_identity_remove"
@@ -1045,12 +1055,11 @@ enum ControlCommand: Sendable {
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: ProjectCheckoutUpsertParams(checkout: checkout)))
-        case .projectCheckoutLinkRepair(let checkoutID, let path):
+        case .managedLinkRepair(let path):
             return try encoder.encode(
                 ControlRequest(
                     requestID: requestID, method: method,
-                    params: ProjectCheckoutLinkRepairParams(
-                        checkoutID: checkoutID, path: path)))
+                    params: ManagedLinkRepairParams(path: path)))
         case .projectCheckoutRemove(let id):
             return try encoder.encode(
                 ControlRequest(
@@ -1212,10 +1221,7 @@ private struct DiscoverReferenceResolveParams: Encodable {
 }
 private struct ProjectCheckoutDiscoverParams: Encodable { let projectID: String }
 private struct ProjectCheckoutUpsertParams: Encodable { let checkout: CatalogProjectCheckout }
-private struct ProjectCheckoutLinkRepairParams: Encodable {
-    let checkoutID: String
-    let path: String
-}
+private struct ManagedLinkRepairParams: Encodable { let path: String }
 private struct SshAgentDiscoverParams: Encodable { let endpoint: String }
 
 private struct SshIdentityImportParams: Encodable {
