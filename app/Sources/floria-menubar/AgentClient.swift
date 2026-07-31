@@ -88,6 +88,10 @@ final class AgentClient {
         let identity = pathIdentity()
         let f = socket(AF_UNIX, SOCK_STREAM, 0)
         if f < 0 { return false }
+        guard configureAgentSocket(f) else {
+            close(f)
+            return false
+        }
 
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
@@ -226,6 +230,13 @@ final class AgentClient {
             return true
         }
     }
+}
+
+func configureAgentSocket(_ socket: Int32) -> Bool {
+    var noSignal: Int32 = 1
+    return setsockopt(
+        socket, SOL_SOCKET, SO_NOSIGPIPE, &noSignal,
+        socklen_t(MemoryLayout<Int32>.size)) == 0
 }
 
 func validateAgentProtocolVersion(_ daemonVersion: UInt32) throws {
