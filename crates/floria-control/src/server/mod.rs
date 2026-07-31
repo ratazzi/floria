@@ -358,6 +358,7 @@ fn is_read_only(command: &ControlCommand) -> bool {
             | ControlCommand::SshAgentDiscover { .. }
             | ControlCommand::SshConfigStatus
             | ControlCommand::ProtectedFiles
+            | ControlCommand::ProtectedFileLookup { .. }
             | ControlCommand::ProtectedFileHistory { .. }
             | ControlCommand::ResolveEnvironment { .. }
             | ControlCommand::ResourceUsage { .. }

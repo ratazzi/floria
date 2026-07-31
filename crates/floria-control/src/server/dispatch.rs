@@ -281,6 +281,13 @@ pub(super) fn dispatch(
             store.ok_or(DispatchError::StoreUnavailable)?,
             mount_path.ok_or(DispatchError::StoreUnavailable)?,
         ),
+        ControlCommand::ProtectedFileLookup { id, path } => lookup_protected_file(
+            catalog,
+            store.ok_or(DispatchError::StoreUnavailable)?,
+            mount_path.ok_or(DispatchError::StoreUnavailable)?,
+            id.as_deref(),
+            path.as_deref(),
+        ),
         ControlCommand::FileProtect { path } => protect_file(
             catalog,
             store.ok_or(DispatchError::StoreUnavailable)?,

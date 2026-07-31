@@ -27,6 +27,52 @@ pub(super) fn protected_files(
     Ok(ControlResult::ProtectedFiles(files))
 }
 
+pub(super) fn lookup_protected_file(
+    catalog: &Catalog,
+    store: &dyn SecretStore,
+    mount_path: &Path,
+    id: Option<&str>,
+    path: Option<&Path>,
+) -> Result<ControlResult, DispatchError> {
+    let record = match (id, path) {
+        (Some(id), None) => file_record(store, id)?.1,
+        (None, Some(path)) => {
+            if !path.is_absolute() {
+                return Err(DispatchError::Validation(format!(
+                    "protected file lookup path {} must be absolute",
+                    path.display()
+                )));
+            }
+            let path = canonical_source_path(path).map_err(|source| DispatchError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            let record = store.get_by_path(&path)?.ok_or_else(|| {
+                DispatchError::Validation(format!(
+                    "{} is not a protected file",
+                    path.display()
+                ))
+            })?;
+            if !matches!(&record.origin, SecretOrigin::File { .. }) {
+                return Err(DispatchError::Validation(format!(
+                    "{} does not identify a protected file",
+                    path.display()
+                )));
+            }
+            record
+        }
+        _ => {
+            return Err(DispatchError::Validation(
+                "protected file lookup requires exactly one of id or path".to_string(),
+            ));
+        }
+    };
+    let snapshot = catalog.snapshot()?;
+    Ok(ControlResult::ProtectedFile(
+        protected_file(record, mount_path, &snapshot).expect("lookup validates a file record"),
+    ))
+}
+
 pub(super) fn configure_managed_file(
     catalog: &Catalog,
     store: &dyn SecretStore,

@@ -686,18 +686,22 @@ fn connect_control(cfg: &ResolvedConfig) -> Result<ControlClient> {
 }
 
 fn resolve_protected_file(client: &mut ControlClient, target: &str) -> Result<ProtectedFile> {
-    let result = client.request(ControlCommand::ProtectedFiles)?;
-    let ControlResult::ProtectedFiles(files) = result else {
+    let command = if target.parse::<SecretId>().is_ok() {
+        ControlCommand::ProtectedFileLookup {
+            id: Some(target.to_string()),
+            path: None,
+        }
+    } else {
+        ControlCommand::ProtectedFileLookup {
+            id: None,
+            path: Some(absolute_cli_path(Path::new(target))?),
+        }
+    };
+    let result = client.request(command)?;
+    let ControlResult::ProtectedFile(file) = result else {
         anyhow::bail!("daemon returned an unexpected file lookup result: {result:?}");
     };
-    if let Some(file) = files.iter().find(|file| file.id == target) {
-        return Ok(file.clone());
-    }
-    let path = absolute_cli_path(Path::new(target))?;
-    files
-        .into_iter()
-        .find(|file| file.source_path == path)
-        .with_context(|| format!("no protected file for {target:?}"))
+    Ok(file)
 }
 
 /// Make a user-supplied path absolute without following the final component, which may already be
@@ -1256,6 +1260,9 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
         }
         ControlResult::ProtectedFiles(files) => {
             println!("{}", serde_json::to_string_pretty(&files)?);
+        }
+        ControlResult::ProtectedFile(file) => {
+            println!("{}", serde_json::to_string_pretty(&file)?);
         }
         ControlResult::FileProtected { file, created } => {
             let action = if created { "protected" } else { "already protected" };

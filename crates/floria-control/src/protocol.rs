@@ -104,6 +104,7 @@ pub enum ControlCommand {
     SshConfigInstall,
     SshConfigRemove,
     ProtectedFiles,
+    ProtectedFileLookup { id: Option<String>, path: Option<PathBuf> },
     FileProtect { path: PathBuf },
     ProtectedFileHistory { id: String },
     ProtectedFileRollback { id: String, version: u32 },
@@ -206,6 +207,7 @@ pub enum ControlResult {
     SshIdentityCreated { resource: Resource },
     SshConfig(SshConfigStatus),
     ProtectedFiles(Vec<ProtectedFile>),
+    ProtectedFile(ProtectedFile),
     FileProtected { file: ProtectedFile, created: bool },
     ProtectedFileHistory { id: String, versions: Vec<ProtectedFileVersion> },
     ProtectedFileRolledBack { file: ProtectedFile },
@@ -1154,6 +1156,22 @@ mod tests {
 
         assert_eq!(value["method"], "file_protect");
         assert_eq!(value["params"]["path"], "/fixture/project/.env");
+    }
+
+    #[test]
+    fn protected_file_lookup_has_one_explicit_selector() {
+        let request = ControlRequest {
+            request_id: 28,
+            command: ControlCommand::ProtectedFileLookup {
+                id: None,
+                path: Some(PathBuf::from("/fixture/.env")),
+            },
+        };
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["method"], "protected_file_lookup");
+        assert_eq!(value["params"]["id"], serde_json::Value::Null);
+        assert_eq!(value["params"]["path"], "/fixture/.env");
     }
 
     #[test]

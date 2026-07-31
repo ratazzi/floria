@@ -3528,6 +3528,17 @@
             files.is_empty(),
             "a configured file must have one project-facing representation"
         );
+        let ControlResult::ProtectedFile(configured_file) = client
+            .request(ControlCommand::ProtectedFileLookup {
+                id: None,
+                path: Some(source.clone()),
+            })
+            .unwrap()
+        else {
+            panic!("expected configured protected file lookup");
+        };
+        assert_eq!(configured_file.id, FIXTURE_SECRET_ID);
+        assert_eq!(configured_file.source_path, source);
         let secret_id: SecretId = FIXTURE_SECRET_ID.parse().unwrap();
         assert_eq!(store.record(&secret_id).unwrap().unwrap().current_version, 1);
 
