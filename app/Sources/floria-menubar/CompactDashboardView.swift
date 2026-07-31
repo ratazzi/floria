@@ -82,6 +82,8 @@ struct DashboardView: View {
     @State private var showingSystemHealth = false
     @State private var pendingAuditWindow: AuditOnlyWindow?
     @State private var showingAuditConfirmation = false
+    @State private var showingUninstallConfirmation = false
+    @State private var uninstallInProgress = false
     @State private var backupNotice: BackupNotice?
     @State private var backupOperationInProgress = false
     @FocusState private var searchIsFocused: Bool
@@ -184,6 +186,18 @@ struct DashboardView: View {
                 "Ask and Touch ID items will be allowed without interaction. Every access will still be audited, and explicit deny rules remain blocked."
             )
         }
+        .confirmationDialog(
+            "Uninstall Floria?", isPresented: $showingUninstallConfirmation
+        ) {
+            Button("Uninstall Floria", role: .destructive) {
+                uninstallApplication()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(
+                "This moves Floria.app to the Trash and stops its daemon and protected filesystem. Your encrypted Library, catalog, backups, configuration, and Keychain key stay on this Mac for a future reinstall."
+            )
+        }
         .alert(item: $backupNotice) { notice in
             Alert(
                 title: Text(notice.title),
@@ -277,6 +291,13 @@ struct DashboardView: View {
                     chooseDiagnosticsDestination()
                 }
                 .disabled(backupOperationInProgress || !state.connected)
+                if ApplicationUninstaller.isAvailable {
+                    Divider()
+                    Button("Uninstall Floria…", systemImage: "trash", role: .destructive) {
+                        showingUninstallConfirmation = true
+                    }
+                    .disabled(uninstallInProgress)
+                }
             } label: {
                 Image(systemName: "ellipsis")
                     .frame(width: 28, height: 28)
@@ -355,6 +376,24 @@ struct DashboardView: View {
                 backupNotice = BackupNotice(
                     title: "Backup Failed",
                     message: error.localizedDescription)
+            }
+        }
+    }
+
+    private func uninstallApplication() {
+        guard !uninstallInProgress else { return }
+        uninstallInProgress = true
+        ApplicationUninstaller.uninstall { result in
+            switch result {
+            case .success:
+                break
+            case .failure(let error):
+                uninstallInProgress = false
+                backupNotice = BackupNotice(
+                    title: "Uninstall Failed",
+                    message:
+                        "\(error.localizedDescription)\nFloria restarted its daemon and your data was not removed."
+                )
             }
         }
     }

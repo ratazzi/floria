@@ -87,6 +87,26 @@ struct DaemonManager: Sendable {
         _ = try? runLaunchctl(["bootout", serviceTarget])
     }
 
+    /// Stop the daemon, detach only the exact Floria mount, and remove its login item.
+    /// User config, catalog, encrypted store, backups, logs, and Keychain items are preserved.
+    func prepareForUninstall() throws {
+        guard Self.isProductionApp else {
+            throw DaemonError.notProductionApp
+        }
+        guard let daemonURL, FileManager.default.isExecutableFile(atPath: daemonURL.path) else {
+            throw DaemonError.noBinary
+        }
+
+        try prepareRuntimeDirectory()
+        try withReconciliationLock {
+            _ = try? runLaunchctl(["bootout", serviceTarget])
+            try runDaemon(daemonURL, arguments: ["unmount", "--config", configURL.path])
+            if FileManager.default.fileExists(atPath: launchAgentURL.path) {
+                try FileManager.default.removeItem(at: launchAgentURL)
+            }
+        }
+    }
+
     /// Install the LaunchAgent plist and bootstrap it with launchd. Existing user config is
     /// preserved; only a missing config and bundled example handler are seeded.
     private func install(daemonURL: URL) throws {
@@ -258,6 +278,7 @@ struct DaemonManager: Sendable {
     }
 
     enum DaemonError: LocalizedError {
+        case notProductionApp
         case noBinary
         case missingResource(String)
         case systemCall(String, Int32)
@@ -265,6 +286,8 @@ struct DaemonManager: Sendable {
 
         var errorDescription: String? {
             switch self {
+            case .notProductionApp:
+                return "Floria can only be uninstalled from a packaged app"
             case .noBinary:
                 return "Rust daemon is missing from the app bundle"
             case .missingResource(let name):
