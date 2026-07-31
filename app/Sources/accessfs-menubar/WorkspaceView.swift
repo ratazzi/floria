@@ -2084,12 +2084,9 @@ private struct LibraryCatalogView: View {
                     .frame(maxWidth: .infinity)
                     .accessibilityHint("Open details")
 
-                    Text(item.typeTitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .frame(width: 112, alignment: .leading)
+                    LibraryItemTypeColumn(title: item.typeTitle)
 
-                    SecurityLevelMenu(level: item.securityLevel) { level in
+                    LibrarySecurityLevelColumn(level: item.securityLevel) { level in
                         try await updateSecurity(item, level: level)
                     }
 
@@ -2170,6 +2167,30 @@ private struct LibraryCatalogView: View {
             try await store.updateSurfaceSecurityLevel(
                 surface.id, securityLevel: level)
         }
+    }
+}
+
+private struct LibraryItemTypeColumn: View {
+    let title: String
+
+    var body: some View {
+        Text(title)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .frame(width: 180, alignment: .leading)
+            .help(title)
+    }
+}
+
+private struct LibrarySecurityLevelColumn: View {
+    let level: WorkspaceSecurityLevel
+    let update: (WorkspaceSecurityLevel) async throws -> Void
+
+    var body: some View {
+        SecurityLevelMenu(level: level, update: update)
+            .frame(width: 108, alignment: .leading)
     }
 }
 

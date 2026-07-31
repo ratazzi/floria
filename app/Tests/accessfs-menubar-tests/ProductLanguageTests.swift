@@ -175,6 +175,15 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertTrue(libraryScene.contains(".windowStyle(.hiddenTitleBar)"))
     }
 
+    func testLibraryRowsUseStableTypeAndSecurityColumns() throws {
+        let workspace = try source("WorkspaceView.swift")
+
+        XCTAssertTrue(workspace.contains("LibraryItemTypeColumn(title: item.typeTitle)"))
+        XCTAssertTrue(workspace.contains("LibrarySecurityLevelColumn("))
+        XCTAssertTrue(workspace.contains(".frame(width: 180, alignment: .leading)"))
+        XCTAssertTrue(workspace.contains(".frame(width: 108, alignment: .leading)"))
+    }
+
     private func source(_ name: String) throws -> String {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
