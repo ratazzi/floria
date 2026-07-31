@@ -573,9 +573,7 @@ struct AdvancedWorkspaceView: View {
                 ContentUnavailableView("Select a project", systemImage: "folder")
             }
         case .library:
-            LibraryCatalogView(
-                store: state.workspace, search: search,
-                openDetails: { selection = $0 })
+            LibraryCatalogView(store: state.workspace, search: search)
         case .protectedFiles:
             ProtectedFilesView(
                 store: state.workspace, search: search,
@@ -2003,29 +2001,14 @@ private enum LibraryCatalogItem: Identifiable {
             }
     }
 
-    var detailsSelection: WorkspaceSidebarSelection {
-        switch self {
-        case .file:
-            .protectedFiles
-        case .resource(let resource):
-            switch resource.kind {
-            case .sharedSecret, .secret, .literal, .command: .sharedSecrets
-            case .envFile: .envFiles
-            case .sshIdentity, .sshAgent: .sshAgents
-            }
-        }
-    }
 }
 
 private struct LibraryCatalogView: View {
     @Bindable var store: WorkspaceStore
     let search: String
-    let openDetails: (WorkspaceSidebarSelection) -> Void
 
     @State private var filter = LibraryCatalogFilter.all
-    @State private var editingFile: WorkspaceProtectedFile?
-    @State private var editingSharedSecret: WorkspaceResource?
-    @State private var editingResource: WorkspaceResource?
+    @State private var selectedItem: LibraryCatalogItem?
 
     private var items: [LibraryCatalogItem] {
         let all =
@@ -2091,8 +2074,8 @@ private struct LibraryCatalogView: View {
                     }
 
                     Menu {
-                        Button("Edit…", systemImage: "pencil") {
-                            edit(item)
+                        Button("Details…", systemImage: "info.circle") {
+                            selectedItem = item
                         }
                         if case .file(let file) = item {
                             Divider()
@@ -2104,10 +2087,6 @@ private struct LibraryCatalogView: View {
                             Button("Copy Path", systemImage: "doc.on.doc") {
                                 copyToPasteboard(file.path)
                             }
-                        }
-                        Divider()
-                        Button("More Details…", systemImage: "ellipsis.circle") {
-                            openDetails(item.detailsSelection)
                         }
                     } label: {
                         Image(systemName: "ellipsis")
@@ -2138,25 +2117,8 @@ private struct LibraryCatalogView: View {
             }
         }
         .navigationTitle("Library")
-        .sheet(item: $editingFile) { file in
-            EditProtectedFileMetadataSheet(store: store, file: file)
-        }
-        .sheet(item: $editingSharedSecret) { resource in
-            EditSharedSecretSheet(store: store, resource: resource)
-        }
-        .sheet(item: $editingResource) { resource in
-            EditResourceMetadataSheet(store: store, resource: resource)
-        }
-    }
-
-    private func edit(_ item: LibraryCatalogItem) {
-        switch item {
-        case .file(let file):
-            editingFile = file
-        case .resource(let resource) where resource.kind == .sharedSecret:
-            editingSharedSecret = resource
-        case .resource(let resource):
-            editingResource = resource
+        .sheet(item: $selectedItem) { item in
+            LibraryItemDetailSheet(store: store, item: item)
         }
     }
 
@@ -2171,6 +2133,343 @@ private struct LibraryCatalogView: View {
             try await store.updateResourceMetadata(
                 resource.id, name: resource.name,
                 securityLevel: level, metadata: resource.metadata)
+        }
+    }
+}
+
+private struct LibraryItemDetailSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @Bindable var store: WorkspaceStore
+    let item: LibraryCatalogItem
+
+    @State private var editingFile: WorkspaceProtectedFile?
+    @State private var editingSharedSecret: WorkspaceResource?
+    @State private var editingResource: WorkspaceResource?
+    @State private var historyFile: WorkspaceProtectedFile?
+    @State private var confirmingRemoval = false
+    @State private var isWorking = false
+    @State private var errorMessage: String?
+
+    private var currentItem: LibraryCatalogItem {
+        switch item {
+        case .file(let file):
+            return store.protectedFiles.first(where: { $0.id == file.id })
+                .map(LibraryCatalogItem.file) ?? item
+        case .resource(let resource):
+            return store.resources.first(where: { $0.id == resource.id })
+                .map(LibraryCatalogItem.resource) ?? item
+        }
+    }
+
+    private var metadata: ItemMetadata {
+        switch currentItem {
+        case .file(let file): file.metadata
+        case .resource(let resource): resource.metadata
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(alignment: .top, spacing: 14) {
+                Image(systemName: currentItem.systemImage)
+                    .font(.system(size: 24, weight: .medium))
+                    .foregroundStyle(Color.blue)
+                    .frame(width: 48, height: 48)
+                    .background(Color.blue.opacity(0.1), in: RoundedRectangle(cornerRadius: 11))
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(currentItem.title)
+                        .font(.title2.bold())
+                    Text(currentItem.detail)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                }
+
+                Spacer()
+
+                SecurityLevelMenu(level: currentItem.securityLevel) { level in
+                    try await updateSecurity(level)
+                }
+                .focusable(false)
+            }
+            .padding(24)
+
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 22) {
+                    InspectorSection(title: "Details") {
+                        LabeledContent("Type", value: currentItem.typeTitle)
+                        switch currentItem {
+                        case .file(let file):
+                            LabeledContent("Path") {
+                                Text((file.path as NSString).abbreviatingWithTildeInPath)
+                                    .textSelection(.enabled)
+                            }
+                            LabeledContent("Current version", value: "v\(file.currentVersion)")
+                            LabeledContent(
+                                "Size",
+                                value: ByteCountFormatter.string(
+                                    fromByteCount: Int64(file.size), countStyle: .file))
+                        case .resource(let resource):
+                            LabeledContent(
+                                "Projects",
+                                value: resource.usageCount == 0
+                                    ? "Not in use"
+                                    : "\(resource.usageCount)")
+                            if let key = resource.defaultEnvKey {
+                                LabeledContent("Default key", value: key)
+                            }
+                            if let origin = resource.originSummary {
+                                LabeledContent("Source") {
+                                    Text(origin)
+                                        .textSelection(.enabled)
+                                }
+                            }
+                        }
+                    }
+
+                    if metadata.note != nil || !metadata.links.isEmpty {
+                        InspectorSection(title: "Info") {
+                            if let note = metadata.note {
+                                Text(note)
+                                    .font(.callout)
+                                    .textSelection(.enabled)
+                            }
+                            ForEach(metadata.links, id: \.self) { link in
+                                Button {
+                                    openMetadataLink(link)
+                                } label: {
+                                    Label(link.label, systemImage: "arrow.up.right.square")
+                                }
+                                .buttonStyle(.link)
+                            }
+                        }
+                    }
+
+                    InspectorSection(title: "Actions") {
+                        HStack(spacing: 10) {
+                            Button("Edit…", systemImage: "pencil") {
+                                editCurrentItem()
+                            }
+
+                            switch currentItem {
+                            case .file(let file):
+                                Button("History", systemImage: "clock.arrow.circlepath") {
+                                    historyFile = file
+                                }
+                                Button("Reveal in Finder", systemImage: "folder") {
+                                    NSWorkspace.shared.activateFileViewerSelecting([
+                                        URL(fileURLWithPath: file.path)
+                                    ])
+                                }
+                                Button("Copy Path", systemImage: "doc.on.doc") {
+                                    copyToPasteboard(file.path)
+                                }
+                            case .resource(let resource):
+                                if let source = resource.originSources.first {
+                                    Button("Reveal Source", systemImage: "folder") {
+                                        NSWorkspace.shared.activateFileViewerSelecting([
+                                            URL(fileURLWithPath: source.path)
+                                        ])
+                                    }
+                                }
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                    }
+
+                    if let removalTitle {
+                        Divider()
+                        HStack {
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(removalTitle)
+                                    .font(.callout.weight(.medium))
+                                Text(removalDetail)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button(removalButtonTitle, role: .destructive) {
+                                confirmingRemoval = true
+                            }
+                            .disabled(isWorking || removalIsBlocked)
+                        }
+                    }
+                }
+                .padding(24)
+            }
+
+            Divider()
+
+            HStack {
+                Spacer()
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(16)
+        }
+        .frame(width: 660, height: sheetHeight)
+        .onAppear {
+            DispatchQueue.main.async {
+                NSApp.keyWindow?.makeFirstResponder(nil)
+            }
+        }
+        .sheet(item: $editingFile) { file in
+            EditProtectedFileMetadataSheet(store: store, file: file)
+        }
+        .sheet(item: $editingSharedSecret) { resource in
+            EditSharedSecretSheet(store: store, resource: resource)
+        }
+        .sheet(item: $editingResource) { resource in
+            EditResourceMetadataSheet(store: store, resource: resource)
+        }
+        .sheet(item: $historyFile) { file in
+            ProtectedFileHistorySheet(store: store, file: file)
+        }
+        .alert(removalConfirmationTitle, isPresented: $confirmingRemoval) {
+            Button("Cancel", role: .cancel) {}
+            Button(removalButtonTitle, role: .destructive) {
+                removeCurrentItem()
+            }
+        } message: {
+            Text(removalConfirmationDetail)
+        }
+        .alert(
+            "Could not update item",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } })
+        ) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
+    }
+
+    private var sheetHeight: CGFloat {
+        var height: CGFloat = removalTitle == nil ? 420 : 470
+        if metadata.note != nil { height += 38 }
+        height += min(CGFloat(metadata.links.count) * 28, 84)
+        return min(height, 540)
+    }
+
+    private var removalTitle: String? {
+        switch currentItem {
+        case .file: "Stop protecting this file"
+        case .resource(let resource) where resource.kind == .sharedSecret:
+            "Delete this secret"
+        case .resource(let resource)
+        where resource.kind == .sshIdentity || resource.kind == .sshAgent:
+            resource.kind == .sshIdentity ? "Delete this SSH identity" : "Disconnect this SSH agent"
+        case .resource:
+            nil
+        }
+    }
+
+    private var removalDetail: String {
+        switch currentItem {
+        case .file:
+            "Restore the current plaintext at its original path and delete its encrypted history."
+        case .resource(let resource) where resource.usageCount > 0:
+            "Remove it from \(resource.usageCount) project\(resource.usageCount == 1 ? "" : "s") first."
+        case .resource(let resource) where resource.kind == .sshAgent:
+            "The external agent is not changed."
+        case .resource:
+            "This permanently removes the encrypted value and version history."
+        }
+    }
+
+    private var removalButtonTitle: String {
+        switch currentItem {
+        case .file: "Stop Protecting…"
+        case .resource(let resource) where resource.kind == .sshAgent: "Disconnect…"
+        case .resource: "Delete…"
+        }
+    }
+
+    private var removalIsBlocked: Bool {
+        switch currentItem {
+        case .file(let file): !file.linked
+        case .resource(let resource): resource.usageCount > 0
+        }
+    }
+
+    private var removalConfirmationTitle: String {
+        switch currentItem {
+        case .file: "Restore plaintext and stop protecting?"
+        case .resource(let resource) where resource.kind == .sshAgent:
+            "Disconnect SSH agent?"
+        case .resource(let resource) where resource.kind == .sshIdentity:
+            "Delete SSH identity?"
+        case .resource:
+            "Delete secret?"
+        }
+    }
+
+    private var removalConfirmationDetail: String {
+        switch currentItem {
+        case .file(let file):
+            "Floria will restore version \(file.currentVersion) at \(file.path), then permanently delete every encrypted version."
+        case .resource(let resource) where resource.kind == .sshIdentity:
+            "This permanently removes the encrypted private-key copy from Floria. The original imported file is not changed."
+        case .resource(let resource) where resource.kind == .sshAgent:
+            "Floria removes only its saved identity metadata. The external agent is not changed."
+        case .resource:
+            "This permanently removes the encrypted value and version history."
+        }
+    }
+
+    private func editCurrentItem() {
+        switch currentItem {
+        case .file(let file):
+            editingFile = file
+        case .resource(let resource) where resource.kind == .sharedSecret:
+            editingSharedSecret = resource
+        case .resource(let resource):
+            editingResource = resource
+        }
+    }
+
+    private func updateSecurity(_ level: WorkspaceSecurityLevel) async throws {
+        switch currentItem {
+        case .file(let file):
+            try await store.updateProtectedFileMetadata(
+                file.id, securityLevel: level, metadata: file.metadata)
+        case .resource(let resource):
+            try await store.updateResourceMetadata(
+                resource.id, name: resource.name,
+                securityLevel: level, metadata: resource.metadata)
+        }
+    }
+
+    private func removeCurrentItem() {
+        isWorking = true
+        Task {
+            defer { isWorking = false }
+            do {
+                switch currentItem {
+                case .file(let file):
+                    let deleted = try await store.restoreFile(file.id)
+                    guard deleted else {
+                        errorMessage =
+                            "The plaintext file was restored, but its encrypted history could not be deleted."
+                        return
+                    }
+                case .resource(let resource) where resource.kind == .sharedSecret:
+                    try await store.deleteSharedSecret(resource.id)
+                case .resource(let resource)
+                where resource.kind == .sshIdentity || resource.kind == .sshAgent:
+                    try await store.removeSshAgentResource(resource.id)
+                case .resource:
+                    return
+                }
+                dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
         }
     }
 }

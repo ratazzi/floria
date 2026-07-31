@@ -74,6 +74,8 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertFalse(workspace.contains(#"sidebarRow("Env Files""#))
         XCTAssertFalse(workspace.contains(#""Protected Files", systemImage:"#))
         XCTAssertTrue(dashboard.contains("openWorkspace(.library)"))
+        XCTAssertTrue(workspace.contains("LibraryItemDetailSheet("))
+        XCTAssertFalse(workspace.contains(#""More Details…""#))
     }
 
     private func source(_ name: String) throws -> String {
