@@ -600,21 +600,10 @@ struct DashboardView: View {
     }
 
     private var librarySummary: String {
-        let secrets = state.workspace.resources.filter {
-            $0.kind == .sharedSecret || $0.kind == .secret
-        }.count
-        let envFiles = state.workspace.resources.filter { $0.kind == .envFile }.count
-        let sshIdentities = state.workspace.resources.filter { $0.kind == .sshIdentity }.count
-        let protected = state.workspace.protectedFiles.count
-        var parts = [
-            "\(secrets) Secret\(secrets == 1 ? "" : "s")",
-            "\(envFiles) Env File\(envFiles == 1 ? "" : "s")",
-            "\(sshIdentities) SSH Identit\(sshIdentities == 1 ? "y" : "ies")",
-        ]
-        if protected > 0 {
-            parts.append("\(protected) Protected File\(protected == 1 ? "" : "s")")
-        }
-        return parts.joined(separator: "  ·  ")
+        let count = state.workspace.resources.count + state.workspace.protectedFiles.count
+        return count == 0
+            ? "No managed items yet"
+            : "\(count) managed item\(count == 1 ? "" : "s")"
     }
 
     private func projectMatchesSearch(_ project: WorkspaceProject) -> Bool {
@@ -996,7 +985,7 @@ private struct CompactProjectDetailView: View {
                         : "Worktrees, \(unmanagedWorktreeCount) newly discovered")
 
                 Button(action: openAdvanced) {
-                    Label("Manage Project", systemImage: "slider.horizontal.3")
+                    Label("Project Settings", systemImage: "slider.horizontal.3")
                 }
                 .buttonStyle(.bordered)
             }
@@ -1597,40 +1586,21 @@ private struct CompactSurfaceRow: View {
     let projectPath: String
     let openAdvanced: () -> Void
 
-    private var enabledBindings: [WorkspaceBinding] {
-        bindings.filter(\.isEnabled)
-    }
-
-    // A linked output whose bindings are all disabled composes to an empty
-    // file; surface that as "Paused" instead of a healthy status.
-    private var isPaused: Bool {
-        !bindings.isEmpty && enabledBindings.isEmpty
-    }
-
-    private var sourceSummary: String? {
-        if bindings.count == 1,
-            let resource = state.workspace.resource(bindings[0].resourceID)
-        {
-            return [resource.kind.title, resource.exportSummary]
-                .compactMap { $0 }
-                .joined(separator: " · ")
-        }
-        if bindings.count > 1 {
-            return "\(bindings.count) sources · \(enabledBindings.count) enabled"
-        }
-        return surface.kind.managedTitle
+    private var needsAttention: Bool {
+        !surface.status.isHealthy
+            || (!bindings.isEmpty && bindings.allSatisfy { !$0.isEnabled })
     }
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: surface.kind.systemImage)
+            Image(systemName: presentation.systemImage)
                 .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(Color.blue.opacity(0.76))
                 .frame(width: 32, height: 32)
                 .background(Color.blue.opacity(0.07), in: RoundedRectangle(cornerRadius: 7))
 
             VStack(alignment: .leading, spacing: 2) {
-                Text(surface.name)
+                Text(URL(fileURLWithPath: surface.path).lastPathComponent)
                     .font(.callout.weight(.semibold))
                     .lineLimit(1)
                 Text(compactManagedPath(surface.path, projectPath: projectPath))
@@ -1642,26 +1612,11 @@ private struct CompactSurfaceRow: View {
 
             Spacer()
 
-            if let sourceSummary {
-                Text(sourceSummary)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-
-            if isPaused {
-                Label("Paused", systemImage: "pause.circle")
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(Color.orange)
-                    .frame(width: 82, alignment: .leading)
-            } else if !surface.status.isHealthy {
-                Label(
-                    surface.status.rawValue,
-                    systemImage: "exclamationmark.circle")
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(Color.orange)
-                    .frame(width: 82, alignment: .leading)
-            }
+            Text(needsAttention ? "Needs attention" : presentation.title)
+                .font(.caption.weight(needsAttention ? .medium : .regular))
+                .foregroundStyle(needsAttention ? Color.orange : Color.secondary)
+                .lineLimit(1)
+                .frame(width: 126, alignment: .leading)
 
             CompactSecurityLevelMenu(state: state, level: surface.securityLevel) { level in
                 try await state.workspace.updateSurfaceSecurityLevel(
@@ -1688,10 +1643,15 @@ private struct CompactSurfaceRow: View {
             }
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
-            .accessibilityLabel("\(surface.name) actions")
+            .accessibilityLabel(
+                "\(URL(fileURLWithPath: surface.path).lastPathComponent) actions")
         }
         .padding(.horizontal, 14)
         .frame(minHeight: 54)
+    }
+
+    private var presentation: CompactManagedKindPresentation {
+        CompactManagedKindPresentation(surface: surface)
     }
 }
 
@@ -1725,16 +1685,11 @@ private struct CompactProtectedFileRow: View {
 
             Spacer()
 
-            Text(file.kind.title)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Text(file.linked ? file.kind.title : "Needs attention")
+                .font(.caption.weight(file.linked ? .regular : .medium))
+                .foregroundStyle(file.linked ? Color.secondary : Color.orange)
                 .lineLimit(1)
-
-            if !file.linked {
-                Label("Needs attention", systemImage: "exclamationmark.circle")
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(Color.orange)
-            }
+                .frame(width: 126, alignment: .leading)
 
             CompactSecurityLevelMenu(state: state, level: file.securityLevel) { level in
                 try await state.workspace.updateProtectedFileMetadata(
@@ -1794,6 +1749,23 @@ private struct CompactProtectedFileRow: View {
             Text(
                 "Floria will keep this path, parse its values, and make its contents configurable. Existing encrypted versions are reused."
             )
+        }
+    }
+}
+
+private struct CompactManagedKindPresentation {
+    let title: String
+    let systemImage: String
+
+    init(surface: WorkspaceSurface) {
+        let recognized = WorkspaceProtectedFileKind.infer(from: surface.path)
+        switch recognized {
+        case .dotenv, .direnv, .pgpass, .awsCredentials:
+            title = recognized.title
+            systemImage = recognized.systemImage
+        case .file:
+            title = surface.kind.managedTitle
+            systemImage = surface.kind.systemImage
         }
     }
 }

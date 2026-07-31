@@ -56,6 +56,11 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertFalse(source.contains(#"DashboardSection(title: "Protected Files")"#))
         XCTAssertFalse(source.contains(#"DashboardSection(title: "Unattached Bindings")"#))
         XCTAssertFalse(source.contains(#""Manage Output…""#))
+        XCTAssertFalse(source.contains(#""Manage Project""#))
+        XCTAssertFalse(source.contains("sourceSummary"))
+        XCTAssertTrue(source.contains(#""Project Settings""#))
+        XCTAssertTrue(source.contains(#""No managed items yet""#))
+        XCTAssertTrue(source.contains(#""\(count) managed item"#))
     }
 
     private func source(_ name: String) throws -> String {
