@@ -224,6 +224,7 @@ private func availableEnvironmentFileName(
 enum WorkspaceSidebarSelection: Hashable {
     case projects
     case project(WorkspaceProject.ID)
+    case library
     case protectedFiles
     case sharedSecrets
     case envFiles
@@ -457,14 +458,7 @@ struct AdvancedWorkspaceView: View {
                     sidebarSectionTitle("Library")
                     VStack(spacing: 3) {
                         sidebarRow("Projects", systemImage: "folder", tag: .projects)
-                        sidebarRow(
-                            "Protected Files", systemImage: "lock.fill",
-                            tag: .protectedFiles)
-                        sidebarRow("Shared Secrets", systemImage: "key", tag: .sharedSecrets)
-                        sidebarRow("Env Files", systemImage: "doc.badge.gearshape", tag: .envFiles)
-                        sidebarRow(
-                            "SSH Identities", systemImage: "key.horizontal",
-                            tag: .sshAgents)
+                        sidebarRow("All Items", systemImage: "books.vertical", tag: .library)
                         sidebarRow(
                             "Access Log",
                             systemImage: "clock.arrow.trianglehead.counterclockwise.rotate.90",
@@ -578,6 +572,10 @@ struct AdvancedWorkspaceView: View {
             } else {
                 ContentUnavailableView("Select a project", systemImage: "folder")
             }
+        case .library:
+            LibraryCatalogView(
+                store: state.workspace, search: search,
+                openDetails: { selection = $0 })
         case .protectedFiles:
             ProtectedFilesView(
                 store: state.workspace, search: search,
@@ -1881,6 +1879,299 @@ private struct ProjectCatalogView: View {
             }
         }
         .navigationTitle("Projects")
+    }
+}
+
+private enum LibraryCatalogFilter: String, CaseIterable, Identifiable {
+    case all
+    case files
+    case secrets
+    case ssh
+
+    var id: Self { self }
+
+    var title: String {
+        switch self {
+        case .all: "All"
+        case .files: "Files"
+        case .secrets: "Secrets"
+        case .ssh: "SSH"
+        }
+    }
+
+    func includes(_ item: LibraryCatalogItem) -> Bool {
+        switch (self, item) {
+        case (.all, _), (.files, .file):
+            true
+        case (.files, .resource(let resource)):
+            resource.kind == .envFile
+        case (.secrets, .resource(let resource)):
+            resource.kind == .sharedSecret || resource.kind == .secret
+        case (.ssh, .resource(let resource)):
+            resource.kind == .sshIdentity || resource.kind == .sshAgent
+        default:
+            false
+        }
+    }
+}
+
+private enum LibraryCatalogItem: Identifiable {
+    case file(WorkspaceProtectedFile)
+    case resource(WorkspaceResource)
+
+    var id: String {
+        switch self {
+        case .file(let file): "file:\(file.id)"
+        case .resource(let resource): "resource:\(resource.id)"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .file(let file):
+            URL(fileURLWithPath: file.path).lastPathComponent
+        case .resource(let resource):
+            resource.name
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .file(let file):
+            return (file.path as NSString).abbreviatingWithTildeInPath
+        case .resource(let resource):
+            if let note = resource.metadata.note { return note }
+            if let origin = resource.originSummary { return origin }
+            if let key = resource.defaultEnvKey { return key }
+            return resource.usageCount == 0
+                ? "Not used by a project"
+                : "Used by \(resource.usageCount) project\(resource.usageCount == 1 ? "" : "s")"
+        }
+    }
+
+    var typeTitle: String {
+        switch self {
+        case .file(let file):
+            file.kind.title
+        case .resource(let resource):
+            switch resource.kind {
+            case .sharedSecret, .secret: "Secret"
+            case .envFile:
+                resource.originSources.first.map {
+                    WorkspaceProtectedFileKind.infer(from: $0.path).title
+                } ?? "Env file"
+            case .sshIdentity: "SSH identity"
+            case .sshAgent: "SSH agent"
+            case .literal: "Value"
+            case .command: "Command"
+            }
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .file(let file): return file.kind.systemImage
+        case .resource(let resource):
+            if resource.kind == .envFile, let source = resource.originSources.first {
+                return WorkspaceProtectedFileKind.infer(from: source.path).systemImage
+            }
+            return resource.kind.systemImage
+        }
+    }
+
+    var securityLevel: WorkspaceSecurityLevel {
+        switch self {
+        case .file(let file): file.securityLevel
+        case .resource(let resource): resource.securityLevel
+        }
+    }
+
+    func matches(_ search: String) -> Bool {
+        guard !search.isEmpty else { return true }
+        let metadata: ItemMetadata
+        switch self {
+        case .file(let file): metadata = file.metadata
+        case .resource(let resource): metadata = resource.metadata
+        }
+        return title.localizedCaseInsensitiveContains(search)
+            || detail.localizedCaseInsensitiveContains(search)
+            || typeTitle.localizedCaseInsensitiveContains(search)
+            || (metadata.note?.localizedCaseInsensitiveContains(search) == true)
+            || metadata.links.contains {
+                $0.label.localizedCaseInsensitiveContains(search)
+                    || $0.url.localizedCaseInsensitiveContains(search)
+            }
+    }
+
+    var detailsSelection: WorkspaceSidebarSelection {
+        switch self {
+        case .file:
+            .protectedFiles
+        case .resource(let resource):
+            switch resource.kind {
+            case .sharedSecret, .secret, .literal, .command: .sharedSecrets
+            case .envFile: .envFiles
+            case .sshIdentity, .sshAgent: .sshAgents
+            }
+        }
+    }
+}
+
+private struct LibraryCatalogView: View {
+    @Bindable var store: WorkspaceStore
+    let search: String
+    let openDetails: (WorkspaceSidebarSelection) -> Void
+
+    @State private var filter = LibraryCatalogFilter.all
+    @State private var editingFile: WorkspaceProtectedFile?
+    @State private var editingSharedSecret: WorkspaceResource?
+    @State private var editingResource: WorkspaceResource?
+
+    private var items: [LibraryCatalogItem] {
+        let all =
+            store.protectedFiles.map(LibraryCatalogItem.file)
+            + store.resources.map(LibraryCatalogItem.resource)
+        return all
+            .filter { filter.includes($0) && $0.matches(search) }
+            .sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 18) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Library").font(.title2.bold())
+                    Text("Everything Floria manages, in one place")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                Picker("Type", selection: $filter) {
+                    ForEach(LibraryCatalogFilter.allCases) { option in
+                        Text(option.title).tag(option)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 420)
+            }
+            .padding(24)
+
+            List(items) { item in
+                HStack(spacing: 12) {
+                    Image(systemName: item.systemImage)
+                        .font(.title3)
+                        .foregroundStyle(.blue)
+                        .frame(width: 36, height: 36)
+                        .background(Color.blue.opacity(0.1))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(item.title)
+                            .font(.body.weight(.medium))
+                            .lineLimit(1)
+                        Text(item.detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+
+                    Spacer()
+
+                    Text(item.typeTitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 112, alignment: .leading)
+
+                    SecurityLevelMenu(level: item.securityLevel) { level in
+                        try await updateSecurity(item, level: level)
+                    }
+
+                    Menu {
+                        Button("Edit…", systemImage: "pencil") {
+                            edit(item)
+                        }
+                        if case .file(let file) = item {
+                            Divider()
+                            Button("Reveal in Finder", systemImage: "folder") {
+                                NSWorkspace.shared.activateFileViewerSelecting([
+                                    URL(fileURLWithPath: file.path)
+                                ])
+                            }
+                            Button("Copy Path", systemImage: "doc.on.doc") {
+                                copyToPasteboard(file.path)
+                            }
+                        }
+                        Divider()
+                        Button("More Details…", systemImage: "ellipsis.circle") {
+                            openDetails(item.detailsSelection)
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis")
+                            .frame(width: 28, height: 28)
+                            .contentShape(Rectangle())
+                    }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
+                    .accessibilityLabel("More actions for \(item.title)")
+                }
+                .padding(.vertical, 5)
+            }
+            .overlay {
+                if items.isEmpty {
+                    if search.isEmpty {
+                        ContentUnavailableView(
+                            filter == .all ? "Nothing managed yet" : "No \(filter.title.lowercased())",
+                            systemImage: "tray",
+                            description: Text(
+                                filter == .all
+                                    ? "Use Discover or Add to bring an existing item into Floria."
+                                    : "Choose another type or add an item."))
+                    } else {
+                        ContentUnavailableView.search(text: search)
+                    }
+                }
+            }
+        }
+        .navigationTitle("Library")
+        .sheet(item: $editingFile) { file in
+            EditProtectedFileMetadataSheet(store: store, file: file)
+        }
+        .sheet(item: $editingSharedSecret) { resource in
+            EditSharedSecretSheet(store: store, resource: resource)
+        }
+        .sheet(item: $editingResource) { resource in
+            EditResourceMetadataSheet(store: store, resource: resource)
+        }
+    }
+
+    private func edit(_ item: LibraryCatalogItem) {
+        switch item {
+        case .file(let file):
+            editingFile = file
+        case .resource(let resource) where resource.kind == .sharedSecret:
+            editingSharedSecret = resource
+        case .resource(let resource):
+            editingResource = resource
+        }
+    }
+
+    private func updateSecurity(
+        _ item: LibraryCatalogItem, level: WorkspaceSecurityLevel
+    ) async throws {
+        switch item {
+        case .file(let file):
+            try await store.updateProtectedFileMetadata(
+                file.id, securityLevel: level, metadata: file.metadata)
+        case .resource(let resource):
+            try await store.updateResourceMetadata(
+                resource.id, name: resource.name,
+                securityLevel: level, metadata: resource.metadata)
+        }
     }
 }
 

@@ -63,6 +63,19 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertTrue(source.contains(#""\(count) managed item"#))
     }
 
+    func testLibraryDefaultsToOneInventoryAndUsesTypesAsFilters() throws {
+        let workspace = try source("WorkspaceView.swift")
+        let dashboard = try source("CompactDashboardView.swift")
+
+        XCTAssertTrue(workspace.contains(#"sidebarRow("All Items""#))
+        XCTAssertTrue(workspace.contains("LibraryCatalogView("))
+        XCTAssertTrue(workspace.contains("LibraryCatalogFilter.allCases"))
+        XCTAssertFalse(workspace.contains(#"sidebarRow("Shared Secrets""#))
+        XCTAssertFalse(workspace.contains(#"sidebarRow("Env Files""#))
+        XCTAssertFalse(workspace.contains(#""Protected Files", systemImage:"#))
+        XCTAssertTrue(dashboard.contains("openWorkspace(.library)"))
+    }
+
     private func source(_ name: String) throws -> String {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

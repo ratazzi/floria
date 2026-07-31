@@ -458,25 +458,10 @@ struct DashboardView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                 Spacer()
-                Menu {
-                    Button("Protected Files", systemImage: "lock.fill") {
-                        openWorkspace(.protectedFiles)
-                    }
-                    Button("Shared Secrets", systemImage: "key") {
-                        openWorkspace(.sharedSecrets)
-                    }
-                    Button("Env Files", systemImage: "doc.badge.gearshape") {
-                        openWorkspace(.envFiles)
-                    }
-                    Button("SSH Identities", systemImage: "key.horizontal") {
-                        openWorkspace(.sshAgents)
-                    }
+                Button {
+                    openWorkspace(.library)
                 } label: {
-                    HStack(spacing: 6) {
-                        Text("Open Library")
-                        Image(systemName: "chevron.down")
-                            .font(.caption2)
-                    }
+                    Text("Open Library")
                 }
                 .buttonStyle(.bordered)
             }
