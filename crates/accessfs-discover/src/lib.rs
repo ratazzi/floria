@@ -2388,7 +2388,7 @@ mod tests {
         fs::create_dir_all(root.join("tmp/secrets")).unwrap();
         fs::write(
             root.join("tmp/secrets/customs.key.pem"),
-            "-----BEGIN FIXTURE MATERIAL-----\nfixture\n-----END FIXTURE MATERIAL-----\n",
+            "obviously-invalid-private-key-fixture\n",
         )
         .unwrap();
         fs::write(root.join(".env"), "VISIBLE=fixture\n").unwrap();
