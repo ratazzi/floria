@@ -787,6 +787,11 @@ private struct ProjectRow: View {
     }
 }
 
+private enum AccessSummaryRowLayout {
+    static let countWidth: CGFloat = 58
+    static let timeWidth: CGFloat = 72
+}
+
 private struct AccessSummaryRow: View {
     let group: RecentAccessGroup
     private var event: RecentAccess { group.latest }
@@ -818,17 +823,21 @@ private struct AccessSummaryRow: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
             Spacer()
-            if group.count > 1 {
-                Text("×\(group.count)")
-                    .font(.caption.monospacedDigit().weight(.medium))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(.tertiary.opacity(0.16), in: Capsule())
+            ZStack(alignment: .trailing) {
+                if group.count > 1 {
+                    Text("×\(group.count)")
+                        .font(.caption.monospacedDigit().weight(.medium))
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(.tertiary.opacity(0.16), in: Capsule())
+                }
             }
+            .frame(width: AccessSummaryRowLayout.countWidth, alignment: .trailing)
             RecentAccessTimeText(event: event)
                 .font(.callout)
                 .foregroundStyle(.secondary)
+                .frame(width: AccessSummaryRowLayout.timeWidth, alignment: .trailing)
         }
         .padding(.horizontal, 14)
         .frame(minHeight: 44)

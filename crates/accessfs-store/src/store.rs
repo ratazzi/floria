@@ -90,6 +90,11 @@ pub struct SecretRecord {
     pub current_version: u32,
     /// Default authorization behavior when no explicit process rule matches this secret.
     pub enforcement: Enforcement,
+    /// Project Environments where this file-backed item is exposed to managed worktrees.
+    ///
+    /// `None` preserves legacy behavior: expose the file in every Environment of its owning
+    /// Project. Managed value secrets do not use this field.
+    pub environment_ids: Option<Vec<String>>,
     /// Plaintext, non-secret context for display and navigation.
     pub metadata: ItemMetadata,
 }
@@ -151,6 +156,7 @@ pub trait SecretStore: Send + Sync {
         id: &SecretId,
         metadata: ItemMetadata,
         enforcement: Enforcement,
+        environment_ids: Option<Vec<String>>,
     ) -> StoreResult<()>;
     /// Delete a secret and all its versions.
     fn delete(&self, id: &SecretId) -> StoreResult<()>;
@@ -172,6 +178,8 @@ struct MetaFile {
     current_version: u32,
     #[serde(default = "default_secret_enforcement")]
     enforcement: Enforcement,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    environment_ids: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "ItemMetadata::is_empty")]
     metadata: ItemMetadata,
 }
@@ -436,6 +444,7 @@ impl SecretStore for AgeDirStore {
                 created: now_rfc3339(),
                 current_version: 1,
                 enforcement: Enforcement::Prompt,
+                environment_ids: None,
                 metadata: ItemMetadata::default(),
             },
         )?;
@@ -534,6 +543,7 @@ impl SecretStore for AgeDirStore {
             created: meta.created,
             current_version: meta.current_version,
             enforcement: meta.enforcement,
+            environment_ids: meta.environment_ids,
             metadata: meta.metadata,
         }))
     }
@@ -581,12 +591,14 @@ impl SecretStore for AgeDirStore {
         id: &SecretId,
         metadata: ItemMetadata,
         enforcement: Enforcement,
+        environment_ids: Option<Vec<String>>,
     ) -> StoreResult<()> {
         metadata.validate().map_err(StoreError::Invalid)?;
         let _lock = self.lock_exclusive()?;
         let mut meta = self.read_meta(id)?;
         meta.metadata = metadata;
         meta.enforcement = enforcement;
+        meta.environment_ids = environment_ids;
         self.write_meta(id, &meta)
     }
 
@@ -817,11 +829,21 @@ mod tests {
             }],
         };
 
-        s.update_settings(&id, metadata.clone(), Enforcement::TouchId).unwrap();
+        s.update_settings(
+            &id,
+            metadata.clone(),
+            Enforcement::TouchId,
+            Some(vec!["production".to_string(), "staging".to_string()]),
+        )
+        .unwrap();
 
         let record = s.record(&id).unwrap().unwrap();
         assert_eq!(record.metadata, metadata);
         assert_eq!(record.enforcement, Enforcement::TouchId);
+        assert_eq!(
+            record.environment_ids,
+            Some(vec!["production".to_string(), "staging".to_string()])
+        );
         assert_eq!(record.current_version, 1);
         assert_eq!(s.history(&id).unwrap().len(), 1);
         let sidecar = std::fs::read_to_string(s.entry_dir(&id).join("meta.toml")).unwrap();

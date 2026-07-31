@@ -78,6 +78,10 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertFalse(workspace.contains(#""Protected Files", systemImage:"#))
         XCTAssertTrue(dashboard.contains("openWorkspace(.library)"))
         XCTAssertTrue(workspace.contains("LibraryItemDetailSheet("))
+        XCTAssertTrue(
+            workspace.contains(
+                #"Button("#)
+                && workspace.contains(#""Update Contents…","#))
         XCTAssertFalse(workspace.contains(#""More Details…""#))
     }
 
@@ -98,6 +102,25 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertFalse(workspace.contains(#""Remove Configuration""#))
         XCTAssertTrue(workspace.contains(#""Stop Protecting…""#))
         XCTAssertTrue(workspace.contains("store.restoreManagedFile(surface.id)"))
+    }
+
+    func testManagedFileEnvironmentScopeIsEditableFromItsDetails() throws {
+        let workspace = try source("WorkspaceView.swift")
+
+        XCTAssertTrue(workspace.contains("ManagedFileEnvironmentMenu("))
+        XCTAssertFalse(
+            workspace.contains(#"LabeledContent("Environments", value: environments)"#))
+    }
+
+    func testRecentAccessCountAndTimeUseStableColumns() throws {
+        let dashboard = try source("CompactDashboardView.swift")
+
+        XCTAssertTrue(
+            dashboard.contains(
+                #".frame(width: AccessSummaryRowLayout.countWidth, alignment: .trailing)"#))
+        XCTAssertTrue(
+            dashboard.contains(
+                #".frame(width: AccessSummaryRowLayout.timeWidth, alignment: .trailing)"#))
     }
 
     func testManagedItemRowsExposeDetailsWithoutOpeningTheMoreMenu() throws {

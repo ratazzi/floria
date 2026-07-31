@@ -2247,6 +2247,14 @@ private struct LibrarySecurityLevelColumn: View {
     }
 }
 
+private struct PendingProtectedFileContentsUpdate {
+    let fileID: WorkspaceProtectedFile.ID
+    let inputPath: String
+    let inputName: String
+    let inputSize: Int64
+    let nextVersion: UInt32
+}
+
 struct LibraryItemDetailSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Bindable var store: WorkspaceStore
@@ -2260,6 +2268,7 @@ struct LibraryItemDetailSheet: View {
     @State private var historyFile: WorkspaceProtectedFile?
     @State private var confirmingConfiguration = false
     @State private var confirmingRemoval = false
+    @State private var pendingContentsUpdate: PendingProtectedFileContentsUpdate?
     @State private var isWorking = false
     @State private var errorMessage: String?
 
@@ -2337,6 +2346,11 @@ struct LibraryItemDetailSheet: View {
                             LabeledContent(
                                 "Status",
                                 value: file.managedLink.statusTitle)
+                            if store.project(containingManagedPath: file.path) != nil {
+                                LabeledContent("Environments") {
+                                    ManagedFileEnvironmentMenu(store: store, file: file)
+                                }
+                            }
                             LabeledContent("Current version", value: "v\(file.currentVersion)")
                             LabeledContent(
                                 "Size",
@@ -2396,6 +2410,13 @@ struct LibraryItemDetailSheet: View {
                             }
                             switch currentItem {
                             case .file(let file):
+                                Button(
+                                    "Update Contents…",
+                                    systemImage: "arrow.triangle.2.circlepath"
+                                ) {
+                                    chooseReplacementContents(for: file)
+                                }
+                                .disabled(isWorking)
                                 Button("Edit Info…", systemImage: "pencil") {
                                     editCurrentItem()
                                 }
@@ -2407,13 +2428,15 @@ struct LibraryItemDetailSheet: View {
                                 Button("History", systemImage: "clock.arrow.circlepath") {
                                     historyFile = file
                                 }
-                                Button("Reveal in Finder", systemImage: "folder") {
-                                    NSWorkspace.shared.activateFileViewerSelecting([
-                                        URL(fileURLWithPath: file.path)
-                                    ])
-                                }
-                                Button("Copy Path", systemImage: "doc.on.doc") {
-                                    copyToPasteboard(file.path)
+                                Menu("More", systemImage: "ellipsis") {
+                                    Button("Reveal in Finder", systemImage: "folder") {
+                                        NSWorkspace.shared.activateFileViewerSelecting([
+                                            URL(fileURLWithPath: file.path)
+                                        ])
+                                    }
+                                    Button("Copy Path", systemImage: "doc.on.doc") {
+                                        copyToPasteboard(file.path)
+                                    }
                                 }
                             case .resource(let resource):
                                 Button("Edit Info…", systemImage: "pencil") {
@@ -2511,6 +2534,25 @@ struct LibraryItemDetailSheet: View {
             Text(
                 "Floria will keep this path, parse its values, and make its contents configurable. Existing encrypted versions are reused."
             )
+        }
+        .alert(
+            "Create version \(pendingContentsUpdate?.nextVersion ?? 1)?",
+            isPresented: Binding(
+                get: { pendingContentsUpdate != nil },
+                set: { if !$0 { pendingContentsUpdate = nil } })
+        ) {
+            Button("Cancel", role: .cancel) {
+                pendingContentsUpdate = nil
+            }
+            Button("Update Contents") {
+                updateProtectedFileContents()
+            }
+        } message: {
+            if let update = pendingContentsUpdate {
+                Text(
+                    "Use \(update.inputName) (\(ByteCountFormatter.string(fromByteCount: update.inputSize, countStyle: .file))) as the new contents. The selected file and existing managed links will not be changed."
+                )
+            }
         }
         .alert(removalConfirmationTitle, isPresented: $confirmingRemoval) {
             Button("Cancel", role: .cancel) {}
@@ -2637,6 +2679,46 @@ struct LibraryItemDetailSheet: View {
                 editingResource = resource
             } else {
                 editingSurface = surface
+            }
+        }
+    }
+
+    private func chooseReplacementContents(for file: WorkspaceProtectedFile) {
+        let panel = NSOpenPanel()
+        panel.title = "Update \(URL(fileURLWithPath: file.path).lastPathComponent)"
+        panel.message = "Choose a file whose exact bytes should become the next managed version."
+        panel.prompt = "Choose"
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        panel.showsHiddenFiles = true
+        panel.resolvesAliases = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
+            let size = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+            pendingContentsUpdate = PendingProtectedFileContentsUpdate(
+                fileID: file.id,
+                inputPath: url.path,
+                inputName: url.lastPathComponent,
+                inputSize: size,
+                nextVersion: file.currentVersion + 1)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func updateProtectedFileContents() {
+        guard let update = pendingContentsUpdate else { return }
+        pendingContentsUpdate = nil
+        isWorking = true
+        Task {
+            defer { isWorking = false }
+            do {
+                try await store.updateProtectedFileContents(
+                    update.fileID, from: update.inputPath)
+            } catch {
+                errorMessage = error.localizedDescription
             }
         }
     }
@@ -2914,6 +2996,178 @@ private struct ProtectedFilesView: View {
     }
 }
 
+private struct ManagedFileEnvironmentMenu: View {
+    @Bindable var store: WorkspaceStore
+    let file: WorkspaceProtectedFile
+
+    @State private var showingNewEnvironment = false
+    @State private var isUpdating = false
+    @State private var errorMessage: String?
+
+    private var currentFile: WorkspaceProtectedFile {
+        store.protectedFiles.first(where: { $0.id == file.id }) ?? file
+    }
+
+    private var project: WorkspaceProject? {
+        store.project(containingManagedPath: currentFile.path)
+    }
+
+    private var selectedIDs: Set<WorkspaceEnvironment.ID> {
+        Set(currentFile.environmentIDs)
+    }
+
+    private var summary: String {
+        guard let project else { return "Not assigned" }
+        let names = project.environments
+            .filter { selectedIDs.contains($0.id) }
+            .map(\.name)
+        return names.isEmpty ? "Choose environments" : names.joined(separator: ", ")
+    }
+
+    var body: some View {
+        Menu {
+            if let project {
+                ForEach(project.environments) { environment in
+                    Button {
+                        toggle(environment.id, in: project)
+                    } label: {
+                        if selectedIDs.contains(environment.id) {
+                            Label(environment.name, systemImage: "checkmark")
+                        } else {
+                            Text(environment.name)
+                        }
+                    }
+                    .disabled(
+                        isUpdating
+                            || (selectedIDs.contains(environment.id) && selectedIDs.count == 1))
+                }
+                Divider()
+                Button("New Environment…", systemImage: "plus") {
+                    showingNewEnvironment = true
+                }
+                .disabled(isUpdating)
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Text(summary)
+                    .lineLimit(1)
+                Image(systemName: "chevron.up.chevron.down")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .accessibilityLabel("Environments")
+        .accessibilityHint("Choose where this managed file is available")
+        .sheet(isPresented: $showingNewEnvironment) {
+            if let project {
+                NewManagedFileEnvironmentSheet(
+                    store: store, fileID: currentFile.id, project: project)
+            }
+        }
+        .alert(
+            "Could not update environments",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } })
+        ) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
+    }
+
+    private func toggle(
+        _ environmentID: WorkspaceEnvironment.ID, in project: WorkspaceProject
+    ) {
+        var updatedIDs = selectedIDs
+        if updatedIDs.contains(environmentID) {
+            guard updatedIDs.count > 1 else { return }
+            updatedIDs.remove(environmentID)
+        } else {
+            updatedIDs.insert(environmentID)
+        }
+        let orderedIDs = project.environments
+            .filter { updatedIDs.contains($0.id) }
+            .map(\.id)
+        Task {
+            isUpdating = true
+            defer { isUpdating = false }
+            do {
+                try await store.updateProtectedFileMetadata(
+                    currentFile.id, securityLevel: currentFile.securityLevel,
+                    environmentIDs: orderedIDs, metadata: currentFile.metadata)
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+}
+
+private struct NewManagedFileEnvironmentSheet: View {
+    @Bindable var store: WorkspaceStore
+    let fileID: WorkspaceProtectedFile.ID
+    let project: WorkspaceProject
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var name = ""
+    @State private var isSaving = false
+    @State private var errorMessage: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("New Environment")
+                    .font(.title2.bold())
+                Text("Add another environment and include this managed file in it.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+
+            TextField("Production", text: $name)
+                .textFieldStyle(.roundedBorder)
+
+            Divider()
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Create and Include", action: create)
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(isSaving || name.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+        .padding(24)
+        .frame(width: 440)
+        .alert(
+            "Could not create environment",
+            isPresented: Binding(
+                get: { errorMessage != nil },
+                set: { if !$0 { errorMessage = nil } })
+        ) {
+            Button("OK") { errorMessage = nil }
+        } message: {
+            Text(errorMessage ?? "Unknown error")
+        }
+    }
+
+    private func create() {
+        Task {
+            isSaving = true
+            defer { isSaving = false }
+            do {
+                try await store.createEnvironment(
+                    name: name, in: project.id, includingManagedFile: fileID)
+                dismiss()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+}
+
 private struct EditProtectedFileMetadataSheet: View {
     @Bindable var store: WorkspaceStore
     let file: WorkspaceProtectedFile
@@ -2936,7 +3190,7 @@ private struct EditProtectedFileMetadataSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Edit Protected File Info").font(.title2.bold())
+                Text("Edit Security & Info").font(.title2.bold())
                 Text(file.path)
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)

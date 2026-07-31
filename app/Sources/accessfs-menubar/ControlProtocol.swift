@@ -857,12 +857,14 @@ struct CatalogProtectedFile: Codable, Sendable {
     let currentVersion: UInt32
     let linked: Bool
     let enforcement: String
+    let environmentIDs: [String]
     let metadata: ItemMetadata
 
     enum CodingKeys: String, CodingKey {
         case id, mode, size, linked, enforcement, metadata
         case sourcePath = "source_path"
         case currentVersion = "current_version"
+        case environmentIDs = "environment_ids"
     }
 }
 
@@ -909,8 +911,9 @@ enum ControlCommand: Sendable {
     case fileProtect(String)
     case protectedFileHistory(String)
     case protectedFileRollback(id: String, version: UInt32)
+    case protectedFileContentsUpdate(id: String, path: String)
     case protectedFileMetadataUpdate(
-        id: String, enforcement: String, metadata: ItemMetadata)
+        id: String, enforcement: String, environmentIDs: [String], metadata: ItemMetadata)
     case managedFileConfigure(id: String, projectID: String, environmentID: String?)
     case managedFileRestore(String)
     case fileRestore(String)
@@ -970,6 +973,7 @@ enum ControlCommand: Sendable {
         case .fileProtect: "file_protect"
         case .protectedFileHistory: "protected_file_history"
         case .protectedFileRollback: "protected_file_rollback"
+        case .protectedFileContentsUpdate: "protected_file_contents_update"
         case .protectedFileMetadataUpdate: "protected_file_metadata_update"
         case .managedFileConfigure: "managed_file_configure"
         case .managedFileRestore: "managed_file_restore"
@@ -1098,12 +1102,19 @@ enum ControlCommand: Sendable {
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: ProtectedFileRollbackParams(id: id, version: version)))
-        case .protectedFileMetadataUpdate(let id, let enforcement, let metadata):
+        case .protectedFileContentsUpdate(let id, let path):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: ProtectedFileContentsUpdateParams(id: id, path: path)))
+        case .protectedFileMetadataUpdate(
+            let id, let enforcement, let environmentIDs, let metadata):
             return try encoder.encode(
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: ProtectedFileMetadataUpdateParams(
-                        id: id, enforcement: enforcement, metadata: metadata)))
+                        id: id, enforcement: enforcement,
+                        environmentIDs: environmentIDs, metadata: metadata)))
         case .managedFileConfigure(let id, let projectID, let environmentID):
             return try encoder.encode(
                 ControlRequest(
@@ -1272,10 +1283,20 @@ private struct ProtectedFileRollbackParams: Encodable {
     let id: String
     let version: UInt32
 }
+private struct ProtectedFileContentsUpdateParams: Encodable {
+    let id: String
+    let path: String
+}
 private struct ProtectedFileMetadataUpdateParams: Encodable {
     let id: String
     let enforcement: String
+    let environmentIDs: [String]
     let metadata: ItemMetadata
+
+    enum CodingKeys: String, CodingKey {
+        case id, enforcement, metadata
+        case environmentIDs = "environment_ids"
+    }
 }
 private struct ManagedFileConfigureParams: Encodable {
     let id: String

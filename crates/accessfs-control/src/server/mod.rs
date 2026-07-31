@@ -23,7 +23,8 @@ use accessfs_ssh::{agent_runtime_socket_path, ManagedKeyError};
 use accessfs_store::{NewSecret, SecretId, SecretOrigin, SecretRecord, SecretStore, StoreError};
 use accessfs_surface::{
     checkout_link_issues, decode_source, ensure_file_surface_link, file_surface_instances,
-    managed_file_links, replace_regular_file_with_symlink_if_matches,
+    managed_file_links, protected_checkout_links, remove_excluded_protected_checkout_links,
+    replace_regular_file_with_symlink_if_matches,
     replace_symlink_with_file_if_target, restore_protected_checkout_links,
     validate_secret_bytes, ManagedLinkStatus as SurfaceManagedLinkStatus, ManagedSymlink,
     SurfaceResolver,

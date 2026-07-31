@@ -92,6 +92,7 @@ mod tests {
             _id: &SecretId,
             _metadata: accessfs_core::metadata::ItemMetadata,
             _enforcement: accessfs_core::authz::Enforcement,
+            _environment_ids: Option<Vec<String>>,
         ) -> StoreResult<()> {
             unimplemented!()
         }

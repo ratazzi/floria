@@ -105,9 +105,11 @@ pub enum ControlCommand {
     FileProtect { path: PathBuf },
     ProtectedFileHistory { id: String },
     ProtectedFileRollback { id: String, version: u32 },
+    ProtectedFileContentsUpdate { id: String, path: PathBuf },
     ProtectedFileMetadataUpdate {
         id: String,
         enforcement: Enforcement,
+        environment_ids: Vec<String>,
         metadata: ItemMetadata,
     },
     ManagedFileConfigure {
@@ -204,6 +206,7 @@ pub enum ControlResult {
     FileProtected { file: ProtectedFile, created: bool },
     ProtectedFileHistory { id: String, versions: Vec<ProtectedFileVersion> },
     ProtectedFileRolledBack { file: ProtectedFile },
+    ProtectedFileUpdated { file: ProtectedFile },
     ManagedFileConfigured { surface: Surface },
     FileRestored { path: PathBuf, storage_deleted: bool },
     ResolvedEnvironment(ResolvedEnvironment),
@@ -561,6 +564,7 @@ pub struct ProtectedFile {
     pub current_version: u32,
     pub linked: bool,
     pub enforcement: Enforcement,
+    pub environment_ids: Vec<String>,
     pub metadata: ItemMetadata,
 }
 
@@ -1097,6 +1101,46 @@ mod tests {
 
         assert_eq!(value["method"], "file_protect");
         assert_eq!(value["params"]["path"], "/fixture/project/.env");
+    }
+
+    #[test]
+    fn protected_file_update_carries_environment_scope() {
+        let request = ControlRequest {
+            request_id: 10,
+            command: ControlCommand::ProtectedFileMetadataUpdate {
+                id: "fixture-secret".to_string(),
+                enforcement: Enforcement::Prompt,
+                environment_ids: vec![
+                    "fixture-development".to_string(),
+                    "fixture-staging".to_string(),
+                ],
+                metadata: ItemMetadata::default(),
+            },
+        };
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["method"], "protected_file_metadata_update");
+        assert_eq!(
+            value["params"]["environment_ids"],
+            serde_json::json!(["fixture-development", "fixture-staging"])
+        );
+    }
+
+    #[test]
+    fn protected_file_contents_update_carries_only_the_local_input_path() {
+        let request = ControlRequest {
+            request_id: 11,
+            command: ControlCommand::ProtectedFileContentsUpdate {
+                id: "fixture-secret".to_string(),
+                path: PathBuf::from("/fixture/replacement.p12"),
+            },
+        };
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["method"], "protected_file_contents_update");
+        assert_eq!(value["params"]["id"], "fixture-secret");
+        assert_eq!(value["params"]["path"], "/fixture/replacement.p12");
+        assert_eq!(value["params"].as_object().unwrap().len(), 2);
     }
 
     #[test]

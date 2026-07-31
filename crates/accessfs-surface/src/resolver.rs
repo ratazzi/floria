@@ -586,6 +586,7 @@ mod tests {
                 created: "fixture-time".to_string(),
                 current_version: *head,
                 enforcement: Default::default(),
+                environment_ids: None,
                 metadata: Default::default(),
             }))
         }
@@ -622,6 +623,7 @@ mod tests {
             _id: &SecretId,
             _metadata: accessfs_core::metadata::ItemMetadata,
             _enforcement: accessfs_core::authz::Enforcement,
+            _environment_ids: Option<Vec<String>>,
         ) -> StoreResult<()> {
             unimplemented!()
         }
@@ -699,8 +701,9 @@ mod tests {
             id: &SecretId,
             metadata: accessfs_core::metadata::ItemMetadata,
             enforcement: accessfs_core::authz::Enforcement,
+            environment_ids: Option<Vec<String>>,
         ) -> StoreResult<()> {
-            self.inner.update_settings(id, metadata, enforcement)
+            self.inner.update_settings(id, metadata, enforcement, environment_ids)
         }
 
         fn delete(&self, id: &SecretId) -> StoreResult<()> {

@@ -267,11 +267,28 @@ pub(super) fn dispatch(
                 version,
             )
         }
-        ControlCommand::ProtectedFileMetadataUpdate { id, enforcement, metadata } => {
-            update_protected_file_metadata(
+        ControlCommand::ProtectedFileContentsUpdate { id, path } => {
+            update_protected_file_contents(
+                catalog,
                 store.ok_or(DispatchError::StoreUnavailable)?,
+                mount_path.ok_or(DispatchError::StoreUnavailable)?,
+                &id,
+                &path,
+            )
+        }
+        ControlCommand::ProtectedFileMetadataUpdate {
+            id,
+            enforcement,
+            environment_ids,
+            metadata,
+        } => {
+            update_protected_file_metadata(
+                catalog,
+                store.ok_or(DispatchError::StoreUnavailable)?,
+                mount_path.ok_or(DispatchError::StoreUnavailable)?,
                 &id,
                 enforcement,
+                environment_ids,
                 metadata,
             )
         }

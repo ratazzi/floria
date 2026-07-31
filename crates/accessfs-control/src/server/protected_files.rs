@@ -21,7 +21,7 @@ pub(super) fn protected_files(
         .list()?
         .into_iter()
         .filter(|record| !catalog_secret_ids.contains(record.id.as_str()))
-        .filter_map(|record| protected_file(record, mount_path))
+        .filter_map(|record| protected_file(record, mount_path, &snapshot))
         .collect::<Vec<_>>();
     files.sort_by(|left, right| left.source_path.cmp(&right.source_path));
     Ok(ControlResult::ProtectedFiles(files))
@@ -457,7 +457,11 @@ fn configurable_file_format(
     )))
 }
 
-pub(super) fn protected_file(record: SecretRecord, mount_path: &Path) -> Option<ProtectedFile> {
+pub(super) fn protected_file(
+    record: SecretRecord,
+    mount_path: &Path,
+    snapshot: &CatalogSnapshot,
+) -> Option<ProtectedFile> {
     let SecretOrigin::File { source_path } = record.origin else { return None };
     let expected = mount_path
         .join(accessfs_core::config::SECRETS_DIR)
@@ -465,6 +469,11 @@ pub(super) fn protected_file(record: SecretRecord, mount_path: &Path) -> Option<
     let linked = ManagedSymlink::new(&source_path, expected)
         .is_ready()
         .unwrap_or(false);
+    let environment_ids = effective_file_environment_ids(
+        snapshot,
+        &source_path,
+        record.environment_ids.as_deref(),
+    );
     Some(ProtectedFile {
         id: record.id.to_string(),
         source_path,
@@ -473,8 +482,38 @@ pub(super) fn protected_file(record: SecretRecord, mount_path: &Path) -> Option<
         current_version: record.current_version,
         linked,
         enforcement: record.enforcement,
+        environment_ids,
         metadata: record.metadata,
     })
+}
+
+fn effective_file_environment_ids(
+    snapshot: &CatalogSnapshot,
+    source_path: &Path,
+    configured: Option<&[String]>,
+) -> Vec<String> {
+    let Some(project) = snapshot
+        .projects
+        .iter()
+        .filter(|project| source_path.starts_with(&project.path))
+        .max_by_key(|project| project.path.components().count())
+    else {
+        return Vec::new();
+    };
+    let configured =
+        configured.map(|ids| ids.iter().map(String::as_str).collect::<HashSet<_>>());
+    let mut environments = snapshot
+        .environments
+        .iter()
+        .filter(|environment| environment.project_id == project.id)
+        .filter(|environment| {
+            configured
+                .as_ref()
+                .is_none_or(|ids| ids.contains(environment.id.as_str()))
+        })
+        .collect::<Vec<_>>();
+    environments.sort_by_key(|environment| environment.position);
+    environments.into_iter().map(|environment| environment.id.clone()).collect()
 }
 
 pub(super) fn protect_file(
@@ -499,6 +538,7 @@ pub(super) fn protect_file(
         source,
     })?;
     if metadata.file_type().is_symlink() {
+        let snapshot = catalog.snapshot()?;
         let record = store.get_by_path(&path)?.ok_or_else(|| {
             DispatchError::Validation(format!(
                 "{} is a symlink not managed by Floria",
@@ -521,7 +561,7 @@ pub(super) fn protect_file(
             )));
         }
         return Ok(ControlResult::FileProtected {
-            file: protected_file(record, mount_path)
+            file: protected_file(record, mount_path, &snapshot)
                 .expect("file lookup returns a file-origin record"),
             created: false,
         });
@@ -573,8 +613,9 @@ pub(super) fn protect_file(
     let record = store
         .record(&id)?
         .ok_or_else(|| DispatchError::Validation(format!("protected file {id} disappeared")))?;
+    let snapshot = catalog.snapshot()?;
     Ok(ControlResult::FileProtected {
-        file: protected_file(record, mount_path)
+        file: protected_file(record, mount_path, &snapshot)
             .expect("new file protection has file-origin metadata"),
         created,
     })
@@ -600,13 +641,74 @@ pub(super) fn protected_file_history(
 }
 
 pub(super) fn update_protected_file_metadata(
+    catalog: &Catalog,
     store: &dyn SecretStore,
+    mount_path: &Path,
     id: &str,
     enforcement: Enforcement,
+    environment_ids: Vec<String>,
     metadata: ItemMetadata,
 ) -> Result<ControlResult, DispatchError> {
-    let (id, _) = file_record(store, id)?;
-    store.update_settings(&id, metadata, enforcement)?;
+    let (id, record) = file_record(store, id)?;
+    let source_path = record.source_path().expect("validated file record");
+    let snapshot = catalog.snapshot()?;
+    let project = snapshot
+        .projects
+        .iter()
+        .filter(|project| source_path.starts_with(&project.path))
+        .max_by_key(|project| project.path.components().count());
+    let environment_ids = match project {
+        None if environment_ids.is_empty() => None,
+        None => {
+            return Err(DispatchError::Validation(format!(
+                "{} is not inside a project and cannot have an Environment Scope",
+                source_path.display()
+            )));
+        }
+        Some(project) => {
+            let mut available = snapshot
+                .environments
+                .iter()
+                .filter(|environment| environment.project_id == project.id)
+                .collect::<Vec<_>>();
+            available.sort_by_key(|environment| environment.position);
+            if !available.is_empty() && environment_ids.is_empty() {
+                return Err(DispatchError::Validation(
+                    "choose at least one Environment".to_string(),
+                ));
+            }
+            let available_ids =
+                available.iter().map(|environment| environment.id.as_str()).collect::<HashSet<_>>();
+            if let Some(unknown) =
+                environment_ids.iter().find(|id| !available_ids.contains(id.as_str()))
+            {
+                return Err(DispatchError::Validation(format!(
+                    "environment {unknown:?} does not belong to project {:?}",
+                    project.id
+                )));
+            }
+            Some(
+                available
+                    .into_iter()
+                    .filter(|environment| environment_ids.contains(&environment.id))
+                    .map(|environment| environment.id.clone())
+                    .collect(),
+            )
+        }
+    };
+    let current_links =
+        protected_checkout_links(&snapshot, std::slice::from_ref(&record), mount_path);
+    let mut updated_record = record.clone();
+    updated_record.environment_ids = environment_ids.clone();
+    let next_links =
+        protected_checkout_links(&snapshot, std::slice::from_ref(&updated_record), mount_path);
+    remove_excluded_protected_checkout_links(&current_links, &next_links).map_err(|source| {
+        DispatchError::Io {
+            path: source_path.to_path_buf(),
+            source,
+        }
+    })?;
+    store.update_settings(&id, metadata, enforcement, environment_ids)?;
     Ok(ControlResult::Empty)
 }
 
@@ -627,7 +729,62 @@ pub(super) fn rollback_protected_file(
         .record(&id)?
         .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
     Ok(ControlResult::ProtectedFileRolledBack {
-        file: protected_file(record, mount_path)
+        file: protected_file(record, mount_path, &snapshot)
+            .expect("validated file record remains file-origin"),
+    })
+}
+
+pub(super) fn update_protected_file_contents(
+    catalog: &Catalog,
+    store: &dyn SecretStore,
+    mount_path: &Path,
+    id: &str,
+    path: &Path,
+) -> Result<ControlResult, DispatchError> {
+    if !path.is_absolute() {
+        return Err(DispatchError::Validation(format!(
+            "replacement file path {} must be absolute",
+            path.display()
+        )));
+    }
+
+    let (id, record) = file_record(store, id)?;
+    let metadata = std::fs::metadata(path).map_err(|source| DispatchError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file() {
+        return Err(DispatchError::Validation(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    let absolute = std::fs::canonicalize(path).map_err(|source| DispatchError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let plaintext = zeroize::Zeroizing::new(
+        std::fs::read(&absolute).map_err(|source| DispatchError::Io {
+            path: absolute.clone(),
+            source,
+        })?,
+    );
+    let snapshot = catalog.snapshot()?;
+    validate_secret_bytes(&snapshot, id.as_str(), &plaintext)
+        .map_err(|error| DispatchError::Validation(error.to_string()))?;
+    let current = store.get(&id)?;
+    if current.as_slice() != plaintext.as_slice() {
+        store.append_version(&id, &plaintext)?;
+    }
+    let record = if current.as_slice() == plaintext.as_slice() {
+        record
+    } else {
+        store
+            .record(&id)?
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))?
+    };
+    Ok(ControlResult::ProtectedFileUpdated {
+        file: protected_file(record, mount_path, &snapshot)
             .expect("validated file record remains file-origin"),
     })
 }

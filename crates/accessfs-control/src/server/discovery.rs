@@ -161,6 +161,18 @@ pub(super) fn apply_discovery(
                             "protecting a discovered file returned an unexpected result".to_string(),
                         ))
                     } else {
+                        if let DiscoveryImportDestination::ProjectFile { project_path } =
+                            &import.destination
+                        {
+                            let project_id = &project_states[project_path].0;
+                            apply_protected_file_environment_scope(
+                                catalog,
+                                store,
+                                &protected,
+                                project_id,
+                                file.environment.as_deref(),
+                            )?;
+                        }
                         result.protected_files += 1;
                         result.files.push(DiscoveryAppliedFile {
                             path: file.path,
@@ -257,6 +269,14 @@ pub(super) fn apply_discovery(
                                     .to_string(),
                             ));
                         }
+                        let project_id = &project_states[&project_path].0;
+                        apply_protected_file_environment_scope(
+                            catalog,
+                            store,
+                            &protected,
+                            project_id,
+                            file.environment.as_deref(),
+                        )?;
                         result.protected_files += 1;
                         result.files.push(DiscoveryAppliedFile {
                             path: file.path,
@@ -1273,6 +1293,68 @@ pub(super) fn ensure_discovered_environment(
         position: snapshot.environments.len() as i64,
     })?;
     Ok((id, true))
+}
+
+fn apply_protected_file_environment_scope(
+    catalog: &Catalog,
+    store: &dyn SecretStore,
+    protected: &ControlResult,
+    project_id: &str,
+    suggested_environment: Option<&str>,
+) -> Result<(), DispatchError> {
+    let ControlResult::FileProtected { file, .. } = protected else {
+        return Err(DispatchError::Validation(
+            "environment scope requires a protected file".to_string(),
+        ));
+    };
+    let snapshot = catalog.snapshot()?;
+    let project = snapshot
+        .projects
+        .iter()
+        .find(|project| project.id == project_id)
+        .ok_or_else(|| {
+            DispatchError::Validation(format!("project {project_id:?} was not found"))
+        })?;
+    let default_environment_id = project.default_environment_id.as_ref().and_then(|id| {
+        snapshot
+            .environments
+            .iter()
+            .any(|environment| environment.project_id == project_id && environment.id == *id)
+            .then(|| id.clone())
+    });
+    let environment_id = if let Some(name) = suggested_environment {
+        ensure_discovered_environment(catalog, project_id, name)?.0
+    } else if let Some(id) = default_environment_id {
+        id
+    } else if let Some(environment) = snapshot
+        .environments
+        .iter()
+        .filter(|environment| environment.project_id == project_id)
+        .min_by_key(|environment| {
+            (
+                !environment.name.eq_ignore_ascii_case("development"),
+                environment.position,
+            )
+        })
+    {
+        environment.id.clone()
+    } else {
+        ensure_discovered_environment(catalog, project_id, "development")?.0
+    };
+    let secret_id: SecretId = file
+        .id
+        .parse()
+        .map_err(|error| DispatchError::Validation(format!("invalid protected file id: {error}")))?;
+    let record = store
+        .record(&secret_id)?
+        .ok_or_else(|| StoreError::NotFound(file.id.clone()))?;
+    store.update_settings(
+        &secret_id,
+        record.metadata,
+        record.enforcement,
+        Some(vec![environment_id]),
+    )?;
+    Ok(())
 }
 
 pub(super) fn replace_discovered_file_with_surface(

@@ -1924,12 +1924,20 @@ fn opaque_file(
         assignment: unassigned_project(),
         kind,
         codec: ResourceCodec::Opaque,
-        environment: None,
+        environment: protected_file_environment(path),
         tags: vec![tag.to_string()],
         entries: Vec::new(),
         warnings: Vec::new(),
         action,
         entry_disposition: EntryDisposition::ProtectedFile,
+    }
+}
+
+fn protected_file_environment(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    match stem {
+        "development" | "test" | "staging" | "production" => Some(stem.to_string()),
+        _ => None,
     }
 }
 
@@ -3003,6 +3011,18 @@ mod tests {
             plan.files[0].assignment.state,
             ProjectAssignmentState::Unassigned
         );
+    }
+
+    #[test]
+    fn opaque_environment_named_file_suggests_environment_scope() {
+        let directory = tempdir().unwrap();
+        let file = directory.path().join("production.key");
+        fs::write(&file, "fixture opaque credential\n").unwrap();
+
+        let plan = discover(&file).unwrap().plan(&[]);
+
+        assert_eq!(plan.files[0].environment.as_deref(), Some("production"));
+        assert_eq!(plan.files[0].action, DiscoveredFileAction::Protect);
     }
 
     #[test]

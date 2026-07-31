@@ -951,6 +951,9 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
         ControlResult::ProtectedFileRolledBack { file } => {
             println!("{} now points to version {}", file.id, file.current_version);
         }
+        ControlResult::ProtectedFileUpdated { file } => {
+            println!("updated {} to version {}", file.id, file.current_version);
+        }
         ControlResult::ManagedFileConfigured { surface } => {
             println!("configured {} as {}", surface.path.display(), surface.id);
         }
@@ -1450,6 +1453,7 @@ mod tests {
             created: "fixture-time".to_string(),
             current_version: 1,
             enforcement: Enforcement::Allow,
+            environment_ids: None,
             metadata: Default::default(),
         }];
 

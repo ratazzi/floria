@@ -449,7 +449,7 @@ final class ControlProtocolTests: XCTestCase {
 
     func testDecodesProtectedFileMetadataWithoutPlaintext() throws {
         let data = Data(
-            #"{"id":"00000000-0000-0000-0000-000000000001","source_path":"/fixture/project/.env","mode":384,"size":42,"current_version":3,"linked":true,"enforcement":"touchid","metadata":{"note":"Local app environment","links":[]}}"#.utf8)
+            #"{"id":"00000000-0000-0000-0000-000000000001","source_path":"/fixture/project/.env","mode":384,"size":42,"current_version":3,"linked":true,"enforcement":"touchid","environment_ids":["fixture-development"],"metadata":{"note":"Local app environment","links":[]}}"#.utf8)
 
         let file = try JSONDecoder().decode(CatalogProtectedFile.self, from: data)
 
@@ -459,6 +459,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(file.currentVersion, 3)
         XCTAssertTrue(file.linked)
         XCTAssertEqual(file.enforcement, "touchid")
+        XCTAssertEqual(file.environmentIDs, ["fixture-development"])
     }
 
     func testProtectedFileMaintenanceRequestsMatchRustWireShape() throws {
@@ -485,13 +486,31 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(rollbackParams["version"] as? UInt32, 2)
 
         let update = try ControlCommand.protectedFileMetadataUpdate(
-            id: "fixture-secret", enforcement: "allow", metadata: .empty
+            id: "fixture-secret", enforcement: "allow",
+            environmentIDs: ["fixture-development", "fixture-staging"], metadata: .empty
         ).requestData(requestID: 731, encoder: encoder)
         let updateValue = try XCTUnwrap(
             JSONSerialization.jsonObject(with: update) as? [String: Any])
         let updateParams = try XCTUnwrap(updateValue["params"] as? [String: Any])
         XCTAssertEqual(updateValue["method"] as? String, "protected_file_metadata_update")
         XCTAssertEqual(updateParams["enforcement"] as? String, "allow")
+        XCTAssertEqual(
+            updateParams["environment_ids"] as? [String],
+            ["fixture-development", "fixture-staging"])
+
+        let contentsUpdate = try ControlCommand.protectedFileContentsUpdate(
+            id: "fixture-secret", path: "/fixture/replacement.p12"
+        ).requestData(requestID: 7311, encoder: encoder)
+        let contentsUpdateValue = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: contentsUpdate) as? [String: Any])
+        let contentsUpdateParams = try XCTUnwrap(
+            contentsUpdateValue["params"] as? [String: Any])
+        XCTAssertEqual(
+            contentsUpdateValue["method"] as? String,
+            "protected_file_contents_update")
+        XCTAssertEqual(contentsUpdateParams["id"] as? String, "fixture-secret")
+        XCTAssertEqual(contentsUpdateParams["path"] as? String, "/fixture/replacement.p12")
+        XCTAssertEqual(contentsUpdateParams.count, 2)
 
         let configure = try ControlCommand.managedFileConfigure(
             id: "fixture-secret", projectID: "fixture-project",

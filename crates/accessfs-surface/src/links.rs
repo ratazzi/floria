@@ -452,6 +452,12 @@ fn protected_checkout_links_excluding(
         for checkout in snapshot.checkouts.iter().filter(|checkout| {
             checkout.kind == ProjectCheckoutKind::Worktree
                 && checkout.project_id == project.id
+                && record.environment_ids.as_ref().is_none_or(|environment_ids| {
+                    checkout
+                        .environment_id
+                        .as_ref()
+                        .is_some_and(|id| environment_ids.contains(id))
+                })
         }) {
             let path = checkout.path.join(relative);
             if excluded_paths.contains(&path) {
@@ -527,6 +533,27 @@ pub fn refresh_protected_checkout_links(
     reconcile_protected_links(&changed, store)?;
     *active = next;
     Ok(true)
+}
+
+/// Remove exact Floria links that fall out of one Managed File's Environment Scope.
+///
+/// Unlike removing a Checkout or stopping protection, narrowing visibility must not leave a
+/// plaintext copy behind in the excluded checkout.
+pub fn remove_excluded_protected_checkout_links(
+    current: &[ProtectedCheckoutLink],
+    next: &[ProtectedCheckoutLink],
+) -> io::Result<bool> {
+    let mut changed = false;
+    for link in current
+        .iter()
+        .filter(|old| !next.iter().any(|new| old.same_location(new)))
+    {
+        if is_exact_symlink(&link.path, &link.target)? {
+            std::fs::remove_file(&link.path)?;
+            changed = true;
+        }
+    }
+    Ok(changed)
 }
 
 /// Restore every exact worktree link for one protected file while its plaintext
@@ -1352,6 +1379,91 @@ mod tests {
         assert!(protected_checkout_links(&snapshot, &records, &mount)
             .iter()
             .any(|link| link.path == staging_worktree.join(".env")));
+    }
+
+    #[test]
+    fn protected_file_environment_scope_limits_worktree_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("project");
+        let development_worktree = dir.path().join("development-worktree");
+        let production_worktree = dir.path().join("production-worktree");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&development_worktree).unwrap();
+        std::fs::create_dir_all(&production_worktree).unwrap();
+        let mount = dir.path().join("mount");
+        let store = AgeDirStore::open(
+            dir.path().join("store"),
+            Arc::new(TestKeys(age::x25519::Identity::generate())),
+        )
+        .unwrap();
+        let id = store
+            .put(NewSecret::file(primary.join("production.key"), 0o600), b"fixture")
+            .unwrap();
+        let snapshot = CatalogSnapshot {
+            projects: vec![Project {
+                id: "fixture-project".to_string(),
+                name: "Fixture".to_string(),
+                path: primary,
+                ..Default::default()
+            }],
+            environments: vec![
+                Environment {
+                    id: "fixture-development".to_string(),
+                    project_id: "fixture-project".to_string(),
+                    name: "Development".to_string(),
+                    position: 0,
+                },
+                Environment {
+                    id: "fixture-production".to_string(),
+                    project_id: "fixture-project".to_string(),
+                    name: "Production".to_string(),
+                    position: 1,
+                },
+            ],
+            checkouts: vec![
+                ProjectCheckout {
+                    id: "fixture-development-checkout".to_string(),
+                    project_id: "fixture-project".to_string(),
+                    path: development_worktree.clone(),
+                    environment_id: Some("fixture-development".to_string()),
+                    ..Default::default()
+                },
+                ProjectCheckout {
+                    id: "fixture-production-checkout".to_string(),
+                    project_id: "fixture-project".to_string(),
+                    path: production_worktree.clone(),
+                    environment_id: Some("fixture-production".to_string()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let mut active = protected_checkout_links(&snapshot, &store.list().unwrap(), &mount);
+        refresh_protected_checkout_links(&mut Vec::new(), active.clone(), &store).unwrap();
+        assert!(development_worktree.join("production.key").is_symlink());
+        assert!(production_worktree.join("production.key").is_symlink());
+
+        store
+            .update_settings(
+                &id,
+                Default::default(),
+                accessfs_core::authz::Enforcement::Prompt,
+                Some(vec!["fixture-production".to_string()]),
+            )
+            .unwrap();
+        let links = protected_checkout_links(&snapshot, &store.list().unwrap(), &mount);
+        remove_excluded_protected_checkout_links(&active, &links).unwrap();
+        refresh_protected_checkout_links(&mut active, links.clone(), &store).unwrap();
+
+        assert!(!links
+            .iter()
+            .any(|link| link.path == development_worktree.join("production.key")));
+        assert!(links
+            .iter()
+            .any(|link| link.path == production_worktree.join("production.key")));
+        assert!(!development_worktree.join("production.key").exists());
+        assert!(production_worktree.join("production.key").is_symlink());
     }
 
     #[test]

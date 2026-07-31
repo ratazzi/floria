@@ -551,6 +551,7 @@ struct WorkspaceProtectedFile: Identifiable, Hashable, Sendable {
     let currentVersion: UInt32
     let managedLink: WorkspaceManagedLink
     let securityLevel: WorkspaceSecurityLevel
+    let environmentIDs: [WorkspaceEnvironment.ID]
     let metadata: ItemMetadata
 
     var kind: WorkspaceProtectedFileKind {
@@ -606,6 +607,16 @@ final class WorkspaceStore {
 
     var selectedProject: WorkspaceProject? {
         projects.first(where: { $0.id == selectedProjectID })
+    }
+
+    func project(containingManagedPath path: String) -> WorkspaceProject? {
+        let source = URL(fileURLWithPath: path).standardizedFileURL.path
+        return projects
+            .filter { project in
+                let root = URL(fileURLWithPath: project.path).standardizedFileURL.path
+                return source == root || source.hasPrefix(root + "/")
+            }
+            .max { left, right in left.path.count < right.path.count }
     }
 
     var selectedProjectCheckouts: [CatalogProjectCheckout] {
@@ -1114,16 +1125,29 @@ final class WorkspaceStore {
         lastError = nil
     }
 
+    func updateProtectedFileContents(_ id: String, from path: String) async throws {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        let file = protectedFileModels([
+            try await controlClient.updateProtectedFileContents(id, from: path)
+        ])[0]
+        if let index = protectedFiles.firstIndex(where: { $0.id == id }) {
+            protectedFiles[index] = file
+        }
+        lastError = nil
+    }
+
     func updateProtectedFileMetadata(
-        _ id: String, securityLevel: WorkspaceSecurityLevel, metadata: ItemMetadata
+        _ id: String, securityLevel: WorkspaceSecurityLevel,
+        environmentIDs: [WorkspaceEnvironment.ID]? = nil, metadata: ItemMetadata
     ) async throws {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
-        guard protectedFiles.contains(where: { $0.id == id }) else {
+        guard let file = protectedFiles.first(where: { $0.id == id }) else {
             throw WorkspaceStoreError.invalid("Choose a protected file first")
         }
         let metadata = try Self.validatedMetadata(metadata)
         try await controlClient.updateProtectedFileMetadata(
-            id, enforcement: securityLevel.rawValue, metadata: metadata)
+            id, enforcement: securityLevel.rawValue,
+            environmentIDs: environmentIDs ?? file.environmentIDs, metadata: metadata)
         if let files = try? await controlClient.protectedFiles() {
             protectedFiles = protectedFileModels(files)
         }
@@ -1430,12 +1454,14 @@ final class WorkspaceStore {
     }
 
     @discardableResult
-    func createEnvironment(name: String, fileName: String) async throws -> WorkspaceEnvironment.ID {
+    func createEnvironment(
+        name: String, in projectID: WorkspaceProject.ID
+    ) async throws -> WorkspaceEnvironment.ID {
         guard let controlClient else {
             throw WorkspaceStoreError.controlUnavailable
         }
-        guard let project = selectedProject else {
-            throw WorkspaceStoreError.invalid("Select a project first")
+        guard let project = projects.first(where: { $0.id == projectID }) else {
+            throw WorkspaceStoreError.invalid("Choose a project first")
         }
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else {
@@ -1446,16 +1472,56 @@ final class WorkspaceStore {
         }) else {
             throw WorkspaceStoreError.invalid("An environment named \(name) already exists")
         }
-        let output = try newSurfaceOutput(fileName: fileName, in: project)
         let environmentID = Self.newID("environment")
-        let surfaceID = Self.newID("dotenv")
-        let commonBindingIDs = project.commonBindings
-            .filter { bindingIsCompatible($0, with: .dotenvFile) }
-            .map(\.id)
         try await controlClient.upsertEnvironment(
             CatalogEnvironment(
                 id: environmentID, projectID: project.id, name: name,
                 position: Int64(project.environments.count)))
+        apply(try await controlClient.snapshot())
+        lastError = nil
+        return environmentID
+    }
+
+    @discardableResult
+    func createEnvironment(
+        name: String, in projectID: WorkspaceProject.ID,
+        includingManagedFile fileID: WorkspaceProtectedFile.ID
+    ) async throws -> WorkspaceEnvironment.ID {
+        guard let controlClient else {
+            throw WorkspaceStoreError.controlUnavailable
+        }
+        let environmentID = try await createEnvironment(name: name, in: projectID)
+        do {
+            guard let file = protectedFiles.first(where: { $0.id == fileID }) else {
+                throw WorkspaceStoreError.invalid("Choose a managed file first")
+            }
+            try await updateProtectedFileMetadata(
+                file.id, securityLevel: file.securityLevel,
+                environmentIDs: file.environmentIDs + [environmentID],
+                metadata: file.metadata)
+        } catch {
+            try? await controlClient.removeEnvironment(environmentID)
+            apply(try await controlClient.snapshot())
+            throw error
+        }
+        return environmentID
+    }
+
+    @discardableResult
+    func createEnvironment(name: String, fileName: String) async throws -> WorkspaceEnvironment.ID {
+        guard let controlClient else {
+            throw WorkspaceStoreError.controlUnavailable
+        }
+        guard let project = selectedProject else {
+            throw WorkspaceStoreError.invalid("Select a project first")
+        }
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let output = try newSurfaceOutput(fileName: fileName, in: project)
+        let surfaceID = Self.newID("dotenv")
+        let commonBindingIDs = project.commonBindings
+            .filter { bindingIsCompatible($0, with: .dotenvFile) }
+            .map(\.id)
+        let environmentID = try await createEnvironment(name: name, in: project.id)
         do {
             try await controlClient.upsertSurface(
                 CatalogSurface(
@@ -2138,6 +2204,7 @@ private extension WorkspaceProtectedFile {
             currentVersion: file.currentVersion,
             managedLink: WorkspaceManagedLink(path: file.sourcePath, status: linkStatus),
             securityLevel: WorkspaceSecurityLevel(catalogValue: file.enforcement),
+            environmentIDs: file.environmentIDs,
             metadata: file.metadata)
     }
 }

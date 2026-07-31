@@ -1708,6 +1708,7 @@ mod tests {
                 created: "fixture-time".to_string(),
                 current_version: entry.head,
                 enforcement: Enforcement::Prompt,
+                environment_ids: None,
                 metadata: Default::default(),
             }))
         }
@@ -1746,6 +1747,7 @@ mod tests {
             _id: &SecretId,
             _metadata: accessfs_core::metadata::ItemMetadata,
             _enforcement: Enforcement,
+            _environment_ids: Option<Vec<String>>,
         ) -> StoreResult<()> {
             unimplemented!()
         }
@@ -2050,6 +2052,7 @@ mod tests {
             created: "fixture-time".to_string(),
             current_version: 1,
             enforcement: accessfs_core::authz::Enforcement::Prompt,
+            environment_ids: None,
             metadata: Default::default(),
         };
 
@@ -2498,6 +2501,7 @@ mod tests {
             _id: &SecretId,
             _metadata: accessfs_core::metadata::ItemMetadata,
             _enforcement: accessfs_core::authz::Enforcement,
+            _environment_ids: Option<Vec<String>>,
         ) -> StoreResult<()> {
             unimplemented!()
         }

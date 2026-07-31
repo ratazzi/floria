@@ -149,6 +149,7 @@ mod tests {
                 created: "fixture-time".to_string(),
                 current_version: self.head.load(Ordering::Relaxed),
                 enforcement: accessfs_core::authz::Enforcement::Prompt,
+                environment_ids: None,
                 metadata: ItemMetadata::default(),
             }))
         }
@@ -166,6 +167,7 @@ mod tests {
             _id: &SecretId,
             _metadata: ItemMetadata,
             _enforcement: accessfs_core::authz::Enforcement,
+            _environment_ids: Option<Vec<String>>,
         ) -> StoreResult<()> {
             unimplemented!()
         }

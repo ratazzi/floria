@@ -40,7 +40,8 @@
 
     struct FixtureStore {
         entries: Mutex<HashMap<String, Vec<Vec<u8>>>>,
-        metadata: Mutex<HashMap<String, (SecretOrigin, u32, ItemMetadata)>>,
+        metadata:
+            Mutex<HashMap<String, (SecretOrigin, u32, ItemMetadata, Option<Vec<String>>)>>,
         heads: Mutex<HashMap<String, u32>>,
         get_calls: AtomicUsize,
     }
@@ -134,7 +135,10 @@
             self.metadata
                 .lock()
                 .unwrap()
-                .insert(id.to_string(), (meta.origin, meta.mode, ItemMetadata::default()));
+                .insert(
+                    id.to_string(),
+                    (meta.origin, meta.mode, ItemMetadata::default(), None),
+                );
             self.heads.lock().unwrap().insert(id.to_string(), 1);
             Ok(id)
         }
@@ -196,6 +200,7 @@
                 created: "fixture-time".to_string(),
                 current_version: heads[id.as_str()],
                 enforcement: Enforcement::Prompt,
+                environment_ids: metadata[id.as_str()].3.clone(),
                 metadata: metadata[id.as_str()].2.clone(),
             }))
         }
@@ -214,6 +219,7 @@
                     created: "fixture-time".to_string(),
                     current_version: heads[id],
                     enforcement: Enforcement::Prompt,
+                    environment_ids: metadata[id].3.clone(),
                     metadata: metadata[id].2.clone(),
                 })
                 .collect())
@@ -225,7 +231,7 @@
                 .lock()
                 .unwrap()
                 .iter()
-                .find_map(|(id, (origin, _, _))| match origin {
+                .find_map(|(id, (origin, _, _, _))| match origin {
                     SecretOrigin::File { source_path: candidate }
                         if candidate == source_path => Some(id.clone()),
                     _ => None,
@@ -241,8 +247,12 @@
             id: &SecretId,
             item_metadata: ItemMetadata,
             _enforcement: Enforcement,
+            environment_ids: Option<Vec<String>>,
         ) -> StoreResult<()> {
-            self.metadata.lock().unwrap().get_mut(id.as_str()).unwrap().2 = item_metadata;
+            let mut metadata = self.metadata.lock().unwrap();
+            let entry = metadata.get_mut(id.as_str()).unwrap();
+            entry.2 = item_metadata;
+            entry.3 = environment_ids;
             Ok(())
         }
 
@@ -356,7 +366,6 @@
                 position: 0,
             })
             .unwrap();
-
         let result = dispatch(
             &catalog,
             DispatchServices::default(),
@@ -1060,6 +1069,50 @@
             mount_path
                 .join(accessfs_core::config::SECRETS_DIR)
                 .join(FIXTURE_SECRET_ID)
+        );
+        let secret_id: SecretId = FIXTURE_SECRET_ID.parse().unwrap();
+        assert_eq!(
+            store.record(&secret_id).unwrap().unwrap().environment_ids,
+            Some(vec![snapshot.environments[0].id.clone()])
+        );
+    }
+
+    #[test]
+    fn discovery_scopes_an_opaque_environment_file_to_its_named_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("fixture-project");
+        let source_path = project_path.join("config/credentials/production.key");
+        let mount_path = dir.path().join("mount");
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
+        std::fs::create_dir_all(source_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&mount_path).unwrap();
+        std::fs::write(&source_path, "fixture-production-key\n").unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let store = FixtureStore::new();
+
+        dispatch(
+            &catalog,
+            DispatchServices {
+                store: Some(&store),
+                mount_path: Some(&mount_path),
+                ..DispatchServices::default()
+            },
+            ControlCommand::DiscoverApply {
+                paths: vec![project_path.clone()],
+                imports: Some(vec![project_file_import(&source_path, &project_path)]),
+                separate_entries: Vec::new(),
+                promote_entries: Vec::new(),
+                demote_entries: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let snapshot = catalog.snapshot().unwrap();
+        assert_eq!(snapshot.environments[0].name, "Production");
+        let secret_id: SecretId = FIXTURE_SECRET_ID.parse().unwrap();
+        assert_eq!(
+            store.record(&secret_id).unwrap().unwrap().environment_ids,
+            Some(vec![snapshot.environments[0].id.clone()])
         );
     }
 
@@ -2938,6 +2991,14 @@
             })
             .unwrap();
         catalog
+            .upsert_environment(&Environment {
+                id: "fixture-production".to_string(),
+                project_id: "fixture-project".to_string(),
+                name: "Production".to_string(),
+                position: 1,
+            })
+            .unwrap();
+        catalog
             .upsert_checkout(&ProjectCheckout {
                 id: "fixture-feature".to_string(),
                 project_id: "fixture-project".to_string(),
@@ -2978,6 +3039,10 @@
         assert_eq!(file.mode, 0o600);
         assert_eq!(file.current_version, 1);
         assert!(file.linked);
+        assert_eq!(
+            file.environment_ids,
+            vec!["fixture-development", "fixture-production"]
+        );
         assert_eq!(observer.notifications.load(Ordering::Relaxed), 1);
         assert!(std::fs::symlink_metadata(&source).unwrap().file_type().is_symlink());
         assert_eq!(
@@ -3025,6 +3090,7 @@
                 .request(ControlCommand::ProtectedFileMetadataUpdate {
                     id: FIXTURE_SECRET_ID.to_string(),
                     enforcement: Enforcement::TouchId,
+                    environment_ids: vec!["fixture-production".to_string()],
                     metadata: file_metadata.clone(),
                 })
                 .unwrap(),
@@ -3036,20 +3102,65 @@
             panic!("expected protected files result");
         };
         assert_eq!(files[0].metadata, file_metadata);
+        assert_eq!(files[0].environment_ids, vec!["fixture-production"]);
         assert_eq!(files[0].current_version, 1);
 
         let mut expected_file = file.clone();
         expected_file.metadata = file_metadata;
+        expected_file.environment_ids = vec!["fixture-production".to_string()];
         assert_eq!(
             client
                 .request(ControlCommand::FileProtect { path: source.clone() })
                 .unwrap(),
-            ControlResult::FileProtected { file: expected_file, created: false }
+            ControlResult::FileProtected {
+                file: expected_file.clone(),
+                created: false,
+            }
         );
 
-        store
-            .append_version(&secret_id, b"export FIXTURE_VALUE='fixture-updated'\n")
+        let replacement = dir.path().join("replacement.bin");
+        let replacement_bytes = b"\0fixture-binary\xff\n";
+        std::fs::write(&replacement, replacement_bytes).unwrap();
+        let source_target = std::fs::read_link(&source).unwrap();
+        let updated = client
+            .request(ControlCommand::ProtectedFileContentsUpdate {
+                id: FIXTURE_SECRET_ID.to_string(),
+                path: replacement.clone(),
+            })
             .unwrap();
+        let ControlResult::ProtectedFileUpdated { file: updated_file } = updated else {
+            panic!("expected protected file update");
+        };
+        assert_eq!(updated_file.current_version, 2);
+        assert_eq!(updated_file.size, replacement_bytes.len() as u64);
+        assert_eq!(updated_file.metadata, expected_file.metadata);
+        assert_eq!(updated_file.environment_ids, expected_file.environment_ids);
+        assert_eq!(store.get(&secret_id).unwrap().as_slice(), replacement_bytes);
+        assert_eq!(std::fs::read_link(&source).unwrap(), source_target);
+
+        let unchanged = client
+            .request(ControlCommand::ProtectedFileContentsUpdate {
+                id: FIXTURE_SECRET_ID.to_string(),
+                path: replacement,
+            })
+            .unwrap();
+        let ControlResult::ProtectedFileUpdated { file: unchanged_file } = unchanged else {
+            panic!("expected unchanged protected file update");
+        };
+        assert_eq!(
+            unchanged_file.current_version, 2,
+            "selecting identical bytes must not create a redundant version"
+        );
+
+        let invalid_update = client
+            .request(ControlCommand::ProtectedFileContentsUpdate {
+                id: FIXTURE_SECRET_ID.to_string(),
+                path: dir.path().to_path_buf(),
+            })
+            .unwrap_err();
+        assert!(invalid_update.to_string().contains("not a regular file"));
+        assert_eq!(store.record(&secret_id).unwrap().unwrap().current_version, 2);
+
         let history = client
             .request(ControlCommand::ProtectedFileHistory {
                 id: FIXTURE_SECRET_ID.to_string(),
@@ -3074,7 +3185,7 @@
         assert_eq!(file.current_version, 1);
         assert_eq!(
             observer.notifications.load(Ordering::Relaxed),
-            5,
+            7,
             "rolling back a protected-file head must refresh managed runtime policy"
         );
 
@@ -3128,14 +3239,7 @@
             std::fs::metadata(&source).unwrap().permissions().mode() & 0o7777,
             0o600
         );
-        assert!(!std::fs::symlink_metadata(worktree.join(".envrc"))
-            .unwrap()
-            .file_type()
-            .is_symlink());
-        assert_eq!(
-            std::fs::read_to_string(worktree.join(".envrc")).unwrap(),
-            "export FIXTURE_VALUE='fixture-value'\n"
-        );
+        assert!(!worktree.join(".envrc").exists());
         assert!(store.record(&secret_id).unwrap().is_none());
     }
 

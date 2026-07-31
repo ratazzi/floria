@@ -24,6 +24,7 @@ pub use links::{
     checkout_link_issues, ensure_file_surface_link, file_surface_instances,
     managed_file_links, protected_checkout_links,
     refresh_protected_checkout_links, release_protected_links_for_file_surfaces,
+    remove_excluded_protected_checkout_links,
     remove_file_surface_link, replace_file_with_symlink,
     replace_regular_file_with_symlink_if_matches, replace_symlink_with_file_if_target,
     restore_protected_checkout_links,

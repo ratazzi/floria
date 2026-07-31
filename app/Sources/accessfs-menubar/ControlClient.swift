@@ -281,12 +281,26 @@ final class ControlClient: @unchecked Sendable {
         return result.file
     }
 
+    func updateProtectedFileContents(_ id: String, from path: String) async throws
+        -> CatalogProtectedFile
+    {
+        guard let result: ProtectedFileResult = try await request(
+            .protectedFileContentsUpdate(id: id, path: path),
+            expecting: "protected_file_updated", as: ProtectedFileResult.self)
+        else {
+            throw ControlClientError.missingResult("protected_file_updated")
+        }
+        return result.file
+    }
+
     func updateProtectedFileMetadata(
-        _ id: String, enforcement: String, metadata: ItemMetadata
+        _ id: String, enforcement: String, environmentIDs: [String],
+        metadata: ItemMetadata
     ) async throws {
         try await requestEmpty(
             .protectedFileMetadataUpdate(
-                id: id, enforcement: enforcement, metadata: metadata))
+                id: id, enforcement: enforcement,
+                environmentIDs: environmentIDs, metadata: metadata))
     }
 
     func configureManagedFile(
