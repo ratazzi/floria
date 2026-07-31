@@ -107,6 +107,35 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertTrue(dashboard.contains(#".accessibilityHint("Open details")"#))
     }
 
+    func testFileConfigurationHidesMountImplementationDetails() throws {
+        let workspace = try source("WorkspaceView.swift")
+        let dashboard = try source("CompactDashboardView.swift")
+        let preview = try source("DiscoveryImportPreview.swift")
+
+        for phrase in [
+            #"InspectorSection(title: "Managed path")"#,
+            #"InspectorSection(title: "Project path")"#,
+            #"InspectorSection(title: "Included content")"#,
+            #""Managed link is healthy""#,
+            #""All configured outputs""#,
+            #"configured-file conflict"#,
+            #""Configured file""#,
+            #"output conflict"#,
+            #"existing output"#,
+            #"outputs and protected files"#,
+            #""Output already exists:"#,
+        ] {
+            XCTAssertFalse(
+                workspace.contains(phrase) || dashboard.contains(phrase)
+                    || preview.contains(phrase),
+                phrase)
+        }
+        XCTAssertTrue(workspace.contains(#"InspectorSection(title: "Location")"#))
+        XCTAssertTrue(workspace.contains(#"InspectorSection(title: "Contents")"#))
+        XCTAssertTrue(workspace.contains(#""Values from this file""#))
+        XCTAssertTrue(dashboard.contains(#""Uses project settings""#))
+    }
+
     private func source(_ name: String) throws -> String {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

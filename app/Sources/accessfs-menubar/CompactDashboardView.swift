@@ -547,7 +547,7 @@ struct DashboardView: View {
             result.append(
                 DashboardIssue(
                     id: "daemon", title: "Floria daemon is offline",
-                    detail: "Protected files and SSH agents may be unavailable.",
+                    detail: "Some Managed items may be unavailable.",
                     actionTitle: "Retry", action: .reload))
         }
         if let error = state.workspace.lastError {
@@ -1429,7 +1429,7 @@ private struct ProjectCheckoutsSheet: View {
             .help("Open in Finder")
 
             if candidate.gitPrimary {
-                Text("All configured outputs")
+                Text("Uses project settings")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .frame(width: 160, alignment: .trailing)
@@ -1498,7 +1498,7 @@ private struct ProjectCheckoutsSheet: View {
             HStack(alignment: .center, spacing: 12) {
                 Image(systemName: "checkmark.shield")
                     .foregroundStyle(.green)
-                Text("Floria links outputs and protected files into managed worktrees. Files that differ from the protected version are never touched.")
+                Text("Floria links the project's Managed files into each worktree. Files that differ from the managed version are never touched.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -1865,7 +1865,7 @@ private struct DiscoveryImportPreviewBanner: View {
             Label {
                 Text(
                     preview.hasConflicts
-                        ? "\(preview.conflicts.count) output conflict\(preview.conflicts.count == 1 ? "" : "s")"
+                        ? "\(preview.conflicts.count) file conflict\(preview.conflicts.count == 1 ? "" : "s")"
                         : (unresolvedAssignments > 0
                             ? "Choose \(unresolvedAssignments) destination\(unresolvedAssignments == 1 ? "" : "s")"
                             : "Ready to protect"))
@@ -1894,7 +1894,7 @@ private struct DiscoveryImportPreviewBanner: View {
                         .foregroundStyle(.secondary)
                 }
                 Text(
-                    "Choose Library, remove the conflicting project, or move the existing output before protecting."
+                    "Choose Library, remove the conflicting project, or move the existing file before continuing."
                 )
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -2110,7 +2110,7 @@ private struct DiscoveryWorkflowSheet: View {
         case .parsingFiles:
             return "\(progress.filesParsed) of \(progress.candidateFiles) candidates read."
         case .reconciling:
-            return "Checking existing projects, outputs, and protected files."
+            return "Checking existing projects and Managed items."
         case .complete:
             return "The review is almost ready."
         }
@@ -2566,7 +2566,7 @@ private struct DiscoveryReviewSheet: View {
         let conflictCount = importPreview.conflicts.count
         if conflictCount > 0 {
             notes.append(
-                "\(conflictCount) configured-file conflict\(conflictCount == 1 ? "" : "s") must be resolved."
+                "\(conflictCount) selected file\(conflictCount == 1 ? "" : "s") conflict with existing Managed items."
             )
         }
         let base = notes.joined(separator: " ")
@@ -2710,9 +2710,7 @@ private struct DiscoveryManagedItemCard: View {
     }
 
     private var detail: String {
-        var parts = [
-            item.kind == .surface ? "Configured file" : "Managed file"
-        ]
+        var parts = ["Managed file"]
         if let environment = item.environment {
             parts.append(environment)
         }

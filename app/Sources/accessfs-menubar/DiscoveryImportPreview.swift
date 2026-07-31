@@ -19,9 +19,9 @@ struct DiscoveryImportPreview: Equatable {
             let displayPath = (path as NSString).abbreviatingWithTildeInPath
             switch kind {
             case .outputExists:
-                return "Output already exists: \(displayPath)"
+                return "A file already exists at \(displayPath)"
             case .duplicateOutput:
-                return "Multiple selected files target \(displayPath)"
+                return "Multiple selected files use \(displayPath)"
             }
         }
     }
@@ -44,7 +44,7 @@ struct DiscoveryImportPreview: Equatable {
         }
         if createdOutputs > 0 {
             parts.append(
-                "\(createdOutputs) project output\(createdOutputs == 1 ? "" : "s") created")
+                "\(createdOutputs) Managed project file\(createdOutputs == 1 ? "" : "s") created")
         }
         if protectedSources > 0 {
             parts.append(

@@ -1548,6 +1548,17 @@ private struct ManageSurfaceSheet: View {
         store.compatibleBindings(for: selectedKind)
     }
 
+    private var backingResourceID: WorkspaceResource.ID? {
+        store.backingResource(for: surface)?.id
+    }
+
+    private func bindingTitle(_ binding: WorkspaceBinding) -> String {
+        if binding.resourceID == backingResourceID {
+            return "Values from this file"
+        }
+        return store.resource(binding.resourceID)?.name ?? binding.resourceID
+    }
+
     private var expectedTarget: String {
         store.expectedLinkTarget(for: surface)
     }
@@ -1556,11 +1567,22 @@ private struct ManageSurfaceSheet: View {
         store.managedLinkTarget(for: surface)
     }
 
-    private var linkSummary: String {
-        guard let actualTarget else { return "Missing — repair will recreate the link" }
-        return actualTarget == expectedTarget
-            ? "Managed link is healthy"
-            : "Conflict — Floria will not replace this link"
+    private var linkPathExists: Bool {
+        FileManager.default.fileExists(atPath: surface.path)
+    }
+
+    private var linkCanBeRepaired: Bool {
+        actualTarget == nil && !linkPathExists
+    }
+
+    private var linkIssue: String? {
+        guard let actualTarget else {
+            return linkPathExists
+                ? "This path is occupied by another file. Floria will not replace it automatically."
+                : "This path is not linked. Repair it to restore access."
+        }
+        guard actualTarget != expectedTarget else { return nil }
+        return "This path points somewhere else. Floria will not replace it automatically."
     }
 
     var body: some View {
@@ -1568,9 +1590,11 @@ private struct ManageSurfaceSheet: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text("Configure \(URL(fileURLWithPath: surface.path).lastPathComponent)")
                     .font(.title2.bold())
-                Text(linkSummary)
-                    .font(.callout)
-                    .foregroundStyle(actualTarget == expectedTarget ? Color.green : Color.orange)
+                if let linkIssue {
+                    Label(linkIssue, systemImage: "exclamationmark.triangle.fill")
+                        .font(.callout)
+                        .foregroundStyle(Color.orange)
+                }
             }
 
             if isManagedSurface {
@@ -1591,7 +1615,7 @@ private struct ManageSurfaceSheet: View {
                 }
             }
 
-            InspectorSection(title: "Project path") {
+            InspectorSection(title: "Location") {
                 Text(
                     ((surface.path as NSString).deletingLastPathComponent as NSString)
                         .appendingPathComponent(fileName)
@@ -1601,10 +1625,10 @@ private struct ManageSurfaceSheet: View {
             }
 
             if isComposedSurface {
-                InspectorSection(title: "Included content") {
+                InspectorSection(title: "Contents") {
                     ForEach(bindingCandidates) { binding in
                         Toggle(
-                            store.resource(binding.resourceID)?.name ?? binding.resourceID,
+                            bindingTitle(binding),
                             isOn: bindingSelection(binding.id)
                         )
                         .toggleStyle(.checkbox)
@@ -1615,7 +1639,6 @@ private struct ManageSurfaceSheet: View {
                     }
                 }
             }
-
 
             if isSocketSurface {
                 InspectorSection(title: "SSH host route") {
@@ -1638,30 +1661,16 @@ private struct ManageSurfaceSheet: View {
                 }
             }
 
-            if isManagedSurface {
-                InspectorSection(title: "Managed path") {
-                    Text(expectedTarget)
+            if let actualTarget, actualTarget != expectedTarget {
+                InspectorSection(title: "Current destination") {
+                    Text(actualTarget)
                         .font(.callout.monospaced())
                         .textSelection(.enabled)
-                }
-                if let actualTarget, actualTarget != expectedTarget {
-                    InspectorSection(title: "Current target") {
-                        Text(actualTarget)
-                            .font(.callout.monospaced())
-                            .textSelection(.enabled)
-                    }
                 }
             }
 
             HStack {
-                Button("Copy Path", systemImage: "doc.on.doc") {
-                    copyToPasteboard(surface.path)
-                }
-                Button("Open in Finder", systemImage: "folder") {
-                    NSWorkspace.shared.activateFileViewerSelecting(
-                        [URL(fileURLWithPath: surface.path)])
-                }
-                if isManagedSurface {
+                if isManagedSurface, linkCanBeRepaired {
                     Button("Repair Link", systemImage: "wrench.and.screwdriver", action: repairLink)
                         .disabled(isWorking)
                 }
