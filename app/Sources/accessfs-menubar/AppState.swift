@@ -173,9 +173,9 @@ final class AppState {
         }
 
         if DaemonManager.isProductionApp {
-            // A packaged app always reconciles the LaunchAgent definition. DaemonManager makes
-            // the same bundle revision a no-op, while a newly installed bundle must replace an
-            // older but still-connectable daemon so new control-plane capabilities become live.
+            // A packaged app always reconciles the LaunchAgent definition. DaemonManager leaves
+            // a running job from the same bundle revision alone, starts it when inactive, and
+            // replaces an older but still-connectable daemon so new capabilities become live.
             // macFUSE readiness gates the whole ladder: without it the daemon can only crash-loop.
             Task { @MainActor [weak self] in
                 try? await Task.sleep(nanoseconds: 500_000_000)

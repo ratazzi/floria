@@ -45,8 +45,9 @@ struct DaemonManager: Sendable {
         Bundle.main.url(forResource: "accessfs", withExtension: nil)
     }
 
-    /// Ensure the current bundle's daemon definition is installed and loaded. A changed
-    /// app build rewrites and reloads the job; reopening the same build leaves it alone.
+    /// Ensure the current bundle's daemon definition is installed and running. A changed
+    /// app build rewrites and reloads the job; reopening the same build starts an inactive
+    /// job without disturbing one that is already running.
     func ensureRunning() {
         guard Self.isProductionApp else { return }
 
@@ -58,9 +59,18 @@ struct DaemonManager: Sendable {
             try prepareRuntimeDirectory()
             try withReconciliationLock {
                 try prepareRuntimeFiles()
-                if isLoaded && installedDefinitionMatches(daemonPath: daemonURL.path) {
-                    Self.log.info("daemon LaunchAgent already loaded")
-                    return
+                if installedDefinitionMatches(daemonPath: daemonURL.path) {
+                    switch currentLaunchAgentState {
+                    case .running:
+                        Self.log.info("daemon LaunchAgent already running")
+                        return
+                    case .loaded:
+                        try runLaunchctl(["kickstart", serviceTarget])
+                        Self.log.info("inactive daemon LaunchAgent started")
+                        return
+                    case .notLoaded:
+                        break
+                    }
                 }
 
                 try install(daemonURL: daemonURL)
@@ -211,8 +221,24 @@ struct DaemonManager: Sendable {
             fromPropertyList: plist, format: .xml, options: 0)
     }
 
-    private var isLoaded: Bool {
-        (try? runLaunchctl(["print", serviceTarget])) != nil
+    enum LaunchAgentState: Equatable {
+        case notLoaded
+        case loaded
+        case running
+    }
+
+    static func launchAgentState(from output: String?) -> LaunchAgentState {
+        guard let output else { return .notLoaded }
+
+        let isRunning = output
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .contains("state = running")
+        return isRunning ? .running : .loaded
+    }
+
+    private var currentLaunchAgentState: LaunchAgentState {
+        Self.launchAgentState(from: try? runLaunchctl(["print", serviceTarget]))
     }
 
     @discardableResult
