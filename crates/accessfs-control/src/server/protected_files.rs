@@ -243,9 +243,24 @@ pub(super) fn restore_file(
     }
 
     let plaintext = store.get(&id)?;
-    replace_symlink_with_file(source_path, &plaintext, record.mode).map_err(|source| {
-        DispatchError::Io { path: source_path.clone(), source }
-    })?;
+    restore_protected_checkout_links(&snapshot, &record, &plaintext, mount_path).map_err(
+        |source| DispatchError::Io {
+            path: source_path.clone(),
+            source,
+        },
+    )?;
+    let restored =
+        replace_symlink_with_file_if_target(source_path, &expected, &plaintext, record.mode)
+            .map_err(|source| DispatchError::Io {
+                path: source_path.clone(),
+                source,
+            })?;
+    if !restored {
+        return Err(DispatchError::Validation(format!(
+            "{} changed while it was being restored; no file was overwritten",
+            source_path.display()
+        )));
+    }
     let storage_deleted = match store.delete(&id) {
         Ok(()) => true,
         Err(error) => {
@@ -280,73 +295,4 @@ pub(super) fn canonical_source_path(path: &Path) -> io::Result<PathBuf> {
     Ok(std::fs::canonicalize(parent)?.join(name))
 }
 
-pub(super) fn replace_symlink_with_file(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("/"));
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let mut temporary = None;
-    for counter in 0..100 {
-        let candidate = parent.join(format!(
-            ".{name}.floria-restore-{}-{counter}.tmp",
-            std::process::id()
-        ));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&candidate)
-        {
-            Ok(mut file) => {
-                if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
-                    let _ = std::fs::remove_file(&candidate);
-                    return Err(error);
-                }
-                if let Err(error) =
-                    std::fs::set_permissions(&candidate, std::fs::Permissions::from_mode(mode))
-                {
-                    let _ = std::fs::remove_file(&candidate);
-                    return Err(error);
-                }
-                temporary = Some(candidate);
-                break;
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    }
-    let temporary = temporary.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::AlreadyExists, "could not allocate a restore file name")
-    })?;
-    if let Err(error) = std::fs::rename(&temporary, path) {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(error);
-    }
-    Ok(())
-}
-
-pub(super) fn replace_file_with_symlink(path: &Path, target: &Path) -> io::Result<()> {
-    let parent = path.parent().unwrap_or_else(|| Path::new("/"));
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let mut temporary = None;
-    for counter in 0..100 {
-        let candidate = parent.join(format!(
-            ".{name}.floria-{}-{counter}.tmp",
-            std::process::id()
-        ));
-        match std::os::unix::fs::symlink(target, &candidate) {
-            Ok(()) => {
-                temporary = Some(candidate);
-                break;
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error),
-        }
-    }
-    let temporary = temporary.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::AlreadyExists, "could not allocate a temporary symlink name")
-    })?;
-    if let Err(error) = std::fs::rename(&temporary, path) {
-        let _ = std::fs::remove_file(&temporary);
-        return Err(error);
-    }
-    Ok(())
-}
+pub(super) use accessfs_surface::replace_file_with_symlink;

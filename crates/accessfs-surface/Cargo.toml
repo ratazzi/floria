@@ -8,9 +8,11 @@ license.workspace = true
 accessfs-catalog = { workspace = true }
 accessfs-core = { workspace = true }
 accessfs-store = { workspace = true }
+libc = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+age = { workspace = true }
 tempfile = { workspace = true }

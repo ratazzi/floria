@@ -1,9 +1,13 @@
-use std::io;
-use std::os::unix::fs::symlink;
-use std::path::{Component, Path};
+use std::collections::HashMap;
+use std::ffi::CString;
+use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Component, Path, PathBuf};
 
 use accessfs_catalog::{CatalogSnapshot, ProjectCheckoutKind, Surface, SurfaceKind};
-use accessfs_core::config::SURFACES_DIR;
+use accessfs_core::config::{SECRETS_DIR, SURFACES_DIR};
+use accessfs_store::{SecretRecord, SecretStore};
 
 use crate::error::{SurfaceError, SurfaceResult};
 
@@ -219,6 +223,431 @@ fn link_conflict(path: &Path, expected: &Path, reason: impl Into<String>) -> Sur
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ProtectedCheckoutLink {
+    secret_id: accessfs_store::SecretId,
+    path: PathBuf,
+    target: PathBuf,
+    mode: u32,
+    current_version: u32,
+}
+
+/// Build the desired protected-file links for managed worktrees. A file belongs
+/// to exactly one project: the deepest project path that contains its original
+/// source, matching discovery's nested-project assignment rule.
+pub fn protected_checkout_links(
+    snapshot: &CatalogSnapshot,
+    records: &[SecretRecord],
+    mount_path: &Path,
+) -> Vec<ProtectedCheckoutLink> {
+    let mut links = Vec::new();
+    for record in records {
+        let Some(source) = record.source_path() else { continue };
+        let Some(project) = snapshot
+            .projects
+            .iter()
+            .filter(|project| source.starts_with(&project.path))
+            .max_by_key(|project| project.path.components().count())
+        else {
+            continue;
+        };
+        let Ok(relative) = source.strip_prefix(&project.path) else { continue };
+        if relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            continue;
+        }
+        let target = mount_path.join(SECRETS_DIR).join(record.id.to_string());
+        for checkout in snapshot.checkouts.iter().filter(|checkout| {
+            checkout.kind == ProjectCheckoutKind::Worktree
+                && checkout.project_id == project.id
+        }) {
+            links.push(ProtectedCheckoutLink {
+                secret_id: record.id.clone(),
+                path: checkout.path.join(relative),
+                target: target.clone(),
+                mode: record.mode,
+                current_version: record.current_version,
+            });
+        }
+    }
+    links.sort_by(|left, right| {
+        left.secret_id
+            .as_str()
+            .cmp(right.secret_id.as_str())
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    links
+}
+
+/// Apply only the delta between two desired link inventories. Unchanged plans
+/// do no filesystem or decryption work; removed exact Floria links are restored
+/// to regular files before new/changed links are reconciled.
+pub fn refresh_protected_checkout_links(
+    active: &mut Vec<ProtectedCheckoutLink>,
+    next: Vec<ProtectedCheckoutLink>,
+    store: &dyn SecretStore,
+) -> io::Result<bool> {
+    if *active == next {
+        return Ok(false);
+    }
+    let removed = active
+        .iter()
+        .filter(|old| !next.iter().any(|new| old.same_location(new)))
+        .cloned()
+        .collect::<Vec<_>>();
+    let changed = next
+        .iter()
+        .filter(|new| !active.contains(new))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    restore_removed_links(&removed, store)?;
+    reconcile_protected_links(&changed, store)?;
+    *active = next;
+    Ok(true)
+}
+
+/// Restore every exact worktree link for one protected file while its plaintext
+/// is still available. Foreign links, divergent regular files, and missing
+/// paths remain untouched.
+pub fn restore_protected_checkout_links(
+    snapshot: &CatalogSnapshot,
+    record: &SecretRecord,
+    plaintext: &[u8],
+    mount_path: &Path,
+) -> io::Result<()> {
+    let links = protected_checkout_links(snapshot, std::slice::from_ref(record), mount_path);
+    for link in links {
+        restore_exact_link(&link, plaintext)?;
+    }
+    Ok(())
+}
+
+impl ProtectedCheckoutLink {
+    fn same_location(&self, other: &Self) -> bool {
+        self.secret_id == other.secret_id
+            && self.path == other.path
+            && self.target == other.target
+    }
+}
+
+fn reconcile_protected_links(
+    links: &[ProtectedCheckoutLink],
+    store: &dyn SecretStore,
+) -> io::Result<()> {
+    let mut groups = HashMap::<accessfs_store::SecretId, Vec<&ProtectedCheckoutLink>>::new();
+    for link in links {
+        groups.entry(link.secret_id.clone()).or_default().push(link);
+    }
+    for (secret_id, links) in groups {
+        let plaintext =
+            store.get(&secret_id).map_err(|error| io::Error::other(error.to_string()))?;
+        for link in links {
+            link_protected_copy(link, &plaintext)?;
+        }
+    }
+    Ok(())
+}
+
+fn restore_removed_links(
+    links: &[ProtectedCheckoutLink],
+    store: &dyn SecretStore,
+) -> io::Result<()> {
+    let mut groups = HashMap::<accessfs_store::SecretId, Vec<&ProtectedCheckoutLink>>::new();
+    for link in links {
+        if is_exact_symlink(&link.path, &link.target)? {
+            groups.entry(link.secret_id.clone()).or_default().push(link);
+        }
+    }
+    for (secret_id, links) in groups {
+        let plaintext =
+            store.get(&secret_id).map_err(|error| io::Error::other(error.to_string()))?;
+        for link in links {
+            restore_exact_link(link, &plaintext)?;
+        }
+    }
+    Ok(())
+}
+
+fn restore_exact_link(link: &ProtectedCheckoutLink, plaintext: &[u8]) -> io::Result<()> {
+    let _ = replace_symlink_with_file_if_target(
+        &link.path,
+        &link.target,
+        plaintext,
+        link.mode,
+    )?;
+    Ok(())
+}
+
+fn link_protected_copy(link: &ProtectedCheckoutLink, plaintext: &[u8]) -> io::Result<()> {
+    match std::fs::symlink_metadata(&link.path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            // Do not invent directories inside a checkout; only fill in the leaf.
+            let Some(parent) = link.path.parent() else { return Ok(()) };
+            if !parent.is_dir() {
+                return Ok(());
+            }
+            symlink(&link.target, &link.path)?;
+            tracing::info!(path = %link.path.display(), "linked protected file into worktree");
+            Ok(())
+        }
+        Err(error) => Err(error),
+        // Already ours, or a foreign symlink the user owns; either way leave it.
+        Ok(metadata) if metadata.file_type().is_symlink() => Ok(()),
+        Ok(metadata) if metadata.is_file() => {
+            if !replace_regular_file_with_symlink_if_matches(
+                &link.path,
+                &link.target,
+                plaintext,
+            )? {
+                tracing::debug!(
+                    path = %link.path.display(),
+                    "worktree copy differs from the protected head; leaving it untouched"
+                );
+                return Ok(());
+            }
+            tracing::info!(
+                path = %link.path.display(),
+                "replaced worktree copy with protected link"
+            );
+            Ok(())
+        }
+        Ok(_) => Ok(()),
+    }
+}
+
+/// Atomically swap a regular file for a symlink to `target`.
+///
+/// This unconditional primitive is reserved for explicit user actions whose
+/// caller already owns the path. Automatic worktree reconciliation uses the
+/// conditional swap below so a concurrent save cannot be overwritten.
+pub fn replace_file_with_symlink(path: &Path, target: &Path) -> io::Result<()> {
+    let temporary = create_temporary_symlink(path, target, "link")?;
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn replace_regular_file_with_symlink_if_matches(
+    path: &Path,
+    target: &Path,
+    expected: &[u8],
+) -> io::Result<bool> {
+    replace_regular_file_with_symlink_if_matches_with(path, target, expected, || Ok(()))
+}
+
+fn replace_regular_file_with_symlink_if_matches_with(
+    path: &Path,
+    target: &Path,
+    expected: &[u8],
+    before_swap: impl FnOnce() -> io::Result<()>,
+) -> io::Result<bool> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !metadata.is_file() || std::fs::read(path)?.as_slice() != expected {
+        return Ok(false);
+    }
+    before_swap()?;
+
+    let temporary = create_temporary_symlink(path, target, "conditional-link")?;
+    if let Err(error) = swap_paths(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    let swapped_matches = std::fs::symlink_metadata(&temporary)
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+        && std::fs::read(&temporary)
+            .map(|bytes| bytes.as_slice() == expected)
+            .unwrap_or(false);
+    if swapped_matches {
+        std::fs::remove_file(&temporary)?;
+        return Ok(true);
+    }
+    rollback_swap(path, &temporary, target)?;
+    Ok(false)
+}
+
+/// Replace only an exact symlink with a regular file. The swap is verified
+/// after it happens, so a path changed concurrently is restored rather than
+/// overwritten.
+pub fn replace_symlink_with_file_if_target(
+    path: &Path,
+    expected_target: &Path,
+    bytes: &[u8],
+    mode: u32,
+) -> io::Result<bool> {
+    if !is_exact_symlink(path, expected_target)? {
+        return Ok(false);
+    }
+    let temporary = create_temporary_file(path, bytes, mode)?;
+    let temporary_metadata = std::fs::symlink_metadata(&temporary)?;
+    if let Err(error) = swap_paths(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if is_exact_symlink(&temporary, expected_target)? {
+        std::fs::remove_file(&temporary)?;
+        return Ok(true);
+    }
+    rollback_file_swap(path, &temporary, &temporary_metadata, bytes)?;
+    Ok(false)
+}
+
+fn rollback_swap(path: &Path, temporary: &Path, expected_target: &Path) -> io::Result<()> {
+    if !is_exact_symlink(path, expected_target)? {
+        return Err(io::Error::other(format!(
+            "{} changed during an atomic Floria swap; displaced content was preserved at {}",
+            path.display(),
+            temporary.display()
+        )));
+    }
+    swap_paths(temporary, path)?;
+    std::fs::remove_file(temporary)
+}
+
+fn rollback_file_swap(
+    path: &Path,
+    temporary: &Path,
+    inserted_metadata: &std::fs::Metadata,
+    inserted_bytes: &[u8],
+) -> io::Result<()> {
+    let current = std::fs::symlink_metadata(path)?;
+    let still_inserted = current.is_file()
+        && current.dev() == inserted_metadata.dev()
+        && current.ino() == inserted_metadata.ino()
+        && std::fs::read(path)?.as_slice() == inserted_bytes;
+    if !still_inserted {
+        return Err(io::Error::other(format!(
+            "{} changed during an atomic Floria restore; displaced content was preserved at {}",
+            path.display(),
+            temporary.display()
+        )));
+    }
+    swap_paths(temporary, path)?;
+    std::fs::remove_file(temporary)
+}
+
+fn is_exact_symlink(path: &Path, expected_target: &Path) -> io::Result<bool> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if !metadata.file_type().is_symlink() {
+        return Ok(false);
+    }
+    Ok(std::fs::read_link(path)? == expected_target)
+}
+
+fn create_temporary_symlink(path: &Path, target: &Path, label: &str) -> io::Result<PathBuf> {
+    allocate_temporary_path(path, label, |candidate| symlink(target, candidate))
+}
+
+fn create_temporary_file(path: &Path, bytes: &[u8], mode: u32) -> io::Result<PathBuf> {
+    allocate_temporary_path(path, "restore", |candidate| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(candidate)?;
+        let result = file
+            .write_all(bytes)
+            .and_then(|_| file.sync_all())
+            .and_then(|_| {
+                std::fs::set_permissions(candidate, std::fs::Permissions::from_mode(mode))
+            });
+        if result.is_err() {
+            let _ = std::fs::remove_file(candidate);
+        }
+        result
+    })
+}
+
+fn allocate_temporary_path(
+    path: &Path,
+    label: &str,
+    create: impl Fn(&Path) -> io::Result<()>,
+) -> io::Result<PathBuf> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("/"));
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    for counter in 0..100 {
+        let candidate = parent.join(format!(
+            ".{name}.floria-{label}-{}-{counter}.tmp",
+            std::process::id()
+        ));
+        match create(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a temporary Floria path",
+    ))
+}
+
+fn path_c_string(path: &Path) -> io::Result<CString> {
+    CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path contains a NUL byte: {}", path.display()),
+        )
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn swap_paths(left: &Path, right: &Path) -> io::Result<()> {
+    let left = path_c_string(left)?;
+    let right = path_c_string(right)?;
+    // SAFETY: both C strings are NUL-terminated and remain alive for the call.
+    let result = unsafe {
+        libc::renameatx_np(
+            libc::AT_FDCWD,
+            left.as_ptr(),
+            libc::AT_FDCWD,
+            right.as_ptr(),
+            libc::RENAME_SWAP,
+        )
+    };
+    if result == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
+#[cfg(target_os = "linux")]
+fn swap_paths(left: &Path, right: &Path) -> io::Result<()> {
+    let left = path_c_string(left)?;
+    let right = path_c_string(right)?;
+    // SAFETY: both C strings are NUL-terminated and remain alive for the syscall.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            left.as_ptr(),
+            libc::AT_FDCWD,
+            right.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if result == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn swap_paths(_left: &Path, _right: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "atomic path exchange is unavailable on this platform",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,7 +655,22 @@ mod tests {
         CatalogSnapshot, Environment, FileBacking, Project, ProjectCheckout, ProjectCheckoutKind,
         SurfaceFormat, SurfaceInput,
     };
+    use accessfs_store::{AgeDirStore, KeyProvider, NewSecret, SecretId, StoreResult};
     use std::path::PathBuf;
+    use std::sync::Arc;
+
+    struct TestKeys(age::x25519::Identity);
+
+    impl KeyProvider for TestKeys {
+        #[allow(clippy::type_complexity)]
+        fn recipients(&self) -> StoreResult<Vec<Box<dyn age::Recipient + Send>>> {
+            Ok(vec![Box::new(self.0.to_public())])
+        }
+
+        fn identity(&self) -> StoreResult<Box<dyn age::Identity>> {
+            Ok(Box::new(self.0.clone()))
+        }
+    }
 
     fn fixture_surface(path: PathBuf) -> Surface {
         Surface {
@@ -392,5 +836,316 @@ mod tests {
             std::fs::read_link(&surface.path).unwrap(),
             PathBuf::from("/fixture/owned-elsewhere")
         );
+    }
+
+    #[test]
+    fn extends_protected_files_into_managed_worktrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("project");
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        let mount = dir.path().join("mount");
+        let store = AgeDirStore::open(
+            dir.path().join("store"),
+            Arc::new(TestKeys(age::x25519::Identity::generate())),
+        )
+        .unwrap();
+
+        let protect = |name: &str, content: &[u8]| -> SecretId {
+            let source = primary.join(name);
+            let id = store
+                .put(NewSecret::file(source.clone(), 0o644), content)
+                .unwrap();
+            symlink(mount.join(SECRETS_DIR).join(id.to_string()), &source).unwrap();
+            id
+        };
+        let identical_id = protect("mise.local.toml", b"secret = 1\n");
+        let divergent_id = protect(".envrc", b"export A=1\n");
+        let missing_id = protect(".pgpass", b"host|5432|db|user|pw\n");
+        let _ = divergent_id;
+
+        // The worktree starts with an identical copy, a locally edited copy,
+        // and no copy at all.
+        std::fs::write(worktree.join("mise.local.toml"), b"secret = 1\n").unwrap();
+        std::fs::write(worktree.join(".envrc"), b"export A=2\n").unwrap();
+
+        let snapshot = CatalogSnapshot {
+            projects: vec![Project {
+                id: "fixture-project".to_string(),
+                name: "Fixture".to_string(),
+                path: primary.clone(),
+                ..Default::default()
+            }],
+            checkouts: vec![
+                ProjectCheckout {
+                    id: "fixture-project".to_string(),
+                    project_id: "fixture-project".to_string(),
+                    path: primary,
+                    kind: ProjectCheckoutKind::Primary,
+                    ..Default::default()
+                },
+                ProjectCheckout {
+                    id: "fixture-feature".to_string(),
+                    project_id: "fixture-project".to_string(),
+                    path: worktree.clone(),
+                    environment_id: Some("fixture-development".to_string()),
+                    ..Default::default()
+                },
+            ],
+            ..CatalogSnapshot::default()
+        };
+
+        let mut active_links = Vec::new();
+        let links = protected_checkout_links(&snapshot, &store.list().unwrap(), &mount);
+        refresh_protected_checkout_links(&mut active_links, links, &store).unwrap();
+
+        let identical = worktree.join("mise.local.toml");
+        assert!(std::fs::symlink_metadata(&identical).unwrap().file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_link(&identical).unwrap(),
+            mount.join(SECRETS_DIR).join(identical_id.to_string())
+        );
+
+        let divergent = worktree.join(".envrc");
+        assert!(!std::fs::symlink_metadata(&divergent).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&divergent).unwrap(), b"export A=2\n");
+
+        let missing = worktree.join(".pgpass");
+        assert!(std::fs::symlink_metadata(&missing).unwrap().file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_link(&missing).unwrap(),
+            mount.join(SECRETS_DIR).join(missing_id.to_string())
+        );
+    }
+
+    #[test]
+    fn assigns_a_protected_file_only_to_the_deepest_nested_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("workspace");
+        let nested = parent.join("service");
+        let parent_worktree = dir.path().join("workspace-feature");
+        let nested_worktree = dir.path().join("service-feature");
+        std::fs::create_dir_all(&nested).unwrap();
+        let mount = dir.path().join("mount");
+        let store = AgeDirStore::open(
+            dir.path().join("store"),
+            Arc::new(TestKeys(age::x25519::Identity::generate())),
+        )
+        .unwrap();
+        store
+            .put(NewSecret::file(nested.join(".env"), 0o600), b"SECRET=fixture\n")
+            .unwrap();
+        let snapshot = CatalogSnapshot {
+            projects: vec![
+                Project {
+                    id: "parent".to_string(),
+                    name: "Parent".to_string(),
+                    path: parent.clone(),
+                    ..Default::default()
+                },
+                Project {
+                    id: "nested".to_string(),
+                    name: "Nested".to_string(),
+                    path: nested,
+                    ..Default::default()
+                },
+            ],
+            checkouts: vec![
+                ProjectCheckout {
+                    id: "parent-feature".to_string(),
+                    project_id: "parent".to_string(),
+                    path: parent_worktree,
+                    kind: ProjectCheckoutKind::Worktree,
+                    environment_id: Some("parent-development".to_string()),
+                    ..Default::default()
+                },
+                ProjectCheckout {
+                    id: "nested-feature".to_string(),
+                    project_id: "nested".to_string(),
+                    path: nested_worktree.clone(),
+                    kind: ProjectCheckoutKind::Worktree,
+                    environment_id: Some("nested-development".to_string()),
+                    ..Default::default()
+                },
+            ],
+            ..CatalogSnapshot::default()
+        };
+
+        let links = protected_checkout_links(&snapshot, &store.list().unwrap(), &mount);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].path, nested_worktree.join(".env"));
+    }
+
+    #[test]
+    fn removing_a_managed_checkout_restores_its_exact_protected_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("project");
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        let mount = dir.path().join("mount");
+        let store = AgeDirStore::open(
+            dir.path().join("store"),
+            Arc::new(TestKeys(age::x25519::Identity::generate())),
+        )
+        .unwrap();
+        let id = store
+            .put(NewSecret::file(primary.join(".env"), 0o640), b"SECRET=fixture\n")
+            .unwrap();
+        let snapshot = CatalogSnapshot {
+            projects: vec![Project {
+                id: "fixture-project".to_string(),
+                name: "Fixture".to_string(),
+                path: primary,
+                ..Default::default()
+            }],
+            checkouts: vec![ProjectCheckout {
+                id: "fixture-feature".to_string(),
+                project_id: "fixture-project".to_string(),
+                path: worktree.clone(),
+                kind: ProjectCheckoutKind::Worktree,
+                environment_id: Some("fixture-development".to_string()),
+                ..Default::default()
+            }],
+            ..CatalogSnapshot::default()
+        };
+        let mut active_links = Vec::new();
+        let links = protected_checkout_links(&snapshot, &store.list().unwrap(), &mount);
+        refresh_protected_checkout_links(&mut active_links, links, &store).unwrap();
+        assert_eq!(
+            std::fs::read_link(worktree.join(".env")).unwrap(),
+            mount.join(SECRETS_DIR).join(id.to_string())
+        );
+
+        refresh_protected_checkout_links(&mut active_links, Vec::new(), &store).unwrap();
+
+        let restored = worktree.join(".env");
+        assert!(!std::fs::symlink_metadata(&restored).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(restored).unwrap(), b"SECRET=fixture\n");
+    }
+
+    #[test]
+    fn restoring_a_file_restores_worktree_links_before_the_store_is_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("project");
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        let mount = dir.path().join("mount");
+        let store = AgeDirStore::open(
+            dir.path().join("store"),
+            Arc::new(TestKeys(age::x25519::Identity::generate())),
+        )
+        .unwrap();
+        let id = store
+            .put(NewSecret::file(primary.join(".env"), 0o600), b"SECRET=fixture\n")
+            .unwrap();
+        let record = store.record(&id).unwrap().unwrap();
+        let target = mount.join(SECRETS_DIR).join(id.to_string());
+        symlink(&target, worktree.join(".env")).unwrap();
+        let snapshot = CatalogSnapshot {
+            projects: vec![Project {
+                id: "fixture-project".to_string(),
+                name: "Fixture".to_string(),
+                path: primary,
+                ..Default::default()
+            }],
+            checkouts: vec![ProjectCheckout {
+                id: "fixture-feature".to_string(),
+                project_id: "fixture-project".to_string(),
+                path: worktree.clone(),
+                kind: ProjectCheckoutKind::Worktree,
+                environment_id: Some("fixture-development".to_string()),
+                ..Default::default()
+            }],
+            ..CatalogSnapshot::default()
+        };
+
+        restore_protected_checkout_links(
+            &snapshot,
+            &record,
+            &store.get(&id).unwrap(),
+            &mount,
+        )
+        .unwrap();
+
+        let restored = worktree.join(".env");
+        assert!(!std::fs::symlink_metadata(&restored).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(restored).unwrap(), b"SECRET=fixture\n");
+    }
+
+    #[test]
+    fn conditional_link_swap_preserves_a_file_changed_after_comparison() {
+        let dir = tempfile::tempdir().unwrap();
+        let candidate = dir.path().join(".env");
+        let target = dir.path().join("secret");
+        std::fs::write(&candidate, b"SECRET=old\n").unwrap();
+
+        let linked = replace_regular_file_with_symlink_if_matches_with(
+            &candidate,
+            &target,
+            b"SECRET=old\n",
+            || std::fs::write(&candidate, b"SECRET=new\n"),
+        )
+        .unwrap();
+
+        assert!(!linked);
+        assert!(!std::fs::symlink_metadata(&candidate).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(candidate).unwrap(), b"SECRET=new\n");
+    }
+
+    #[test]
+    fn unchanged_link_plan_skips_rechecking_divergent_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("project");
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        let mount = dir.path().join("mount");
+        let store = AgeDirStore::open(
+            dir.path().join("store"),
+            Arc::new(TestKeys(age::x25519::Identity::generate())),
+        )
+        .unwrap();
+        let id = store
+            .put(NewSecret::file(primary.join(".env"), 0o600), b"SECRET=expected\n")
+            .unwrap();
+        std::fs::write(worktree.join(".env"), b"SECRET=divergent\n").unwrap();
+        let snapshot = CatalogSnapshot {
+            projects: vec![Project {
+                id: "fixture-project".to_string(),
+                name: "Fixture".to_string(),
+                path: primary,
+                ..Default::default()
+            }],
+            checkouts: vec![ProjectCheckout {
+                id: "fixture-feature".to_string(),
+                project_id: "fixture-project".to_string(),
+                path: worktree.clone(),
+                kind: ProjectCheckoutKind::Worktree,
+                environment_id: Some("fixture-development".to_string()),
+                ..Default::default()
+            }],
+            ..CatalogSnapshot::default()
+        };
+        let mut active_links = Vec::new();
+        let plan = protected_checkout_links(&snapshot, &store.list().unwrap(), &mount);
+        refresh_protected_checkout_links(&mut active_links, plan.clone(), &store).unwrap();
+        std::fs::write(worktree.join(".env"), b"SECRET=expected\n").unwrap();
+
+        assert!(!refresh_protected_checkout_links(&mut active_links, plan, &store).unwrap());
+        assert!(!std::fs::symlink_metadata(worktree.join(".env"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        store.append_version(&id, b"SECRET=expected\n").unwrap();
+        let updated = protected_checkout_links(&snapshot, &store.list().unwrap(), &mount);
+        assert!(refresh_protected_checkout_links(&mut active_links, updated, &store).unwrap());
+        assert!(std::fs::symlink_metadata(worktree.join(".env"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 }

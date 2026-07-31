@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::io;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -21,7 +21,10 @@ use accessfs_discover::{
 use accessfs_platform::SocketPeerVerifier;
 use accessfs_ssh::ManagedKeyError;
 use accessfs_store::{NewSecret, SecretId, SecretOrigin, SecretRecord, SecretStore, StoreError};
-use accessfs_surface::{decode_source, ensure_file_surface_link, validate_secret_bytes};
+use accessfs_surface::{
+    decode_source, ensure_file_surface_link, replace_symlink_with_file_if_target,
+    restore_protected_checkout_links, validate_secret_bytes,
+};
 
 use crate::protocol::{
     read_msg, write_msg, AccessHistoryEvent, AccessHistoryIdentity, AccessHistoryProcess,

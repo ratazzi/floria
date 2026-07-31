@@ -190,6 +190,8 @@ dependencies = [
  "accessfs-catalog",
  "accessfs-core",
  "accessfs-store",
+ "age",
+ "libc",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",

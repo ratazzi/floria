@@ -26,8 +26,9 @@ use accessfs_store::{
     SshKeyProvider,
 };
 use accessfs_surface::{
-    ensure_file_surface_link, file_surface_instances, remove_file_surface_link,
-    validate_secret_bytes, SurfaceLinkRemoval, SurfaceLinkState, SurfaceRegistry,
+    ensure_file_surface_link, file_surface_instances, protected_checkout_links,
+    refresh_protected_checkout_links, remove_file_surface_link, validate_secret_bytes,
+    ProtectedCheckoutLink, SurfaceLinkRemoval, SurfaceLinkState, SurfaceRegistry,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -513,9 +514,17 @@ fn cmd_mount(config: &Path) -> Result<()> {
         file_surface_instances(&snapshot).context("materializing project checkout links")?;
     reconcile_file_links(&linked_file_surfaces, &cfg.mount_path);
     let store: Arc<dyn SecretStore> = Arc::new(open_store(&cfg)?);
+    let records = store.list()?;
+    let mut linked_protected_files = Vec::new();
+    refresh_protected_checkout_links(
+        &mut linked_protected_files,
+        protected_checkout_links(&snapshot, &records, &cfg.mount_path),
+        store.as_ref(),
+    )
+    .context("materializing protected files in project worktrees")?;
     let agent = accessfs_agent::SocketAgent::start(&cfg, agent_peer_verifier)
         .context("starting agent socket")?;
-    agent.replace_managed_policy(managed_policy_items(&snapshot, &store.list()?));
+    agent.replace_managed_policy(managed_policy_items(&snapshot, &records));
     let audit = Arc::new(AuditLog::open(&cfg.audit_log).context("opening shared audit log")?);
     let ssh_authorizer: Arc<dyn Authorizer> = agent.clone();
     let managed_keys: Arc<dyn accessfs_agent::ManagedKeyReader> =
@@ -541,6 +550,7 @@ fn cmd_mount(config: &Path) -> Result<()> {
         agent: Arc::clone(&agent),
         ssh_runtime: Arc::clone(&ssh_runtime),
         linked_file_surfaces: Mutex::new(linked_file_surfaces),
+        linked_protected_files: Mutex::new(linked_protected_files),
         checkout_monitor: Arc::clone(&checkout_monitor),
     });
     let policy: Arc<dyn RuntimePolicyController> = Arc::new(AgentPolicyController {
@@ -665,6 +675,7 @@ struct RuntimeCatalogObserver {
     agent: Arc<accessfs_agent::SocketAgent>,
     ssh_runtime: Arc<accessfs_agent::SshAgentRuntime>,
     linked_file_surfaces: Mutex<Vec<Surface>>,
+    linked_protected_files: Mutex<Vec<ProtectedCheckoutLink>>,
     checkout_monitor: Arc<GitCheckoutMonitor>,
 }
 
@@ -687,14 +698,31 @@ impl CatalogObserver for RuntimeCatalogObserver {
         self.surface_registry.replace(snapshot);
         reconcile_file_links(&next_links, &self.mount_path);
         *previous_links = next_links;
+        drop(previous_links);
+        let records = self.store.list();
+        if let Ok(records) = &records {
+            let next_protected_files =
+                protected_checkout_links(snapshot, records, &self.mount_path);
+            let mut previous_protected_files = self
+                .linked_protected_files
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if let Err(error) = refresh_protected_checkout_links(
+                &mut previous_protected_files,
+                next_protected_files,
+                self.store.as_ref(),
+            ) {
+                tracing::warn!(%error, "refreshing protected worktree links failed");
+            }
+        } else if let Err(error) = &records {
+            tracing::warn!(%error, "listing protected files for runtime refresh failed");
+        }
         if let Err(error) = self.ssh_runtime.replace(snapshot) {
             tracing::warn!(%error, "refreshing SSH agent surfaces failed");
         }
-        match self.store.list() {
-            Ok(records) => self
-                .agent
-                .replace_managed_policy(managed_policy_items(snapshot, &records)),
-            Err(error) => tracing::warn!(%error, "refreshing managed security levels failed"),
+        if let Ok(records) = records {
+            self.agent
+                .replace_managed_policy(managed_policy_items(snapshot, &records));
         }
     }
 }

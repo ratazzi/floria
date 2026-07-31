@@ -1561,7 +1561,7 @@ private struct ProjectCheckoutsSheet: View {
             HStack(alignment: .center, spacing: 12) {
                 Image(systemName: "checkmark.shield")
                     .foregroundStyle(.green)
-                Text("Floria only creates and removes its own output links. Git worktrees and project files are never changed.")
+                Text("Floria links outputs and protected files into managed worktrees. Files that differ from the protected version are never touched.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()

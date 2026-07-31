@@ -7,13 +7,14 @@
     };
     use crate::client::ControlClient;
     use accessfs_catalog::{
-        Binding, BindingScope, EntrySelection, Environment, ItemLink, Project, Surface, SurfaceKind,
+        Binding, BindingScope, EntrySelection, Environment, ItemLink, Project, ProjectCheckout,
+        ProjectCheckoutKind, Surface, SurfaceKind,
     };
     use accessfs_store::{
         SecretOrigin, SecretRecord, StoreResult, VersionRecord,
     };
     use std::collections::{HashMap, HashSet};
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -2654,7 +2655,39 @@
         let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
         let socket = dir.path().join("control.sock");
         let mount = dir.path().join("mount");
-        let source = dir.path().join(".envrc");
+        let project = dir.path().join("project");
+        let worktree = dir.path().join("project-feature");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        let project = std::fs::canonicalize(project).unwrap();
+        let worktree = std::fs::canonicalize(worktree).unwrap();
+        catalog
+            .upsert_project(&Project {
+                id: "fixture-project".to_string(),
+                name: "Fixture".to_string(),
+                path: project.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+        catalog
+            .upsert_environment(&Environment {
+                id: "fixture-development".to_string(),
+                project_id: "fixture-project".to_string(),
+                name: "Development".to_string(),
+                position: 0,
+            })
+            .unwrap();
+        catalog
+            .upsert_checkout(&ProjectCheckout {
+                id: "fixture-feature".to_string(),
+                project_id: "fixture-project".to_string(),
+                path: worktree.clone(),
+                kind: ProjectCheckoutKind::Worktree,
+                environment_id: Some("fixture-development".to_string()),
+                ..Default::default()
+            })
+            .unwrap();
+        let source = project.join(".envrc");
         std::fs::write(&source, "export FIXTURE_VALUE='fixture-value'\n").unwrap();
         std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
         let canonical_source = canonical_source_path(&source).unwrap();
@@ -2691,6 +2724,11 @@
             std::fs::read_link(&source).unwrap(),
             mount.join(accessfs_core::config::SECRETS_DIR).join(FIXTURE_SECRET_ID)
         );
+        symlink(
+            mount.join(accessfs_core::config::SECRETS_DIR).join(FIXTURE_SECRET_ID),
+            worktree.join(".envrc"),
+        )
+        .unwrap();
         let secret_id: SecretId = FIXTURE_SECRET_ID.parse().unwrap();
         assert_eq!(
             store.get(&secret_id).unwrap().as_slice(),
@@ -2817,6 +2855,14 @@
         assert_eq!(
             std::fs::metadata(&source).unwrap().permissions().mode() & 0o7777,
             0o600
+        );
+        assert!(!std::fs::symlink_metadata(worktree.join(".envrc"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(worktree.join(".envrc")).unwrap(),
+            "export FIXTURE_VALUE='fixture-value'\n"
         );
         assert!(store.record(&secret_id).unwrap().is_none());
     }

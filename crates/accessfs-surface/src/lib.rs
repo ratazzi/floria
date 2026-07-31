@@ -21,8 +21,10 @@ pub use dotenv::{parse_dotenv, render_dotenv, ParsedDotenvEntry, DOTENV_MAX_SIZE
 pub use error::{SurfaceError, SurfaceResult};
 pub use ini::{parse_ini, ParsedIniEntry, INI_MAX_SIZE};
 pub use links::{
-    ensure_file_surface_link, file_surface_instances, remove_file_surface_link,
-    SurfaceLinkRemoval, SurfaceLinkState,
+    ensure_file_surface_link, file_surface_instances, protected_checkout_links,
+    refresh_protected_checkout_links, remove_file_surface_link, replace_file_with_symlink,
+    replace_symlink_with_file_if_target, restore_protected_checkout_links,
+    ProtectedCheckoutLink, SurfaceLinkRemoval, SurfaceLinkState,
 };
 pub use lines::LINES_MAX_SIZE;
 pub use render::{
