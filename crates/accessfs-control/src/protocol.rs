@@ -86,6 +86,7 @@ pub enum ControlCommand {
     ProjectCheckoutInventory,
     ProjectCheckoutDiscover { project_id: String },
     ProjectCheckoutUpsert { checkout: ProjectCheckout },
+    ProjectCheckoutLinkRepair { checkout_id: String, path: PathBuf },
     ProjectCheckoutRemove { id: String },
     SshAgentDiscover { endpoint: PathBuf },
     SshIdentityImport {
@@ -789,8 +790,23 @@ mod tests {
         );
         assert_eq!(upsert["params"]["checkout"]["kind"], "worktree");
 
-        let remove = serde_json::to_value(ControlRequest {
+        let repair = serde_json::to_value(ControlRequest {
             request_id: 33,
+            command: ControlCommand::ProjectCheckoutLinkRepair {
+                checkout_id: "fixture-worktree".to_string(),
+                path: PathBuf::from("/workspace/fixture-worktree/.envrc"),
+            },
+        })
+        .unwrap();
+        assert_eq!(repair["method"], "project_checkout_link_repair");
+        assert_eq!(repair["params"]["checkout_id"], "fixture-worktree");
+        assert_eq!(
+            repair["params"]["path"],
+            "/workspace/fixture-worktree/.envrc"
+        );
+
+        let remove = serde_json::to_value(ControlRequest {
+            request_id: 34,
             command: ControlCommand::ProjectCheckoutRemove {
                 id: "fixture-worktree".to_string(),
             },

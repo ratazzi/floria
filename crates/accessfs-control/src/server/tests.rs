@@ -499,6 +499,49 @@
             .unwrap();
         assert_eq!(candidate.managed_checkout_id.as_deref(), Some("fixture-worktree"));
         assert_eq!(candidate.link_issues, vec![worktree.join(".envrc")]);
+
+        dispatch(
+            &catalog,
+            DispatchServices {
+                store: Some(&store),
+                mount_path: Some(&mount),
+                ..DispatchServices::default()
+            },
+            ControlCommand::ProjectCheckoutLinkRepair {
+                checkout_id: "fixture-worktree".to_string(),
+                path: worktree.join(".envrc"),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read_link(worktree.join(".envrc")).unwrap(),
+            mount
+                .join(accessfs_core::config::SECRETS_DIR)
+                .join(store.list().unwrap()[0].id.to_string())
+        );
+
+        let repaired = dispatch(
+            &catalog,
+            DispatchServices {
+                store: Some(&store),
+                mount_path: Some(&mount),
+                ..DispatchServices::default()
+            },
+            ControlCommand::ProjectCheckoutDiscover {
+                project_id: "fixture-project".to_string(),
+            },
+        )
+        .unwrap();
+        let ControlResult::ProjectCheckoutDiscovery(repaired) = repaired else {
+            panic!("unexpected checkout discovery result")
+        };
+        assert!(repaired
+            .checkouts
+            .iter()
+            .find(|candidate| candidate.path == worktree)
+            .unwrap()
+            .link_issues
+            .is_empty());
     }
 
     #[test]

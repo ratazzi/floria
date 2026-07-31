@@ -159,6 +159,8 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertTrue(dashboard.contains("reviewWorktreeIssuesButton"))
         XCTAssertTrue(dashboard.contains("expandedIssuePaths"))
         XCTAssertTrue(dashboard.contains("worktreeIssueDetails("))
+        XCTAssertTrue(dashboard.contains("repairWorktreeLink("))
+        XCTAssertTrue(dashboard.contains("\"Repair Link\""))
         XCTAssertTrue(dashboard.contains("revealWorktreeIssue("))
     }
 

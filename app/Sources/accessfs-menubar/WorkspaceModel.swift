@@ -1077,6 +1077,18 @@ final class WorkspaceStore {
         lastError = nil
     }
 
+    func repairProjectCheckoutLink(
+        checkoutID: CatalogProjectCheckout.ID, path: String
+    ) async throws {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        guard checkouts.contains(where: { $0.id == checkoutID && $0.kind == .worktree }) else {
+            throw WorkspaceStoreError.invalid("Choose a managed worktree first")
+        }
+        try await controlClient.repairProjectCheckoutLink(
+            checkoutID: checkoutID, path: path)
+        lastError = nil
+    }
+
     func protectFile(at path: String) async throws {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
         let file = try await controlClient.protectFile(at: path)

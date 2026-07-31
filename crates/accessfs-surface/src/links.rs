@@ -296,6 +296,68 @@ pub fn checkout_link_issues(
     Ok(issues.into_iter().collect())
 }
 
+/// Repair one explicitly selected managed worktree link.
+///
+/// Missing paths and foreign symlinks may be replaced because this function is
+/// only reached through an explicit user action. Regular files and other
+/// filesystem objects are preserved so a repair cannot discard local work.
+pub fn repair_checkout_link(
+    snapshot: &CatalogSnapshot,
+    records: &[SecretRecord],
+    mount_path: &Path,
+    checkout: &ProjectCheckout,
+    path: &Path,
+) -> SurfaceResult<SurfaceLinkState> {
+    if checkout.kind != ProjectCheckoutKind::Worktree {
+        return Err(SurfaceError::NotFound(format!(
+            "managed worktree link {}",
+            path.display()
+        )));
+    }
+
+    let surface_target = file_surface_instances(snapshot)?
+        .into_iter()
+        .find(|surface| surface.path == path && surface.path.starts_with(&checkout.path))
+        .map(|surface| mount_path.join(SURFACES_DIR).join(surface.id));
+    let protected_target = protected_checkout_links(snapshot, records, mount_path)
+        .into_iter()
+        .find(|link| link.path == path && link.path.starts_with(&checkout.path))
+        .map(|link| link.target);
+    let expected = surface_target.or(protected_target).ok_or_else(|| {
+        SurfaceError::NotFound(format!("managed worktree link {}", path.display()))
+    })?;
+
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => create_link(path, &expected),
+        Err(source) => Err(SurfaceError::LinkIo {
+            operation: "inspecting before repair",
+            path: path.to_path_buf(),
+            source,
+        }),
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            let actual = std::fs::read_link(path).map_err(|source| SurfaceError::LinkIo {
+                operation: "reading before repair",
+                path: path.to_path_buf(),
+                source,
+            })?;
+            if actual == expected {
+                return Ok(SurfaceLinkState::Ready);
+            }
+            replace_file_with_symlink(path, &expected).map_err(|source| SurfaceError::LinkIo {
+                operation: "repairing",
+                path: path.to_path_buf(),
+                source,
+            })?;
+            Ok(SurfaceLinkState::Created)
+        }
+        Ok(_) => Err(link_conflict(
+            path,
+            &expected,
+            "an existing file occupies the path; move it aside before repairing",
+        )),
+    }
+}
+
 fn protected_checkout_links_excluding(
     snapshot: &CatalogSnapshot,
     records: &[SecretRecord],
@@ -916,6 +978,55 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn explicit_checkout_repair_replaces_foreign_links_but_preserves_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("project");
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir(&primary).unwrap();
+        std::fs::create_dir(&worktree).unwrap();
+        let checkout = ProjectCheckout {
+            id: "fixture-feature".to_string(),
+            project_id: "fixture-project".to_string(),
+            path: worktree.clone(),
+            environment_id: Some("fixture-development".to_string()),
+            kind: ProjectCheckoutKind::Worktree,
+            git_common_dir: None,
+        };
+        let snapshot = CatalogSnapshot {
+            projects: vec![Project {
+                id: "fixture-project".to_string(),
+                name: "Fixture".to_string(),
+                path: primary.clone(),
+                ..Default::default()
+            }],
+            checkouts: vec![checkout.clone()],
+            environments: vec![Environment {
+                id: "fixture-development".to_string(),
+                project_id: "fixture-project".to_string(),
+                name: "Development".to_string(),
+                position: 0,
+            }],
+            surfaces: vec![fixture_surface(primary.join(".env"))],
+            ..CatalogSnapshot::default()
+        };
+        let mount = dir.path().join("mount");
+        let path = worktree.join(".env");
+        let expected = mount.join(SURFACES_DIR).join("fixture-dotenv");
+        symlink("../project/.env", &path).unwrap();
+
+        repair_checkout_link(&snapshot, &[], &mount, &checkout, &path).unwrap();
+        assert_eq!(std::fs::read_link(&path).unwrap(), expected);
+
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"FIXTURE=local\n").unwrap();
+        assert!(matches!(
+            repair_checkout_link(&snapshot, &[], &mount, &checkout, &path),
+            Err(SurfaceError::LinkConflict { .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), b"FIXTURE=local\n");
     }
 
     #[test]

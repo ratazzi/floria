@@ -181,6 +181,11 @@ final class ControlClient: @unchecked Sendable {
         try await requestEmpty(.projectCheckoutUpsert(checkout))
     }
 
+    func repairProjectCheckoutLink(checkoutID: String, path: String) async throws {
+        try await requestEmpty(
+            .projectCheckoutLinkRepair(checkoutID: checkoutID, path: path))
+    }
+
     func removeProjectCheckout(_ id: String) async throws {
         try await requestEmpty(.projectCheckoutRemove(id: id))
     }

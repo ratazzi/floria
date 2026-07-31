@@ -885,6 +885,7 @@ enum ControlCommand: Sendable {
     case projectCheckoutInventory
     case projectCheckoutDiscover(projectID: String)
     case projectCheckoutUpsert(CatalogProjectCheckout)
+    case projectCheckoutLinkRepair(checkoutID: String, path: String)
     case projectCheckoutRemove(id: String)
     case sshAgentDiscover(endpoint: String)
     case sshIdentityImport(
@@ -947,6 +948,7 @@ enum ControlCommand: Sendable {
         case .projectCheckoutInventory: "project_checkout_inventory"
         case .projectCheckoutDiscover: "project_checkout_discover"
         case .projectCheckoutUpsert: "project_checkout_upsert"
+        case .projectCheckoutLinkRepair: "project_checkout_link_repair"
         case .projectCheckoutRemove: "project_checkout_remove"
         case .sshAgentDiscover: "ssh_agent_discover"
         case .sshIdentityImport: "ssh_identity_import"
@@ -1043,6 +1045,12 @@ enum ControlCommand: Sendable {
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: ProjectCheckoutUpsertParams(checkout: checkout)))
+        case .projectCheckoutLinkRepair(let checkoutID, let path):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: ProjectCheckoutLinkRepairParams(
+                        checkoutID: checkoutID, path: path)))
         case .projectCheckoutRemove(let id):
             return try encoder.encode(
                 ControlRequest(
@@ -1204,6 +1212,10 @@ private struct DiscoverReferenceResolveParams: Encodable {
 }
 private struct ProjectCheckoutDiscoverParams: Encodable { let projectID: String }
 private struct ProjectCheckoutUpsertParams: Encodable { let checkout: CatalogProjectCheckout }
+private struct ProjectCheckoutLinkRepairParams: Encodable {
+    let checkoutID: String
+    let path: String
+}
 private struct SshAgentDiscoverParams: Encodable { let endpoint: String }
 
 private struct SshIdentityImportParams: Encodable {

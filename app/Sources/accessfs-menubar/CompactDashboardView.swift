@@ -1361,6 +1361,16 @@ private struct ProjectCheckoutsSheet: View {
         } else if let discovery, !discovery.checkouts.isEmpty {
             ScrollView {
                 LazyVStack(spacing: 18) {
+                    if let errorMessage {
+                        Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(Color.orange)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(10)
+                            .background(
+                                Color.orange.opacity(0.08),
+                                in: RoundedRectangle(cornerRadius: 8))
+                    }
                     checkoutGroup(
                         title: "Managed",
                         candidates: enabledCheckouts(in: discovery),
@@ -1573,33 +1583,38 @@ private struct ProjectCheckoutsSheet: View {
     ) -> some View {
         VStack(spacing: 0) {
             ForEach(Array(candidate.linkIssues.enumerated()), id: \.element) { index, path in
-                Button {
-                    revealWorktreeIssue(path)
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: "exclamationmark.circle")
-                            .foregroundStyle(Color.orange)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(worktreeIssuePath(path, relativeTo: candidate.path))
-                                .font(.caption.monospaced())
-                                .foregroundStyle(.primary)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                            Text("Doesn’t point to Floria")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
-                        Label("Show in Finder", systemImage: "folder")
-                            .font(.caption)
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.circle")
+                        .foregroundStyle(Color.orange)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(worktreeIssuePath(path, relativeTo: candidate.path))
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.primary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Text("Doesn’t point to Floria")
+                            .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
-                    .padding(.horizontal, 12)
-                    .frame(minHeight: 44)
-                    .contentShape(Rectangle())
+                    Spacer()
+                    if busyPath == candidate.path {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Button("Repair Link", systemImage: "wrench.and.screwdriver") {
+                            Task { await repairWorktreeLink(path, candidate: candidate) }
+                        }
+                        .controlSize(.small)
+                        Button("Show in Finder", systemImage: "folder") {
+                            revealWorktreeIssue(path)
+                        }
+                        .buttonStyle(.borderless)
+                        .controlSize(.small)
+                        .foregroundStyle(.secondary)
+                    }
                 }
-                .buttonStyle(.plain)
-                .help("Show \(path) in Finder")
+                .padding(.horizontal, 12)
+                .frame(minHeight: 44)
                 if index != candidate.linkIssues.count - 1 {
                     Divider()
                 }
@@ -1609,6 +1624,23 @@ private struct ProjectCheckoutsSheet: View {
         .padding(.leading, 64)
         .padding(.trailing, 16)
         .padding(.bottom, 10)
+    }
+
+    @MainActor
+    private func repairWorktreeLink(
+        _ path: String, candidate: ProjectCheckoutCandidate
+    ) async {
+        guard let checkoutID = candidate.managedCheckoutID else { return }
+        busyPath = candidate.path
+        errorMessage = nil
+        defer { busyPath = nil }
+        do {
+            try await store.repairProjectCheckoutLink(
+                checkoutID: checkoutID, path: path)
+            await discover()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
     }
 
     private func toggleWorktreeIssueDetails(for path: String) {

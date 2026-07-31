@@ -22,7 +22,7 @@ pub use error::{SurfaceError, SurfaceResult};
 pub use ini::{parse_ini, ParsedIniEntry, INI_MAX_SIZE};
 pub use links::{
     checkout_link_issues, ensure_file_surface_link, file_surface_instances,
-    protected_checkout_links,
+    protected_checkout_links, repair_checkout_link,
     refresh_protected_checkout_links, release_protected_links_for_file_surfaces,
     remove_file_surface_link, replace_file_with_symlink,
     replace_regular_file_with_symlink_if_matches, replace_symlink_with_file_if_target,

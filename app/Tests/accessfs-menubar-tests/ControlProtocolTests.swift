@@ -697,6 +697,22 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(encodedCheckout["environment_id"] as? String, "fixture-development")
         XCTAssertEqual(encodedCheckout["kind"] as? String, "worktree")
 
+        let repair = try ControlCommand.projectCheckoutLinkRepair(
+            checkoutID: "fixture-worktree",
+            path: "/tmp/fixture-worktree/.envrc"
+        ).requestData(requestID: 33, encoder: encoder)
+        let repairValue = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: repair) as? [String: Any])
+        XCTAssertEqual(
+            repairValue["method"] as? String,
+            "project_checkout_link_repair")
+        XCTAssertEqual(
+            (repairValue["params"] as? [String: Any])?["checkout_id"] as? String,
+            "fixture-worktree")
+        XCTAssertEqual(
+            (repairValue["params"] as? [String: Any])?["path"] as? String,
+            "/tmp/fixture-worktree/.envrc")
+
         let response = Data(
             #"{"request_id":31,"status":"ok","result":{"type":"project_checkout_discovery","value":{"project_id":"fixture-project","common_dir":"/tmp/fixture/.git","checkouts":[{"path":"/tmp/fixture","git_primary":true,"managed_checkout_id":"fixture-project","link_issues":[]},{"path":"/tmp/fixture-worktree","git_primary":false,"managed_checkout_id":"fixture-worktree","link_issues":["/tmp/fixture-worktree/.envrc"]}]}}}"#.utf8)
         let decoded = try JSONDecoder().decode(
@@ -720,7 +736,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(inventoryResult.projects.first?.projectID, "fixture-project")
 
         let remove = try ControlCommand.projectCheckoutRemove(id: "fixture-worktree")
-            .requestData(requestID: 33, encoder: encoder)
+            .requestData(requestID: 34, encoder: encoder)
         let removeValue = try XCTUnwrap(
             JSONSerialization.jsonObject(with: remove) as? [String: Any])
         XCTAssertEqual(removeValue["method"] as? String, "project_checkout_remove")

@@ -160,6 +160,9 @@ pub(super) fn dispatch(
             catalog.upsert_checkout(&checkout)?;
             Ok(ControlResult::Empty)
         }
+        ControlCommand::ProjectCheckoutLinkRepair { checkout_id, path } => {
+            repair_project_checkout_link(catalog, store, mount_path, &checkout_id, &path)
+        }
         ControlCommand::ProjectCheckoutRemove { id } => {
             catalog.remove_checkout(&id)?;
             Ok(ControlResult::Empty)
