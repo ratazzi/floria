@@ -239,13 +239,6 @@ struct DashboardView: View {
                 Button("Open Library", systemImage: "rectangle.3.group") {
                     openWorkspace()
                 }
-                Button("Open Access Log", systemImage: "clock") {
-                    showingAccessLog = true
-                }
-                Divider()
-                Button("Refresh", systemImage: "arrow.clockwise") {
-                    reload()
-                }
             } label: {
                 Image(systemName: "ellipsis")
                     .frame(width: 28, height: 28)
@@ -264,26 +257,16 @@ struct DashboardView: View {
     private var policyMenu: some View {
         let auditOnly = state.policyMode.isAuditOnly()
         return Menu {
-            if !state.connected {
-                Button("Daemon Offline") {}
-                    .disabled(true)
-            }
-            if auditOnly {
-                Button("Return to Normal", systemImage: "checkmark.shield") {
-                    Task { await state.setPolicyMode(.normal, durationSecs: nil) }
-                }
-            } else {
-                Menu("Enable Audit Only", systemImage: "eye") {
-                    ForEach(
-                        [AuditOnlyWindow.oneHour, .eightHours, .untilChanged]
-                    ) { window in
-                        Button(window.title) {
-                            pendingAuditWindow = window
-                            showingAuditConfirmation = true
-                        }
-                    }
-                }
-            }
+            ProtectionMenuContent(
+                state: state,
+                requestAuditOnly: { window in
+                    pendingAuditWindow = window
+                    showingAuditConfirmation = true
+                },
+                refresh: reload,
+                openAccessLog: {
+                    showingAccessLog = true
+                })
         } label: {
             HStack(spacing: 7) {
                 Image(

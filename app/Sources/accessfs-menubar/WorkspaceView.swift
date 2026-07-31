@@ -202,6 +202,64 @@ private struct SecurityLevelMenu: View {
     }
 }
 
+struct ProtectionMenuContent: View {
+    @Bindable var state: AppState
+    let requestAuditOnly: (AuditOnlyWindow) -> Void
+    let refresh: () -> Void
+    let openAccessLog: () -> Void
+
+    var body: some View {
+        Button(state.connected ? "Daemon connected" : "Daemon disconnected") {}
+            .disabled(true)
+
+        if state.policyMode.isAuditOnly() {
+            Button("Audit Only is active", systemImage: "eye.fill") {}
+                .disabled(true)
+            Button("Return to Normal", systemImage: "checkmark.shield") {
+                Task { await state.setPolicyMode(.normal, durationSecs: nil) }
+            }
+        } else {
+            Menu("Enable Audit Only", systemImage: "eye") {
+                ForEach(
+                    [AuditOnlyWindow.oneHour, .eightHours, .untilChanged]
+                ) { window in
+                    Button(window.title) {
+                        requestAuditOnly(window)
+                    }
+                }
+            }
+        }
+
+        Divider()
+        Button("Refresh Library", systemImage: "arrow.clockwise", action: refresh)
+        Divider()
+        Button("Open Access Log", systemImage: "clock", action: openAccessLog)
+    }
+}
+
+private struct WorkspaceProtectionMenuLabel: View {
+    let connected: Bool
+    let auditOnly: Bool
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(
+                systemName: auditOnly
+                    ? "eye.circle.fill"
+                    : (connected ? "checkmark.shield.fill" : "shield.slash"))
+            Text(auditOnly ? "Audit Only" : (connected ? "Protected" : "Offline"))
+                .lineLimit(1)
+            Image(systemName: "chevron.down")
+                .font(.caption)
+        }
+        .font(.callout.weight(.medium))
+        .foregroundStyle(
+            auditOnly ? Color.orange : (connected ? Color.green : Color.secondary)
+        )
+        .frame(height: 30)
+    }
+}
+
 private func defaultEnvironmentFileName(_ name: String) -> String {
     let slug = name
         .lowercased()
@@ -385,50 +443,25 @@ struct AdvancedWorkspaceView: View {
             Spacer(minLength: 16)
 
             Menu {
-                Button(state.connected ? "Daemon connected" : "Daemon disconnected") { }
-                    .disabled(true)
-                if state.policyMode.isAuditOnly() {
-                    Button("Audit Only is active", systemImage: "eye.fill") { }
-                        .disabled(true)
-                    Button("Return to Normal", systemImage: "checkmark.shield") {
-                        Task { await state.setPolicyMode(.normal, durationSecs: nil) }
-                    }
-                } else {
-                    Menu("Enable Audit Only", systemImage: "eye") {
-                        ForEach(
-                            [AuditOnlyWindow.oneHour, .eightHours, .untilChanged]
-                        ) { window in
-                            Button(window.title) {
-                                pendingAuditWindow = window
-                                showingAuditConfirmation = true
-                            }
+                ProtectionMenuContent(
+                    state: state,
+                    requestAuditOnly: { window in
+                        pendingAuditWindow = window
+                        showingAuditConfirmation = true
+                    },
+                    refresh: {
+                        Task {
+                            await state.workspace.reload(reportErrors: true)
+                            await state.reloadPolicyMode()
                         }
-                    }
-                }
-                Divider()
-                Button("Refresh Library", systemImage: "arrow.clockwise") {
-                    Task {
-                        await state.workspace.reload(reportErrors: true)
-                        await state.reloadPolicyMode()
-                    }
-                }
-                Divider()
-                Button("Open Access Log", systemImage: "clock") {
-                    selection = .accessLog
-                }
+                    },
+                    openAccessLog: {
+                        selection = .accessLog
+                    })
             } label: {
-                HStack(spacing: 8) {
-                    Image(
-                        systemName: state.policyMode.isAuditOnly()
-                            ? "eye.circle.fill" : "checkmark.shield.fill")
-                        .foregroundStyle(
-                            state.policyMode.isAuditOnly()
-                                ? Color.orange
-                                : (state.connected ? Color.green : Color.secondary))
-                    Image(systemName: "chevron.down")
-                        .font(.caption)
-                }
-                .frame(height: 30)
+                WorkspaceProtectionMenuLabel(
+                    connected: state.connected,
+                    auditOnly: state.policyMode.isAuditOnly())
             }
             .buttonStyle(.bordered)
             .accessibilityLabel(

@@ -184,6 +184,33 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertTrue(workspace.contains(".frame(width: 108, alignment: .leading)"))
     }
 
+    func testFullAndCompactProtectionMenusShareGlobalActions() throws {
+        let workspace = try source("WorkspaceView.swift")
+        let dashboard = try source("CompactDashboardView.swift")
+
+        XCTAssertTrue(workspace.contains("struct ProtectionMenuContent"))
+        XCTAssertTrue(workspace.contains("ProtectionMenuContent("))
+        XCTAssertTrue(dashboard.contains("ProtectionMenuContent("))
+
+        for title in [
+            "Daemon connected",
+            "Enable Audit Only",
+            "Refresh Library",
+            "Open Access Log",
+        ] {
+            XCTAssertTrue(workspace.contains(#""\#(title)"#), title)
+        }
+    }
+
+    func testFullProtectionMenuShowsItsCurrentMode() throws {
+        let workspace = try source("WorkspaceView.swift")
+
+        XCTAssertTrue(workspace.contains("WorkspaceProtectionMenuLabel("))
+        XCTAssertTrue(workspace.contains(#""Protected""#))
+        XCTAssertTrue(workspace.contains(#""Audit Only""#))
+        XCTAssertTrue(workspace.contains(#""Offline""#))
+    }
+
     private func source(_ name: String) throws -> String {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
