@@ -48,7 +48,10 @@ pub(super) fn create_shared_secret(
         Err(error) => return Err(DispatchError::Catalog(error)),
     }
 
-    let secret_id = store.put(NewSecret::managed(resource.name.clone()), value.as_bytes())?;
+    let secret_id = store.put(
+        NewSecret::managed(resource.name.clone()).with_enforcement(enforcement),
+        value.as_bytes(),
+    )?;
     resource.source = ResourceSource::SecretRef { secret_id: secret_id.to_string() };
     if let Err(error) = catalog.create_resource(&resource) {
         if let Err(cleanup_error) = store.delete(&secret_id) {
@@ -293,7 +296,10 @@ pub(super) fn create_env_file(
         Err(error) => return Err(DispatchError::Catalog(error)),
     }
 
-    let secret_id = store.put(NewSecret::managed(resource.name.clone()), value.as_bytes())?;
+    let secret_id = store.put(
+        NewSecret::managed(resource.name.clone()).with_enforcement(enforcement),
+        value.as_bytes(),
+    )?;
     resource.source = ResourceSource::SecretRef { secret_id: secret_id.to_string() };
     if let Err(error) = catalog.create_resource(&resource) {
         if let Err(cleanup_error) = store.delete(&secret_id) {

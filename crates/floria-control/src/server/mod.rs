@@ -479,6 +479,7 @@ mod managed_links;
 mod projects;
 mod protected_files;
 mod resources;
+mod security_defaults;
 mod ssh;
 
 use checkouts::*;

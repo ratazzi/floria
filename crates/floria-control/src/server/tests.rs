@@ -72,10 +72,17 @@
 
     const FIXTURE_SECRET_ID: &str = "00000000-0000-0000-0000-000000000101";
 
+    struct FixtureSecretMetadata {
+        origin: SecretOrigin,
+        mode: u32,
+        enforcement: Enforcement,
+        metadata: ItemMetadata,
+        environment_ids: Option<Vec<String>>,
+    }
+
     struct FixtureStore {
         entries: Mutex<HashMap<String, Vec<Vec<u8>>>>,
-        metadata:
-            Mutex<HashMap<String, (SecretOrigin, u32, ItemMetadata, Option<Vec<String>>)>>,
+        metadata: Mutex<HashMap<String, FixtureSecretMetadata>>,
         heads: Mutex<HashMap<String, u32>>,
         mutation_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         get_calls: AtomicUsize,
@@ -231,7 +238,13 @@
                 .unwrap()
                 .insert(
                     id.to_string(),
-                    (meta.origin, meta.mode, ItemMetadata::default(), None),
+                    FixtureSecretMetadata {
+                        origin: meta.origin,
+                        mode: meta.mode,
+                        enforcement: meta.enforcement,
+                        metadata: ItemMetadata::default(),
+                        environment_ids: None,
+                    },
                 );
             self.heads.lock().unwrap().insert(id.to_string(), 1);
             self.run_mutation_hook();
@@ -291,14 +304,14 @@
             let heads = self.heads.lock().unwrap();
             Ok(entries.get(id.as_str()).map(|versions| SecretRecord {
                 id: id.clone(),
-                origin: metadata[id.as_str()].0.clone(),
-                mode: metadata[id.as_str()].1,
+                origin: metadata[id.as_str()].origin.clone(),
+                mode: metadata[id.as_str()].mode,
                 size: versions[(heads[id.as_str()] - 1) as usize].len() as u64,
                 created: "fixture-time".to_string(),
                 current_version: heads[id.as_str()],
-                enforcement: Enforcement::Prompt,
-                environment_ids: metadata[id.as_str()].3.clone(),
-                metadata: metadata[id.as_str()].2.clone(),
+                enforcement: metadata[id.as_str()].enforcement,
+                environment_ids: metadata[id.as_str()].environment_ids.clone(),
+                metadata: metadata[id.as_str()].metadata.clone(),
             }))
         }
 
@@ -310,14 +323,14 @@
                 .iter()
                 .map(|(id, versions)| SecretRecord {
                     id: id.parse().unwrap(),
-                    origin: metadata[id].0.clone(),
-                    mode: metadata[id].1,
+                    origin: metadata[id].origin.clone(),
+                    mode: metadata[id].mode,
                     size: versions[(heads[id] - 1) as usize].len() as u64,
                     created: "fixture-time".to_string(),
                     current_version: heads[id],
-                    enforcement: Enforcement::Prompt,
-                    environment_ids: metadata[id].3.clone(),
-                    metadata: metadata[id].2.clone(),
+                    enforcement: metadata[id].enforcement,
+                    environment_ids: metadata[id].environment_ids.clone(),
+                    metadata: metadata[id].metadata.clone(),
                 })
                 .collect())
         }
@@ -328,7 +341,7 @@
                 .lock()
                 .unwrap()
                 .iter()
-                .find_map(|(id, (origin, _, _, _))| match origin {
+                .find_map(|(id, metadata)| match &metadata.origin {
                     SecretOrigin::File { source_path: candidate }
                         if candidate == source_path => Some(id.clone()),
                     _ => None,
@@ -343,13 +356,14 @@
             &self,
             id: &SecretId,
             item_metadata: ItemMetadata,
-            _enforcement: Enforcement,
+            enforcement: Enforcement,
             environment_ids: Option<Vec<String>>,
         ) -> StoreResult<()> {
             let mut metadata = self.metadata.lock().unwrap();
             let entry = metadata.get_mut(id.as_str()).unwrap();
-            entry.2 = item_metadata;
-            entry.3 = environment_ids;
+            entry.metadata = item_metadata;
+            entry.enforcement = enforcement;
+            entry.environment_ids = environment_ids;
             Ok(())
         }
 
@@ -1098,6 +1112,8 @@
         assert_eq!(snapshot.resources.len(), 1);
         assert_eq!(snapshot.bindings.len(), 1);
         assert_eq!(snapshot.surfaces.len(), 1);
+        assert_eq!(snapshot.resources[0].enforcement, Enforcement::Allow);
+        assert_eq!(snapshot.surfaces[0].enforcement, Enforcement::Allow);
         assert_eq!(
             std::fs::read_link(&source_path).unwrap(),
             mount_path
@@ -1721,7 +1737,7 @@
             .find(|resource| resource.kind == ResourceKind::SharedSecret)
             .unwrap();
         assert_eq!(secret.name, "DISCOVERED_TOKEN");
-        assert_eq!(secret.enforcement, Enforcement::Prompt);
+        assert_eq!(secret.enforcement, Enforcement::Allow);
         assert_eq!(secret.origin.kind, floria_catalog::OriginKind::Discovered);
         assert_eq!(secret.origin.sources.len(), 1);
         assert_eq!(secret.origin.sources[0].path, source_path);
@@ -1732,6 +1748,7 @@
             .unwrap();
         assert_eq!(env_file.name, ".env");
         assert_eq!(env_file.enforcement, Enforcement::Allow);
+        assert_eq!(snapshot.surfaces[0].enforcement, Enforcement::Allow);
         assert_eq!(env_file.origin.kind, floria_catalog::OriginKind::Discovered);
         let env_keys = env_file
             .entries
@@ -1830,7 +1847,7 @@
                 name: "Fixture Shared Secret".to_string(),
                 default_env_key: Some("API_TOKEN".to_string()),
                 value: crate::protocol::SecretValue::new("fixture-shared-value"),
-                enforcement: Enforcement::Prompt,
+                enforcement: Enforcement::TouchId,
                 metadata: ItemMetadata::default(),
             },
         )
@@ -1854,9 +1871,14 @@
         .unwrap();
 
         let resource = catalog.resource("fixture-shared-api-token").unwrap();
+        assert_eq!(resource.enforcement, Enforcement::TouchId);
         assert_eq!(resource.origin.kind, floria_catalog::OriginKind::Manual);
         assert_eq!(resource.origin.sources.len(), 1);
         assert_eq!(resource.origin.sources[0].path, source_path);
+        assert_eq!(
+            catalog.snapshot().unwrap().surfaces[0].enforcement,
+            Enforcement::TouchId
+        );
     }
 
     #[test]
@@ -2399,6 +2421,7 @@
         let snapshot = catalog.snapshot().unwrap();
         assert_eq!(snapshot.resources.len(), 1);
         assert_eq!(snapshot.resources[0].kind, ResourceKind::SshIdentity);
+        assert_eq!(snapshot.resources[0].enforcement, Enforcement::TouchId);
     }
 
     #[test]
@@ -2446,6 +2469,7 @@
         assert_eq!(snapshot.resources.len(), 1);
         assert_eq!(snapshot.resources[0].kind, ResourceKind::EnvFile);
         assert_eq!(snapshot.resources[0].codec, ResourceCodec::Ini);
+        assert_eq!(snapshot.resources[0].enforcement, Enforcement::Prompt);
         assert!(snapshot.resources[0]
             .entries
             .iter()
@@ -2455,6 +2479,7 @@
             .iter()
             .any(|entry| entry.address.contains("staging")));
         assert_eq!(snapshot.surfaces[0].kind, SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Ini)));
+        assert_eq!(snapshot.surfaces[0].enforcement, Enforcement::Prompt);
         assert!(std::fs::symlink_metadata(source_path)
             .unwrap()
             .file_type()
@@ -3208,6 +3233,7 @@
         assert_eq!(file.source_path, canonical_source);
         assert_eq!(file.mode, 0o600);
         assert_eq!(file.current_version, 1);
+        assert_eq!(file.enforcement, Enforcement::Allow);
         assert!(file.linked);
         assert_eq!(
             file.environment_ids,
@@ -3273,10 +3299,12 @@
         };
         assert_eq!(files[0].metadata, file_metadata);
         assert_eq!(files[0].environment_ids, vec!["fixture-production"]);
+        assert_eq!(files[0].enforcement, Enforcement::TouchId);
         assert_eq!(files[0].current_version, 1);
 
         let mut expected_file = file.clone();
         expected_file.metadata = file_metadata;
+        expected_file.enforcement = Enforcement::TouchId;
         expected_file.environment_ids = vec!["fixture-production".to_string()];
         assert_eq!(
             client

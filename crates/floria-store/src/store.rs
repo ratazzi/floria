@@ -64,15 +64,31 @@ pub enum SecretOrigin {
 pub struct NewSecret {
     pub origin: SecretOrigin,
     pub mode: u32,
+    /// Initial authorization behavior. Once persisted, callers update it only through the
+    /// explicit settings interface.
+    pub enforcement: Enforcement,
 }
 
 impl NewSecret {
     pub fn file(source_path: PathBuf, mode: u32) -> Self {
-        NewSecret { origin: SecretOrigin::File { source_path }, mode }
+        NewSecret {
+            origin: SecretOrigin::File { source_path },
+            mode,
+            enforcement: Enforcement::Prompt,
+        }
     }
 
     pub fn managed(label: impl Into<String>) -> Self {
-        NewSecret { origin: SecretOrigin::Managed { label: label.into() }, mode: 0o600 }
+        NewSecret {
+            origin: SecretOrigin::Managed { label: label.into() },
+            mode: 0o600,
+            enforcement: Enforcement::Prompt,
+        }
+    }
+
+    pub fn with_enforcement(mut self, enforcement: Enforcement) -> Self {
+        self.enforcement = enforcement;
+        self
     }
 }
 
@@ -559,6 +575,7 @@ fn copy_store_contents(source: &Path, destination: &Path) -> StoreResult<()> {
 impl SecretStore for AgeDirStore {
     fn put(&self, meta: NewSecret, plaintext: &[u8]) -> StoreResult<SecretId> {
         let mode = meta.mode;
+        let enforcement = meta.enforcement;
         let (source_path, managed_label) = match meta.origin {
             SecretOrigin::File { source_path } if source_path.is_absolute() => {
                 (Some(source_path.to_string_lossy().into_owned()), None)
@@ -593,7 +610,7 @@ impl SecretStore for AgeDirStore {
                 mode,
                 created: now_rfc3339(),
                 current_version: 1,
-                enforcement: Enforcement::Prompt,
+                enforcement,
                 environment_ids: None,
                 metadata: ItemMetadata::default(),
             },
@@ -960,6 +977,21 @@ mod tests {
         let meta = std::fs::read_to_string(s.entry_dir(&id).join("meta.toml")).unwrap();
         assert!(meta.contains("managed_label = \"Fixture Shared Secret\""));
         assert!(!meta.contains("fixture-managed-value"));
+    }
+
+    #[test]
+    fn new_secret_persists_its_initial_enforcement() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path().to_path_buf());
+        let id = s
+            .put(
+                NewSecret::file(PathBuf::from("/fixture/.envrc"), 0o600)
+                    .with_enforcement(Enforcement::Allow),
+                b"export FIXTURE=1\n",
+            )
+            .unwrap();
+
+        assert_eq!(s.record(&id).unwrap().unwrap().enforcement, Enforcement::Allow);
     }
 
     #[test]

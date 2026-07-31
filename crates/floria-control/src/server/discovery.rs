@@ -1,4 +1,5 @@
 use super::*;
+use super::security_defaults::SecurityDefaults;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply_discovery(
@@ -155,7 +156,8 @@ pub(super) fn apply_discovery(
         let applied = (|| -> Result<Vec<PathBuf>, DispatchError> {
             match file.action {
                 DiscoveredFileAction::Protect => {
-                    let protected = protect_file(catalog, store, mount_path, &file.path)?;
+                    let protected =
+                        protect_discovered_file(catalog, store, mount_path, &file)?;
                     if !matches!(protected, ControlResult::FileProtected { .. }) {
                         Err(DispatchError::Validation(
                             "protecting a discovered file returned an unexpected result".to_string(),
@@ -201,7 +203,7 @@ pub(super) fn apply_discovery(
                         &file.path,
                         None,
                         ManagedItemSettings {
-                            enforcement: Enforcement::Prompt,
+                            enforcement: SecurityDefaults::discovered_resource(file.kind),
                             metadata: ItemMetadata::default(),
                         },
                         ResourceOrigin {
@@ -220,7 +222,7 @@ pub(super) fn apply_discovery(
                             if import.source_disposition
                                 == DiscoverySourceDisposition::ProtectInPlace
                             {
-                                protect_file(catalog, store, mount_path, &file.path)?;
+                                protect_discovered_file(catalog, store, mount_path, &file)?;
                                 result.protected_files += 1;
                             }
                             result.files.push(DiscoveryAppliedFile {
@@ -240,7 +242,7 @@ pub(super) fn apply_discovery(
                                     | ManagedKeyError::DecryptionFailed
                             ) =>
                         {
-                            protect_file(catalog, store, mount_path, &file.path)?;
+                            protect_discovered_file(catalog, store, mount_path, &file)?;
                             result.protected_files += 1;
                             result.files.push(DiscoveryAppliedFile {
                                 path: file.path,
@@ -257,12 +259,8 @@ pub(super) fn apply_discovery(
                 }
                 DiscoveredFileAction::Compose => match import.destination {
                     DiscoveryImportDestination::ProjectFile { project_path } => {
-                        let protected = protect_file(
-                            catalog,
-                            store,
-                            mount_path,
-                            &file.path,
-                        )?;
+                        let protected =
+                            protect_discovered_file(catalog, store, mount_path, &file)?;
                         if !matches!(protected, ControlResult::FileProtected { .. }) {
                             return Err(DispatchError::Validation(
                                 "managing a discovered file returned an unexpected result"
@@ -639,6 +637,7 @@ struct DiscoveryReuseState<'a> {
 #[derive(Clone)]
 struct MaterializedResource {
     resource_id: String,
+    enforcement: Enforcement,
     position: i64,
 }
 
@@ -686,7 +685,8 @@ fn apply_project_output_discovery(
         &resources,
         &mut mutation,
     )?;
-    let surface = discovered_surface(&file, environment_id, output_path, binding_ids)?;
+    let surface =
+        discovered_surface(&file, environment_id, output_path, &resources, binding_ids)?;
     replace_discovered_file_with_surface(catalog, mount_path, &surface)?;
     mutation.commit();
     result.files.push(DiscoveryAppliedFile {
@@ -726,7 +726,7 @@ fn apply_library_discovery(
         store,
         mount_path,
         source_disposition,
-        &file.path,
+        &file,
         result,
     )?;
     mutation.commit();
@@ -789,8 +789,13 @@ fn apply_project_outputs_discovery(
             &resources,
             &mut mutation,
         )?;
-        let surface =
-            discovered_surface(&file, environment_id, &output.output_path, binding_ids)?;
+        let surface = discovered_surface(
+            &file,
+            environment_id,
+            &output.output_path,
+            &resources,
+            binding_ids,
+        )?;
         if output.output_path == file.path {
             source_surface = Some(surface);
         } else {
@@ -806,7 +811,7 @@ fn apply_project_outputs_discovery(
             store,
             mount_path,
             source_disposition,
-            &file.path,
+            &file,
             result,
         )?;
     }
@@ -853,13 +858,15 @@ fn materialize_discovered_resources(
                             && candidate.value.as_slice() == entry.value.as_bytes()
                     })
                 });
-                let resource_id = if let Some(candidate) = reusable.flatten() {
+                let (resource_id, enforcement) = if let Some(candidate) = reusable.flatten() {
                     result.reused_resources += 1;
                     let resource_id = candidate.resource_id.clone();
                     catalog.append_resource_origin(&resource_id, &source)?;
-                    resource_id
+                    let enforcement = catalog.resource(&resource_id)?.enforcement;
+                    (resource_id, enforcement)
                 } else {
                     let resource_id = generated_id("secret");
+                    let enforcement = SecurityDefaults::discovered_resource(file.kind);
                     create_shared_secret(
                         catalog,
                         store,
@@ -868,7 +875,7 @@ fn materialize_discovered_resources(
                         Some(entry.key.clone()),
                         SecretValue::new(entry.value.as_str().to_string()),
                         ManagedItemSettings {
-                            enforcement: Enforcement::Prompt,
+                            enforcement,
                             metadata: ItemMetadata::default(),
                         },
                         ResourceOrigin {
@@ -886,10 +893,11 @@ fn materialize_discovered_resources(
                         });
                     }
                     result.created_resources += 1;
-                    resource_id
+                    (resource_id, enforcement)
                 };
                 resources.push(MaterializedResource {
                     resource_id,
+                    enforcement,
                     position: position as i64,
                 });
             }
@@ -907,6 +915,7 @@ fn materialize_discovered_resources(
                     ))
                 })?;
                 let resource_id = generated_id("env-file");
+                let enforcement = SecurityDefaults::discovered_resource(file.kind);
                 create_env_file(
                     catalog,
                     store,
@@ -915,7 +924,7 @@ fn materialize_discovered_resources(
                     ResourceCodec::Dotenv,
                     SecretValue::new(content),
                     ManagedItemSettings {
-                        enforcement: Enforcement::Allow,
+                        enforcement,
                         metadata: ItemMetadata::default(),
                     },
                     ResourceOrigin {
@@ -927,6 +936,7 @@ fn materialize_discovered_resources(
                 result.created_resources += 1;
                 resources.push(MaterializedResource {
                     resource_id,
+                    enforcement,
                     position: plain_entries[0].0 as i64,
                 });
             }
@@ -942,6 +952,7 @@ fn materialize_discovered_resources(
                 ))
             })?;
             let resource_id = generated_id("env-file");
+            let enforcement = SecurityDefaults::discovered_resource(file.kind);
             create_env_file(
                 catalog,
                 store,
@@ -954,7 +965,7 @@ fn materialize_discovered_resources(
                 ResourceCodec::Ini,
                 SecretValue::new(text.to_string()),
                 ManagedItemSettings {
-                    enforcement: Enforcement::Prompt,
+                    enforcement,
                     metadata: ItemMetadata::default(),
                 },
                 ResourceOrigin {
@@ -966,6 +977,7 @@ fn materialize_discovered_resources(
             result.created_resources += 1;
             resources.push(MaterializedResource {
                 resource_id,
+                enforcement,
                 position: 0,
             });
         }
@@ -1008,6 +1020,7 @@ fn discovered_surface(
     file: &DiscoveredContent,
     environment_id: String,
     output_path: &Path,
+    resources: &[MaterializedResource],
     binding_ids: Vec<String>,
 ) -> Result<Surface, DispatchError> {
     let kind = match file.kind {
@@ -1038,7 +1051,9 @@ fn discovered_surface(
         kind,
         path: output_path.to_path_buf(),
         input: SurfaceInput::Bindings { binding_ids },
-        enforcement: Enforcement::Prompt,
+        enforcement: SecurityDefaults::composed_surface(
+            resources.iter().map(|resource| resource.enforcement),
+        ),
         position: 0,
     })
 }
@@ -1077,12 +1092,12 @@ fn apply_source_disposition(
     store: &dyn SecretStore,
     mount_path: &Path,
     disposition: DiscoverySourceDisposition,
-    source_path: &Path,
+    file: &DiscoveredContent,
     result: &mut DiscoveryApplyResult,
 ) -> Result<(), DispatchError> {
     match disposition {
         DiscoverySourceDisposition::ProtectInPlace => {
-            let protected = protect_file(catalog, store, mount_path, source_path)?;
+            let protected = protect_discovered_file(catalog, store, mount_path, file)?;
             if !matches!(protected, ControlResult::FileProtected { .. }) {
                 return Err(DispatchError::Validation(
                     "protecting a discovered source returned an unexpected result".to_string(),

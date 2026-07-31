@@ -1,4 +1,5 @@
 use super::*;
+use super::security_defaults::SecurityDefaults;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn protected_files(
@@ -568,6 +569,37 @@ pub(super) fn protect_file(
     mount_path: &Path,
     path: &Path,
 ) -> Result<ControlResult, DispatchError> {
+    protect_file_with_initial_enforcement(
+        catalog,
+        store,
+        mount_path,
+        path,
+        SecurityDefaults::managed_file(path),
+    )
+}
+
+pub(super) fn protect_discovered_file(
+    catalog: &Catalog,
+    store: &dyn SecretStore,
+    mount_path: &Path,
+    file: &DiscoveredContent,
+) -> Result<ControlResult, DispatchError> {
+    protect_file_with_initial_enforcement(
+        catalog,
+        store,
+        mount_path,
+        &file.path,
+        SecurityDefaults::discovered_file(file.kind, &file.path),
+    )
+}
+
+fn protect_file_with_initial_enforcement(
+    catalog: &Catalog,
+    store: &dyn SecretStore,
+    mount_path: &Path,
+    path: &Path,
+    initial_enforcement: Enforcement,
+) -> Result<ControlResult, DispatchError> {
     if !path.is_absolute() {
         return Err(DispatchError::Validation(format!(
             "protected file path {} must be absolute",
@@ -639,7 +671,14 @@ pub(super) fn protect_file(
             }
             (record.id, false)
         }
-        None => (store.put(NewSecret::file(absolute.clone(), mode), &plaintext)?, true),
+        None => (
+            store.put(
+                NewSecret::file(absolute.clone(), mode)
+                    .with_enforcement(initial_enforcement),
+                &plaintext,
+            )?,
+            true,
+        ),
     };
 
     let target = mount_path
