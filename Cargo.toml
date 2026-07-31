@@ -34,7 +34,7 @@ age = { version = "0.10", features = ["ssh"] }
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 notify = "8.2"
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["backup", "bundled"] }
 signature = "2"
 rsa = "0.9.10"
 ssh-key = { version = "0.6.7", features = ["ed25519", "encryption", "getrandom", "p256", "p384", "p521", "rsa"] }
@@ -50,3 +50,4 @@ floria-control = { path = "crates/floria-control" }
 floria-discover = { path = "crates/floria-discover" }
 floria-surface = { path = "crates/floria-surface" }
 floria-ssh = { path = "crates/floria-ssh" }
+floria-backup = { path = "crates/floria-backup" }

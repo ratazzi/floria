@@ -1,0 +1,20 @@
+[package]
+name = "floria-backup"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+floria-catalog = { workspace = true }
+floria-store = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+age = { workspace = true }
+floria-core = { workspace = true }
+tempfile = { workspace = true }

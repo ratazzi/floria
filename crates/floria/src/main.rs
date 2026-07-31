@@ -122,10 +122,33 @@ enum Cmd {
         #[arg(short, long, default_value = "floria.toml")]
         config: PathBuf,
     },
+    /// Create or verify an encrypted backup of all Floria-managed data.
+    Backup {
+        #[command(subcommand)]
+        command: BackupCmd,
+    },
     /// Manage the store's decryption key.
     Keys {
         #[command(subcommand)]
         command: KeysCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum BackupCmd {
+    /// Create a new immutable backup directory and verify it before publishing.
+    Create {
+        /// New directory to create. Existing paths are never overwritten.
+        destination: PathBuf,
+        #[arg(short, long, default_value = "floria.toml")]
+        config: PathBuf,
+    },
+    /// Verify checksums, catalog integrity, references, and every encrypted version.
+    Verify {
+        /// Existing backup directory.
+        backup: PathBuf,
+        #[arg(short, long, default_value = "floria.toml")]
+        config: PathBuf,
     },
 }
 
@@ -209,6 +232,12 @@ fn main() -> Result<()> {
         Cmd::Rollback { target, version, config } => cmd_rollback(&target, version, &config),
         Cmd::List { config } => cmd_list(&config),
         Cmd::Control { command, socket, config } => cmd_control(command, socket, &config),
+        Cmd::Backup { command } => match command {
+            BackupCmd::Create { destination, config } => {
+                cmd_backup_create(&destination, &config)
+            }
+            BackupCmd::Verify { backup, config } => cmd_backup_verify(&backup, &config),
+        },
         Cmd::Keys { command } => match command {
             KeysCmd::Import { remove_file, config } => cmd_keys_import(remove_file, &config),
         },
@@ -246,6 +275,45 @@ fn open_store(cfg: &ResolvedConfig) -> Result<AgeDirStore> {
     let store = AgeDirStore::open(cfg.store_root.clone(), keys)
         .with_context(|| format!("opening store at {}", cfg.store_root.display()))?;
     Ok(store)
+}
+
+fn cmd_backup_create(destination: &Path, config: &Path) -> Result<()> {
+    let cfg = load(config)?;
+    let catalog_path = support_dir(&cfg)?.join("catalog.sqlite");
+    if !catalog_path.is_file() {
+        anyhow::bail!(
+            "catalog does not exist at {}; start Floria before creating a backup",
+            catalog_path.display()
+        );
+    }
+    let catalog = Catalog::open(&catalog_path)
+        .with_context(|| format!("opening catalog at {}", catalog_path.display()))?;
+    let store = open_store(&cfg)?;
+    let report = floria_backup::create(&catalog, &store, destination)
+        .with_context(|| format!("creating backup at {}", destination.display()))?;
+    print_backup_report("created and verified", &report);
+    Ok(())
+}
+
+fn cmd_backup_verify(backup: &Path, config: &Path) -> Result<()> {
+    let cfg = load(config)?;
+    let store = open_store(&cfg)?;
+    let report = floria_backup::verify(backup, &store)
+        .with_context(|| format!("verifying backup at {}", backup.display()))?;
+    print_backup_report("verified", &report);
+    Ok(())
+}
+
+fn print_backup_report(action: &str, report: &floria_backup::BackupReport) {
+    println!(
+        "{action} {}: {} projects, {} resources, {} secrets, {} versions, {} backup files",
+        report.path.display(),
+        report.projects,
+        report.resources,
+        report.secrets,
+        report.versions,
+        report.files,
+    );
 }
 
 fn cmd_keys_import(remove_file: bool, config: &Path) -> Result<()> {
@@ -1379,6 +1447,33 @@ mod tests {
             bundled_gui_executable(Path::new("/workspace/floria/target/release/floria")),
             None
         );
+    }
+
+    #[test]
+    fn backup_commands_use_the_standard_config_by_default() {
+        let create = Cli::try_parse_from(["floria", "backup", "create", "/tmp/floria-backup"])
+            .unwrap();
+        match create.command {
+            Cmd::Backup {
+                command: BackupCmd::Create { destination, config },
+            } => {
+                assert_eq!(destination, PathBuf::from("/tmp/floria-backup"));
+                assert_eq!(config, PathBuf::from("floria.toml"));
+            }
+            _ => panic!("expected backup create"),
+        }
+
+        let verify = Cli::try_parse_from(["floria", "backup", "verify", "/tmp/floria-backup"])
+            .unwrap();
+        match verify.command {
+            Cmd::Backup {
+                command: BackupCmd::Verify { backup, config },
+            } => {
+                assert_eq!(backup, PathBuf::from("/tmp/floria-backup"));
+                assert_eq!(config, PathBuf::from("floria.toml"));
+            }
+            _ => panic!("expected backup verify"),
+        }
     }
 
     #[test]

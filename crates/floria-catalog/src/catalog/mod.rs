@@ -71,12 +71,68 @@ impl Catalog {
         SCHEMA_VERSION
     }
 
+    pub fn current_schema_version() -> i64 {
+        SCHEMA_VERSION
+    }
+
     pub fn snapshot(&self) -> CatalogResult<CatalogSnapshot> {
         let mut conn = self.connection()?;
         let tx = conn.transaction()?;
         let snapshot = snapshot_from(&tx)?;
         tx.commit()?;
         Ok(snapshot)
+    }
+
+    /// Create a transactionally consistent SQLite copy without pausing readers or writers.
+    ///
+    /// The destination must not exist. It is created private and is a standalone database:
+    /// WAL sidecars from the live catalog are not part of the backup.
+    pub fn backup_to(&self, destination: &Path) -> CatalogResult<()> {
+        if let Some(parent) = destination.parent() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)
+                .map_err(|source| CatalogError::io(parent, source))?;
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(destination)
+            .map_err(|source| CatalogError::io(destination, source))?;
+
+        let source = self.connection()?;
+        let mut target = Connection::open(destination)?;
+        let backup = rusqlite::backup::Backup::new(&source, &mut target)?;
+        backup.run_to_completion(32, Duration::from_millis(10), None)?;
+        drop(backup);
+        target.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o600))
+            .map_err(|source| CatalogError::io(destination, source))
+    }
+
+    /// Validate a standalone catalog backup without migrating or modifying it.
+    pub fn inspect_backup(path: &Path) -> CatalogResult<CatalogSnapshot> {
+        let conn = Connection::open_with_flags(
+            path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version != SCHEMA_VERSION {
+            return Err(CatalogError::UnsupportedSchema {
+                found: version,
+                expected: SCHEMA_VERSION,
+            });
+        }
+        let quick_check: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+        if quick_check != "ok" {
+            return Err(CatalogError::Validation(format!(
+                "catalog integrity check failed: {quick_check}"
+            )));
+        }
+        snapshot_from(&conn)
     }
 }
 

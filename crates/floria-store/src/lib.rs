@@ -15,5 +15,6 @@ pub use keys::{
 };
 pub use source::StoreSource;
 pub use store::{
-    AgeDirStore, NewSecret, SecretId, SecretOrigin, SecretRecord, SecretStore, VersionRecord,
+    AgeDirStore, NewSecret, SecretId, SecretOrigin, SecretRecord, SecretStore, StoreVerification,
+    VersionRecord,
 };

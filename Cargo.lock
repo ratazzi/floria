@@ -775,6 +775,7 @@ dependencies = [
  "anyhow",
  "clap",
  "floria-agent",
+ "floria-backup",
  "floria-catalog",
  "floria-control",
  "floria-core",
@@ -814,6 +815,23 @@ dependencies = [
  "threadpool",
  "tracing",
  "zeroize",
+]
+
+[[package]]
+name = "floria-backup"
+version = "0.1.0"
+dependencies = [
+ "age",
+ "chrono",
+ "floria-catalog",
+ "floria-core",
+ "floria-store",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

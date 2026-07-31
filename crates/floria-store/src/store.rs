@@ -7,7 +7,7 @@
 //! [`Zeroizing`] in memory and never touches disk here.
 
 use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -124,6 +124,14 @@ pub struct VersionRecord {
     pub note: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreVerification {
+    pub secrets: usize,
+    pub versions: usize,
+    pub plaintext_bytes: u64,
+    pub secret_ids: Vec<String>,
+}
+
 /// A place to keep secret blobs confidential at rest, addressed by [`SecretId`].
 ///
 /// Versions are append-only and immutable; each secret has a head pointer (its current version).
@@ -215,6 +223,77 @@ impl AgeDirStore {
                 .map_err(|e| StoreError::io(&root, e))?;
         }
         Ok(AgeDirStore { root, keys })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Copy one immutable, internally consistent encrypted-store snapshot.
+    ///
+    /// Store mutations take the same exclusive lock. The destination must not exist and no
+    /// plaintext or key material is written there.
+    pub fn backup_to(&self, destination: &Path) -> StoreResult<()> {
+        let _lock = self.lock_exclusive()?;
+        copy_store_directory(&self.root, destination)
+    }
+
+    /// Verify every version in this store by decrypting it and comparing its declared size.
+    pub fn verify_all(&self) -> StoreResult<StoreVerification> {
+        let records = self.list()?;
+        let mut versions = 0usize;
+        let mut plaintext_bytes = 0u64;
+        for record in &records {
+            let history = self.history(&record.id)?;
+            if history.is_empty()
+                || !history.iter().any(|version| version.version == record.current_version)
+            {
+                return Err(StoreError::Corrupt {
+                    id: record.id.to_string(),
+                    reason: format!(
+                        "head version {} is missing from version history",
+                        record.current_version
+                    ),
+                });
+            }
+            for version in history {
+                let plaintext = self.get_version(&record.id, version.version)?;
+                if plaintext.len() as u64 != version.size {
+                    return Err(StoreError::Corrupt {
+                        id: record.id.to_string(),
+                        reason: format!(
+                            "v{} declares {} bytes but decrypts to {}",
+                            version.version,
+                            version.size,
+                            plaintext.len()
+                        ),
+                    });
+                }
+                versions += 1;
+                plaintext_bytes = plaintext_bytes.saturating_add(version.size);
+            }
+        }
+        Ok(StoreVerification {
+            secrets: records.len(),
+            versions,
+            plaintext_bytes,
+            secret_ids: records.iter().map(|record| record.id.to_string()).collect(),
+        })
+    }
+
+    /// Verify a copied store with the same key provider as this live store.
+    pub fn verify_backup(&self, root: &Path) -> StoreResult<StoreVerification> {
+        if !root.is_dir() {
+            return Err(StoreError::Invalid(format!(
+                "backup store directory does not exist: {}",
+                root.display()
+            )));
+        }
+        AgeDirStore {
+            root: root.to_path_buf(),
+            keys: Arc::clone(&self.keys),
+        }
+        .verify_all()
     }
 
     /// Take the store-wide exclusive lock (blocking), serializing mutations across processes —
@@ -404,6 +483,53 @@ impl AgeDirStore {
             }
         })
     }
+}
+
+fn copy_store_directory(source: &Path, destination: &Path) -> StoreResult<()> {
+    if destination.exists() {
+        return Err(StoreError::Invalid(format!(
+            "backup store destination already exists: {}",
+            destination.display()
+        )));
+    }
+    std::fs::DirBuilder::new()
+        .recursive(false)
+        .mode(0o700)
+        .create(destination)
+        .map_err(|source| StoreError::io(destination, source))?;
+    copy_store_contents(source, destination)
+}
+
+fn copy_store_contents(source: &Path, destination: &Path) -> StoreResult<()> {
+    let entries = std::fs::read_dir(source).map_err(|error| StoreError::io(source, error))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| StoreError::io(source, error))?;
+        if entry.file_name() == ".lock" {
+            continue;
+        }
+        let from = entry.path();
+        let to = destination.join(entry.file_name());
+        let metadata =
+            std::fs::symlink_metadata(&from).map_err(|error| StoreError::io(&from, error))?;
+        if metadata.is_dir() {
+            std::fs::DirBuilder::new()
+                .recursive(false)
+                .mode(0o700)
+                .create(&to)
+                .map_err(|error| StoreError::io(&to, error))?;
+            copy_store_contents(&from, &to)?;
+        } else if metadata.is_file() {
+            std::fs::copy(&from, &to).map_err(|error| StoreError::io(&to, error))?;
+            std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| StoreError::io(&to, error))?;
+        } else {
+            return Err(StoreError::Invalid(format!(
+                "store contains unsupported filesystem entry: {}",
+                from.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl SecretStore for AgeDirStore {
