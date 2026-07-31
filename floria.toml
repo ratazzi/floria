@@ -1,27 +1,15 @@
-# Floria step-one example config.
-# After mounting: two read-only virtual files appear under ~/.floria.
+# Floria example config.
 
 [mount]
 path = "~/.floria"
 volname = "Floria"
 # audit_log defaults to <name>.audit.jsonl next to the mount point, i.e. ~/.floria.audit.jsonl
 
-# Built-in constant demo file: all bytes are known at mount time, so size is exact -- the strongest "plain file" evidence.
-[[file]]
-path = "demo/hello.txt"
-mode = "0444"
-content = "hello from floria\nstep-one demo\n"
-
-# Script-handler dynamic file: the script runs on open and its stdout is the content. size is a declared upper bound + direct-io.
-# enforcement gates each open through the menubar app. "prompt" = allow/deny dialog;
-# "touchid" additionally requires Touch ID to allow. Both are subject to the grant cache.
-[[file]]
-path = "env/demo/dev.env"
-mode = "0444"
-ttl  = "0s"
-size = 4096
-enforcement = "touchid"
-read = ["./scripts/render-env", "demo", "dev"]
+# [[file]] entries declare virtual files under the mount point. A `content` string is a
+# constant file (bytes known at mount time, exact size). A `read = [cmd, args...]` command
+# instead runs on open and its stdout becomes the content -- `size` is a declared upper bound,
+# `enforcement` gates each open through the menubar app ("prompt" = allow/deny dialog,
+# "touchid" additionally requires Touch ID), both subject to the grant cache.
 
 # Subject-aware rules. Evaluated first-match by descending priority; a per-file `enforcement`
 # above is an implicit rule at priority 0 with subject = any. A trailing read-only `allow`

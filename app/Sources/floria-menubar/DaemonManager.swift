@@ -123,22 +123,6 @@ struct DaemonManager: Sendable {
                 [.posixPermissions: 0o600], ofItemAtPath: configURL.path)
         }
 
-        let scriptsDirectory = runtimeDirectory.appendingPathComponent("scripts", isDirectory: true)
-        let handlerURL = scriptsDirectory.appendingPathComponent("render-env")
-        if !fileManager.fileExists(atPath: handlerURL.path) {
-            guard let bundledHandler = Bundle.main.url(
-                forResource: "render-env", withExtension: nil, subdirectory: "scripts")
-            else {
-                throw DaemonError.missingResource("scripts/render-env")
-            }
-            try fileManager.createDirectory(
-                at: scriptsDirectory,
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700])
-            try fileManager.copyItem(at: bundledHandler, to: handlerURL)
-            try fileManager.setAttributes(
-                [.posixPermissions: 0o700], ofItemAtPath: handlerURL.path)
-        }
     }
 
     private func prepareRuntimeDirectory() throws {
