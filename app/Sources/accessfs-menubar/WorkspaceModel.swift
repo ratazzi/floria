@@ -348,6 +348,15 @@ enum WorkspaceSurfaceKind: String, CaseIterable, Sendable {
         }
     }
 
+    var managedTitle: String {
+        switch self {
+        case .dotenvFile, .direnvFile, .envFileDirect: "Env file"
+        case .iniFile: "Credentials file"
+        case .linesFile: "Text file"
+        case .unixSocket: "Socket"
+        }
+    }
+
     var systemImage: String {
         switch self {
         case .dotenvFile: "doc.text"
@@ -503,17 +512,21 @@ enum WorkspaceProtectedFileKind: String, Sendable {
         if name == "credentials", url.deletingLastPathComponent().lastPathComponent == ".aws" {
             return .awsCredentials
         }
-        if name == ".env" || name.hasPrefix(".env.") { return .dotenv }
+        if name == ".env" || name.hasPrefix(".env.")
+            || name == ".dev.vars" || name.hasPrefix(".dev.vars.")
+        {
+            return .dotenv
+        }
         return .file
     }
 
     var title: String {
         switch self {
-        case .dotenv: "Dotenv"
-        case .direnv: "direnv"
+        case .dotenv: "Env file"
+        case .direnv: "Shell environment"
         case .pgpass: "PostgreSQL password file"
         case .awsCredentials: "AWS credentials"
-        case .file: "Protected file"
+        case .file: "File"
         }
     }
 
@@ -524,6 +537,13 @@ enum WorkspaceProtectedFileKind: String, Sendable {
         case .pgpass: "cylinder"
         case .awsCredentials: "cloud"
         case .file: "lock.fill"
+        }
+    }
+
+    var isConfigurable: Bool {
+        switch self {
+        case .dotenv, .direnv, .awsCredentials: true
+        case .pgpass, .file: false
         }
     }
 }
@@ -854,6 +874,9 @@ final class WorkspaceStore {
         let standardizedImports = imports.map { item in
             let destination: DiscoveryImportDestination
             switch item.destination {
+            case .projectFile(let projectPath):
+                destination = .projectFile(
+                    projectPath: (projectPath as NSString).standardizingPath)
             case .projectOutput(let projectPath, let outputPath):
                 destination = .projectOutput(
                     projectPath: (projectPath as NSString).standardizingPath,
@@ -1052,6 +1075,21 @@ final class WorkspaceStore {
         if let files = try? await controlClient.protectedFiles() {
             protectedFiles = files.map(WorkspaceProtectedFile.init)
         }
+        lastError = nil
+    }
+
+    func configureManagedFile(
+        _ id: String, projectID: WorkspaceProject.ID,
+        environmentID: WorkspaceEnvironment.ID?
+    ) async throws {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        guard projects.contains(where: { $0.id == projectID }) else {
+            throw WorkspaceStoreError.invalid("Choose a project first")
+        }
+        _ = try await controlClient.configureManagedFile(
+            id, projectID: projectID, environmentID: environmentID)
+        apply(try await controlClient.snapshot(), selectingProject: projectID)
+        protectedFiles = try await controlClient.protectedFiles().map(WorkspaceProtectedFile.init)
         lastError = nil
     }
 

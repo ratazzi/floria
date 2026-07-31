@@ -285,6 +285,19 @@ final class ControlClient: @unchecked Sendable {
                 id: id, enforcement: enforcement, metadata: metadata))
     }
 
+    func configureManagedFile(
+        _ id: String, projectID: String, environmentID: String?
+    ) async throws -> CatalogSurface {
+        guard let result: ManagedFileConfigured = try await request(
+            .managedFileConfigure(
+                id: id, projectID: projectID, environmentID: environmentID),
+            expecting: "managed_file_configured", as: ManagedFileConfigured.self)
+        else {
+            throw ControlClientError.missingResult("managed_file_configured")
+        }
+        return result.surface
+    }
+
     func restoreFile(_ id: String) async throws -> Bool {
         guard let result: FileRestored = try await request(
             .fileRestore(id), expecting: "file_restored", as: FileRestored.self)
@@ -535,6 +548,10 @@ final class ControlClient: @unchecked Sendable {
     private struct ProtectedFileHistory: Decodable {
         let id: String
         let versions: [CatalogProtectedFileVersion]
+    }
+
+    private struct ManagedFileConfigured: Decodable {
+        let surface: CatalogSurface
     }
 
     private struct FileRestored: Decodable {

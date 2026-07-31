@@ -67,6 +67,16 @@
         }
     }
 
+    fn project_file_import(path: &Path, project_path: &Path) -> DiscoveryImport {
+        DiscoveryImport {
+            path: path.to_path_buf(),
+            destination: DiscoveryImportDestination::ProjectFile {
+                project_path: project_path.to_path_buf(),
+            },
+            source_disposition: DiscoverySourceDisposition::ProtectInPlace,
+        }
+    }
+
     fn library_import(
         path: &Path,
         source_disposition: DiscoverySourceDisposition,
@@ -804,6 +814,59 @@
     }
 
     #[test]
+    fn discovery_manages_parseable_project_files_without_configuring_outputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("fixture-project");
+        let source_path = project_path.join(".dev.vars");
+        let mount_path = dir.path().join("mount");
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
+        std::fs::create_dir_all(&mount_path).unwrap();
+        std::fs::write(
+            &source_path,
+            "DISCOVERED_TOKEN=fixture-discovered-value\n",
+        )
+        .unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let store = FixtureStore::new();
+
+        let applied = dispatch(
+            &catalog,
+            DispatchServices {
+                store: Some(&store),
+                mount_path: Some(&mount_path),
+                ..DispatchServices::default()
+            },
+            ControlCommand::DiscoverApply {
+                paths: vec![project_path.clone()],
+                imports: Some(vec![project_file_import(&source_path, &project_path)]),
+                separate_entries: Vec::new(),
+                promote_entries: Vec::new(),
+                demote_entries: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let ControlResult::DiscoveryApplied(result) = applied else {
+            panic!("expected discovery apply result");
+        };
+        assert_eq!(result.project_ids.len(), 1);
+        assert_eq!(result.protected_files, 1);
+        assert_eq!(result.created_resources, 0);
+        assert_eq!(result.files[0].outcome, DiscoveryApplyOutcome::Protected);
+        let snapshot = catalog.snapshot().unwrap();
+        assert_eq!(snapshot.projects.len(), 1);
+        assert!(snapshot.resources.is_empty());
+        assert!(snapshot.bindings.is_empty());
+        assert!(snapshot.surfaces.is_empty());
+        assert_eq!(
+            std::fs::read_link(&source_path).unwrap(),
+            mount_path
+                .join(accessfs_core::config::SECRETS_DIR)
+                .join(FIXTURE_SECRET_ID)
+        );
+    }
+
+    #[test]
     fn rediscovering_a_managed_project_does_not_reimport_surface_links() {
         let dir = tempfile::tempdir().unwrap();
         let project_path = dir.path().join("fixture-project");
@@ -1521,7 +1584,7 @@
             },
             ControlCommand::DiscoverApply {
                 paths: vec![project_path.clone()],
-                imports: None,
+                imports: Some(vec![project_output_import(&source_path, &project_path)]),
                 separate_entries: Vec::new(),
                 promote_entries: Vec::new(),
                 demote_entries: Vec::new(),
@@ -2865,6 +2928,107 @@
             "export FIXTURE_VALUE='fixture-value'\n"
         );
         assert!(store.record(&secret_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn configures_a_managed_env_file_only_after_an_explicit_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let socket = dir.path().join("control.sock");
+        let mount = dir.path().join("mount");
+        let project_path = dir.path().join("project");
+        std::fs::create_dir_all(&project_path).unwrap();
+        let project_path = std::fs::canonicalize(project_path).unwrap();
+        catalog
+            .upsert_project(&Project {
+                id: "fixture-project".to_string(),
+                name: "Fixture".to_string(),
+                path: project_path.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+        catalog
+            .upsert_environment(&Environment {
+                id: "fixture-development".to_string(),
+                project_id: "fixture-project".to_string(),
+                name: "Development".to_string(),
+                position: 0,
+            })
+            .unwrap();
+        let source = project_path.join(".dev.vars");
+        std::fs::write(&source, "FIRST=fixture-one\nSECOND=fixture-two\n").unwrap();
+        let store = Arc::new(FixtureStore::new());
+        let observer = Arc::new(SnapshotObserver {
+            notifications: AtomicUsize::new(0),
+            latest: Mutex::new(None),
+        });
+        let _server = ControlServer::start_runtime(
+            &socket,
+            catalog.clone(),
+            Arc::clone(&store) as Arc<dyn SecretStore>,
+            mount.clone(),
+            observer,
+            test_peer_verifier(),
+        )
+        .unwrap();
+        let mut client = ControlClient::connect(&socket).unwrap();
+
+        client
+            .request(ControlCommand::FileProtect { path: source.clone() })
+            .unwrap();
+        let before = catalog.snapshot().unwrap();
+        assert!(before.resources.is_empty());
+        assert!(before.bindings.is_empty());
+        assert!(before.surfaces.is_empty());
+
+        let configured = client
+            .request(ControlCommand::ManagedFileConfigure {
+                id: FIXTURE_SECRET_ID.to_string(),
+                project_id: "fixture-project".to_string(),
+                environment_id: Some("fixture-development".to_string()),
+            })
+            .unwrap();
+        let ControlResult::ManagedFileConfigured { surface } = configured else {
+            panic!("expected configured managed file");
+        };
+        assert_eq!(surface.path, source);
+        assert_eq!(
+            surface.kind,
+            SurfaceKind::File(accessfs_catalog::FileBacking::Composed(
+                accessfs_catalog::SurfaceFormat::Dotenv
+            ))
+        );
+        assert_eq!(
+            std::fs::read_link(&source).unwrap(),
+            mount.join(accessfs_core::config::SURFACES_DIR).join(&surface.id)
+        );
+
+        let snapshot = catalog.snapshot().unwrap();
+        assert_eq!(snapshot.resources.len(), 1);
+        assert_eq!(snapshot.resources[0].kind, ResourceKind::EnvFile);
+        assert_eq!(snapshot.resources[0].codec, ResourceCodec::Dotenv);
+        assert_eq!(
+            snapshot.resources[0].entries.iter().filter_map(|entry| entry.key.as_deref()).collect::<Vec<_>>(),
+            vec!["FIRST", "SECOND"]
+        );
+        assert_eq!(
+            snapshot.resources[0].source,
+            ResourceSource::SecretRef { secret_id: FIXTURE_SECRET_ID.to_string() }
+        );
+        assert_eq!(snapshot.bindings.len(), 1);
+        assert_eq!(snapshot.surfaces, vec![surface]);
+
+        let ControlResult::ProtectedFiles(files) =
+            client.request(ControlCommand::ProtectedFiles).unwrap()
+        else {
+            panic!("expected protected files result");
+        };
+        assert!(
+            files.is_empty(),
+            "a configured file must have one project-facing representation"
+        );
+        let secret_id: SecretId = FIXTURE_SECRET_ID.parse().unwrap();
+        assert_eq!(store.record(&secret_id).unwrap().unwrap().current_version, 1);
     }
 
     #[test]

@@ -135,6 +135,10 @@ final class ControlProtocolTests: XCTestCase {
             paths: ["/fixture/project"],
             imports: [
                 DiscoveryImport(
+                    path: "/fixture/project/.dev.vars",
+                    destination: .projectFile(projectPath: "/fixture/project"),
+                    sourceDisposition: .protectInPlace),
+                DiscoveryImport(
                     path: "/fixture/project/.env",
                     destination: .projectOutput(
                         projectPath: "/fixture/project",
@@ -169,13 +173,17 @@ final class ControlProtocolTests: XCTestCase {
             ["/fixture/project"])
         let imports = try XCTUnwrap(
             (request["params"] as? [String: Any])?["imports"] as? [[String: Any]])
-        XCTAssertEqual(imports.count, 2)
+        XCTAssertEqual(imports.count, 3)
         XCTAssertEqual(
             (imports[0]["destination"] as? [String: Any])?["type"] as? String,
-            "project_output")
-        XCTAssertEqual(imports[0]["source_disposition"] as? String, "replace_with_surface")
+            "project_file")
+        XCTAssertEqual(imports[0]["source_disposition"] as? String, "protect_in_place")
         XCTAssertEqual(
             (imports[1]["destination"] as? [String: Any])?["type"] as? String,
+            "project_output")
+        XCTAssertEqual(imports[1]["source_disposition"] as? String, "replace_with_surface")
+        XCTAssertEqual(
+            (imports[2]["destination"] as? [String: Any])?["type"] as? String,
             "project_outputs")
         let separateEntries = try XCTUnwrap(
             (request["params"] as? [String: Any])?["separate_entries"]
@@ -484,6 +492,18 @@ final class ControlProtocolTests: XCTestCase {
         let updateParams = try XCTUnwrap(updateValue["params"] as? [String: Any])
         XCTAssertEqual(updateValue["method"] as? String, "protected_file_metadata_update")
         XCTAssertEqual(updateParams["enforcement"] as? String, "allow")
+
+        let configure = try ControlCommand.managedFileConfigure(
+            id: "fixture-secret", projectID: "fixture-project",
+            environmentID: "fixture-development"
+        ).requestData(requestID: 732, encoder: encoder)
+        let configureValue = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: configure) as? [String: Any])
+        let configureParams = try XCTUnwrap(configureValue["params"] as? [String: Any])
+        XCTAssertEqual(configureValue["method"] as? String, "managed_file_configure")
+        XCTAssertEqual(configureParams["id"] as? String, "fixture-secret")
+        XCTAssertEqual(configureParams["project_id"] as? String, "fixture-project")
+        XCTAssertEqual(configureParams["environment_id"] as? String, "fixture-development")
 
         let restore = try ControlCommand.fileRestore("fixture-secret")
             .requestData(requestID: 74, encoder: encoder)

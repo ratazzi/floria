@@ -109,6 +109,11 @@ pub enum ControlCommand {
         enforcement: Enforcement,
         metadata: ItemMetadata,
     },
+    ManagedFileConfigure {
+        id: String,
+        project_id: String,
+        environment_id: Option<String>,
+    },
     FileRestore { id: String },
     ResolveEnvironment { project_id: String, environment_id: String },
     ResourceUsage { resource_id: String },
@@ -197,6 +202,7 @@ pub enum ControlResult {
     FileProtected { file: ProtectedFile, created: bool },
     ProtectedFileHistory { id: String, versions: Vec<ProtectedFileVersion> },
     ProtectedFileRolledBack { file: ProtectedFile },
+    ManagedFileConfigured { surface: Surface },
     FileRestored { path: PathBuf, storage_deleted: bool },
     ResolvedEnvironment(ResolvedEnvironment),
     ResourceUsage(ResourceUsage),
@@ -418,6 +424,9 @@ pub struct DiscoveryImport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DiscoveryImportDestination {
+    ProjectFile {
+        project_path: PathBuf,
+    },
     ProjectOutput {
         project_path: PathBuf,
         output_path: PathBuf,
@@ -1038,6 +1047,24 @@ mod tests {
 
         assert_eq!(value["method"], "file_protect");
         assert_eq!(value["params"]["path"], "/fixture/project/.env");
+    }
+
+    #[test]
+    fn managed_file_configuration_is_an_explicit_project_transition() {
+        let request = ControlRequest {
+            request_id: 10,
+            command: ControlCommand::ManagedFileConfigure {
+                id: "fixture-secret".to_string(),
+                project_id: "fixture-project".to_string(),
+                environment_id: Some("fixture-development".to_string()),
+            },
+        };
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["method"], "managed_file_configure");
+        assert_eq!(value["params"]["id"], "fixture-secret");
+        assert_eq!(value["params"]["project_id"], "fixture-project");
+        assert_eq!(value["params"]["environment_id"], "fixture-development");
     }
 
     #[test]

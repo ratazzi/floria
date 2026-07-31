@@ -301,12 +301,16 @@ final class WorkspaceModelTests: XCTestCase {
         XCTAssertEqual(WorkspaceProtectedFileKind.infer(from: "/fixture/project/.env"), .dotenv)
         XCTAssertEqual(
             WorkspaceProtectedFileKind.infer(from: "/fixture/project/.env.production"), .dotenv)
+        XCTAssertEqual(
+            WorkspaceProtectedFileKind.infer(from: "/fixture/project/.dev.vars"), .dotenv)
         XCTAssertEqual(WorkspaceProtectedFileKind.infer(from: "/fixture/project/.envrc"), .direnv)
         XCTAssertEqual(WorkspaceProtectedFileKind.infer(from: "/fixture/home/.pgpass"), .pgpass)
         XCTAssertEqual(
             WorkspaceProtectedFileKind.infer(from: "/fixture/home/.aws/credentials"),
             .awsCredentials)
         XCTAssertEqual(WorkspaceProtectedFileKind.infer(from: "/fixture/opaque.bin"), .file)
+        XCTAssertEqual(WorkspaceProtectedFileKind.dotenv.title, "Env file")
+        XCTAssertEqual(WorkspaceProtectedFileKind.file.title, "File")
     }
 
     func testEachSurfaceResolvesOnlyItsExplicitMembers() {

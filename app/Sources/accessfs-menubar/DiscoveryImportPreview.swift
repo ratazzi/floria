@@ -121,6 +121,8 @@ struct DiscoveryImportPreview: Equatable {
         for destination: DiscoveryImportDestination
     ) -> [String] {
         switch destination {
+        case .projectFile:
+            return []
         case .projectOutput(_, let outputPath):
             return [outputPath]
         case .library:

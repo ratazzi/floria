@@ -2,16 +2,230 @@ use super::*;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn protected_files(
+    catalog: &Catalog,
     store: &dyn SecretStore,
     mount_path: &Path,
 ) -> Result<ControlResult, DispatchError> {
+    let snapshot = catalog.snapshot()?;
+    let configured_secret_ids = snapshot.file_surface_secret_ids();
     let mut files = store
         .list()?
         .into_iter()
+        .filter(|record| !configured_secret_ids.contains(record.id.as_str()))
         .filter_map(|record| protected_file(record, mount_path))
         .collect::<Vec<_>>();
     files.sort_by(|left, right| left.source_path.cmp(&right.source_path));
     Ok(ControlResult::ProtectedFiles(files))
+}
+
+pub(super) fn configure_managed_file(
+    catalog: &Catalog,
+    store: &dyn SecretStore,
+    mount_path: &Path,
+    id: &str,
+    project_id: &str,
+    environment_id: Option<&str>,
+) -> Result<ControlResult, DispatchError> {
+    let (secret_id, record) = file_record(store, id)?;
+    let SecretOrigin::File { source_path } = &record.origin else { unreachable!() };
+    let snapshot = catalog.snapshot()?;
+    let project = snapshot
+        .projects
+        .iter()
+        .find(|project| project.id == project_id)
+        .ok_or_else(|| DispatchError::Validation(format!("project {project_id:?} was not found")))?;
+    if !source_path.starts_with(&project.path) {
+        return Err(DispatchError::Validation(format!(
+            "{} is outside project {}",
+            source_path.display(),
+            project.path.display()
+        )));
+    }
+    if snapshot.resources.iter().any(|resource| {
+        matches!(
+            &resource.source,
+            ResourceSource::SecretRef { secret_id: existing } if existing == id
+        )
+    }) {
+        return Err(DispatchError::Validation(format!(
+            "{} is already configured",
+            source_path.display()
+        )));
+    }
+    let expected = mount_path
+        .join(accessfs_core::config::SECRETS_DIR)
+        .join(secret_id.to_string());
+    let actual = std::fs::read_link(source_path).map_err(|source| DispatchError::Io {
+        path: source_path.clone(),
+        source,
+    })?;
+    if actual != expected {
+        return Err(DispatchError::Validation(format!(
+            "{} no longer points to its managed file",
+            source_path.display()
+        )));
+    }
+
+    let (codec, format) = configurable_file_format(source_path)?;
+    let plaintext = store.get(&secret_id)?;
+    let decoded = decode_source(codec, id, &plaintext)
+        .map_err(|error| DispatchError::Validation(error.to_string()))?;
+    if decoded.is_empty() {
+        return Err(DispatchError::Validation(format!(
+            "{} has no configurable entries",
+            source_path.display()
+        )));
+    }
+
+    let existing_environment = match environment_id {
+        Some(id) => {
+            let environment = snapshot
+                .environments
+                .iter()
+                .find(|environment| environment.id == id)
+                .ok_or_else(|| {
+                    DispatchError::Validation(format!("environment {id:?} was not found"))
+                })?;
+            if environment.project_id != project_id {
+                return Err(DispatchError::Validation(format!(
+                    "environment {id:?} does not belong to project {project_id:?}"
+                )));
+            }
+            Some(environment)
+        }
+        None => project
+            .default_environment_id
+            .as_deref()
+            .and_then(|id| {
+                snapshot.environments.iter().find(|environment| environment.id == id)
+            })
+            .or_else(|| {
+                snapshot
+                    .environments
+                    .iter()
+                    .find(|environment| environment.project_id == project_id)
+            }),
+    };
+    let (environment_id, created_environment) = match existing_environment {
+        Some(environment) => (environment.id.clone(), false),
+        None => ensure_discovered_environment(catalog, project_id, "development")?,
+    };
+    let environment_name = catalog
+        .snapshot()?
+        .environments
+        .into_iter()
+        .find(|environment| environment.id == environment_id)
+        .map(|environment| environment.name)
+        .unwrap_or_else(|| "Development".to_string());
+
+    let resource_id = generated_id("env-file");
+    let binding_id = generated_id("binding");
+    let name = source_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("Environment")
+        .to_string();
+    let resource = Resource {
+        id: resource_id.clone(),
+        name: name.clone(),
+        kind: ResourceKind::EnvFile,
+        shape: ValueShape::KeyValueSet,
+        codec,
+        default_env_key: None,
+        entries: decoded
+            .into_iter()
+            .map(|entry| EntrySpec {
+                address: entry.address,
+                label: match (&entry.section, &entry.key) {
+                    (Some(section), Some(key)) => format!("[{section}] {key}"),
+                    (_, Some(key)) => key.clone(),
+                    _ => "Value".to_string(),
+                },
+                key: entry.key,
+                sensitive: true,
+            })
+            .collect(),
+        source: ResourceSource::SecretRef { secret_id: secret_id.to_string() },
+        enforcement: record.enforcement,
+        metadata: record.metadata.clone(),
+        origin: ResourceOrigin {
+            kind: OriginKind::Discovered,
+            sources: vec![OriginSource {
+                path: source_path.clone(),
+                project_id: Some(project_id.to_string()),
+                environment: Some(environment_name),
+                imported_at: now_rfc3339(),
+            }],
+        },
+    };
+    let binding = Binding {
+        id: binding_id.clone(),
+        project_id: project_id.to_string(),
+        scope: BindingScope::Environment { environment_id: environment_id.clone() },
+        resource_id: resource_id.clone(),
+        selection: EntrySelection::All,
+        key_override: None,
+        enabled: true,
+        allow_override: false,
+        position: 0,
+    };
+    let surface = Surface {
+        id: generated_id("surface"),
+        environment_id,
+        name,
+        kind: SurfaceKind::File(FileBacking::Composed(format)),
+        path: source_path.clone(),
+        input: SurfaceInput::Bindings { binding_ids: vec![binding_id.clone()] },
+        enforcement: record.enforcement,
+        position: 0,
+    };
+
+    catalog.create_resource(&resource)?;
+    if let Err(error) = catalog.upsert_binding(&binding) {
+        let _ = catalog.remove_resource(&resource_id);
+        if created_environment {
+            let _ = catalog.remove_environment(&surface.environment_id);
+        }
+        return Err(DispatchError::Catalog(error));
+    }
+    if let Err(error) = replace_discovered_file_with_surface(catalog, mount_path, &surface) {
+        let _ = catalog.remove_binding(&binding_id);
+        let _ = catalog.remove_resource(&resource_id);
+        if created_environment {
+            let _ = catalog.remove_environment(&surface.environment_id);
+        }
+        return Err(error);
+    }
+
+    Ok(ControlResult::ManagedFileConfigured { surface })
+}
+
+fn configurable_file_format(
+    path: &Path,
+) -> Result<(ResourceCodec, SurfaceFormat), DispatchError> {
+    let name = path.file_name().and_then(|value| value.to_str()).unwrap_or_default();
+    if name == ".envrc" {
+        return Ok((ResourceCodec::Dotenv, SurfaceFormat::Direnv));
+    }
+    if name == "credentials"
+        && path
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|parent| parent == ".aws")
+    {
+        return Ok((ResourceCodec::Ini, SurfaceFormat::Ini));
+    }
+    if name == ".env"
+        || name.starts_with(".env.")
+        || name == ".dev.vars"
+        || name.starts_with(".dev.vars.")
+    {
+        return Ok((ResourceCodec::Dotenv, SurfaceFormat::Dotenv));
+    }
+    Err(DispatchError::Validation(format!(
+        "{} is managed unchanged and has no configurable format",
+        path.display()
+    )))
 }
 
 pub(super) fn protected_file(record: SecretRecord, mount_path: &Path) -> Option<ProtectedFile> {

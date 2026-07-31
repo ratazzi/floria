@@ -50,6 +50,13 @@ pub(super) fn apply_discovery(
         .iter()
         .filter(|file| {
             file.action == DiscoveredFileAction::Compose
+                && imports_by_path.get(&file.path).is_some_and(|import| {
+                    matches!(
+                        &import.destination,
+                        DiscoveryImportDestination::ProjectOutput { .. }
+                            | DiscoveryImportDestination::ProjectOutputs { .. }
+                    )
+                })
                 && matches!(
                     file.kind,
                     DiscoveredFileKind::Dotenv | DiscoveredFileKind::Direnv
@@ -125,7 +132,15 @@ pub(super) fn apply_discovery(
         let import = imports_by_path
             .remove(&file.path)
             .expect("selected discovery import");
-        if file.action == DiscoveredFileAction::Compose && !file.warnings.is_empty() {
+        let configures_output = matches!(
+            &import.destination,
+            DiscoveryImportDestination::ProjectOutput { .. }
+                | DiscoveryImportDestination::ProjectOutputs { .. }
+        );
+        if file.action == DiscoveredFileAction::Compose
+            && configures_output
+            && !file.warnings.is_empty()
+        {
             result.files.push(DiscoveryAppliedFile {
                 path: file.path,
                 outcome: DiscoveryApplyOutcome::Skipped,
@@ -150,9 +165,12 @@ pub(super) fn apply_discovery(
                         result.files.push(DiscoveryAppliedFile {
                             path: file.path,
                             outcome: DiscoveryApplyOutcome::Protected,
-                            detail: "Protected as a read-only audited file".to_string(),
+                            detail: "Managed unchanged at its original path".to_string(),
                         });
-                        Ok(Vec::new())
+                        Ok(import_project_paths(&import.destination)
+                            .into_iter()
+                            .cloned()
+                            .collect())
                     }
                 }
                 DiscoveredFileAction::ImportSshIdentity => {
@@ -226,6 +244,28 @@ pub(super) fn apply_discovery(
                     Ok(Vec::new())
                 }
                 DiscoveredFileAction::Compose => match import.destination {
+                    DiscoveryImportDestination::ProjectFile { project_path } => {
+                        let protected = protect_file(
+                            catalog,
+                            store,
+                            mount_path,
+                            &file.path,
+                        )?;
+                        if !matches!(protected, ControlResult::FileProtected { .. }) {
+                            return Err(DispatchError::Validation(
+                                "managing a discovered file returned an unexpected result"
+                                    .to_string(),
+                            ));
+                        }
+                        result.protected_files += 1;
+                        result.files.push(DiscoveryAppliedFile {
+                            path: file.path,
+                            outcome: DiscoveryApplyOutcome::Protected,
+                            detail: "Managed unchanged; this file type can be configured later"
+                                .to_string(),
+                        });
+                        Ok(vec![project_path])
+                    }
                     DiscoveryImportDestination::ProjectOutput {
                         project_path,
                         output_path,
@@ -356,18 +396,25 @@ fn resolve_discovery_imports(
                     };
                     DiscoveryImport {
                         path: file.path.clone(),
-                        destination: DiscoveryImportDestination::ProjectOutput {
-                            project_path,
-                            output_path: file.path.clone(),
-                        },
-                        source_disposition: DiscoverySourceDisposition::ReplaceWithSurface,
+                        destination: DiscoveryImportDestination::ProjectFile { project_path },
+                        source_disposition: DiscoverySourceDisposition::ProtectInPlace,
                     }
                 }
-                DiscoveredFileAction::Protect => DiscoveryImport {
-                    path: file.path.clone(),
-                    destination: DiscoveryImportDestination::Library,
-                    source_disposition: DiscoverySourceDisposition::ProtectInPlace,
-                },
+                DiscoveredFileAction::Protect => {
+                    let destination = file
+                        .assignment
+                        .project_path
+                        .clone()
+                        .map(|project_path| {
+                            DiscoveryImportDestination::ProjectFile { project_path }
+                        })
+                        .unwrap_or(DiscoveryImportDestination::Library);
+                    DiscoveryImport {
+                        path: file.path.clone(),
+                        destination,
+                        source_disposition: DiscoverySourceDisposition::ProtectInPlace,
+                    }
+                }
                 DiscoveredFileAction::ImportSshIdentity => DiscoveryImport {
                     path: file.path.clone(),
                     destination: DiscoveryImportDestination::Library,
@@ -384,6 +431,7 @@ fn import_project_paths(
     destination: &DiscoveryImportDestination,
 ) -> Vec<&PathBuf> {
     match destination {
+        DiscoveryImportDestination::ProjectFile { project_path } => vec![project_path],
         DiscoveryImportDestination::ProjectOutput { project_path, .. } => vec![project_path],
         DiscoveryImportDestination::Library => Vec::new(),
         DiscoveryImportDestination::ProjectOutputs { outputs } => {
@@ -402,6 +450,20 @@ fn validate_discovery_import(
         file.path.display()
     ));
     match (&import.destination, import.source_disposition) {
+        (
+            DiscoveryImportDestination::ProjectFile { project_path },
+            DiscoverySourceDisposition::ProtectInPlace,
+        ) if matches!(
+            file.action,
+            DiscoveredFileAction::Compose | DiscoveredFileAction::Protect
+        ) => {
+            if !valid_project_paths.contains(project_path) {
+                return Err(invalid(format!(
+                    "assigned project was not part of discovery: {}",
+                    project_path.display()
+                )));
+            }
+        }
         (
             DiscoveryImportDestination::ProjectOutput {
                 project_path,
@@ -1332,6 +1394,7 @@ pub(super) fn discovery_review_plan(
     discovery: DiscoveryPlan,
 ) -> Result<DiscoveryReviewPlan, DispatchError> {
     let snapshot = catalog.snapshot()?;
+    let configured_secret_ids = snapshot.file_surface_secret_ids();
     let mut managed_items = Vec::new();
 
     for surface in snapshot.surfaces.iter().filter(|surface| surface.kind.is_file()) {
@@ -1372,6 +1435,9 @@ pub(super) fn discovery_review_plan(
 
     for record in store.list()? {
         let SecretOrigin::File { source_path } = record.origin else { continue };
+        if configured_secret_ids.contains(record.id.as_str()) {
+            continue;
+        }
         if !discovery_path_is_in_scope(&source_path, &discovery.paths) {
             continue;
         }

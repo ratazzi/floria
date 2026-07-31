@@ -39,12 +39,23 @@ final class ProductLanguageTests: XCTestCase {
         ] {
             XCTAssertFalse(source.contains(#""\#(phrase)""#), phrase)
         }
-        XCTAssertTrue(source.contains(#""Protected""#))
-        XCTAssertTrue(source.contains(#""Will be protected""#))
+        XCTAssertTrue(source.contains(#""Managed""#))
+        XCTAssertTrue(source.contains(#""Will be managed""#))
         XCTAssertTrue(source.contains(#""Not selected""#))
-        XCTAssertTrue(source.contains(#""Opaque file · unchanged""#))
+        XCTAssertTrue(source.contains(#""Managed file""#))
         XCTAssertTrue(source.contains(#"return selected ? .green : .secondary"#))
         XCTAssertFalse(source.contains(#""doc.badge.lock""#))
+        XCTAssertFalse(source.contains(#""shared automatically""#))
+    }
+
+    func testCompactProjectUsesOneManagedInventory() throws {
+        let source = try source("CompactDashboardView.swift")
+
+        XCTAssertTrue(source.contains(#"DashboardSection(title: "Managed")"#))
+        XCTAssertFalse(source.contains(#"DashboardSection(title: "Outputs")"#))
+        XCTAssertFalse(source.contains(#"DashboardSection(title: "Protected Files")"#))
+        XCTAssertFalse(source.contains(#"DashboardSection(title: "Unattached Bindings")"#))
+        XCTAssertFalse(source.contains(#""Manage Output…""#))
     }
 
     private func source(_ name: String) throws -> String {

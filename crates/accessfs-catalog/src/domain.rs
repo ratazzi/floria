@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use accessfs_core::authz::Enforcement;
@@ -506,6 +506,42 @@ pub struct CatalogSnapshot {
     pub surfaces: Vec<Surface>,
 }
 
+impl CatalogSnapshot {
+    /// Stored secrets whose former file-origin path is now represented by a configured file
+    /// surface. This is the semantic boundary between byte-preserving managed files and
+    /// explicitly configured outputs.
+    pub fn file_surface_secret_ids(&self) -> HashSet<&str> {
+        let mut resource_ids = HashSet::<&str>::new();
+        for surface in self.surfaces.iter().filter(|surface| surface.kind.is_file()) {
+            match &surface.input {
+                SurfaceInput::Resource { resource_id } => {
+                    resource_ids.insert(resource_id);
+                }
+                SurfaceInput::Bindings { binding_ids }
+                | SurfaceInput::SshAgent { binding_ids, .. } => {
+                    for binding in self
+                        .bindings
+                        .iter()
+                        .filter(|binding| binding_ids.contains(&binding.id))
+                    {
+                        resource_ids.insert(&binding.resource_id);
+                    }
+                }
+            }
+        }
+        self.resources
+            .iter()
+            .filter(|resource| resource_ids.contains(resource.id.as_str()))
+            .filter_map(|resource| match &resource.source {
+                ResourceSource::SecretRef { secret_id } => Some(secret_id.as_str()),
+                ResourceSource::Literal { .. }
+                | ResourceSource::Command { .. }
+                | ResourceSource::Socket => None,
+            })
+            .collect()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolvedExport {
     pub key: String,
@@ -544,10 +580,7 @@ pub struct ResourceUsage {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        FileBacking, FormatInputModel, ResourceCodec, ResourceKind, ResourceSource, SurfaceFormat,
-        SurfaceKind, ValueShape,
-    };
+    use super::*;
 
     #[test]
     fn surface_formats_declare_their_catalog_input_contract() {
@@ -578,6 +611,61 @@ mod tests {
             }
         );
         assert!(!lines.allow_key_override);
+    }
+
+    #[test]
+    fn file_surface_secret_ids_excludes_unconfigured_resources() {
+        let resource = |id: &str, secret_id: &str| Resource {
+            id: id.to_string(),
+            name: id.to_string(),
+            kind: ResourceKind::EnvFile,
+            shape: ValueShape::KeyValueSet,
+            codec: ResourceCodec::Dotenv,
+            default_env_key: None,
+            entries: vec![EntrySpec {
+                address: "keys/FIXTURE".to_string(),
+                label: "FIXTURE".to_string(),
+                key: Some("FIXTURE".to_string()),
+                sensitive: true,
+            }],
+            source: ResourceSource::SecretRef { secret_id: secret_id.to_string() },
+            enforcement: Enforcement::Prompt,
+            metadata: ItemMetadata::default(),
+            origin: ResourceOrigin::default(),
+        };
+        let snapshot = CatalogSnapshot {
+            resources: vec![
+                resource("configured", "configured-secret"),
+                resource("unconfigured", "unconfigured-secret"),
+            ],
+            bindings: vec![Binding {
+                id: "configured-binding".to_string(),
+                project_id: "fixture-project".to_string(),
+                scope: BindingScope::Environment {
+                    environment_id: "fixture-environment".to_string(),
+                },
+                resource_id: "configured".to_string(),
+                ..Default::default()
+            }],
+            surfaces: vec![Surface {
+                id: "fixture-surface".to_string(),
+                environment_id: "fixture-environment".to_string(),
+                name: ".env".to_string(),
+                kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
+                path: PathBuf::from("/fixture/.env"),
+                input: SurfaceInput::Bindings {
+                    binding_ids: vec!["configured-binding".to_string()],
+                },
+                enforcement: Enforcement::Prompt,
+                position: 0,
+            }],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            snapshot.file_surface_secret_ids(),
+            HashSet::from(["configured-secret"])
+        );
     }
 
     #[test]

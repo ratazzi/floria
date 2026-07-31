@@ -237,6 +237,7 @@ pub(super) fn dispatch(
             .map(ControlResult::SshConfig)
             .map_err(DispatchError::SshConfig),
         ControlCommand::ProtectedFiles => protected_files(
+            catalog,
             store.ok_or(DispatchError::StoreUnavailable)?,
             mount_path.ok_or(DispatchError::StoreUnavailable)?,
         ),
@@ -265,6 +266,16 @@ pub(super) fn dispatch(
                 &id,
                 enforcement,
                 metadata,
+            )
+        }
+        ControlCommand::ManagedFileConfigure { id, project_id, environment_id } => {
+            configure_managed_file(
+                catalog,
+                store.ok_or(DispatchError::StoreUnavailable)?,
+                mount_path.ok_or(DispatchError::StoreUnavailable)?,
+                &id,
+                &project_id,
+                environment_id.as_deref(),
             )
         }
         ControlCommand::FileRestore { id } => restore_file(

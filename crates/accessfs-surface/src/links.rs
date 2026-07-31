@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
@@ -240,6 +240,20 @@ pub fn protected_checkout_links(
     records: &[SecretRecord],
     mount_path: &Path,
 ) -> Vec<ProtectedCheckoutLink> {
+    let configured_paths = file_surface_instances(snapshot)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|surface| surface.path)
+        .collect::<HashSet<_>>();
+    protected_checkout_links_excluding(snapshot, records, mount_path, &configured_paths)
+}
+
+fn protected_checkout_links_excluding(
+    snapshot: &CatalogSnapshot,
+    records: &[SecretRecord],
+    mount_path: &Path,
+    excluded_paths: &HashSet<PathBuf>,
+) -> Vec<ProtectedCheckoutLink> {
     let mut links = Vec::new();
     for record in records {
         let Some(source) = record.source_path() else { continue };
@@ -264,9 +278,13 @@ pub fn protected_checkout_links(
             checkout.kind == ProjectCheckoutKind::Worktree
                 && checkout.project_id == project.id
         }) {
+            let path = checkout.path.join(relative);
+            if excluded_paths.contains(&path) {
+                continue;
+            }
             links.push(ProtectedCheckoutLink {
                 secret_id: record.id.clone(),
-                path: checkout.path.join(relative),
+                path,
                 target: target.clone(),
                 mode: record.mode,
                 current_version: record.current_version,
@@ -280,6 +298,32 @@ pub fn protected_checkout_links(
             .then_with(|| left.path.cmp(&right.path))
     });
     links
+}
+
+/// Release an exact protected-file worktree link when a configured file Surface now owns the
+/// same path. Foreign links and divergent regular files are preserved. Call this before
+/// reconciling file Surface links so the transition never restores plaintext between models.
+pub fn release_protected_links_for_file_surfaces(
+    snapshot: &CatalogSnapshot,
+    records: &[SecretRecord],
+    surfaces: &[Surface],
+    mount_path: &Path,
+) -> io::Result<bool> {
+    let surfaced_paths = surfaces.iter().map(|surface| &surface.path).collect::<HashSet<_>>();
+    let candidates =
+        protected_checkout_links_excluding(snapshot, records, mount_path, &HashSet::new());
+    let mut changed = false;
+    for link in candidates
+        .into_iter()
+        .filter(|link| surfaced_paths.contains(&link.path))
+    {
+        if !is_exact_symlink(&link.path, &link.target)? {
+            continue;
+        }
+        std::fs::remove_file(&link.path)?;
+        changed = true;
+    }
+    Ok(changed)
 }
 
 /// Apply only the delta between two desired link inventories. Unchanged plans
@@ -917,6 +961,90 @@ mod tests {
             std::fs::read_link(&missing).unwrap(),
             mount.join(SECRETS_DIR).join(missing_id.to_string())
         );
+    }
+
+    #[test]
+    fn configured_surface_takes_over_only_matching_worktree_links_without_plaintext() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("project");
+        let development_worktree = dir.path().join("development-worktree");
+        let staging_worktree = dir.path().join("staging-worktree");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&development_worktree).unwrap();
+        std::fs::create_dir_all(&staging_worktree).unwrap();
+        let mount = dir.path().join("mount");
+        let store = AgeDirStore::open(
+            dir.path().join("store"),
+            Arc::new(TestKeys(age::x25519::Identity::generate())),
+        )
+        .unwrap();
+        let id = store
+            .put(NewSecret::file(primary.join(".env"), 0o600), b"SECRET=fixture\n")
+            .unwrap();
+        let secret_target = mount.join(SECRETS_DIR).join(id.to_string());
+        symlink(&secret_target, development_worktree.join(".env")).unwrap();
+        symlink(&secret_target, staging_worktree.join(".env")).unwrap();
+
+        let surface = fixture_surface(primary.join(".env"));
+        let snapshot = CatalogSnapshot {
+            projects: vec![Project {
+                id: "fixture-project".to_string(),
+                name: "Fixture".to_string(),
+                path: primary.clone(),
+                ..Default::default()
+            }],
+            checkouts: vec![
+                ProjectCheckout {
+                    id: "fixture-development-worktree".to_string(),
+                    project_id: "fixture-project".to_string(),
+                    path: development_worktree.clone(),
+                    environment_id: Some("fixture-development".to_string()),
+                    ..Default::default()
+                },
+                ProjectCheckout {
+                    id: "fixture-staging-worktree".to_string(),
+                    project_id: "fixture-project".to_string(),
+                    path: staging_worktree.clone(),
+                    environment_id: Some("fixture-staging".to_string()),
+                    ..Default::default()
+                },
+            ],
+            environments: vec![Environment {
+                id: "fixture-development".to_string(),
+                project_id: "fixture-project".to_string(),
+                name: "Development".to_string(),
+                position: 0,
+            }],
+            surfaces: vec![surface],
+            ..Default::default()
+        };
+        let records = store.list().unwrap();
+        let surface_instances = file_surface_instances(&snapshot).unwrap();
+
+        assert!(release_protected_links_for_file_surfaces(
+            &snapshot,
+            &records,
+            &surface_instances,
+            &mount,
+        )
+        .unwrap());
+        let development_surface = surface_instances
+            .iter()
+            .find(|surface| surface.path == development_worktree.join(".env"))
+            .unwrap();
+        ensure_file_surface_link(development_surface, &mount).unwrap();
+
+        assert_eq!(
+            std::fs::read_link(development_worktree.join(".env")).unwrap(),
+            mount.join(SURFACES_DIR).join("fixture-dotenv")
+        );
+        assert_eq!(
+            std::fs::read_link(staging_worktree.join(".env")).unwrap(),
+            secret_target
+        );
+        assert!(protected_checkout_links(&snapshot, &records, &mount)
+            .iter()
+            .any(|link| link.path == staging_worktree.join(".env")));
     }
 
     #[test]

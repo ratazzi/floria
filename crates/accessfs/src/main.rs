@@ -27,8 +27,9 @@ use accessfs_store::{
 };
 use accessfs_surface::{
     ensure_file_surface_link, file_surface_instances, protected_checkout_links,
-    refresh_protected_checkout_links, remove_file_surface_link, validate_secret_bytes,
-    ProtectedCheckoutLink, SurfaceLinkRemoval, SurfaceLinkState, SurfaceRegistry,
+    refresh_protected_checkout_links, release_protected_links_for_file_surfaces,
+    remove_file_surface_link, validate_secret_bytes, ProtectedCheckoutLink, SurfaceLinkRemoval,
+    SurfaceLinkState, SurfaceRegistry,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -512,9 +513,16 @@ fn cmd_mount(config: &Path) -> Result<()> {
     let surface_registry = Arc::new(SurfaceRegistry::from_snapshot(&snapshot));
     let linked_file_surfaces =
         file_surface_instances(&snapshot).context("materializing project checkout links")?;
-    reconcile_file_links(&linked_file_surfaces, &cfg.mount_path);
     let store: Arc<dyn SecretStore> = Arc::new(open_store(&cfg)?);
     let records = store.list()?;
+    release_protected_links_for_file_surfaces(
+        &snapshot,
+        &records,
+        &linked_file_surfaces,
+        &cfg.mount_path,
+    )
+    .context("transitioning protected worktree links to configured surfaces")?;
+    reconcile_file_links(&linked_file_surfaces, &cfg.mount_path);
     let mut linked_protected_files = Vec::new();
     refresh_protected_checkout_links(
         &mut linked_protected_files,
@@ -695,12 +703,19 @@ impl CatalogObserver for RuntimeCatalogObserver {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         cleanup_removed_file_links(&previous_links, &next_links, &self.mount_path);
-        self.surface_registry.replace(snapshot);
-        reconcile_file_links(&next_links, &self.mount_path);
-        *previous_links = next_links;
-        drop(previous_links);
         let records = self.store.list();
         if let Ok(records) = &records {
+            if let Err(error) = release_protected_links_for_file_surfaces(
+                snapshot,
+                records,
+                &next_links,
+                &self.mount_path,
+            ) {
+                tracing::warn!(
+                    %error,
+                    "transitioning protected worktree links to configured surfaces failed"
+                );
+            }
             let next_protected_files =
                 protected_checkout_links(snapshot, records, &self.mount_path);
             let mut previous_protected_files = self
@@ -717,6 +732,10 @@ impl CatalogObserver for RuntimeCatalogObserver {
         } else if let Err(error) = &records {
             tracing::warn!(%error, "listing protected files for runtime refresh failed");
         }
+        self.surface_registry.replace(snapshot);
+        reconcile_file_links(&next_links, &self.mount_path);
+        *previous_links = next_links;
+        drop(previous_links);
         if let Err(error) = self.ssh_runtime.replace(snapshot) {
             tracing::warn!(%error, "refreshing SSH agent surfaces failed");
         }
@@ -743,10 +762,14 @@ fn managed_policy_items(
     records: &[SecretRecord],
 ) -> Vec<ManagedPolicyItem> {
     let mut items = Vec::new();
+    let configured_secret_ids = snapshot.file_surface_secret_ids();
 
     // File-origin secrets are independently managed items. Managed-origin secrets inherit from
-    // their Resource below. Duplicate secret objects are merged by the agent using strictest wins.
-    for record in records.iter().filter(|record| record.source_path().is_some()) {
+    // their Resource below. Once a file is explicitly configured, its Resource owns this policy
+    // so the former byte-preserving file does not remain as a hidden stricter rule.
+    for record in records.iter().filter(|record| {
+        record.source_path().is_some() && !configured_secret_ids.contains(record.id.as_str())
+    }) {
         items.push(ManagedPolicyItem {
             object: ManagedObject::Secret { secret_id: record.id.to_string() },
             enforcement: record.enforcement,
@@ -925,6 +948,9 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
         }
         ControlResult::ProtectedFileRolledBack { file } => {
             println!("{} now points to version {}", file.id, file.current_version);
+        }
+        ControlResult::ManagedFileConfigured { surface } => {
+            println!("configured {} as {}", surface.path.display(), surface.id);
         }
         ControlResult::FileRestored { path, storage_deleted } => {
             println!("restored {} (history deleted: {storage_deleted})", path.display());

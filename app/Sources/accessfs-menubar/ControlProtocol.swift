@@ -724,6 +724,7 @@ struct DiscoveryProjectOutput: Codable, Hashable, Sendable {
 }
 
 enum DiscoveryImportDestination: Codable, Hashable, Sendable {
+    case projectFile(projectPath: String)
     case projectOutput(projectPath: String, outputPath: String)
     case library
     case projectOutputs(outputs: [DiscoveryProjectOutput])
@@ -736,6 +737,7 @@ enum DiscoveryImportDestination: Codable, Hashable, Sendable {
     }
 
     private enum Kind: String, Codable {
+        case projectFile = "project_file"
         case projectOutput = "project_output"
         case library
         case projectOutputs = "project_outputs"
@@ -744,6 +746,9 @@ enum DiscoveryImportDestination: Codable, Hashable, Sendable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         switch try container.decode(Kind.self, forKey: .type) {
+        case .projectFile:
+            self = .projectFile(
+                projectPath: try container.decode(String.self, forKey: .projectPath))
         case .projectOutput:
             self = .projectOutput(
                 projectPath: try container.decode(String.self, forKey: .projectPath),
@@ -759,6 +764,9 @@ enum DiscoveryImportDestination: Codable, Hashable, Sendable {
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         switch self {
+        case .projectFile(let projectPath):
+            try container.encode(Kind.projectFile, forKey: .type)
+            try container.encode(projectPath, forKey: .projectPath)
         case .projectOutput(let projectPath, let outputPath):
             try container.encode(Kind.projectOutput, forKey: .type)
             try container.encode(projectPath, forKey: .projectPath)
@@ -867,6 +875,7 @@ enum ControlCommand: Sendable {
     case protectedFileRollback(id: String, version: UInt32)
     case protectedFileMetadataUpdate(
         id: String, enforcement: String, metadata: ItemMetadata)
+    case managedFileConfigure(id: String, projectID: String, environmentID: String?)
     case fileRestore(String)
     case sharedSecretCreate(
         resourceID: String, name: String, defaultEnvKey: String?, value: String,
@@ -924,6 +933,7 @@ enum ControlCommand: Sendable {
         case .protectedFileHistory: "protected_file_history"
         case .protectedFileRollback: "protected_file_rollback"
         case .protectedFileMetadataUpdate: "protected_file_metadata_update"
+        case .managedFileConfigure: "managed_file_configure"
         case .fileRestore: "file_restore"
         case .sharedSecretCreate: "shared_secret_create"
         case .sharedSecretUpdate: "shared_secret_update"
@@ -1050,6 +1060,12 @@ enum ControlCommand: Sendable {
                     requestID: requestID, method: method,
                     params: ProtectedFileMetadataUpdateParams(
                         id: id, enforcement: enforcement, metadata: metadata)))
+        case .managedFileConfigure(let id, let projectID, let environmentID):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: ManagedFileConfigureParams(
+                        id: id, projectID: projectID, environmentID: environmentID)))
         case .sharedSecretCreate(
             let resourceID, let name, let defaultEnvKey, let value, let enforcement, let metadata):
             return try encoder.encode(
@@ -1215,6 +1231,11 @@ private struct ProtectedFileMetadataUpdateParams: Encodable {
     let id: String
     let enforcement: String
     let metadata: ItemMetadata
+}
+private struct ManagedFileConfigureParams: Encodable {
+    let id: String
+    let projectID: String
+    let environmentID: String?
 }
 
 private struct EnvFileCreateParams: Encodable {
