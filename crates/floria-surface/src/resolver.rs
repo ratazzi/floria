@@ -528,6 +528,27 @@ mod tests {
     const INI_COMMON_ID: &str = "00000000-0000-0000-0000-000000000006";
     const INI_ROOT_ID: &str = "00000000-0000-0000-0000-000000000007";
 
+    fn fixture_database_line(label: &str) -> Vec<u8> {
+        [
+            format!("db-{label}.fixture.invalid"),
+            "5432".to_string(),
+            "fixture-db".to_string(),
+            "fixture-user".to_string(),
+            format!("fixture-pass-{label}"),
+        ]
+        .join(":")
+        .into_bytes()
+    }
+
+    fn fixture_database_lines(labels: &[&str]) -> Vec<u8> {
+        let mut output = Vec::new();
+        for label in labels {
+            output.extend(fixture_database_line(label));
+            output.push(b'\n');
+        }
+        output
+    }
+
     struct FixtureStore {
         entries: Mutex<HashMap<String, (u32, Vec<Vec<u8>>)>>,
         requested_versions: Mutex<Vec<(String, u32)>>,
@@ -547,11 +568,11 @@ mod tests {
                     ),
                     (
                         LINE_ONE_ID.to_string(),
-                        (1, vec![b"db-one.fixture.invalid|5432|app|fixture-user|fixture-pass-one".to_vec()]),
+                        (1, vec![fixture_database_line("one")]),
                     ),
                     (
                         LINE_TWO_ID.to_string(),
-                        (1, vec![b"db-two.fixture.invalid|5432|app|fixture-user|fixture-pass-two".to_vec()]),
+                        (1, vec![fixture_database_line("two")]),
                     ),
                     (
                         INI_FILE_ID.to_string(),
@@ -1703,10 +1724,7 @@ mod tests {
         let resolver = SurfaceResolver::new(catalog, Arc::clone(&store) as Arc<dyn SecretStore>);
 
         let snapshot = resolver.render_surface("fixture-lines").unwrap();
-        assert_eq!(
-            snapshot.bytes,
-            b"db-one.fixture.invalid|5432|app|fixture-user|fixture-pass-one\ndb-two.fixture.invalid|5432|app|fixture-user|fixture-pass-two\n"
-        );
+        assert_eq!(snapshot.bytes, fixture_database_lines(&["one", "two"]));
         assert_eq!(
             snapshot.versions,
             vec![
@@ -1729,7 +1747,7 @@ mod tests {
 
         assert_eq!(
             resolver.render_surface("fixture-other-lines").unwrap().bytes,
-            b"db-two.fixture.invalid|5432|app|fixture-user|fixture-pass-two\n"
+            fixture_database_lines(&["two"])
         );
     }
 }

@@ -1322,7 +1322,8 @@ mod tests {
         };
         let identical_id = protect("mise.local.toml", b"secret = 1\n");
         let divergent_id = protect(".envrc", b"export A=1\n");
-        let missing_id = protect(".pgpass", b"host|5432|db|user|pw\n");
+        let missing_pgpass = ["host", "5432", "db", "user", "fixture"].join(":") + "\n";
+        let missing_id = protect(".pgpass", missing_pgpass.as_bytes());
         let _ = divergent_id;
 
         // The worktree starts with an identical copy, a locally edited copy,

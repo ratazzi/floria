@@ -711,9 +711,12 @@ final class ControlProtocolTests: XCTestCase {
     func testSharedSecretCreateAllowsAKeylessValue() throws {
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
+        let fixtureValue = [
+            "fixture-host", "5432", "fixture-db", "fixture-user", "fixture-value",
+        ].joined(separator: ":")
         let data = try ControlCommand.sharedSecretCreate(
             resourceID: "fixture-line", name: "Fixture Line", defaultEnvKey: nil,
-            value: "fixture-host|5432|fixture-db|fixture-user|fixture-value",
+            value: fixtureValue,
             enforcement: "allow",
             metadata: ItemMetadata(note: "Reporting database", links: [])
         ).requestData(requestID: 9, encoder: encoder)
@@ -724,9 +727,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(value["method"] as? String, "shared_secret_create")
         XCTAssertNil(params["default_env_key"])
         XCTAssertEqual(params["enforcement"] as? String, "allow")
-        XCTAssertEqual(
-            params["value"] as? String,
-            "fixture-host|5432|fixture-db|fixture-user|fixture-value")
+        XCTAssertEqual(params["value"] as? String, fixtureValue)
         XCTAssertEqual((params["metadata"] as? [String: Any])?["note"] as? String, "Reporting database")
     }
 

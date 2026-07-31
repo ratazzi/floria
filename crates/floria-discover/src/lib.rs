@@ -2219,7 +2219,10 @@ mod tests {
             "[default]\naws_access_key_id=fixture-access-id\n",
         )
         .unwrap();
-        fs::write(root.join(".pgpass"), "db.invalid|5432|fixture|fixture|fixture\n").unwrap();
+        let pgpass = ["db.invalid", "5432", "fixture-db", "fixture-user", "fixture-value"]
+            .join(":")
+            + "\n";
+        fs::write(root.join(".pgpass"), pgpass).unwrap();
 
         let discovery = discover(root).unwrap();
         let plan = discovery.plan(&[]);

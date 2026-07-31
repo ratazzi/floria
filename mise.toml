@@ -11,14 +11,17 @@ run = "uv run --with pillow python scripts/generate-dmg-background.py app/Assets
 
 [tasks.build-app]
 description = "Build and sign Floria.app without installing or launching it"
+depends = ["check-rust-fixtures"]
 run = "scripts/build-app"
 
 [tasks.install-app]
 description = "Build Floria.app (Rust daemon + Swift UI) and install it in /Applications"
+depends = ["check-rust-fixtures"]
 run = "scripts/install-app"
 
 [tasks.package-dmg]
 description = "Build, sign, package, and verify a Floria DMG without overwriting an existing image"
+depends = ["check-rust-fixtures"]
 run = "scripts/package-dmg"
 
 [tasks.notarize-dmg]
@@ -32,16 +35,16 @@ depends = ["install-app"]
 run = "scripts/smoke-daemon-recovery"
 
 [tasks.check-rust-fixtures]
-description = "Reject credential-shaped values from Rust sources and test fixtures"
+description = "Reject credential-shaped values from source and test fixtures"
 run = '''
 set -euo pipefail
 
-PATTERN='(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|A(KIA|SIA)[0-9A-Z]{16}|glpat-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|sk-[A-Za-z0-9_-]{16,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|-----BEGIN ([A-Z ]+)?PRIVATE KEY-----)'
+PATTERN='(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|A(KIA|SIA)[0-9A-Z]{16}|glpat-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|sk-[A-Za-z0-9_-]{16,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|-----BEGIN ([A-Z ]+)?PRIVATE KEY-----|postgres(ql)?://[A-Za-z0-9._~-]+:[^@[:space:]]+@|"[^"[:space:]:]+:[0-9*]+:[^"[:space:]:]+:[^"[:space:]:]+:[^"[:space:]:]+(\\n)?")'
 
-if rg --line-number --glob '*.rs' "$PATTERN" crates; then
-    echo "Credential-shaped value found in Rust source; use an obvious fixture placeholder instead."
+if rg --files-with-matches --glob '*.{rs,swift}' "$PATTERN" crates app; then
+    echo "Credential-shaped value found in source; assemble structured fixture values at runtime instead."
     exit 1
 fi
 
-echo "Rust fixtures contain no credential-shaped values"
+echo "Source fixtures contain no credential-shaped values"
 '''

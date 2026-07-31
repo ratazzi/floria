@@ -28,18 +28,28 @@ pub(crate) fn render_lines_refs<'a>(
 mod tests {
     use super::*;
 
+    fn fixture_database_line(label: &str) -> String {
+        [
+            format!("db-{label}.fixture.invalid"),
+            "5432".to_string(),
+            "fixture-db".to_string(),
+            "fixture-user".to_string(),
+            format!("fixture-pass-{label}"),
+        ]
+        .join(":")
+    }
+
     #[test]
     fn preserves_opaque_colon_delimited_values_and_order() {
+        let first = fixture_database_line("one");
+        let second = fixture_database_line("two");
         let rendered = render_lines_refs([
-            ("fixture-first", "db-one.fixture.invalid|5432|app|fixture-user|fixture-pass-one"),
-            ("fixture-second", "db-two.fixture.invalid|5432|app|fixture-user|fixture-pass-two"),
+            ("fixture-first", first.as_str()),
+            ("fixture-second", second.as_str()),
         ])
         .unwrap();
 
-        assert_eq!(
-            rendered,
-            b"db-one.fixture.invalid|5432|app|fixture-user|fixture-pass-one\ndb-two.fixture.invalid|5432|app|fixture-user|fixture-pass-two\n"
-        );
+        assert_eq!(rendered, format!("{first}\n{second}\n").into_bytes());
     }
 
     #[test]
