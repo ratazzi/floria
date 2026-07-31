@@ -1,0 +1,126 @@
+#!/bin/bash
+set -euo pipefail
+
+VERSION="$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')"
+BUILD_NUMBER="${BUILD_NUMBER:-$(date +%Y%m%d%H%M)}"
+SIGN_IDENTITY="${SIGN_IDENTITY:--}"
+PRODUCT_NAME="floria-menubar"
+APP_NAME="Floria"
+APP_BUNDLE="app/.build/${APP_NAME}.app"
+INSTALL_DIR="${INSTALL_DIR:-/Applications}"
+INSTALLED_APP="${INSTALL_DIR}/${APP_NAME}.app"
+INSTALLED_DAEMON="${INSTALLED_APP}/Contents/Resources/floria"
+INFO_PLIST="${INSTALLED_APP}/Contents/Info.plist"
+RUNTIME_DIRECTORY="${HOME}/Library/Application Support/floria"
+CONFIG_PATH="${RUNTIME_DIRECTORY}/floria.toml"
+SERVICE_LABEL="dev.floria.hola.ac.daemon"
+SERVICE_TARGET="gui/$(id -u)/${SERVICE_LABEL}"
+LAUNCH_AGENT_PLIST="${HOME}/Library/LaunchAgents/${SERVICE_LABEL}.plist"
+WAIT_SECONDS="${FLORIA_INSTALL_WAIT_SECONDS:-20}"
+EXPECTED_REVISION="${VERSION}+${BUILD_NUMBER}"
+
+wait_for_app_to_stop() {
+    local deadline=$((SECONDS + WAIT_SECONDS))
+
+    while ((SECONDS < deadline)); do
+        if ! pgrep -x "${APP_NAME}" >/dev/null; then
+            return 0
+        fi
+        sleep 0.25
+    done
+
+    echo "Timed out waiting for the previous ${APP_NAME} app to stop" >&2
+    return 1
+}
+
+wait_for_app_to_start() {
+    local deadline=$((SECONDS + WAIT_SECONDS))
+
+    while ((SECONDS < deadline)); do
+        if pgrep -x "${APP_NAME}" >/dev/null; then
+            return 0
+        fi
+        sleep 0.25
+    done
+
+    echo "Timed out waiting for the installed ${APP_NAME} app to start" >&2
+    return 1
+}
+
+installed_definition_revision() {
+    /usr/libexec/PlistBuddy \
+        -c "Print :EnvironmentVariables:FLORIA_BUNDLE_REVISION" \
+        "${LAUNCH_AGENT_PLIST}" 2>/dev/null || true
+}
+
+wait_for_current_daemon() {
+    local deadline=$((SECONDS + WAIT_SECONDS))
+    local actual_revision=""
+
+    while ((SECONDS < deadline)); do
+        actual_revision="$(installed_definition_revision)"
+        if [[ "${actual_revision}" == "${EXPECTED_REVISION}" ]] &&
+            /bin/launchctl print "${SERVICE_TARGET}" 2>/dev/null |
+                grep -q "state = running" &&
+            "${INSTALLED_DAEMON}" control --config "${CONFIG_PATH}" ping >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 0.25
+    done
+
+    echo "Timed out waiting for daemon revision ${EXPECTED_REVISION}; found ${actual_revision:-none}" >&2
+    /bin/launchctl print "${SERVICE_TARGET}" >&2 || true
+    return 1
+}
+
+echo "==> Building ${APP_NAME}.app v${VERSION} (build ${BUILD_NUMBER})"
+echo "==> Building Rust daemon"
+cargo build --release -p floria
+
+echo "==> Building Swift app"
+swift build --package-path app --configuration release --product "${PRODUCT_NAME}"
+BIN_DIR="$(swift build --package-path app --configuration release --show-bin-path)"
+
+echo "==> Packaging ${APP_BUNDLE}"
+rm -rf "${APP_BUNDLE}"
+mkdir -p "${APP_BUNDLE}/Contents/MacOS" "${APP_BUNDLE}/Contents/Resources"
+cp "${BIN_DIR}/${PRODUCT_NAME}" "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}"
+cp target/release/floria "${APP_BUNDLE}/Contents/Resources/floria"
+cp floria.toml "${APP_BUNDLE}/Contents/Resources/floria.toml"
+cp app/Assets/AppIcon.icns "${APP_BUNDLE}/Contents/Resources/AppIcon.icns"
+cp app/Assets/MenuBarTemplate.png "${APP_BUNDLE}/Contents/Resources/MenuBarTemplate.png"
+cp app/Info.plist "${APP_BUNDLE}/Contents/Info.plist"
+plutil -replace CFBundleShortVersionString -string "${VERSION}" "${APP_BUNDLE}/Contents/Info.plist"
+plutil -replace CFBundleVersion -string "${BUILD_NUMBER}" "${APP_BUNDLE}/Contents/Info.plist"
+chmod 0755 "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}"
+chmod 0755 "${APP_BUNDLE}/Contents/Resources/floria"
+codesign --force --sign "${SIGN_IDENTITY}" "${APP_BUNDLE}/Contents/Resources/floria"
+codesign --force --sign "${SIGN_IDENTITY}" "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}"
+codesign --force --sign "${SIGN_IDENTITY}" "${APP_BUNDLE}"
+codesign --verify --deep --strict "${APP_BUNDLE}"
+
+if pgrep -x "${APP_NAME}" >/dev/null; then
+    echo "==> Stopping previous ${APP_NAME} app"
+    killall "${APP_NAME}"
+    wait_for_app_to_stop
+fi
+
+echo "==> Installing ${INSTALLED_APP}"
+if [[ -w "${INSTALL_DIR}" ]]; then
+    rm -rf "${INSTALLED_APP}"
+    ditto "${APP_BUNDLE}" "${INSTALLED_APP}"
+else
+    sudo rm -rf "${INSTALLED_APP}"
+    sudo ditto "${APP_BUNDLE}" "${INSTALLED_APP}"
+fi
+
+echo "==> Starting installed ${APP_NAME} app"
+open -na "${INSTALLED_APP}"
+wait_for_app_to_start
+
+if [[ -d /Library/Filesystems/macfuse.fs ]]; then
+    echo "==> Waiting for daemon revision ${EXPECTED_REVISION}"
+    wait_for_current_daemon
+fi
+
+echo "==> Installed and started: ${INSTALLED_APP}"

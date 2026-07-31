@@ -214,8 +214,8 @@ restore_environment() {
 trap restore_environment EXIT INT TERM
 
 echo "==> Establishing installed-app baseline"
-stop_app
-start_app
+wait_for_current_definition
+wait_for_job_state running "install-app to start the current Floria daemon"
 wait_for_doctor "the installed Floria app to become healthy"
 "${DAEMON_PATH}" doctor --config "${CONFIG_PATH}"
 

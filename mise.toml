@@ -7,55 +7,7 @@ run = "uv run --with pillow python scripts/generate-app-icons.py app/Assets/Flor
 
 [tasks.install-app]
 description = "Build Floria.app (Rust daemon + Swift UI) and install it in /Applications"
-run = '''
-set -euo pipefail
-
-VERSION="$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')"
-BUILD_NUMBER="${BUILD_NUMBER:-$(date +%Y%m%d%H%M)}"
-SIGN_IDENTITY="${SIGN_IDENTITY:--}"
-PRODUCT_NAME="floria-menubar"
-APP_NAME="Floria"
-APP_BUNDLE="app/.build/${APP_NAME}.app"
-INSTALL_DIR="${INSTALL_DIR:-/Applications}"
-INSTALLED_APP="${INSTALL_DIR}/${APP_NAME}.app"
-
-echo "==> Building ${APP_NAME}.app v${VERSION} (build ${BUILD_NUMBER})"
-echo "==> Building Rust daemon"
-cargo build --release -p floria
-
-echo "==> Building Swift app"
-swift build --package-path app --configuration release --product "$PRODUCT_NAME"
-BIN_DIR="$(swift build --package-path app --configuration release --show-bin-path)"
-
-echo "==> Packaging ${APP_BUNDLE}"
-rm -rf "$APP_BUNDLE"
-mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
-cp "$BIN_DIR/$PRODUCT_NAME" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
-cp target/release/floria "$APP_BUNDLE/Contents/Resources/floria"
-cp floria.toml "$APP_BUNDLE/Contents/Resources/floria.toml"
-cp app/Assets/AppIcon.icns "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
-cp app/Assets/MenuBarTemplate.png "$APP_BUNDLE/Contents/Resources/MenuBarTemplate.png"
-cp app/Info.plist "$APP_BUNDLE/Contents/Info.plist"
-plutil -replace CFBundleShortVersionString -string "$VERSION" "$APP_BUNDLE/Contents/Info.plist"
-plutil -replace CFBundleVersion -string "$BUILD_NUMBER" "$APP_BUNDLE/Contents/Info.plist"
-chmod 0755 "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
-chmod 0755 "$APP_BUNDLE/Contents/Resources/floria"
-codesign --force --sign "$SIGN_IDENTITY" "$APP_BUNDLE/Contents/Resources/floria"
-codesign --force --sign "$SIGN_IDENTITY" "$APP_BUNDLE/Contents/MacOS/$APP_NAME"
-codesign --force --sign "$SIGN_IDENTITY" "$APP_BUNDLE"
-codesign --verify --deep --strict "$APP_BUNDLE"
-
-echo "==> Installing ${INSTALLED_APP}"
-if [[ -w "$INSTALL_DIR" ]]; then
-    rm -rf "$INSTALLED_APP"
-    ditto "$APP_BUNDLE" "$INSTALLED_APP"
-else
-    sudo rm -rf "$INSTALLED_APP"
-    sudo ditto "$APP_BUNDLE" "$INSTALLED_APP"
-fi
-
-echo "==> Installed: ${INSTALLED_APP}"
-'''
+run = "scripts/install-app"
 
 [tasks.smoke-app]
 description = "Install Floria.app and verify cold-start and runtime daemon recovery"
