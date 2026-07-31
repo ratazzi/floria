@@ -11,6 +11,14 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertFalse(source.contains(#""Activate Backup…""#))
     }
 
+    func testFirstProjectEmptyStateOffersDiscoveryDirectly() throws {
+        let source = try source("CompactDashboardView.swift")
+
+        XCTAssertTrue(source.contains(#""Discover a project directory to get started.""#))
+        XCTAssertTrue(source.contains(#"actionTitle: state.workspace.projects.isEmpty"#))
+        XCTAssertTrue(source.contains(#"action: state.workspace.projects.isEmpty ? chooseDiscoverySource : nil"#))
+    }
+
     func testResourceManagementIsCalledLibraryAcrossNavigationSurfaces() throws {
         let sources = try [
             source("MenuBarView.swift"),

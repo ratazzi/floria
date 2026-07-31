@@ -482,8 +482,13 @@ struct DashboardView: View {
                     icon: state.workspace.projects.isEmpty ? "folder.badge.plus" : "magnifyingglass",
                     title: state.workspace.projects.isEmpty ? "No projects yet" : "No matching projects",
                     detail: state.workspace.projects.isEmpty
-                        ? "Use Discover to import a project directory."
-                        : "Try a different search or project scope.")
+                        ? "Discover a project directory to get started."
+                        : "Try a different search or project scope.",
+                    actionTitle: state.workspace.projects.isEmpty
+                        ? (isDiscovering ? "Discovering…" : "Discover…")
+                        : nil,
+                    actionDisabled: isDiscovering,
+                    action: state.workspace.projects.isEmpty ? chooseDiscoverySource : nil)
             } else {
                 VStack(spacing: 0) {
                     ForEach(Array(projects.enumerated()), id: \.element.id) { index, project in
@@ -1014,6 +1019,9 @@ private struct CompactEmptyRow: View {
     let icon: String
     let title: String
     let detail: String
+    var actionTitle: String? = nil
+    var actionDisabled = false
+    var action: (() -> Void)? = nil
 
     var body: some View {
         HStack(spacing: 12) {
@@ -1029,6 +1037,11 @@ private struct CompactEmptyRow: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            if let actionTitle, let action {
+                Button(actionTitle, action: action)
+                    .controlSize(.small)
+                    .disabled(actionDisabled)
+            }
         }
         .padding(.horizontal, 14)
         .frame(minHeight: 56)
