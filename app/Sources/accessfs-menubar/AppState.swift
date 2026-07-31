@@ -125,6 +125,8 @@ final class AppState {
                         await self.reloadActiveGrants()
                         await self.loadAccessHistoryIfNeeded()
                     }
+                } else {
+                    self.scheduleDaemonRecoveryAfterDisconnect()
                 }
             }
         }
@@ -209,6 +211,17 @@ final class AppState {
             }
             guard let self, !Task.isCancelled else { return }
             self.macFuseSetupStage = .approveKext
+        }
+    }
+
+    /// The socket closes before the mount process has necessarily exited. Reconcile after a
+    /// short delay so a clean daemon exit cannot leave a running app permanently offline.
+    /// `ensureRunning` is idempotent when launchd has already restarted the process.
+    private func scheduleDaemonRecoveryAfterDisconnect() {
+        guard DaemonManager.isProductionApp, MacFuseSetupStage.isInstalled else { return }
+        let manager = daemonManager
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1) {
+            manager.ensureRunning()
         }
     }
 
