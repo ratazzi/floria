@@ -690,10 +690,45 @@ pub fn replace_regular_file_with_symlink_if_matches(
     replace_regular_file_with_symlink_if_matches_with(path, target, expected, || Ok(()))
 }
 
+/// Replace a regular file only while both its identity and bytes still match a captured snapshot.
+///
+/// Unlike automatic worktree reconciliation, explicit protection must also preserve metadata-only
+/// saves and same-content file replacements that happened while the encrypted copy was prepared.
+pub fn replace_regular_file_with_symlink_if_unchanged(
+    path: &Path,
+    target: &Path,
+    expected: &[u8],
+    expected_metadata: &std::fs::Metadata,
+) -> io::Result<bool> {
+    replace_regular_file_with_symlink_if_matches_snapshot(
+        path,
+        target,
+        expected,
+        Some(expected_metadata),
+        || Ok(()),
+    )
+}
+
 fn replace_regular_file_with_symlink_if_matches_with(
     path: &Path,
     target: &Path,
     expected: &[u8],
+    before_swap: impl FnOnce() -> io::Result<()>,
+) -> io::Result<bool> {
+    replace_regular_file_with_symlink_if_matches_snapshot(
+        path,
+        target,
+        expected,
+        None,
+        before_swap,
+    )
+}
+
+fn replace_regular_file_with_symlink_if_matches_snapshot(
+    path: &Path,
+    target: &Path,
+    expected: &[u8],
+    expected_metadata: Option<&std::fs::Metadata>,
     before_swap: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<bool> {
     let metadata = match std::fs::symlink_metadata(path) {
@@ -701,7 +736,10 @@ fn replace_regular_file_with_symlink_if_matches_with(
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error),
     };
-    if !metadata.is_file() || std::fs::read(path)?.as_slice() != expected {
+    if !metadata.is_file()
+        || expected_metadata.is_some_and(|expected| !same_file_snapshot(&metadata, expected))
+        || std::fs::read(path)?.as_slice() != expected
+    {
         return Ok(false);
     }
     before_swap()?;
@@ -712,17 +750,37 @@ fn replace_regular_file_with_symlink_if_matches_with(
         return Err(error);
     }
     let swapped_matches = std::fs::symlink_metadata(&temporary)
-        .map(|metadata| metadata.is_file())
+        .map(|metadata| {
+            metadata.is_file()
+                && expected_metadata
+                    .is_none_or(|expected| same_displaced_file_snapshot(&metadata, expected))
+        })
         .unwrap_or(false)
-        && std::fs::read(&temporary)
-            .map(|bytes| bytes.as_slice() == expected)
-            .unwrap_or(false);
+        && std::fs::read(&temporary).map(|bytes| bytes == expected).unwrap_or(false);
     if swapped_matches {
         std::fs::remove_file(&temporary)?;
         return Ok(true);
     }
     rollback_swap(path, &temporary, target)?;
     Ok(false)
+}
+
+fn same_file_snapshot(actual: &std::fs::Metadata, expected: &std::fs::Metadata) -> bool {
+    same_displaced_file_snapshot(actual, expected)
+        && actual.ctime() == expected.ctime()
+        && actual.ctime_nsec() == expected.ctime_nsec()
+}
+
+fn same_displaced_file_snapshot(
+    actual: &std::fs::Metadata,
+    expected: &std::fs::Metadata,
+) -> bool {
+    actual.dev() == expected.dev()
+        && actual.ino() == expected.ino()
+        && actual.len() == expected.len()
+        && actual.mode() == expected.mode()
+        && actual.mtime() == expected.mtime()
+        && actual.mtime_nsec() == expected.mtime_nsec()
 }
 
 /// Replace only an exact symlink with a regular file. The swap is verified
@@ -1640,6 +1698,32 @@ mod tests {
         assert!(!linked);
         assert!(!std::fs::symlink_metadata(&candidate).unwrap().file_type().is_symlink());
         assert_eq!(std::fs::read(candidate).unwrap(), b"SECRET=new\n");
+    }
+
+    #[test]
+    fn conditional_link_swap_preserves_a_same_content_file_replaced_after_comparison() {
+        let dir = tempfile::tempdir().unwrap();
+        let candidate = dir.path().join(".env");
+        let replacement = dir.path().join(".env.replacement");
+        let target = dir.path().join("secret");
+        std::fs::write(&candidate, b"SECRET=fixture\n").unwrap();
+        let expected_metadata = std::fs::symlink_metadata(&candidate).unwrap();
+
+        let linked = replace_regular_file_with_symlink_if_matches_snapshot(
+            &candidate,
+            &target,
+            b"SECRET=fixture\n",
+            Some(&expected_metadata),
+            || {
+                std::fs::write(&replacement, b"SECRET=fixture\n")?;
+                std::fs::rename(&replacement, &candidate)
+            },
+        )
+        .unwrap();
+
+        assert!(!linked);
+        assert!(!std::fs::symlink_metadata(&candidate).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(candidate).unwrap(), b"SECRET=fixture\n");
     }
 
     #[test]

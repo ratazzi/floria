@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
-use std::io;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::io::{self, Read};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,6 +25,7 @@ use accessfs_surface::{
     checkout_link_issues, decode_source, ensure_file_surface_link, file_surface_instances,
     managed_file_links, protected_checkout_links, remove_excluded_protected_checkout_links,
     replace_regular_file_with_symlink_if_matches,
+    replace_regular_file_with_symlink_if_unchanged,
     replace_symlink_with_file_if_target, restore_protected_checkout_links,
     validate_secret_bytes, ManagedLinkStatus as SurfaceManagedLinkStatus, ManagedSymlink,
     SurfaceResolver,

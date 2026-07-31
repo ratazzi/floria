@@ -43,6 +43,7 @@
         metadata:
             Mutex<HashMap<String, (SecretOrigin, u32, ItemMetadata, Option<Vec<String>>)>>,
         heads: Mutex<HashMap<String, u32>>,
+        mutation_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         get_calls: AtomicUsize,
     }
 
@@ -52,7 +53,18 @@
                 entries: Mutex::new(HashMap::new()),
                 metadata: Mutex::new(HashMap::new()),
                 heads: Mutex::new(HashMap::new()),
+                mutation_hook: Mutex::new(None),
                 get_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn after_next_mutation(&self, hook: impl FnOnce() + Send + 'static) {
+            *self.mutation_hook.lock().unwrap() = Some(Box::new(hook));
+        }
+
+        fn run_mutation_hook(&self) {
+            if let Some(hook) = self.mutation_hook.lock().unwrap().take() {
+                hook();
             }
         }
     }
@@ -140,6 +152,7 @@
                     (meta.origin, meta.mode, ItemMetadata::default(), None),
                 );
             self.heads.lock().unwrap().insert(id.to_string(), 1);
+            self.run_mutation_hook();
             Ok(id)
         }
 
@@ -160,7 +173,9 @@
             let versions = entries.get_mut(id.as_str()).unwrap();
             versions.push(plaintext.to_vec());
             let version = versions.len() as u32;
+            drop(entries);
             self.heads.lock().unwrap().insert(id.to_string(), version);
+            self.run_mutation_hook();
             Ok(version)
         }
 
@@ -2960,6 +2975,79 @@
         assert!(catalog.resource("fixture-shared-secret").is_ok());
         let secret_id: SecretId = FIXTURE_SECRET_ID.parse().unwrap();
         assert!(store.record(&secret_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn protecting_a_file_preserves_a_save_that_races_with_encryption() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let mount = dir.path().join("mount");
+        let source = dir.path().join(".env");
+        std::fs::write(&source, b"FIXTURE_VALUE=before\n").unwrap();
+        let store = FixtureStore::new();
+        let changed_source = source.clone();
+        store.after_next_mutation(move || {
+            std::fs::write(changed_source, b"FIXTURE_VALUE=after\n").unwrap();
+        });
+
+        let error = dispatch(
+            &catalog,
+            DispatchServices {
+                store: Some(&store),
+                mount_path: Some(&mount),
+                ..DispatchServices::default()
+            },
+            ControlCommand::FileProtect { path: source.clone() },
+        )
+        .unwrap_err();
+
+        let DispatchError::Validation(message) = error else {
+            panic!("expected concurrent protection validation error");
+        };
+        assert!(message.contains("changed while it was being protected"));
+        assert!(!std::fs::symlink_metadata(&source).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&source).unwrap(), b"FIXTURE_VALUE=after\n");
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn failed_reprotection_restores_the_previous_store_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let mount = dir.path().join("mount");
+        let source = dir.path().join(".env");
+        std::fs::write(&source, b"FIXTURE_VALUE=candidate\n").unwrap();
+        let canonical_source = canonical_source_path(&source).unwrap();
+        let store = FixtureStore::new();
+        let id = store
+            .put(
+                NewSecret::file(canonical_source, 0o600),
+                b"FIXTURE_VALUE=previous\n",
+            )
+            .unwrap();
+        let changed_source = source.clone();
+        store.after_next_mutation(move || {
+            std::fs::write(changed_source, b"FIXTURE_VALUE=after\n").unwrap();
+        });
+
+        let error = dispatch(
+            &catalog,
+            DispatchServices {
+                store: Some(&store),
+                mount_path: Some(&mount),
+                ..DispatchServices::default()
+            },
+            ControlCommand::FileProtect { path: source.clone() },
+        )
+        .unwrap_err();
+
+        let DispatchError::Validation(message) = error else {
+            panic!("expected concurrent reprotection validation error");
+        };
+        assert!(message.contains("changed while it was being protected"));
+        assert_eq!(std::fs::read(&source).unwrap(), b"FIXTURE_VALUE=after\n");
+        assert_eq!(store.get(&id).unwrap().as_slice(), b"FIXTURE_VALUE=previous\n");
+        assert_eq!(store.record(&id).unwrap().unwrap().current_version, 1);
     }
 
     #[test]

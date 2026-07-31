@@ -13,6 +13,7 @@ accessfs-store = { workspace = true }
 accessfs-surface = { workspace = true }
 accessfs-ssh = { workspace = true }
 chrono = { workspace = true }
+libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }

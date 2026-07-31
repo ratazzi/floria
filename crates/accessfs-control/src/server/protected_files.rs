@@ -573,18 +573,14 @@ pub(super) fn protect_file(
         )));
     }
 
-    let absolute = std::fs::canonicalize(&path).map_err(|source| DispatchError::Io {
-        path: path.clone(),
-        source,
-    })?;
-    let plaintext = zeroize::Zeroizing::new(
-        std::fs::read(&absolute).map_err(|source| DispatchError::Io {
-            path: absolute.clone(),
-            source,
-        })?,
-    );
-    let mode = (metadata.mode() & 0o7777) as u32;
+    // `canonical_source_path` already resolved the parent without following the final path.
+    // Opening with O_NOFOLLOW closes the race where a regular file becomes a symlink between
+    // inspection and reading.
+    let absolute = path;
+    let (plaintext, file_snapshot) = read_protection_snapshot(&absolute)?;
+    let mode = file_snapshot.mode() & 0o7777;
     let existing = store.get_by_path(&absolute)?;
+    let mut previous_head = None;
     let (id, created) = match existing {
         Some(record) => {
             let current = store.get(&record.id)?;
@@ -593,6 +589,7 @@ pub(super) fn protect_file(
                 validate_secret_bytes(&snapshot, record.id.as_str(), &plaintext)
                     .map_err(|error| DispatchError::Validation(error.to_string()))?;
                 store.append_version(&record.id, &plaintext)?;
+                previous_head = Some(record.current_version);
             }
             (record.id, false)
         }
@@ -602,13 +599,24 @@ pub(super) fn protect_file(
     let target = mount_path
         .join(accessfs_core::config::SECRETS_DIR)
         .join(id.to_string());
-    if let Err(source) = replace_file_with_symlink(&absolute, &target) {
-        if created {
-            if let Err(cleanup_error) = store.delete(&id) {
-                tracing::warn!(%id, %cleanup_error, "cleaning up failed file protection failed");
-            }
+    match replace_regular_file_with_symlink_if_unchanged(
+        &absolute,
+        &target,
+        &plaintext,
+        &file_snapshot,
+    ) {
+        Ok(true) => {}
+        Ok(false) => {
+            rollback_provisional_protection(store, &id, created, previous_head);
+            return Err(DispatchError::Validation(format!(
+                "{} changed while it was being protected; no file was overwritten, retry",
+                absolute.display()
+            )));
         }
-        return Err(DispatchError::Io { path: absolute, source });
+        Err(source) => {
+            rollback_provisional_protection(store, &id, created, previous_head);
+            return Err(DispatchError::Io { path: absolute, source });
+        }
     }
     let record = store
         .record(&id)?
@@ -619,6 +627,75 @@ pub(super) fn protect_file(
             .expect("new file protection has file-origin metadata"),
         created,
     })
+}
+
+fn read_protection_snapshot(
+    path: &Path,
+) -> Result<(zeroize::Zeroizing<Vec<u8>>, std::fs::Metadata), DispatchError> {
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|source| DispatchError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    let before = file.metadata().map_err(|source| DispatchError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !before.is_file() {
+        return Err(DispatchError::Validation(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+
+    let mut plaintext = zeroize::Zeroizing::new(Vec::new());
+    file.read_to_end(&mut plaintext).map_err(|source| DispatchError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let after = file.metadata().map_err(|source| DispatchError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !same_file_snapshot(&before, &after) || after.len() != plaintext.len() as u64 {
+        return Err(DispatchError::Validation(format!(
+            "{} changed while it was being read; no encrypted copy was created, retry",
+            path.display()
+        )));
+    }
+    Ok((plaintext, after))
+}
+
+fn same_file_snapshot(actual: &std::fs::Metadata, expected: &std::fs::Metadata) -> bool {
+    actual.dev() == expected.dev()
+        && actual.ino() == expected.ino()
+        && actual.len() == expected.len()
+        && actual.mode() == expected.mode()
+        && actual.mtime() == expected.mtime()
+        && actual.mtime_nsec() == expected.mtime_nsec()
+        && actual.ctime() == expected.ctime()
+        && actual.ctime_nsec() == expected.ctime_nsec()
+}
+
+fn rollback_provisional_protection(
+    store: &dyn SecretStore,
+    id: &SecretId,
+    created: bool,
+    previous_head: Option<u32>,
+) {
+    let result = if created {
+        store.delete(id)
+    } else if let Some(version) = previous_head {
+        store.set_head(id, version)
+    } else {
+        return;
+    };
+    if let Err(error) = result {
+        tracing::warn!(%id, %error, "rolling back failed file protection failed");
+    }
 }
 
 pub(super) fn protected_file_history(
@@ -892,5 +969,3 @@ pub(super) fn canonical_source_path(path: &Path) -> io::Result<PathBuf> {
     })?;
     Ok(std::fs::canonicalize(parent)?.join(name))
 }
-
-pub(super) use accessfs_surface::replace_file_with_symlink;
