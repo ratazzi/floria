@@ -4,6 +4,10 @@ import XCTest
 
 @MainActor
 final class WorkspaceModelTests: XCTestCase {
+    func testAuditSecurityLevelUsesAnAuditLogSymbol() {
+        XCTAssertEqual(WorkspaceSecurityLevel.auditOnly.systemImage, "list.bullet.clipboard")
+    }
+
     func testUnmanagedWorktreeCountIgnoresPrimaryAndManagedCheckouts() throws {
         let store = WorkspaceStore.preview()
         let projectID = try XCTUnwrap(store.projects.first?.id)

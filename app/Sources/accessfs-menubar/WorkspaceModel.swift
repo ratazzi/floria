@@ -52,7 +52,7 @@ enum WorkspaceSecurityLevel: String, CaseIterable, Hashable, Sendable {
 
     var systemImage: String {
         switch self {
-        case .auditOnly: "eye"
+        case .auditOnly: "list.bullet.clipboard"
         case .confirmation: "hand.raised"
         case .touchID: "touchid"
         }
