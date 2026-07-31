@@ -62,6 +62,8 @@ pub enum ControlCommand {
     GrantRevoke { id: String },
     GrantClear,
     AccessHistory { limit: usize },
+    BackupCreate { destination: PathBuf },
+    BackupVerify { backup: PathBuf },
     Snapshot,
     Discover { paths: Vec<PathBuf> },
     DiscoverStart { paths: Vec<PathBuf> },
@@ -192,6 +194,7 @@ pub enum ControlResult {
     PolicyMode(PolicyModeStatus),
     ActiveGrants(Vec<ActiveGrant>),
     AccessHistory(Vec<AccessHistoryEvent>),
+    Backup(BackupReport),
     Snapshot(WorkspaceSnapshot),
     Discovery(DiscoveryReviewPlan),
     DiscoveryJob(DiscoveryJobStatus),
@@ -215,6 +218,18 @@ pub enum ControlResult {
     SharedSecretRotated { resource_id: String, version: u32 },
     EnvFileCreated { resource: Resource, version: u32 },
     Empty,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupReport {
+    pub path: PathBuf,
+    pub catalog_schema: i64,
+    pub projects: usize,
+    pub resources: usize,
+    pub secrets: usize,
+    pub versions: usize,
+    pub plaintext_bytes: u64,
+    pub files: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -686,6 +701,44 @@ mod tests {
                 "params": { "limit": 500 }
             })
         );
+    }
+
+    #[test]
+    fn backup_commands_and_report_have_stable_wire_shapes() {
+        let create = serde_json::to_value(ControlRequest {
+            request_id: 18,
+            command: ControlCommand::BackupCreate {
+                destination: PathBuf::from("/tmp/floria-backup"),
+            },
+        })
+        .unwrap();
+        assert_eq!(create["method"], "backup_create");
+        assert_eq!(create["params"]["destination"], "/tmp/floria-backup");
+
+        let verify = serde_json::to_value(ControlRequest {
+            request_id: 19,
+            command: ControlCommand::BackupVerify {
+                backup: PathBuf::from("/tmp/floria-backup"),
+            },
+        })
+        .unwrap();
+        assert_eq!(verify["method"], "backup_verify");
+        assert_eq!(verify["params"]["backup"], "/tmp/floria-backup");
+
+        let result = serde_json::to_value(ControlResult::Backup(BackupReport {
+            path: PathBuf::from("/tmp/floria-backup"),
+            catalog_schema: 5,
+            projects: 2,
+            resources: 3,
+            secrets: 4,
+            versions: 5,
+            plaintext_bytes: 6,
+            files: 7,
+        }))
+        .unwrap();
+        assert_eq!(result["type"], "backup");
+        assert_eq!(result["value"]["path"], "/tmp/floria-backup");
+        assert_eq!(result["value"]["versions"], 5);
     }
 
     #[test]

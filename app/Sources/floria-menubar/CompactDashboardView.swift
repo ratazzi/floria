@@ -18,6 +18,12 @@ private struct DiscoveryPresentation: Identifiable {
     let paths: [String]
 }
 
+private struct BackupNotice: Identifiable {
+    let id = UUID()
+    let title: String
+    let message: String
+}
+
 /// Matches access events to a project with pre-lowercased, pre-expanded
 /// strings so hot loops stay on plain Swift string operations (macOS paths
 /// are case-insensitive, so lowercased comparison is safe).
@@ -75,6 +81,8 @@ struct DashboardView: View {
     @State private var showingAccessLog = false
     @State private var pendingAuditWindow: AuditOnlyWindow?
     @State private var showingAuditConfirmation = false
+    @State private var backupNotice: BackupNotice?
+    @State private var backupOperationInProgress = false
     @FocusState private var searchIsFocused: Bool
     @Environment(\.openWindow) private var openWindow
 
@@ -166,6 +174,12 @@ struct DashboardView: View {
                 "Ask and Touch ID items will be allowed without interaction. Every access will still be audited, and explicit deny rules remain blocked."
             )
         }
+        .alert(item: $backupNotice) { notice in
+            Alert(
+                title: Text(notice.title),
+                message: Text(notice.message),
+                dismissButton: .default(Text("OK")))
+        }
     }
 
     // Occupies the hidden-titlebar strip: traffic lights on the left, then
@@ -239,6 +253,15 @@ struct DashboardView: View {
                 Button("Open Library", systemImage: "rectangle.3.group") {
                     openWorkspace()
                 }
+                Divider()
+                Button("Create Backup…", systemImage: "externaldrive.badge.plus") {
+                    chooseBackupDestination()
+                }
+                .disabled(backupOperationInProgress || !state.connected)
+                Button("Verify Backup…", systemImage: "checkmark.circle") {
+                    chooseBackupToVerify()
+                }
+                .disabled(backupOperationInProgress || !state.connected)
             } label: {
                 Image(systemName: "ellipsis")
                     .frame(width: 28, height: 28)
@@ -252,6 +275,58 @@ struct DashboardView: View {
         .padding(.trailing, 16)
         .frame(height: 52)
         .gesture(WindowDragGesture())
+    }
+
+    private func chooseBackupDestination() {
+        let panel = NSSavePanel()
+        panel.title = "Create Floria Backup"
+        panel.prompt = "Create Backup"
+        panel.canCreateDirectories = true
+        panel.nameFieldStringValue = "Floria Backup"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        runBackupOperation {
+            let report = try await state.workspace.createBackup(at: url.path)
+            return BackupNotice(
+                title: "Backup Created",
+                message:
+                    "\(report.secrets) secrets and \(report.versions) versions were verified.\n\(report.path)"
+            )
+        }
+    }
+
+    private func chooseBackupToVerify() {
+        let panel = NSOpenPanel()
+        panel.title = "Verify Floria Backup"
+        panel.prompt = "Verify Backup"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        runBackupOperation {
+            let report = try await state.workspace.verifyBackup(at: url.path)
+            return BackupNotice(
+                title: "Backup Verified",
+                message:
+                    "\(report.secrets) secrets and \(report.versions) versions are recoverable.\n\(report.path)"
+            )
+        }
+    }
+
+    private func runBackupOperation(
+        _ operation: @escaping @MainActor () async throws -> BackupNotice
+    ) {
+        guard !backupOperationInProgress else { return }
+        backupOperationInProgress = true
+        Task {
+            defer { backupOperationInProgress = false }
+            do {
+                backupNotice = try await operation()
+            } catch {
+                backupNotice = BackupNotice(
+                    title: "Backup Failed",
+                    message: error.localizedDescription)
+            }
+        }
     }
 
     private var policyMenu: some View {

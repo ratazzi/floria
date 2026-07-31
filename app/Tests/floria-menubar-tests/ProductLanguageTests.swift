@@ -2,6 +2,15 @@ import Foundation
 import XCTest
 
 final class ProductLanguageTests: XCTestCase {
+    func testDashboardOffersSafeBackupActionsWithoutDataReplacement() throws {
+        let source = try source("CompactDashboardView.swift")
+
+        XCTAssertTrue(source.contains(#""Create Backup…""#))
+        XCTAssertTrue(source.contains(#""Verify Backup…""#))
+        XCTAssertFalse(source.contains(#""Restore Backup…""#))
+        XCTAssertFalse(source.contains(#""Activate Backup…""#))
+    }
+
     func testResourceManagementIsCalledLibraryAcrossNavigationSurfaces() throws {
         let sources = try [
             source("MenuBarView.swift"),

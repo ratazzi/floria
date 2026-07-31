@@ -36,6 +36,40 @@
         }
     }
 
+    struct FixtureBackupService;
+
+    impl BackupService for FixtureBackupService {
+        fn create(
+            &self,
+            _catalog: &Catalog,
+            destination: &Path,
+        ) -> Result<BackupReport, String> {
+            Ok(BackupReport {
+                path: destination.to_path_buf(),
+                catalog_schema: Catalog::current_schema_version(),
+                projects: 1,
+                resources: 2,
+                secrets: 3,
+                versions: 4,
+                plaintext_bytes: 5,
+                files: 6,
+            })
+        }
+
+        fn verify(&self, backup: &Path) -> Result<BackupReport, String> {
+            Ok(BackupReport {
+                path: backup.to_path_buf(),
+                catalog_schema: Catalog::current_schema_version(),
+                projects: 1,
+                resources: 2,
+                secrets: 3,
+                versions: 4,
+                plaintext_bytes: 5,
+                files: 6,
+            })
+        }
+    }
+
     const FIXTURE_SECRET_ID: &str = "00000000-0000-0000-0000-000000000101";
 
     struct FixtureStore {
@@ -99,6 +133,54 @@
             destination: DiscoveryImportDestination::Library,
             source_disposition,
         }
+    }
+
+    #[test]
+    fn backup_operations_use_the_runtime_service_and_require_absolute_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite")).unwrap();
+        let backup = FixtureBackupService;
+        let services = DispatchServices {
+            backup: Some(&backup),
+            ..DispatchServices::default()
+        };
+        let destination = directory.path().join("new-backup");
+
+        let created = dispatch(
+            &catalog,
+            services,
+            ControlCommand::BackupCreate {
+                destination: destination.clone(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            created,
+            ControlResult::Backup(BackupReport { path, versions: 4, .. }) if path == destination
+        ));
+
+        let verified = dispatch(
+            &catalog,
+            services,
+            ControlCommand::BackupVerify {
+                backup: destination.clone(),
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            verified,
+            ControlResult::Backup(BackupReport { path, files: 6, .. }) if path == destination
+        ));
+
+        let relative = dispatch(
+            &catalog,
+            services,
+            ControlCommand::BackupCreate {
+                destination: PathBuf::from("relative-backup"),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(relative, DispatchError::Validation(_)));
     }
 
     fn project_outputs_import(

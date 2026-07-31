@@ -338,6 +338,41 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(event.identity.parent_chain?.first?.name, "cat")
     }
 
+    func testBackupRequestsAndReportMatchRustWireShape() throws {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+
+        let createData = try ControlCommand.backupCreate(
+            destination: "/tmp/floria-backup"
+        ).requestData(requestID: 18, encoder: encoder)
+        let create = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: createData) as? [String: Any])
+        XCTAssertEqual(create["method"] as? String, "backup_create")
+        XCTAssertEqual(
+            (create["params"] as? [String: Any])?["destination"] as? String,
+            "/tmp/floria-backup")
+
+        let verifyData = try ControlCommand.backupVerify(
+            backup: "/tmp/floria-backup"
+        ).requestData(requestID: 19, encoder: encoder)
+        let verify = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: verifyData) as? [String: Any])
+        XCTAssertEqual(verify["method"] as? String, "backup_verify")
+        XCTAssertEqual(
+            (verify["params"] as? [String: Any])?["backup"] as? String,
+            "/tmp/floria-backup")
+
+        let response = Data(
+            #"{"request_id":19,"status":"ok","result":{"type":"backup","value":{"path":"/tmp/floria-backup","catalog_schema":5,"projects":2,"resources":3,"secrets":4,"versions":5,"plaintext_bytes":6,"files":7}}}"#.utf8)
+        let decoded = try JSONDecoder().decode(
+            ControlResponseEnvelope<BackupReport>.self, from: response)
+        let report = try XCTUnwrap(decoded.result?.value)
+        XCTAssertEqual(decoded.result?.type, "backup")
+        XCTAssertEqual(report.path, "/tmp/floria-backup")
+        XCTAssertEqual(report.versions, 5)
+        XCTAssertEqual(report.plaintextBytes, 6)
+    }
+
     func testSshAgentDiscoveryAndResourceRequestsMatchRustWireShape() throws {
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase

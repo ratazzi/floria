@@ -11,13 +11,13 @@ mod ssh_config;
 pub use client::ControlClient;
 pub use protocol::{
     AccessHistoryEvent, AccessHistoryIdentity, AccessHistoryProcess, AccessHistorySsh, ActiveGrant,
-    ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest, ControlResponse, ControlResult,
-    DiscoveryJobPhase, DiscoveryJobProgress, DiscoveryJobState, DiscoveryJobStatus,
+    BackupReport, ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest, ControlResponse,
+    ControlResult, DiscoveryJobPhase, DiscoveryJobProgress, DiscoveryJobState, DiscoveryJobStatus,
     ProjectCheckoutCandidate, ProjectCheckoutDiscovery, ProjectCheckoutInventory, ProtectedFile,
     ProtectedFileVersion, SecretValue, SshConfigState, SshConfigStatus, SshIdentity,
 };
 pub use server::{
-    CatalogObserver, ControlRuntimeServices, ControlServer, RuntimePolicyController,
-    SshConfigManager, SshIdentityDiscovery,
+    BackupService, CatalogObserver, ControlRuntimeServices, ControlServer,
+    RuntimePolicyController, SshConfigManager, SshIdentityDiscovery,
 };
 pub use ssh_config::ManagedSshConfig;

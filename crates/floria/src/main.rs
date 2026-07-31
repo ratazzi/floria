@@ -12,9 +12,10 @@ use floria_catalog::{
 };
 use floria_agent::{ManagedObject, ManagedPolicyItem};
 use floria_control::{
-    ActiveGrant as ControlActiveGrant, CatalogObserver, ControlClient, ControlCommand,
-    ControlResult, ControlRuntimeServices, ControlServer, ManagedSshConfig,
-    RuntimePolicyController, SshConfigManager, SshIdentity, SshIdentityDiscovery,
+    ActiveGrant as ControlActiveGrant, BackupReport as ControlBackupReport, BackupService,
+    CatalogObserver, ControlClient, ControlCommand, ControlResult, ControlRuntimeServices,
+    ControlServer, ManagedSshConfig, RuntimePolicyController, SshConfigManager, SshIdentity,
+    SshIdentityDiscovery,
 };
 use floria_core::audit::AuditLog;
 use floria_core::authz::{Authorizer, PolicyMode, PolicyModeStatus};
@@ -788,7 +789,10 @@ fn cmd_mount(config: &Path) -> Result<()> {
     let surface_registry = Arc::new(SurfaceRegistry::from_snapshot(&snapshot));
     let linked_file_surfaces =
         file_surface_instances(&snapshot).context("materializing project checkout links")?;
-    let store: Arc<dyn SecretStore> = Arc::new(store);
+    let concrete_store = Arc::new(store);
+    let backup: Arc<dyn BackupService> =
+        Arc::new(DaemonBackupService { store: Arc::clone(&concrete_store) });
+    let store: Arc<dyn SecretStore> = concrete_store;
     let records = store.list()?;
     release_protected_links_for_file_surfaces(
         &snapshot,
@@ -857,6 +861,7 @@ fn cmd_mount(config: &Path) -> Result<()> {
             policy,
             ssh_discovery,
             ssh_config,
+            backup,
             audit_log: cfg.audit_log.clone(),
             ssh_runtime_dir,
             peer_verifier: control_peer_verifier,
@@ -880,6 +885,41 @@ struct AgentPolicyController {
 }
 
 struct AgentSshIdentityDiscovery;
+
+struct DaemonBackupService {
+    store: Arc<AgeDirStore>,
+}
+
+impl BackupService for DaemonBackupService {
+    fn create(
+        &self,
+        catalog: &Catalog,
+        destination: &Path,
+    ) -> Result<ControlBackupReport, String> {
+        floria_backup::create(catalog, &self.store, destination)
+            .map(control_backup_report)
+            .map_err(|error| error.to_string())
+    }
+
+    fn verify(&self, backup: &Path) -> Result<ControlBackupReport, String> {
+        floria_backup::verify(backup, &self.store)
+            .map(control_backup_report)
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn control_backup_report(report: floria_backup::BackupReport) -> ControlBackupReport {
+    ControlBackupReport {
+        path: report.path,
+        catalog_schema: report.catalog_schema,
+        projects: report.projects,
+        resources: report.resources,
+        secrets: report.secrets,
+        versions: report.versions,
+        plaintext_bytes: report.plaintext_bytes,
+        files: report.files,
+    }
+}
 
 struct StoreManagedKeyReader {
     store: Arc<dyn SecretStore>,
@@ -1182,6 +1222,9 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
         }
         ControlResult::AccessHistory(events) => {
             println!("{}", serde_json::to_string_pretty(&events)?);
+        }
+        ControlResult::Backup(report) => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         ControlResult::Snapshot(snapshot) => {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);

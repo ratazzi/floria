@@ -68,6 +68,26 @@ final class ControlClient: @unchecked Sendable {
         return events
     }
 
+    func createBackup(destination: String) async throws -> BackupReport {
+        guard let report: BackupReport = try await request(
+            .backupCreate(destination: destination), expecting: "backup",
+            as: BackupReport.self)
+        else {
+            throw ControlClientError.missingResult("backup")
+        }
+        return report
+    }
+
+    func verifyBackup(at path: String) async throws -> BackupReport {
+        guard let report: BackupReport = try await request(
+            .backupVerify(backup: path), expecting: "backup",
+            as: BackupReport.self)
+        else {
+            throw ControlClientError.missingResult("backup")
+        }
+        return report
+    }
+
     func snapshot() async throws -> CatalogSnapshot {
         guard let snapshot: CatalogSnapshot = try await request(
             .snapshot, expecting: "snapshot", as: CatalogSnapshot.self)

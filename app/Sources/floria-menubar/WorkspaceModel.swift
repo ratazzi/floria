@@ -911,6 +911,18 @@ final class WorkspaceStore {
         return try await controlClient.cancelDiscovery(id: id)
     }
 
+    func createBackup(at path: String) async throws -> BackupReport {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        return try await controlClient.createBackup(
+            destination: (path as NSString).standardizingPath)
+    }
+
+    func verifyBackup(at path: String) async throws -> BackupReport {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        return try await controlClient.verifyBackup(
+            at: (path as NSString).standardizingPath)
+    }
+
     func applyDiscovery(
         at paths: [String], imports: [DiscoveryImport],
         separateEntries: [DiscoverySeparateEntry],

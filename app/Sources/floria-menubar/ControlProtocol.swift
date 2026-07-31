@@ -876,6 +876,23 @@ struct CatalogProtectedFileVersion: Codable, Sendable {
     let current: Bool
 }
 
+struct BackupReport: Codable, Equatable, Sendable {
+    let path: String
+    let catalogSchema: Int64
+    let projects: Int
+    let resources: Int
+    let secrets: Int
+    let versions: Int
+    let plaintextBytes: UInt64
+    let files: Int
+
+    enum CodingKeys: String, CodingKey {
+        case path, projects, resources, secrets, versions, files
+        case catalogSchema = "catalog_schema"
+        case plaintextBytes = "plaintext_bytes"
+    }
+}
+
 enum ControlCommand: Sendable {
     case policyModeGet
     case policyModeSet(mode: RuntimePolicyMode, durationSecs: UInt64?)
@@ -883,6 +900,8 @@ enum ControlCommand: Sendable {
     case grantRevoke(id: String)
     case grantClear
     case accessHistory(limit: Int)
+    case backupCreate(destination: String)
+    case backupVerify(backup: String)
     case snapshot
     case discover(paths: [String])
     case discoverStart(paths: [String])
@@ -951,6 +970,8 @@ enum ControlCommand: Sendable {
         case .grantRevoke: "grant_revoke"
         case .grantClear: "grant_clear"
         case .accessHistory: "access_history"
+        case .backupCreate: "backup_create"
+        case .backupVerify: "backup_verify"
         case .snapshot: "snapshot"
         case .discover: "discover"
         case .discoverStart: "discover_start"
@@ -1018,6 +1039,16 @@ enum ControlCommand: Sendable {
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: AccessHistoryParams(limit: limit)))
+        case .backupCreate(let destination):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: BackupCreateParams(destination: destination)))
+        case .backupVerify(let backup):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: BackupVerifyParams(backup: backup)))
         case .discover(let paths):
             return try encoder.encode(
                 ControlRequest(
@@ -1210,6 +1241,8 @@ private struct PolicyModeSetParams: Encodable {
 
 private struct GrantIDParams: Encodable { let id: String }
 private struct AccessHistoryParams: Encodable { let limit: Int }
+private struct BackupCreateParams: Encodable { let destination: String }
+private struct BackupVerifyParams: Encodable { let backup: String }
 private struct DiscoverParams: Encodable { let paths: [String] }
 private struct DiscoveryJobIDParams: Encodable { let id: String }
 private struct DiscoverApplyParams: Encodable {

@@ -12,6 +12,7 @@ pub(super) fn dispatch(
         policy,
         ssh_discovery,
         ssh_config,
+        backup,
         checkout_monitor,
         audit_log,
         ssh_runtime_dir,
@@ -82,6 +83,38 @@ pub(super) fn dispatch(
             })?,
             limit.min(500),
         ),
+        ControlCommand::BackupCreate { destination } => {
+            if !destination.is_absolute() {
+                return Err(DispatchError::Validation(
+                    "backup destination must be absolute".to_string(),
+                ));
+            }
+            backup
+                .ok_or_else(|| {
+                    DispatchError::Validation(
+                        "backup service is unavailable on this control server".to_string(),
+                    )
+                })?
+                .create(catalog, &destination)
+                .map(ControlResult::Backup)
+                .map_err(DispatchError::Backup)
+        }
+        ControlCommand::BackupVerify { backup: backup_path } => {
+            if !backup_path.is_absolute() {
+                return Err(DispatchError::Validation(
+                    "backup path must be absolute".to_string(),
+                ));
+            }
+            backup
+                .ok_or_else(|| {
+                    DispatchError::Validation(
+                        "backup service is unavailable on this control server".to_string(),
+                    )
+                })?
+                .verify(&backup_path)
+                .map(ControlResult::Backup)
+                .map_err(DispatchError::Backup)
+        }
         ControlCommand::Snapshot => {
             workspace_snapshot(catalog, store, mount_path, ssh_runtime_dir)
         }

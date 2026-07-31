@@ -33,12 +33,12 @@ use floria_surface::{
 
 use crate::protocol::{
     read_msg, write_msg, AccessHistoryEvent, AccessHistoryIdentity, AccessHistoryProcess,
-    AccessHistorySsh, ActiveGrant, ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest,
-    ControlResponse, ControlResult, DiscoveryAppliedFile, DiscoveryApplyOutcome, DiscoveryApplyResult,
-    DiscoveryImport, DiscoveryImportDestination, DiscoveryJobPhase, DiscoveryJobProgress,
-    DiscoveryJobState, DiscoveryJobStatus, DiscoveryManagedItem, DiscoveryManagedItemKind,
-    DiscoveryReferenceResolution, DiscoveryReferenceSource, DiscoveryReviewPlan,
-    DiscoverySourceDisposition, ManagedLink, ManagedLinkStatus,
+    AccessHistorySsh, ActiveGrant, BackupReport, ControlCommand, ControlErrorBody, ControlOutcome,
+    ControlRequest, ControlResponse, ControlResult, DiscoveryAppliedFile, DiscoveryApplyOutcome,
+    DiscoveryApplyResult, DiscoveryImport, DiscoveryImportDestination, DiscoveryJobPhase,
+    DiscoveryJobProgress, DiscoveryJobState, DiscoveryJobStatus, DiscoveryManagedItem,
+    DiscoveryManagedItemKind, DiscoveryReferenceResolution, DiscoveryReferenceSource,
+    DiscoveryReviewPlan, DiscoverySourceDisposition, ManagedLink, ManagedLinkStatus,
     ProjectCheckoutCandidate, ProjectCheckoutDiscovery, ProjectCheckoutInventory, ProtectedFile,
     ProtectedFileVersion, SecretValue, SshConfigStatus, SshIdentity, WorkspaceSnapshot,
 };
@@ -78,12 +78,22 @@ pub trait SshConfigManager: Send + Sync + 'static {
     fn remove(&self) -> io::Result<SshConfigStatus>;
 }
 
+/// Narrow runtime seam for immutable backup operations.
+///
+/// The control plane owns only redacted counts and paths; encryption, locking, SQLite snapshots,
+/// and verification remain inside the backup implementation.
+pub trait BackupService: Send + Sync + 'static {
+    fn create(&self, catalog: &Catalog, destination: &Path) -> Result<BackupReport, String>;
+    fn verify(&self, backup: &Path) -> Result<BackupReport, String>;
+}
+
 pub struct ControlRuntimeServices {
     pub observer: Arc<dyn CatalogObserver>,
     pub checkout_monitor: Arc<GitCheckoutMonitor>,
     pub policy: Arc<dyn RuntimePolicyController>,
     pub ssh_discovery: Arc<dyn SshIdentityDiscovery>,
     pub ssh_config: Arc<dyn SshConfigManager>,
+    pub backup: Arc<dyn BackupService>,
     pub audit_log: PathBuf,
     pub ssh_runtime_dir: PathBuf,
     pub peer_verifier: Arc<dyn SocketPeerVerifier>,
@@ -98,6 +108,7 @@ struct ControlDependencies {
     policy: Option<Arc<dyn RuntimePolicyController>>,
     ssh_discovery: Option<Arc<dyn SshIdentityDiscovery>>,
     ssh_config: Option<Arc<dyn SshConfigManager>>,
+    backup: Option<Arc<dyn BackupService>>,
     audit_log: Option<PathBuf>,
     ssh_runtime_dir: Option<PathBuf>,
     discovery_jobs: Option<Arc<DiscoveryJobManager>>,
@@ -190,6 +201,7 @@ impl ControlServer {
                 policy: Some(services.policy),
                 ssh_discovery: Some(services.ssh_discovery),
                 ssh_config: Some(services.ssh_config),
+                backup: Some(services.backup),
                 audit_log: Some(services.audit_log),
                 ssh_runtime_dir: Some(services.ssh_runtime_dir),
                 discovery_jobs: None,
@@ -299,6 +311,7 @@ fn handle_connection(
             policy: dependencies.policy.as_deref(),
             ssh_discovery: dependencies.ssh_discovery.as_deref(),
             ssh_config: dependencies.ssh_config.as_deref(),
+            backup: dependencies.backup.as_deref(),
             checkout_monitor: dependencies.checkout_monitor.as_deref(),
             audit_log: dependencies.audit_log.as_deref(),
             ssh_runtime_dir: dependencies.ssh_runtime_dir.as_deref(),
@@ -333,6 +346,8 @@ fn is_read_only(command: &ControlCommand) -> bool {
             | ControlCommand::PolicyModeGet
             | ControlCommand::GrantList
             | ControlCommand::AccessHistory { .. }
+            | ControlCommand::BackupCreate { .. }
+            | ControlCommand::BackupVerify { .. }
             | ControlCommand::Snapshot
             | ControlCommand::Discover { .. }
             | ControlCommand::DiscoverStart { .. }
@@ -365,6 +380,7 @@ enum DispatchError {
     Io { path: PathBuf, source: io::Error },
     Policy(io::Error),
     SshConfig(io::Error),
+    Backup(String),
     Validation(String),
     StoreUnavailable,
 }
@@ -382,6 +398,7 @@ struct DispatchServices<'a> {
     policy: Option<&'a dyn RuntimePolicyController>,
     ssh_discovery: Option<&'a dyn SshIdentityDiscovery>,
     ssh_config: Option<&'a dyn SshConfigManager>,
+    backup: Option<&'a dyn BackupService>,
     checkout_monitor: Option<&'a GitCheckoutMonitor>,
     audit_log: Option<&'a Path>,
     ssh_runtime_dir: Option<&'a Path>,
@@ -420,6 +437,10 @@ impl DispatchError {
                     "ssh_config_io".to_string()
                 },
                 message: error.to_string(),
+            },
+            DispatchError::Backup(message) => ControlErrorBody {
+                code: "backup".to_string(),
+                message: message.clone(),
             },
             DispatchError::StoreUnavailable => ControlErrorBody {
                 code: "secret_store_unavailable".to_string(),
