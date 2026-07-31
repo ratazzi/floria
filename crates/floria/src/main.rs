@@ -778,14 +778,14 @@ fn resolve_target(store: &AgeDirStore, target: &str) -> Result<SecretRecord> {
             return Ok(r);
         }
     }
-    let abs = std::fs::canonicalize(target).unwrap_or_else(|_| {
-        std::env::current_dir()
-            .map(|d| d.join(target))
-            .unwrap_or_else(|_| PathBuf::from(target))
-    });
+    let abs = reveal_lookup_path(Path::new(target))?;
     store
         .get_by_path(&abs)?
         .with_context(|| format!("no protected secret for {target:?}"))
+}
+
+fn reveal_lookup_path(path: &Path) -> Result<PathBuf> {
+    absolute_cli_path(path)
 }
 
 fn load(config: &Path) -> Result<ResolvedConfig> {
@@ -1835,6 +1835,18 @@ mod tests {
             }
             _ => panic!("expected unprotect"),
         }
+    }
+
+    #[test]
+    fn reveal_lookup_preserves_a_managed_source_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join(".env");
+        let mount_target = dir.path().join("mounted-secret");
+        std::fs::write(&mount_target, b"fixture").unwrap();
+        std::os::unix::fs::symlink(&mount_target, &source).unwrap();
+
+        let expected = std::fs::canonicalize(dir.path()).unwrap().join(".env");
+        assert_eq!(reveal_lookup_path(&source).unwrap(), expected);
     }
 
     #[test]
