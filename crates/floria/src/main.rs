@@ -921,12 +921,14 @@ fn cmd_mount(config: &Path) -> Result<()> {
         PathBuf::from(home).join(".ssh/config"),
         generated_ssh_config,
     ));
+    let mutations = Arc::new(floria_surface::ManagedMutationCoordinator::new());
     let _control = ControlServer::start_runtime_with_services(
         &control_path,
         catalog.clone(),
         Arc::clone(&store),
         cfg.mount_path.clone(),
         ControlRuntimeServices {
+            mutations: Arc::clone(&mutations),
             observer,
             checkout_monitor,
             policy,
@@ -950,6 +952,7 @@ fn cmd_mount(config: &Path) -> Result<()> {
         Some(catalog),
         Some(surface_registry),
         audit,
+        mutations,
     )
     .context("mount failed")
 }

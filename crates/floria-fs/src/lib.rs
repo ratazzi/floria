@@ -30,8 +30,8 @@ use floria_core::source::{ContentSource, SourceCtx};
 use floria_core::writebuf::{WriteBufTable, WriteErr};
 use floria_store::{SecretId, SecretRecord, SecretStore};
 use floria_surface::{
-    commit_secret_version, renderer_for, RegisteredSurface, SurfaceBacking, SurfaceError,
-    SurfaceRegistry, SurfaceResolver,
+    commit_secret_version, renderer_for, ManagedMutationCoordinator, RegisteredSurface,
+    SurfaceBacking, SurfaceError, SurfaceRegistry, SurfaceResolver,
 };
 use dashmap::DashMap;
 use fuser::{
@@ -92,6 +92,7 @@ impl InoMap {
 struct SecretsNs {
     store: Arc<dyn SecretStore>,
     catalog: Option<Catalog>,
+    mutations: Arc<ManagedMutationCoordinator>,
     inos: InoMap,
 }
 
@@ -99,12 +100,14 @@ impl SecretsNs {
     fn new(
         store: Arc<dyn SecretStore>,
         catalog: Option<Catalog>,
+        mutations: Arc<ManagedMutationCoordinator>,
         dir_ino: u64,
         next_ino: Arc<AtomicU64>,
     ) -> Self {
         SecretsNs {
             store,
             catalog,
+            mutations,
             inos: InoMap::new(dir_ino, next_ino),
         }
     }
@@ -192,6 +195,7 @@ impl Floria {
         store: Option<Arc<dyn SecretStore>>,
         catalog: Option<Catalog>,
         surface_registry: Option<Arc<SurfaceRegistry>>,
+        mutations: Arc<ManagedMutationCoordinator>,
     ) -> anyhow::Result<Self> {
         // SAFETY: geteuid/getegid take no arguments, have no side effects, and always succeed.
         let (mount_uid, mount_gid) = unsafe { (libc::geteuid(), libc::getegid()) };
@@ -212,7 +216,11 @@ impl Floria {
         let surfaces = match (catalog, store.as_ref(), surface_registry) {
             (Some(catalog), Some(store), Some(registry)) => Some(SurfaceNs::new(
                 registry,
-                SurfaceResolver::new(catalog, Arc::clone(store)),
+                SurfaceResolver::with_mutation_coordinator(
+                    catalog,
+                    Arc::clone(store),
+                    Arc::clone(&mutations),
+                ),
                 tree.surfaces_dir_ino(),
                 Arc::clone(&next_ino),
             )),
@@ -225,6 +233,7 @@ impl Floria {
             SecretsNs::new(
                 store,
                 secret_catalog,
+                Arc::clone(&mutations),
                 tree.secrets_dir_ino(),
                 Arc::clone(&next_ino),
             )
@@ -419,6 +428,7 @@ impl Shared {
                     let version = commit_secret_version(
                         ns.catalog.as_ref(),
                         ns.store.as_ref(),
+                        ns.mutations.as_ref(),
                         &sid,
                         &bytes,
                     )
@@ -1521,7 +1531,15 @@ pub fn mount(
     surface_registry: Option<Arc<SurfaceRegistry>>,
 ) -> anyhow::Result<()> {
     let audit = Arc::new(AuditLog::open(&cfg.audit_log)?);
-    mount_with_audit(cfg, authorizer, store, catalog, surface_registry, audit)
+    mount_with_audit(
+        cfg,
+        authorizer,
+        store,
+        catalog,
+        surface_registry,
+        audit,
+        Arc::new(ManagedMutationCoordinator::new()),
+    )
 }
 
 /// Mount using an audit sink shared with other runtime capabilities such as SSH agent surfaces.
@@ -1532,10 +1550,19 @@ pub fn mount_with_audit(
     catalog: Option<Catalog>,
     surface_registry: Option<Arc<SurfaceRegistry>>,
     audit: Arc<AuditLog>,
+    mutations: Arc<ManagedMutationCoordinator>,
 ) -> anyhow::Result<()> {
     let mount_point = cfg.mount_path.clone();
     let config = mount_config(&cfg.volname);
-    let fs = Floria::new(&cfg, audit, authorizer, store, catalog, surface_registry)?;
+    let fs = Floria::new(
+        &cfg,
+        audit,
+        authorizer,
+        store,
+        catalog,
+        surface_registry,
+        mutations,
+    )?;
 
     tracing::info!(
         mount = %mount_point.display(),
@@ -2013,16 +2040,18 @@ mod tests {
     ) -> Arc<Shared> {
         let tree = Tree::build(files);
         let next_ino = Arc::new(AtomicU64::new(tree.next_ino()));
+        let mutations = Arc::new(ManagedMutationCoordinator::new());
         let secrets = SecretsNs::new(
             Arc::clone(&store),
             catalog.clone(),
+            Arc::clone(&mutations),
             tree.secrets_dir_ino(),
             Arc::clone(&next_ino),
         );
         let surfaces = match (catalog, registry) {
             (Some(catalog), Some(registry)) => Some(SurfaceNs::new(
                 registry,
-                SurfaceResolver::new(catalog, store),
+                SurfaceResolver::with_mutation_coordinator(catalog, store, mutations),
                 tree.surfaces_dir_ino(),
                 next_ino,
             )),
@@ -2398,6 +2427,7 @@ mod tests {
         let secret_ns = SecretsNs::new(
             Arc::clone(&store) as Arc<dyn SecretStore>,
             None,
+            Arc::new(ManagedMutationCoordinator::new()),
             tree.secrets_dir_ino(),
             Arc::clone(&next_ino),
         );
@@ -2513,7 +2543,13 @@ mod tests {
     fn shared_with_store(store: Arc<dyn SecretStore>, tmp: &Path) -> Arc<Shared> {
         let tree = Tree::build(&[]);
         let next_ino = Arc::new(AtomicU64::new(tree.next_ino()));
-        let secrets = SecretsNs::new(store, None, tree.secrets_dir_ino(), next_ino);
+        let secrets = SecretsNs::new(
+            store,
+            None,
+            Arc::new(ManagedMutationCoordinator::new()),
+            tree.secrets_dir_ino(),
+            next_ino,
+        );
         Arc::new(Shared {
             tree,
             reads: ReadSessionTable::new(),

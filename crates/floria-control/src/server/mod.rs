@@ -27,8 +27,8 @@ use floria_surface::{
     replace_regular_file_with_symlink_if_matches,
     replace_regular_file_with_symlink_if_unchanged,
     replace_symlink_with_file_if_target, restore_protected_checkout_links,
-    validate_secret_bytes, ManagedLinkStatus as SurfaceManagedLinkStatus, ManagedSymlink,
-    SurfaceResolver,
+    validate_secret_bytes, ManagedLinkStatus as SurfaceManagedLinkStatus,
+    ManagedMutationCoordinator, ManagedSymlink, SurfaceResolver,
 };
 
 use crate::protocol::{
@@ -120,6 +120,7 @@ pub trait RuntimeDiagnosticsExporter: Send + Sync + 'static {
 }
 
 pub struct ControlRuntimeServices {
+    pub mutations: Arc<ManagedMutationCoordinator>,
     pub observer: Arc<dyn CatalogObserver>,
     pub checkout_monitor: Arc<GitCheckoutMonitor>,
     pub policy: Arc<dyn RuntimePolicyController>,
@@ -138,6 +139,7 @@ pub struct ControlRuntimeServices {
 struct ControlDependencies {
     store: Option<Arc<dyn SecretStore>>,
     mount_path: Option<PathBuf>,
+    mutations: Option<Arc<ManagedMutationCoordinator>>,
     observer: Option<Arc<dyn CatalogObserver>>,
     checkout_monitor: Option<Arc<GitCheckoutMonitor>>,
     policy: Option<Arc<dyn RuntimePolicyController>>,
@@ -234,6 +236,7 @@ impl ControlServer {
             ControlDependencies {
                 store: Some(store),
                 mount_path: Some(mount_path),
+                mutations: Some(services.mutations),
                 observer: Some(services.observer),
                 checkout_monitor: Some(services.checkout_monitor),
                 policy: Some(services.policy),
@@ -276,7 +279,12 @@ impl ControlServer {
                     mount_path.clone(),
                 ))
             });
-        let dependencies = ControlDependencies { discovery_jobs, ..dependencies };
+        let mutations = dependencies
+            .mutations
+            .clone()
+            .unwrap_or_else(|| Arc::new(ManagedMutationCoordinator::new()));
+        let dependencies =
+            ControlDependencies { mutations: Some(mutations), discovery_jobs, ..dependencies };
         std::thread::Builder::new()
             .name("floria-control-accept".to_string())
             .spawn(move || accept_loop(listener, catalog, dependencies, peer_verifier))?;
@@ -344,11 +352,11 @@ fn handle_connection(
                 break;
             }
         };
-        let is_read_only = is_read_only(&request.command);
         let services = DispatchServices {
             store: dependencies.store.as_deref(),
             store_arc: dependencies.store.as_ref(),
             mount_path: dependencies.mount_path.as_deref(),
+            mutations: dependencies.mutations.as_deref(),
             policy: dependencies.policy.as_deref(),
             ssh_discovery: dependencies.ssh_discovery.as_deref(),
             ssh_config: dependencies.ssh_config.as_deref(),
@@ -361,13 +369,13 @@ fn handle_connection(
             ssh_runtime_dir: dependencies.ssh_runtime_dir.as_deref(),
             discovery_jobs: dependencies.discovery_jobs.as_deref(),
         };
-        let outcome = match dispatch(&catalog, services, request.command) {
-            Ok(result) => {
-                if !is_read_only {
-                    notify_observer(&catalog, dependencies.observer.as_deref());
-                }
-                ControlOutcome::Ok { result }
-            }
+        let outcome = match dispatch_observed(
+            &catalog,
+            services,
+            request.command,
+            dependencies.observer.as_deref(),
+        ) {
+            Ok(result) => ControlOutcome::Ok { result },
             Err(error) => ControlOutcome::Error { error: error.body() },
         };
         if let Err(error) = write_msg(
@@ -445,6 +453,7 @@ struct DispatchServices<'a> {
     store: Option<&'a dyn SecretStore>,
     store_arc: Option<&'a Arc<dyn SecretStore>>,
     mount_path: Option<&'a Path>,
+    mutations: Option<&'a ManagedMutationCoordinator>,
     policy: Option<&'a dyn RuntimePolicyController>,
     ssh_discovery: Option<&'a dyn SshIdentityDiscovery>,
     ssh_config: Option<&'a dyn SshConfigManager>,

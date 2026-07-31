@@ -11,6 +11,7 @@ use crate::dotenv::parse_dotenv;
 use crate::error::{SurfaceError, SurfaceResult};
 use crate::ini::parse_ini;
 use crate::lines::render_lines_refs;
+use crate::mutation::ManagedMutationCoordinator;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CodecCapabilities {
@@ -232,15 +233,18 @@ pub fn validate_secret_bytes(
 pub fn commit_secret_version(
     catalog: Option<&Catalog>,
     store: &dyn SecretStore,
+    mutations: &ManagedMutationCoordinator,
     id: &SecretId,
     bytes: &[u8],
 ) -> SurfaceResult<u32> {
-    if let Some(catalog) = catalog {
-        validate_secret_bytes(&catalog.snapshot()?, id.as_str(), bytes)?;
-    } else {
-        tracing::debug!(secret_id = %id, "no catalog configured; skipping schema validation");
-    }
-    store.append_version(id, bytes).map_err(Into::into)
+    mutations.run(|| {
+        if let Some(catalog) = catalog {
+            validate_secret_bytes(&catalog.snapshot()?, id.as_str(), bytes)?;
+        } else {
+            tracing::debug!(secret_id = %id, "no catalog configured; skipping schema validation");
+        }
+        store.append_version(id, bytes).map_err(Into::into)
+    })
 }
 
 fn same_schema(left: &[(String, Option<String>)], right: &[(String, Option<String>)]) -> bool {

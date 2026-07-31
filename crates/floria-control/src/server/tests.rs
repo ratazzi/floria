@@ -17,7 +17,7 @@
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{mpsc, Mutex};
     use zeroize::Zeroizing;
 
     fn test_peer_verifier() -> Arc<dyn SocketPeerVerifier> {
@@ -131,6 +131,7 @@
         metadata: Mutex<HashMap<String, FixtureSecretMetadata>>,
         heads: Mutex<HashMap<String, u32>>,
         mutation_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        before_append_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         get_calls: AtomicUsize,
     }
 
@@ -141,6 +142,7 @@
                 metadata: Mutex::new(HashMap::new()),
                 heads: Mutex::new(HashMap::new()),
                 mutation_hook: Mutex::new(None),
+                before_append_hook: Mutex::new(None),
                 get_calls: AtomicUsize::new(0),
             }
         }
@@ -151,6 +153,16 @@
 
         fn run_mutation_hook(&self) {
             if let Some(hook) = self.mutation_hook.lock().unwrap().take() {
+                hook();
+            }
+        }
+
+        fn before_next_append(&self, hook: impl FnOnce() + Send + 'static) {
+            *self.before_append_hook.lock().unwrap() = Some(Box::new(hook));
+        }
+
+        fn run_before_append_hook(&self) {
+            if let Some(hook) = self.before_append_hook.lock().unwrap().take() {
                 hook();
             }
         }
@@ -420,6 +432,7 @@
         }
 
         fn append_version(&self, id: &SecretId, plaintext: &[u8]) -> StoreResult<u32> {
+            self.run_before_append_hook();
             let mut entries = self.entries.lock().unwrap();
             let versions = entries.get_mut(id.as_str()).unwrap();
             versions.push(plaintext.to_vec());
@@ -3318,6 +3331,98 @@
         assert_eq!(std::fs::read(&source).unwrap(), b"FIXTURE_VALUE=after\n");
         assert_eq!(store.get(&id).unwrap().as_slice(), b"FIXTURE_VALUE=previous\n");
         assert_eq!(store.record(&id).unwrap().unwrap().current_version, 1);
+    }
+
+    #[test]
+    fn concurrent_schema_attachment_and_version_append_cannot_leave_drift() {
+        use floria_surface::{commit_secret_version, ManagedMutationCoordinator};
+
+        let dir = tempfile::tempdir().unwrap();
+        let catalog_path = dir.path().join("catalog.sqlite");
+        let catalog = Catalog::open(&catalog_path).unwrap();
+        let store = Arc::new(FixtureStore::new());
+        let mutations = Arc::new(ManagedMutationCoordinator::new());
+        let id = store
+            .put(
+                NewSecret::managed("DEBUG"),
+                b"FIXTURE_A=before\n",
+            )
+            .unwrap();
+        let (append_entered_tx, append_entered_rx) = mpsc::channel();
+        let (release_append_tx, release_append_rx) = mpsc::channel();
+        store.before_next_append(move || {
+            append_entered_tx.send(()).unwrap();
+            release_append_rx.recv().unwrap();
+        });
+
+        let commit_catalog = catalog.clone();
+        let commit_store = Arc::clone(&store);
+        let commit_mutations = Arc::clone(&mutations);
+        let commit_id = id.clone();
+        let commit = std::thread::spawn(move || {
+            commit_secret_version(
+                Some(&commit_catalog),
+                commit_store.as_ref(),
+                commit_mutations.as_ref(),
+                &commit_id,
+                b"FIXTURE_B=after\n",
+            )
+        });
+        append_entered_rx.recv().unwrap();
+
+        let schema_catalog = catalog.clone();
+        let schema_store = Arc::clone(&store);
+        let schema_mutations = Arc::clone(&mutations);
+        let schema_secret_id = id.to_string();
+        let (schema_started_tx, schema_started_rx) = mpsc::channel();
+        let schema = std::thread::spawn(move || {
+            schema_started_tx.send(()).unwrap();
+            dispatch(
+                &schema_catalog,
+                DispatchServices {
+                    store: Some(schema_store.as_ref()),
+                    mutations: Some(schema_mutations.as_ref()),
+                    ..DispatchServices::default()
+                },
+                ControlCommand::ResourceUpsert {
+                    resource: Resource {
+                        id: "fixture-env-resource".to_string(),
+                        name: "Fixture Env File".to_string(),
+                        kind: ResourceKind::EnvFile,
+                        shape: ValueShape::KeyValueSet,
+                        codec: ResourceCodec::Dotenv,
+                        default_env_key: None,
+                        entries: vec![EntrySpec {
+                            address: "keys/FIXTURE_A".to_string(),
+                            label: "FIXTURE_A".to_string(),
+                            key: Some("FIXTURE_A".to_string()),
+                            sensitive: true,
+                        }],
+                        source: ResourceSource::SecretRef {
+                            secret_id: schema_secret_id,
+                        },
+                        enforcement: Enforcement::Allow,
+                        metadata: Default::default(),
+                        origin: Default::default(),
+                    },
+                    endpoint: None,
+                },
+            )
+        });
+        schema_started_rx.recv().unwrap();
+        release_append_tx.send(()).unwrap();
+
+        assert_eq!(commit.join().unwrap().unwrap(), 2);
+        assert!(
+            schema.join().unwrap().is_err(),
+            "the later schema mutation must validate the committed head"
+        );
+        let snapshot = catalog.snapshot().unwrap();
+        assert!(snapshot.resources.is_empty());
+        assert!(
+            validate_secret_bytes(&snapshot, id.as_str(), &store.get(&id).unwrap()).is_ok(),
+            "catalog and store must remain mutually valid"
+        );
     }
 
     #[test]

@@ -7,6 +7,7 @@ mod error;
 mod ini;
 mod links;
 mod lines;
+mod mutation;
 mod render;
 mod registry;
 mod resolver;
@@ -33,6 +34,7 @@ pub use links::{
     SurfaceLinkState,
 };
 pub use lines::LINES_MAX_SIZE;
+pub use mutation::ManagedMutationCoordinator;
 pub use render::{
     renderer_for, RenderedSurface, Renderer, ResolvedBindingEntry, ResolvedDocument,
     ResolvedEntryMeta, ResolvedEnvironmentEntry,

@@ -1,6 +1,37 @@
 use super::*;
 
+#[cfg(test)]
 pub(super) fn dispatch(
+    catalog: &Catalog,
+    services: DispatchServices<'_>,
+    command: ControlCommand,
+) -> Result<ControlResult, DispatchError> {
+    dispatch_observed(catalog, services, command, None)
+}
+
+pub(super) fn dispatch_observed(
+    catalog: &Catalog,
+    services: DispatchServices<'_>,
+    command: ControlCommand,
+    observer: Option<&dyn CatalogObserver>,
+) -> Result<ControlResult, DispatchError> {
+    let mutating = !is_read_only(&command);
+    let operation = || {
+        let result = dispatch_uncoordinated(catalog, services, command);
+        if result.is_ok() && mutating {
+            notify_observer(catalog, observer);
+        }
+        result
+    };
+    if mutating {
+        if let Some(mutations) = services.mutations {
+            return mutations.run(operation);
+        }
+    }
+    operation()
+}
+
+fn dispatch_uncoordinated(
     catalog: &Catalog,
     services: DispatchServices<'_>,
     command: ControlCommand,
@@ -9,6 +40,7 @@ pub(super) fn dispatch(
         store,
         store_arc,
         mount_path,
+        mutations: _,
         policy,
         ssh_discovery,
         ssh_config,

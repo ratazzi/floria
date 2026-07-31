@@ -99,11 +99,24 @@ struct DirectEnvFileTarget {
 pub struct SurfaceResolver {
     catalog: Catalog,
     store: Arc<dyn SecretStore>,
+    mutations: Arc<crate::ManagedMutationCoordinator>,
 }
 
 impl SurfaceResolver {
     pub fn new(catalog: Catalog, store: Arc<dyn SecretStore>) -> Self {
-        SurfaceResolver { catalog, store }
+        SurfaceResolver {
+            catalog,
+            store,
+            mutations: Arc::new(crate::ManagedMutationCoordinator::new()),
+        }
+    }
+
+    pub fn with_mutation_coordinator(
+        catalog: Catalog,
+        store: Arc<dyn SecretStore>,
+        mutations: Arc<crate::ManagedMutationCoordinator>,
+    ) -> Self {
+        SurfaceResolver { catalog, store, mutations }
     }
 
     /// Resolve any composed file surface into one process access-session snapshot. Every
@@ -301,6 +314,7 @@ impl SurfaceResolver {
         let version = crate::codec::commit_secret_version(
             Some(&self.catalog),
             self.store.as_ref(),
+            self.mutations.as_ref(),
             &id,
             bytes,
         )?;
