@@ -8,10 +8,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::domain::{
     Binding, BindingScope, CatalogSnapshot, EntrySelection, Environment, FileBacking,
-    FormatInputModel, OriginSource, Project, ProjectCheckout, ProjectCheckoutKind,
-    ResolvedEnvironment, ResolvedExport, Resource, ResourceBindingUsage, ResourceCodec,
-    ResourceKind, ResourceOrigin, ResourceSource, ResourceUsage, Surface, SurfaceFormat,
-    SurfaceInput, SurfaceKind, ValueShape,
+    FormatInputModel, ManagedFileConfigurationRemoval, OriginKind, OriginSource, Project,
+    ProjectCheckout, ProjectCheckoutKind, ResolvedEnvironment, ResolvedExport, Resource,
+    ResourceBindingUsage, ResourceCodec, ResourceKind, ResourceOrigin, ResourceSource,
+    ResourceUsage, Surface, SurfaceFormat, SurfaceInput, SurfaceKind, ValueShape,
 };
 use crate::error::{CatalogError, CatalogResult};
 
@@ -799,6 +799,114 @@ mod tests {
             catalog.snapshot().unwrap().surfaces[0].input,
             SurfaceInput::Bindings { binding_ids: Vec::new() }
         );
+    }
+
+    #[test]
+    fn managed_file_configuration_cleanup_removes_only_unshared_generated_rows() {
+        let (_dir, catalog) = catalog();
+        let path = PathBuf::from("/workspace/floria/.env");
+        let mut resource = env_file_resource("managed-env");
+        resource.origin = ResourceOrigin {
+            kind: OriginKind::Discovered,
+            sources: vec![OriginSource {
+                path: path.clone(),
+                project_id: Some("floria".to_string()),
+                environment: Some("Development".to_string()),
+                imported_at: "2026-07-28T00:00:00Z".to_string(),
+            }],
+        };
+        catalog.upsert_resource(&resource).unwrap();
+        catalog
+            .upsert_binding(&binding(
+                "managed-binding",
+                &resource.id,
+                BindingScope::Environment { environment_id: "development".to_string() },
+            ))
+            .unwrap();
+        catalog
+            .upsert_surface(&Surface {
+                id: "managed-surface".to_string(),
+                environment_id: "development".to_string(),
+                name: ".env".to_string(),
+                kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
+                path,
+                input: SurfaceInput::Bindings {
+                    binding_ids: vec!["managed-binding".to_string()],
+                },
+                enforcement: Enforcement::Prompt,
+                position: 0,
+            })
+            .unwrap();
+
+        let removed = catalog
+            .remove_managed_file_configuration(
+                "managed-surface",
+                "managed-binding",
+                "managed-env",
+            )
+            .unwrap();
+
+        assert!(removed.binding_removed);
+        assert!(removed.resource_removed);
+        let snapshot = catalog.snapshot().unwrap();
+        assert!(snapshot.surfaces.is_empty());
+        assert!(snapshot.bindings.is_empty());
+        assert!(snapshot.resources.is_empty());
+    }
+
+    #[test]
+    fn managed_file_configuration_cleanup_preserves_reused_content() {
+        let (_dir, catalog) = catalog();
+        let path = PathBuf::from("/workspace/floria/.env");
+        let mut resource = env_file_resource("managed-env");
+        resource.origin = ResourceOrigin {
+            kind: OriginKind::Discovered,
+            sources: vec![OriginSource {
+                path: path.clone(),
+                project_id: Some("floria".to_string()),
+                environment: Some("Development".to_string()),
+                imported_at: "2026-07-28T00:00:00Z".to_string(),
+            }],
+        };
+        catalog.upsert_resource(&resource).unwrap();
+        catalog
+            .upsert_binding(&binding(
+                "managed-binding",
+                &resource.id,
+                BindingScope::Environment { environment_id: "development".to_string() },
+            ))
+            .unwrap();
+        for (id, name) in [("managed-surface", ".env"), ("reused-surface", ".envrc")] {
+            catalog
+                .upsert_surface(&Surface {
+                    id: id.to_string(),
+                    environment_id: "development".to_string(),
+                    name: name.to_string(),
+                    kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
+                    path: PathBuf::from("/workspace/floria").join(name),
+                    input: SurfaceInput::Bindings {
+                        binding_ids: vec!["managed-binding".to_string()],
+                    },
+                    enforcement: Enforcement::Prompt,
+                    position: 0,
+                })
+                .unwrap();
+        }
+
+        let removed = catalog
+            .remove_managed_file_configuration(
+                "managed-surface",
+                "managed-binding",
+                "managed-env",
+            )
+            .unwrap();
+
+        assert!(!removed.binding_removed);
+        assert!(!removed.resource_removed);
+        let snapshot = catalog.snapshot().unwrap();
+        assert_eq!(snapshot.surfaces.len(), 1);
+        assert_eq!(snapshot.bindings.len(), 1);
+        assert_eq!(snapshot.resources.len(), 1);
     }
 
     #[test]

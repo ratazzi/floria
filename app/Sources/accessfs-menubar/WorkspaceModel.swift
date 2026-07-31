@@ -633,6 +633,42 @@ final class WorkspaceStore {
     var commonBindings: [WorkspaceBinding] { selectedProject?.commonBindings ?? [] }
     var environmentBindings: [WorkspaceBinding] { selectedEnvironment?.bindings ?? [] }
 
+    var allBindings: [WorkspaceBinding] {
+        projects.flatMap { project in
+            project.commonBindings + project.environments.flatMap(\.bindings)
+        }
+    }
+
+    var allSurfaces: [WorkspaceSurface] {
+        projects.flatMap { $0.environments.flatMap(\.surfaces) }
+    }
+
+    func backingResource(for surface: WorkspaceSurface) -> WorkspaceResource? {
+        if let resourceID = surface.resourceID {
+            return resource(resourceID)
+        }
+        let resourceIDs = Set(
+            allBindings
+                .filter { surface.bindingIDs.contains($0.id) }
+                .map(\.resourceID))
+        let matches = resources.filter { resource in
+            resourceIDs.contains(resource.id)
+                && resource.kind == .envFile
+                && resource.originSources.contains { $0.path == surface.path }
+        }
+        return matches.count == 1 ? matches[0] : nil
+    }
+
+    var representedFileResourceIDs: Set<WorkspaceResource.ID> {
+        Set(allSurfaces.compactMap { backingResource(for: $0)?.id })
+    }
+
+    var managedItemCount: Int {
+        protectedFiles.count
+            + resources.count { !representedFileResourceIDs.contains($0.id) }
+            + allSurfaces.count
+    }
+
     var activeBindings: [WorkspaceBinding] {
         (commonBindings + environmentBindings).filter(\.isEnabled)
     }
@@ -1114,6 +1150,14 @@ final class WorkspaceStore {
         }
         lastError = nil
         return storageDeleted
+    }
+
+    func restoreManagedFile(_ id: WorkspaceSurface.ID) async throws {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        try await controlClient.restoreManagedFile(id)
+        apply(try await controlClient.snapshot())
+        protectedFiles = try await controlClient.protectedFiles().map(WorkspaceProtectedFile.init)
+        lastError = nil
     }
 
     @discardableResult

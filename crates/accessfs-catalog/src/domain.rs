@@ -492,6 +492,16 @@ pub struct Surface {
     pub position: i64,
 }
 
+/// Catalog rows removed when one discovered file stops using a configured surface.
+///
+/// A discovered resource can outlive the surface when another managed file still reuses it.
+/// Callers use `resource_removed` to decide whether its encrypted backing can also be deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ManagedFileConfigurationRemoval {
+    pub binding_removed: bool,
+    pub resource_removed: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CatalogSnapshot {
     pub projects: Vec<Project>,

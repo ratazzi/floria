@@ -78,6 +78,44 @@ final class WorkspaceModelTests: XCTestCase {
         XCTAssertTrue(store.resolvedExports.isEmpty)
     }
 
+    func testConfiguredFileResolvesItsHiddenBackingResource() throws {
+        let path = "/fixture/project/.env"
+        let resource = WorkspaceResource(
+            id: "fixture-env", name: ".env", kind: .envFile, shape: .keyValueSet,
+            exports: [],
+            origin: CatalogResourceOrigin(
+                kind: "discovered",
+                sources: [
+                    CatalogOriginSource(
+                        path: path, projectID: "fixture-project",
+                        environment: "Development", importedAt: "2026-07-28T00:00:00Z")
+                ]),
+            usageCount: 1)
+        let binding = WorkspaceBinding(
+            id: "fixture-binding", resourceID: resource.id,
+            keyOverride: nil, isEnabled: true)
+        let surface = WorkspaceSurface(
+            id: "fixture-surface", name: ".env", kind: .dotenvFile,
+            path: path, status: .linked, input: .bindings([binding.id]))
+        let store = WorkspaceStore(
+            projects: [
+                WorkspaceProject(
+                    id: "fixture-project", name: "Fixture", path: "/fixture/project",
+                    commonBindings: [],
+                    environments: [
+                        WorkspaceEnvironment(
+                            id: "fixture-development", name: "Development",
+                            bindings: [binding], surfaces: [surface])
+                    ])
+            ],
+            resources: [resource])
+
+        XCTAssertEqual(store.allSurfaces, [surface])
+        XCTAssertEqual(store.backingResource(for: surface)?.id, resource.id)
+        XCTAssertEqual(store.representedFileResourceIDs, Set([resource.id]))
+        XCTAssertEqual(store.managedItemCount, 1)
+    }
+
     func testEntrySelectionUsesResourceOrderInsteadOfCheckboxOrder() {
         let resource = WorkspaceResource(
             id: "fixture-env", name: "Fixture Env File",

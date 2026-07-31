@@ -505,6 +505,15 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(configureParams["project_id"] as? String, "fixture-project")
         XCTAssertEqual(configureParams["environment_id"] as? String, "fixture-development")
 
+        let restoreManaged = try ControlCommand.managedFileRestore("fixture-surface")
+            .requestData(requestID: 733, encoder: encoder)
+        let restoreManagedValue = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: restoreManaged) as? [String: Any])
+        XCTAssertEqual(restoreManagedValue["method"] as? String, "managed_file_restore")
+        XCTAssertEqual(
+            (restoreManagedValue["params"] as? [String: Any])?["id"] as? String,
+            "fixture-surface")
+
         let restore = try ControlCommand.fileRestore("fixture-secret")
             .requestData(requestID: 74, encoder: encoder)
         let restoreValue = try XCTUnwrap(

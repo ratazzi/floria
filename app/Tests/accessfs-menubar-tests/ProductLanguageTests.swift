@@ -61,6 +61,7 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertTrue(source.contains(#""Project Settings""#))
         XCTAssertTrue(source.contains(#""No managed items yet""#))
         XCTAssertTrue(source.contains(#""\(count) managed item"#))
+        XCTAssertTrue(source.contains("state.workspace.managedItemCount"))
     }
 
     func testLibraryDefaultsToOneInventoryAndUsesTypesAsFilters() throws {
@@ -70,6 +71,8 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertTrue(workspace.contains(#"sidebarRow("All Items""#))
         XCTAssertTrue(workspace.contains("LibraryCatalogView("))
         XCTAssertTrue(workspace.contains("LibraryCatalogFilter.allCases"))
+        XCTAssertTrue(workspace.contains("store.allSurfaces"))
+        XCTAssertTrue(workspace.contains("store.backingResource(for:"))
         XCTAssertFalse(workspace.contains(#"sidebarRow("Shared Secrets""#))
         XCTAssertFalse(workspace.contains(#"sidebarRow("Env Files""#))
         XCTAssertFalse(workspace.contains(#""Protected Files", systemImage:"#))
@@ -90,6 +93,9 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertTrue(dashboard.contains(#"Button("Details…", systemImage: "info.circle")"#))
         XCTAssertFalse(workspace.contains(#""Edit Output""#))
         XCTAssertFalse(workspace.contains(#""Remove Output""#))
+        XCTAssertFalse(workspace.contains(#""Remove Configuration""#))
+        XCTAssertTrue(workspace.contains(#""Stop Protecting…""#))
+        XCTAssertTrue(workspace.contains("store.restoreManagedFile(surface.id)"))
     }
 
     func testManagedItemRowsExposeDetailsWithoutOpeningTheMoreMenu() throws {

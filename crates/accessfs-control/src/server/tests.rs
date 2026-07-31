@@ -2937,8 +2937,11 @@
         let socket = dir.path().join("control.sock");
         let mount = dir.path().join("mount");
         let project_path = dir.path().join("project");
+        let worktree_path = dir.path().join("worktree");
         std::fs::create_dir_all(&project_path).unwrap();
+        std::fs::create_dir_all(&worktree_path).unwrap();
         let project_path = std::fs::canonicalize(project_path).unwrap();
+        let worktree_path = std::fs::canonicalize(worktree_path).unwrap();
         catalog
             .upsert_project(&Project {
                 id: "fixture-project".to_string(),
@@ -2953,6 +2956,16 @@
                 project_id: "fixture-project".to_string(),
                 name: "Development".to_string(),
                 position: 0,
+            })
+            .unwrap();
+        catalog
+            .upsert_checkout(&ProjectCheckout {
+                id: "fixture-worktree".to_string(),
+                project_id: "fixture-project".to_string(),
+                path: worktree_path.clone(),
+                environment_id: Some("fixture-development".to_string()),
+                kind: ProjectCheckoutKind::Worktree,
+                ..Default::default()
             })
             .unwrap();
         let source = project_path.join(".dev.vars");
@@ -3002,6 +3015,11 @@
             std::fs::read_link(&source).unwrap(),
             mount.join(accessfs_core::config::SURFACES_DIR).join(&surface.id)
         );
+        symlink(
+            mount.join(accessfs_core::config::SURFACES_DIR).join(&surface.id),
+            worktree_path.join(".dev.vars"),
+        )
+        .unwrap();
 
         let snapshot = catalog.snapshot().unwrap();
         assert_eq!(snapshot.resources.len(), 1);
@@ -3016,7 +3034,7 @@
             ResourceSource::SecretRef { secret_id: FIXTURE_SECRET_ID.to_string() }
         );
         assert_eq!(snapshot.bindings.len(), 1);
-        assert_eq!(snapshot.surfaces, vec![surface]);
+        assert_eq!(snapshot.surfaces, vec![surface.clone()]);
 
         let ControlResult::ProtectedFiles(files) =
             client.request(ControlCommand::ProtectedFiles).unwrap()
@@ -3029,6 +3047,37 @@
         );
         let secret_id: SecretId = FIXTURE_SECRET_ID.parse().unwrap();
         assert_eq!(store.record(&secret_id).unwrap().unwrap().current_version, 1);
+
+        let restored = client
+            .request(ControlCommand::ManagedFileRestore {
+                id: surface.id.clone(),
+            })
+            .unwrap();
+        assert_eq!(
+            restored,
+            ControlResult::FileRestored {
+                path: source.clone(),
+                storage_deleted: true,
+            }
+        );
+        assert!(!std::fs::symlink_metadata(&source).unwrap().file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(&source).unwrap(),
+            "FIRST=fixture-one\nSECOND=fixture-two\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree_path.join(".dev.vars")).unwrap(),
+            "FIRST=fixture-one\nSECOND=fixture-two\n"
+        );
+        assert!(!std::fs::symlink_metadata(worktree_path.join(".dev.vars"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let snapshot = catalog.snapshot().unwrap();
+        assert!(snapshot.resources.is_empty());
+        assert!(snapshot.bindings.is_empty());
+        assert!(snapshot.surfaces.is_empty());
+        assert!(store.record(&secret_id).unwrap().is_none());
     }
 
     #[test]

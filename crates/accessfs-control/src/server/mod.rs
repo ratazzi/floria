@@ -22,8 +22,9 @@ use accessfs_platform::SocketPeerVerifier;
 use accessfs_ssh::ManagedKeyError;
 use accessfs_store::{NewSecret, SecretId, SecretOrigin, SecretRecord, SecretStore, StoreError};
 use accessfs_surface::{
-    decode_source, ensure_file_surface_link, replace_symlink_with_file_if_target,
-    restore_protected_checkout_links, validate_secret_bytes,
+    decode_source, ensure_file_surface_link, file_surface_instances,
+    replace_regular_file_with_symlink_if_matches, replace_symlink_with_file_if_target,
+    restore_protected_checkout_links, validate_secret_bytes, SurfaceResolver,
 };
 
 use crate::protocol::{
@@ -286,6 +287,7 @@ fn handle_connection(
         let is_read_only = is_read_only(&request.command);
         let services = DispatchServices {
             store: dependencies.store.as_deref(),
+            store_arc: dependencies.store.as_ref(),
             mount_path: dependencies.mount_path.as_deref(),
             policy: dependencies.policy.as_deref(),
             ssh_discovery: dependencies.ssh_discovery.as_deref(),
@@ -367,6 +369,7 @@ struct ManagedItemSettings {
 #[derive(Clone, Copy, Default)]
 struct DispatchServices<'a> {
     store: Option<&'a dyn SecretStore>,
+    store_arc: Option<&'a Arc<dyn SecretStore>>,
     mount_path: Option<&'a Path>,
     policy: Option<&'a dyn RuntimePolicyController>,
     ssh_discovery: Option<&'a dyn SshIdentityDiscovery>,

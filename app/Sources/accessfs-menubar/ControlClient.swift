@@ -307,6 +307,14 @@ final class ControlClient: @unchecked Sendable {
         return result.storageDeleted
     }
 
+    func restoreManagedFile(_ id: String) async throws {
+        guard let _: FileRestored = try await request(
+            .managedFileRestore(id), expecting: "file_restored", as: FileRestored.self)
+        else {
+            throw ControlClientError.missingResult("file_restored")
+        }
+    }
+
     func createSharedSecret(
         resourceID: String, name: String, defaultEnvKey: String?, value: String,
         enforcement: String, metadata: ItemMetadata

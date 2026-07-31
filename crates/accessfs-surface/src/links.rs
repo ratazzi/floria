@@ -477,7 +477,10 @@ pub fn replace_file_with_symlink(path: &Path, target: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn replace_regular_file_with_symlink_if_matches(
+/// Replace a regular file only while its bytes still match the caller's snapshot.
+///
+/// This is the rollback half of a cross-store transition: concurrent edits are preserved.
+pub fn replace_regular_file_with_symlink_if_matches(
     path: &Path,
     target: &Path,
     expected: &[u8],

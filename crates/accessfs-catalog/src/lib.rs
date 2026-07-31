@@ -11,9 +11,10 @@ mod error;
 pub use catalog::{resolve_catalog_snapshot, resolve_catalog_surface, Catalog};
 pub use domain::{
     Binding, BindingScope, CatalogSnapshot, EntrySelection, EntrySpec, Environment, FileBacking,
-    FormatInputModel, FormatSpec, ItemLink, ItemMetadata, OriginKind, OriginSource, Project,
-    ProjectCheckout, ProjectCheckoutKind, ResolvedEnvironment, ResolvedExport, Resource,
-    ResourceBindingUsage, ResourceCodec, ResourceKind, ResourceOrigin, ResourceSource,
-    ResourceUsage, SshRouteSpec, Surface, SurfaceFormat, SurfaceInput, SurfaceKind, ValueShape,
+    FormatInputModel, FormatSpec, ItemLink, ItemMetadata, ManagedFileConfigurationRemoval,
+    OriginKind, OriginSource, Project, ProjectCheckout, ProjectCheckoutKind, ResolvedEnvironment,
+    ResolvedExport, Resource, ResourceBindingUsage, ResourceCodec, ResourceKind, ResourceOrigin,
+    ResourceSource, ResourceUsage, SshRouteSpec, Surface, SurfaceFormat, SurfaceInput, SurfaceKind,
+    ValueShape,
 };
 pub use error::{CatalogError, CatalogResult};

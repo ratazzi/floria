@@ -585,7 +585,7 @@ struct DashboardView: View {
     }
 
     private var librarySummary: String {
-        let count = state.workspace.resources.count + state.workspace.protectedFiles.count
+        let count = state.workspace.managedItemCount
         return count == 0
             ? "No managed items yet"
             : "\(count) managed item\(count == 1 ? "" : "s")"

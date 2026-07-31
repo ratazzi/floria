@@ -7,11 +7,20 @@ pub(super) fn protected_files(
     mount_path: &Path,
 ) -> Result<ControlResult, DispatchError> {
     let snapshot = catalog.snapshot()?;
-    let configured_secret_ids = snapshot.file_surface_secret_ids();
+    let catalog_secret_ids = snapshot
+        .resources
+        .iter()
+        .filter_map(|resource| match &resource.source {
+            ResourceSource::SecretRef { secret_id } => Some(secret_id.as_str()),
+            ResourceSource::Literal { .. }
+            | ResourceSource::Command { .. }
+            | ResourceSource::Socket => None,
+        })
+        .collect::<HashSet<_>>();
     let mut files = store
         .list()?
         .into_iter()
-        .filter(|record| !configured_secret_ids.contains(record.id.as_str()))
+        .filter(|record| !catalog_secret_ids.contains(record.id.as_str()))
         .filter_map(|record| protected_file(record, mount_path))
         .collect::<Vec<_>>();
     files.sort_by(|left, right| left.source_path.cmp(&right.source_path));
@@ -198,6 +207,226 @@ pub(super) fn configure_managed_file(
     }
 
     Ok(ControlResult::ManagedFileConfigured { surface })
+}
+
+pub(super) fn restore_managed_file(
+    catalog: &Catalog,
+    store: &Arc<dyn SecretStore>,
+    mount_path: &Path,
+    surface_id: &str,
+) -> Result<ControlResult, DispatchError> {
+    let snapshot = catalog.snapshot()?;
+    let surface = snapshot
+        .surfaces
+        .iter()
+        .find(|surface| surface.id == surface_id)
+        .cloned()
+        .ok_or_else(|| DispatchError::Validation(format!("managed file {surface_id:?} was not found")))?;
+    if !surface.kind.is_file() {
+        return Err(DispatchError::Validation(format!(
+            "{} is not a managed file",
+            surface.path.display()
+        )));
+    }
+
+    let mut origins = Vec::new();
+    for resource in snapshot.resources.iter().filter(|resource| {
+        resource.origin.kind == OriginKind::Discovered
+            && resource.origin.sources.len() == 1
+            && resource.origin.sources[0].path == surface.path
+    }) {
+        let ResourceSource::SecretRef { secret_id } = &resource.source else { continue };
+        let parsed: SecretId = secret_id.parse()?;
+        let Some(record) = store.record(&parsed)? else { continue };
+        if matches!(&record.origin, SecretOrigin::File { source_path } if source_path == &surface.path)
+        {
+            origins.push((resource, parsed, record));
+        }
+    }
+    if origins.len() > 1 {
+        return Err(DispatchError::Validation(format!(
+            "{} has {} discovered backing resources; expected at most one",
+            surface.path.display(),
+            origins.len()
+        )));
+    }
+    let cleanup = if let Some((resource, secret_id, record)) = origins.pop() {
+        let binding_ids = surface.input.binding_ids().unwrap_or_default();
+        let origin_bindings = snapshot
+            .bindings
+            .iter()
+            .filter(|binding| binding.resource_id == resource.id)
+            .collect::<Vec<_>>();
+        let included_origin_bindings = origin_bindings
+            .iter()
+            .copied()
+            .filter(|binding| binding_ids.contains(&binding.id))
+            .collect::<Vec<_>>();
+        let binding = match (included_origin_bindings.as_slice(), origin_bindings.as_slice()) {
+            ([binding], _) | ([], [binding]) => *binding,
+            ([], []) => {
+                return Err(DispatchError::Validation(format!(
+                    "{} no longer has a binding to its discovered backing resource",
+                    surface.path.display()
+                )));
+            }
+            _ => {
+                return Err(DispatchError::Validation(format!(
+                    "{} has ambiguous bindings to its discovered backing resource",
+                    surface.path.display()
+                )));
+            }
+        };
+        Some((resource, binding, secret_id, record))
+    } else {
+        None
+    };
+    let resolver = SurfaceResolver::new(catalog.clone(), Arc::clone(store));
+    let plaintext = zeroize::Zeroizing::new(match surface.kind {
+        SurfaceKind::File(FileBacking::Composed(_)) => resolver
+            .render_surface(surface_id)
+            .map_err(|error| DispatchError::Validation(error.to_string()))?
+            .bytes,
+        SurfaceKind::File(FileBacking::EnvFileDirect) => resolver
+            .read_direct_env_file(surface_id)
+            .map_err(|error| DispatchError::Validation(error.to_string()))?
+            .bytes,
+        SurfaceKind::UnixSocket => unreachable!("file surface checked above"),
+    });
+    let mode = cleanup.as_ref().map_or(0o600, |(_, _, _, record)| record.mode);
+    let restored_paths =
+        restore_configured_file_links(&snapshot, &surface, mount_path, &plaintext, mode)?;
+
+    let resource_removed = match cleanup.as_ref() {
+        Some((resource, binding, _, _)) => {
+            match catalog.remove_managed_file_configuration(
+                surface_id,
+                &binding.id,
+                &resource.id,
+            ) {
+                Ok(removal) => removal.resource_removed,
+                Err(error) => {
+                    rollback_configured_file_links(
+                        &restored_paths,
+                        mount_path,
+                        surface_id,
+                        &plaintext,
+                    );
+                    return Err(DispatchError::Catalog(error));
+                }
+            }
+        }
+        None => {
+            if let Err(error) = catalog.remove_surface(surface_id) {
+                rollback_configured_file_links(
+                    &restored_paths,
+                    mount_path,
+                    surface_id,
+                    &plaintext,
+                );
+                return Err(DispatchError::Catalog(error));
+            }
+            false
+        }
+    };
+
+    let storage_deleted = if resource_removed {
+        let secret_id = &cleanup
+            .as_ref()
+            .expect("removed resource has a discovered backing")
+            .2;
+        match store.delete(secret_id) {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    id = %secret_id,
+                    %error,
+                    "restored configured plaintext but could not delete encrypted history"
+                );
+                false
+            }
+        }
+    } else {
+        false
+    };
+    Ok(ControlResult::FileRestored {
+        path: surface.path,
+        storage_deleted,
+    })
+}
+
+fn restore_configured_file_links(
+    snapshot: &CatalogSnapshot,
+    surface: &Surface,
+    mount_path: &Path,
+    plaintext: &[u8],
+    mode: u32,
+) -> Result<Vec<PathBuf>, DispatchError> {
+    let target = mount_path
+        .join(accessfs_core::config::SURFACES_DIR)
+        .join(&surface.id);
+    let instances = file_surface_instances(snapshot)
+        .map_err(|error| DispatchError::Validation(error.to_string()))?
+        .into_iter()
+        .filter(|instance| instance.id == surface.id)
+        .collect::<Vec<_>>();
+    let mut restored = Vec::new();
+    for instance in instances {
+        match replace_symlink_with_file_if_target(&instance.path, &target, plaintext, mode) {
+            Ok(true) => restored.push(instance.path),
+            Ok(false) if instance.path == surface.path => {
+                rollback_configured_file_links(
+                    &restored,
+                    mount_path,
+                    &surface.id,
+                    plaintext,
+                );
+                return Err(DispatchError::Validation(format!(
+                    "{} no longer points to its configured managed file",
+                    surface.path.display()
+                )));
+            }
+            Ok(false) => {}
+            Err(source) => {
+                rollback_configured_file_links(
+                    &restored,
+                    mount_path,
+                    &surface.id,
+                    plaintext,
+                );
+                return Err(DispatchError::Io {
+                    path: instance.path,
+                    source,
+                });
+            }
+        }
+    }
+    Ok(restored)
+}
+
+fn rollback_configured_file_links(
+    restored_paths: &[PathBuf],
+    mount_path: &Path,
+    surface_id: &str,
+    plaintext: &[u8],
+) {
+    let target = mount_path
+        .join(accessfs_core::config::SURFACES_DIR)
+        .join(surface_id);
+    for path in restored_paths.iter().rev() {
+        match replace_regular_file_with_symlink_if_matches(path, &target, plaintext) {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(
+                path = %path.display(),
+                "configured file changed before rollback; preserving its plaintext"
+            ),
+            Err(error) => tracing::warn!(
+                path = %path.display(),
+                %error,
+                "rolling back configured file restore failed"
+            ),
+        }
+    }
 }
 
 fn configurable_file_format(

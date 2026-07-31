@@ -7,6 +7,7 @@ pub(super) fn dispatch(
 ) -> Result<ControlResult, DispatchError> {
     let DispatchServices {
         store,
+        store_arc,
         mount_path,
         policy,
         ssh_discovery,
@@ -278,6 +279,12 @@ pub(super) fn dispatch(
                 environment_id.as_deref(),
             )
         }
+        ControlCommand::ManagedFileRestore { id } => restore_managed_file(
+            catalog,
+            store_arc.ok_or(DispatchError::StoreUnavailable)?,
+            mount_path.ok_or(DispatchError::StoreUnavailable)?,
+            &id,
+        ),
         ControlCommand::FileRestore { id } => restore_file(
             catalog,
             store.ok_or(DispatchError::StoreUnavailable)?,

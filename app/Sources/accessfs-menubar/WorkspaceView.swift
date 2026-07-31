@@ -1504,11 +1504,9 @@ private struct SurfaceFooter: View {
 private struct ManageSurfaceSheet: View {
     @Bindable var store: WorkspaceStore
     let surface: WorkspaceSurface
-    let onRemoved: () -> Void
 
     @Environment(\.dismiss) private var dismiss
     @State private var isWorking = false
-    @State private var confirmingRemoval = false
     @State private var errorMessage: String?
     @State private var selectedBindingIDs: Set<WorkspaceBinding.ID> = []
     @State private var fileName: String
@@ -1519,13 +1517,9 @@ private struct ManageSurfaceSheet: View {
     @State private var sshPort: String
     @State private var sshForwardAgent: Bool
 
-    init(
-        store: WorkspaceStore, surface: WorkspaceSurface,
-        onRemoved: @escaping () -> Void = {}
-    ) {
+    init(store: WorkspaceStore, surface: WorkspaceSurface) {
         self.store = store
         self.surface = surface
-        self.onRemoved = onRemoved
         _fileName = State(initialValue: surface.name)
         _selectedKind = State(initialValue: surface.kind)
         _sshHostPatterns = State(
@@ -1683,17 +1677,6 @@ private struct ManageSurfaceSheet: View {
                 }
             }
 
-            Divider()
-            HStack {
-                Text("Removing this configuration keeps its reusable content.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button("Remove Configuration", systemImage: "trash", role: .destructive) {
-                    confirmingRemoval = true
-                }
-                .disabled(isWorking)
-            }
         }
         .padding(24)
         .frame(width: 620)
@@ -1711,12 +1694,6 @@ private struct ManageSurfaceSheet: View {
         .onChange(of: selectedKind) { _, kind in
             let allowed = Set(store.compatibleBindings(for: kind).map(\.id))
             selectedBindingIDs.formIntersection(allowed)
-        }
-        .alert("Remove configuration?", isPresented: $confirmingRemoval) {
-            Button("Cancel", role: .cancel) { }
-            Button("Remove", role: .destructive, action: removeSurface)
-        } message: {
-            Text("Floria removes only the managed link. Reusable content stays in the Library.")
         }
         .alert(
             "Could not update item",
@@ -1790,19 +1767,6 @@ private struct ManageSurfaceSheet: View {
             })
     }
 
-    private func removeSurface() {
-        Task {
-            isWorking = true
-            defer { isWorking = false }
-            do {
-                try await store.deleteSurface(surface.id)
-                onRemoved()
-                dismiss()
-            } catch {
-                errorMessage = error.localizedDescription
-            }
-        }
-    }
 }
 
 private struct SurfaceStatusBadge: View {
@@ -2042,9 +2006,13 @@ private struct LibraryCatalogView: View {
     @State private var selectedItem: LibraryCatalogItem?
 
     private var items: [LibraryCatalogItem] {
+        let surfaces = store.allSurfaces
         let all =
             store.protectedFiles.map(LibraryCatalogItem.file)
-            + store.resources.map(LibraryCatalogItem.resource)
+            + store.resources
+                .filter { !store.representedFileResourceIDs.contains($0.id) }
+                .map(LibraryCatalogItem.resource)
+            + surfaces.map(LibraryCatalogItem.surface)
         return all
             .filter { filter.includes($0) && $0.matches(search) }
             .sorted { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
@@ -2118,7 +2086,8 @@ private struct LibraryCatalogView: View {
                         Button("Details…", systemImage: "info.circle") {
                             selectedItem = item
                         }
-                        if case .file(let file) = item {
+                        switch item {
+                        case .file(let file):
                             Divider()
                             Button("Reveal in Finder", systemImage: "folder") {
                                 NSWorkspace.shared.activateFileViewerSelecting([
@@ -2128,6 +2097,18 @@ private struct LibraryCatalogView: View {
                             Button("Copy Path", systemImage: "doc.on.doc") {
                                 copyToPasteboard(file.path)
                             }
+                        case .surface(let surface):
+                            Divider()
+                            Button("Reveal in Finder", systemImage: "folder") {
+                                NSWorkspace.shared.activateFileViewerSelecting([
+                                    URL(fileURLWithPath: surface.path)
+                                ])
+                            }
+                            Button("Copy Path", systemImage: "doc.on.doc") {
+                                copyToPasteboard(surface.path)
+                            }
+                        case .resource:
+                            EmptyView()
                         }
                     } label: {
                         Image(systemName: "ellipsis")
@@ -2223,7 +2204,8 @@ struct LibraryItemDetailSheet: View {
         switch currentItem {
         case .file(let file): file.metadata
         case .resource(let resource): resource.metadata
-        case .surface: .empty
+        case .surface(let surface):
+            store.backingResource(for: surface)?.metadata ?? .empty
         }
     }
 
@@ -2351,6 +2333,11 @@ struct LibraryItemDetailSheet: View {
                                     }
                                 }
                             case .surface(let surface):
+                                if let resource = store.backingResource(for: surface) {
+                                    Button("Edit Info…", systemImage: "pencil") {
+                                        editingResource = resource
+                                    }
+                                }
                                 Button("Configure…", systemImage: "slider.horizontal.3") {
                                     editingSurface = surface
                                 }
@@ -2413,9 +2400,7 @@ struct LibraryItemDetailSheet: View {
             EditResourceMetadataSheet(store: store, resource: resource)
         }
         .sheet(item: $editingSurface) { surface in
-            ManageSurfaceSheet(
-                store: store, surface: surface,
-                onRemoved: { dismiss() })
+            ManageSurfaceSheet(store: store, surface: surface)
         }
         .sheet(item: $historyFile) { file in
             ProtectedFileHistorySheet(store: store, file: file)
@@ -2470,8 +2455,10 @@ struct LibraryItemDetailSheet: View {
             resource.kind == .sshIdentity ? "Delete this SSH identity" : "Disconnect this SSH agent"
         case .resource:
             nil
-        case .surface:
-            nil
+        case .surface(let surface):
+            surface.kind == .unixSocket
+                ? "Remove this socket"
+                : "Stop protecting this file"
         }
     }
 
@@ -2485,8 +2472,10 @@ struct LibraryItemDetailSheet: View {
             "The external agent is not changed."
         case .resource:
             "This permanently removes the encrypted value and version history."
+        case .surface(let surface) where surface.kind == .unixSocket:
+            "Remove the local socket. Its reusable SSH identities stay in the Library."
         case .surface:
-            ""
+            "Restore the current generated content at this path. Reusable content used elsewhere stays in the Library."
         }
     }
 
@@ -2495,7 +2484,8 @@ struct LibraryItemDetailSheet: View {
         case .file: "Stop Protecting…"
         case .resource(let resource) where resource.kind == .sshAgent: "Disconnect…"
         case .resource: "Delete…"
-        case .surface: ""
+        case .surface(let surface):
+            surface.kind == .unixSocket ? "Remove Socket…" : "Stop Protecting…"
         }
     }
 
@@ -2503,7 +2493,7 @@ struct LibraryItemDetailSheet: View {
         switch currentItem {
         case .file(let file): !file.linked
         case .resource(let resource): resource.usageCount > 0
-        case .surface: true
+        case .surface: false
         }
     }
 
@@ -2516,8 +2506,10 @@ struct LibraryItemDetailSheet: View {
             "Delete SSH identity?"
         case .resource:
             "Delete secret?"
-        case .surface:
-            "Remove managed item?"
+        case .surface(let surface):
+            surface.kind == .unixSocket
+                ? "Remove managed socket?"
+                : "Restore plaintext and stop protecting?"
         }
     }
 
@@ -2531,8 +2523,10 @@ struct LibraryItemDetailSheet: View {
             "Floria removes only its saved identity metadata. The external agent is not changed."
         case .resource:
             "This permanently removes the encrypted value and version history."
-        case .surface:
-            ""
+        case .surface(let surface) where surface.kind == .unixSocket:
+            "Floria removes the local socket at \(surface.path). Reusable SSH identities are not deleted."
+        case .surface(let surface):
+            "Floria will restore the current generated content at \(surface.path), then remove this file from Managed."
         }
     }
 
@@ -2545,7 +2539,11 @@ struct LibraryItemDetailSheet: View {
         case .resource(let resource):
             editingResource = resource
         case .surface(let surface):
-            editingSurface = surface
+            if let resource = store.backingResource(for: surface) {
+                editingResource = resource
+            } else {
+                editingSurface = surface
+            }
         }
     }
 
@@ -2598,8 +2596,12 @@ struct LibraryItemDetailSheet: View {
                     try await store.removeSshAgentResource(resource.id)
                 case .resource:
                     return
-                case .surface:
-                    return
+                case .surface(let surface):
+                    if surface.kind == .unixSocket {
+                        try await store.deleteSurface(surface.id)
+                    } else {
+                        try await store.restoreManagedFile(surface.id)
+                    }
                 }
                 dismiss()
             } catch {

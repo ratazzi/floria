@@ -876,6 +876,7 @@ enum ControlCommand: Sendable {
     case protectedFileMetadataUpdate(
         id: String, enforcement: String, metadata: ItemMetadata)
     case managedFileConfigure(id: String, projectID: String, environmentID: String?)
+    case managedFileRestore(String)
     case fileRestore(String)
     case sharedSecretCreate(
         resourceID: String, name: String, defaultEnvKey: String?, value: String,
@@ -934,6 +935,7 @@ enum ControlCommand: Sendable {
         case .protectedFileRollback: "protected_file_rollback"
         case .protectedFileMetadataUpdate: "protected_file_metadata_update"
         case .managedFileConfigure: "managed_file_configure"
+        case .managedFileRestore: "managed_file_restore"
         case .fileRestore: "file_restore"
         case .sharedSecretCreate: "shared_secret_create"
         case .sharedSecretUpdate: "shared_secret_update"
@@ -1044,7 +1046,7 @@ enum ControlCommand: Sendable {
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: FileProtectParams(path: path)))
-        case .protectedFileHistory(let id), .fileRestore(let id):
+        case .protectedFileHistory(let id), .managedFileRestore(let id), .fileRestore(let id):
             return try encoder.encode(
                 ControlRequest(
                     requestID: requestID, method: method,

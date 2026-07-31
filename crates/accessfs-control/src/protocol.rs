@@ -114,6 +114,7 @@ pub enum ControlCommand {
         project_id: String,
         environment_id: Option<String>,
     },
+    ManagedFileRestore { id: String },
     FileRestore { id: String },
     ResolveEnvironment { project_id: String, environment_id: String },
     ResourceUsage { resource_id: String },
@@ -1065,6 +1066,20 @@ mod tests {
         assert_eq!(value["params"]["id"], "fixture-secret");
         assert_eq!(value["params"]["project_id"], "fixture-project");
         assert_eq!(value["params"]["environment_id"], "fixture-development");
+    }
+
+    #[test]
+    fn configured_managed_file_restore_names_the_surface() {
+        let request = ControlRequest {
+            request_id: 11,
+            command: ControlCommand::ManagedFileRestore {
+                id: "fixture-surface".to_string(),
+            },
+        };
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["method"], "managed_file_restore");
+        assert_eq!(value["params"]["id"], "fixture-surface");
     }
 
     #[test]

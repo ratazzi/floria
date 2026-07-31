@@ -162,6 +162,102 @@ impl Catalog {
         remove_one(&self.connection()?, "surfaces", id, "surface")
     }
 
+    /// Remove the configured representation of one discovered file in a single transaction.
+    ///
+    /// Only the binding/resource created for that discovered file are eligible for cleanup.
+    /// Reuse by another surface or binding keeps them in the catalog.
+    pub fn remove_managed_file_configuration(
+        &self,
+        surface_id: &str,
+        binding_id: &str,
+        resource_id: &str,
+    ) -> CatalogResult<ManagedFileConfigurationRemoval> {
+        require_id(surface_id, "surface id")?;
+        require_id(binding_id, "binding id")?;
+        require_id(resource_id, "resource id")?;
+        let mut conn = self.connection()?;
+        let tx = conn.transaction()?;
+        let snapshot = snapshot_from(&tx)?;
+        let surface = snapshot
+            .surfaces
+            .iter()
+            .find(|surface| surface.id == surface_id)
+            .ok_or_else(|| CatalogError::NotFound(format!("surface {surface_id}")))?;
+        if !surface.kind.is_file() {
+            return Err(CatalogError::Validation(format!(
+                "surface {surface_id:?} is not a managed file"
+            )));
+        }
+        let binding = snapshot
+            .bindings
+            .iter()
+            .find(|binding| binding.id == binding_id)
+            .ok_or_else(|| CatalogError::NotFound(format!("binding {binding_id}")))?;
+        if binding.resource_id != resource_id {
+            return Err(CatalogError::Validation(format!(
+                "binding {binding_id:?} does not reference resource {resource_id:?}"
+            )));
+        }
+        let resource = snapshot
+            .resources
+            .iter()
+            .find(|resource| resource.id == resource_id)
+            .ok_or_else(|| CatalogError::NotFound(format!("resource {resource_id}")))?;
+        let is_discovered_file_resource = resource.origin.kind == OriginKind::Discovered
+            && resource.origin.sources.len() == 1
+            && resource.origin.sources[0].path == surface.path;
+        if !is_discovered_file_resource {
+            return Err(CatalogError::Validation(format!(
+                "resource {resource_id:?} was not created from {}",
+                surface.path.display()
+            )));
+        }
+
+        tx.execute("DELETE FROM surfaces WHERE id = ?1", [surface_id])?;
+
+        let binding_still_used = snapshot
+            .surfaces
+            .iter()
+            .filter(|candidate| candidate.id != surface_id)
+            .any(|candidate| {
+                candidate
+                    .input
+                    .binding_ids()
+                    .is_some_and(|ids| ids.iter().any(|id| id == binding_id))
+            });
+        let binding_removed = !binding_still_used;
+        if binding_removed {
+            tx.execute("DELETE FROM bindings WHERE id = ?1", [binding_id])?;
+        }
+
+        let resource_still_bound = snapshot.bindings.iter().any(|candidate| {
+            candidate.resource_id == resource_id
+                && (!binding_removed || candidate.id != binding_id)
+        });
+        let resource_still_direct = snapshot
+            .surfaces
+            .iter()
+            .filter(|candidate| candidate.id != surface_id)
+            .any(|candidate| {
+                matches!(
+                    &candidate.input,
+                    SurfaceInput::Resource { resource_id: candidate_id }
+                        if candidate_id == resource_id
+                )
+            });
+        let resource_removed = !resource_still_bound && !resource_still_direct;
+        if resource_removed {
+            tx.execute("DELETE FROM resources WHERE id = ?1", [resource_id])?;
+        }
+
+        validate_snapshot_conflicts(&snapshot_from(&tx)?)?;
+        tx.commit()?;
+        Ok(ManagedFileConfigurationRemoval {
+            binding_removed,
+            resource_removed,
+        })
+    }
+
     /// Resolve enabled common and environment bindings to export metadata with provenance.
     /// No secret value is decrypted or returned.
     pub fn resolve_environment(
