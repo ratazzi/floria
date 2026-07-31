@@ -1,0 +1,84 @@
+#!/bin/bash
+set -euo pipefail
+
+VERSION="$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')"
+BUILD_NUMBER="${BUILD_NUMBER:-$(date +%Y%m%d%H%M)}"
+SIGN_IDENTITY="${SIGN_IDENTITY:--}"
+APP_NAME="Floria"
+APP_BUNDLE="app/.build/${APP_NAME}.app"
+OUTPUT_DMG="${OUTPUT_DMG:-build/${APP_NAME}-${VERSION}.dmg}"
+OUTPUT_DIRECTORY="$(dirname "${OUTPUT_DMG}")"
+OUTPUT_BASENAME="$(basename "${OUTPUT_DMG}")"
+PARTIAL_DMG="${OUTPUT_DIRECTORY}/.${OUTPUT_BASENAME}.partial.$$.dmg"
+STAGING_DIRECTORY="$(mktemp -d "${TMPDIR:-/private/tmp}/floria-dmg-stage.XXXXXX")"
+MOUNT_DIRECTORY="$(mktemp -d "${TMPDIR:-/private/tmp}/floria-dmg-mount.XXXXXX")"
+MOUNTED=0
+
+cleanup() {
+    local cleanup_status=$?
+    trap - EXIT INT TERM
+    if ((MOUNTED == 1)); then
+        hdiutil detach "${MOUNT_DIRECTORY}" -quiet || true
+    fi
+    rm -rf "${STAGING_DIRECTORY}" "${MOUNT_DIRECTORY}"
+    rm -f "${PARTIAL_DMG}"
+    exit "${cleanup_status}"
+}
+trap cleanup EXIT INT TERM
+
+if [[ -e "${OUTPUT_DMG}" ]]; then
+    echo "Refusing to overwrite existing DMG: ${OUTPUT_DMG}" >&2
+    exit 1
+fi
+
+mkdir -p "${OUTPUT_DIRECTORY}"
+BUILD_NUMBER="${BUILD_NUMBER}" SIGN_IDENTITY="${SIGN_IDENTITY}" scripts/build-app
+
+echo "==> Staging ${APP_NAME}.app"
+ditto "${APP_BUNDLE}" "${STAGING_DIRECTORY}/${APP_NAME}.app"
+ln -s /Applications "${STAGING_DIRECTORY}/Applications"
+
+echo "==> Creating ${OUTPUT_DMG}"
+hdiutil create \
+    -volname "${APP_NAME}" \
+    -srcfolder "${STAGING_DIRECTORY}" \
+    -format UDZO \
+    -imagekey zlib-level=9 \
+    "${PARTIAL_DMG}" >/dev/null
+
+if [[ "${SIGN_IDENTITY}" != "-" ]]; then
+    echo "==> Signing DMG"
+    codesign --force --sign "${SIGN_IDENTITY}" --timestamp "${PARTIAL_DMG}"
+    codesign --verify --strict "${PARTIAL_DMG}"
+fi
+
+echo "==> Verifying DMG contents"
+hdiutil verify "${PARTIAL_DMG}" >/dev/null
+hdiutil attach \
+    -readonly \
+    -nobrowse \
+    -mountpoint "${MOUNT_DIRECTORY}" \
+    "${PARTIAL_DMG}" >/dev/null
+MOUNTED=1
+
+MOUNTED_APP="${MOUNT_DIRECTORY}/${APP_NAME}.app"
+MOUNTED_DAEMON="${MOUNTED_APP}/Contents/Resources/floria"
+MOUNTED_BUNDLE_IDENTIFIER="$(
+    /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "${MOUNTED_APP}/Contents/Info.plist"
+)"
+if [[ "$(readlink "${MOUNT_DIRECTORY}/Applications")" != "/Applications" ]]; then
+    echo "DMG Applications link does not point to /Applications" >&2
+    exit 1
+fi
+if [[ "${MOUNTED_BUNDLE_IDENTIFIER}" != "floria.hola.ac" ]]; then
+    echo "DMG app has the wrong bundle identifier" >&2
+    exit 1
+fi
+codesign --verify --deep --strict "${MOUNTED_APP}"
+"${MOUNTED_DAEMON}" --version >/dev/null
+
+hdiutil detach "${MOUNT_DIRECTORY}" -quiet
+MOUNTED=0
+mv "${PARTIAL_DMG}" "${OUTPUT_DMG}"
+
+echo "==> DMG: ${OUTPUT_DMG}"

@@ -13,6 +13,15 @@ run = "scripts/build-app"
 description = "Build Floria.app (Rust daemon + Swift UI) and install it in /Applications"
 run = "scripts/install-app"
 
+[tasks.package-dmg]
+description = "Build, sign, package, and verify a Floria DMG without overwriting an existing image"
+run = "scripts/package-dmg"
+
+[tasks.notarize-dmg]
+description = "Submit a Developer ID-signed DMG using a notarytool Keychain profile"
+run = "scripts/notarize-dmg"
+raw = true
+
 [tasks.smoke-app]
 description = "Install Floria.app and verify cold-start and runtime daemon recovery"
 depends = ["install-app"]
