@@ -35,14 +35,20 @@ wait_for_app_to_stop() {
     return 1
 }
 
-wait_for_app_to_start() {
+start_installed_app() {
     local deadline=$((SECONDS + WAIT_SECONDS))
 
     while ((SECONDS < deadline)); do
         if pgrep -x "${APP_NAME}" >/dev/null; then
             return 0
         fi
-        sleep 0.25
+
+        # LaunchServices can briefly retain the just-terminated instance while the
+        # bundle at the same path is being replaced, returning -600 on the first open.
+        # Retry the launch instead of treating that transient registration state as
+        # an installation failure.
+        open -na "${INSTALLED_APP}" >/dev/null 2>&1 || true
+        sleep 1
     done
 
     echo "Timed out waiting for the installed ${APP_NAME} app to start" >&2
@@ -100,8 +106,7 @@ else
 fi
 
 echo "==> Starting installed ${APP_NAME} app"
-open -na "${INSTALLED_APP}"
-wait_for_app_to_start
+start_installed_app
 
 if [[ -d /Library/Filesystems/macfuse.fs ]]; then
     echo "==> Waiting for daemon revision ${EXPECTED_REVISION}"
