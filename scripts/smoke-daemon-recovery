@@ -7,6 +7,8 @@ DAEMON_PATH="${APP_PATH}/Contents/Resources/floria"
 INFO_PLIST="${APP_PATH}/Contents/Info.plist"
 RUNTIME_DIRECTORY="${HOME}/Library/Application Support/floria"
 CONFIG_PATH="${RUNTIME_DIRECTORY}/floria.toml"
+AGENT_SOCKET="${RUNTIME_DIRECTORY}/agent.sock"
+CONTROL_SOCKET="${RUNTIME_DIRECTORY}/control.sock"
 SERVICE_LABEL="floria.hola.ac.daemon"
 SERVICE_TARGET="gui/$(id -u)/${SERVICE_LABEL}"
 LAUNCH_AGENT_PLIST="${HOME}/Library/LaunchAgents/${SERVICE_LABEL}.plist"
@@ -59,6 +61,49 @@ job_runs() {
     else
         printf '0\n'
     fi
+}
+
+job_pid() {
+    local value
+    value="$(job_value pid || true)"
+    if [[ "${value}" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "${value}"
+    else
+        printf '0\n'
+    fi
+}
+
+socket_inode() {
+    local path="$1"
+    stat -f '%i' "${path}" 2>/dev/null || true
+}
+
+assert_daemon_owns_socket() {
+    local pid="$1"
+    local path="$2"
+
+    if ! /usr/sbin/lsof -n -Fn -a -p "${pid}" "${path}" 2>/dev/null |
+        awk -v path="${path}" '$0 == "n" path { found = 1 } END { exit !found }'; then
+        echo "Daemon ${pid} does not own runtime socket ${path}" >&2
+        /usr/sbin/lsof -n -U -a -p "${pid}" >&2 || true
+        return 1
+    fi
+}
+
+wait_for_process_exit() {
+    local pid="$1"
+    local description="$2"
+    local deadline=$((SECONDS + WAIT_SECONDS))
+
+    while ((SECONDS < deadline)); do
+        if ! kill -0 "${pid}" 2>/dev/null; then
+            return 0
+        fi
+        sleep 0.25
+    done
+
+    echo "Timed out waiting for ${description} (pid ${pid}) to exit" >&2
+    return 1
 }
 
 wait_for_job_state() {
@@ -234,12 +279,50 @@ fi
 echo "==> Verifying runtime daemon recovery"
 app_pid="$(pgrep -x "${APP_NAME}" | awk 'NR == 1 { first = $0 } END { print first }')"
 runtime_runs_before="$(job_runs)"
+old_daemon_pid="$(job_pid)"
+if [[ "${old_daemon_pid}" == "0" ]]; then
+    echo "Could not capture the running daemon generation before recovery" >&2
+    exit 1
+fi
+assert_daemon_owns_socket "${old_daemon_pid}" "${AGENT_SOCKET}"
+assert_daemon_owns_socket "${old_daemon_pid}" "${CONTROL_SOCKET}"
 /bin/launchctl stop "${SERVICE_LABEL}"
 wait_for_job_restart "${runtime_runs_before}" "the running app to recover its daemon"
 if ! kill -0 "${app_pid}" 2>/dev/null; then
     echo "Runtime recovery restarted the Floria app instead of only its daemon" >&2
     exit 1
 fi
+new_daemon_pid="$(job_pid)"
+if [[ "${new_daemon_pid}" == "0" || "${new_daemon_pid}" == "${old_daemon_pid}" ]]; then
+    echo "Runtime recovery did not replace daemon pid ${old_daemon_pid}" >&2
+    exit 1
+fi
+wait_for_process_exit "${old_daemon_pid}" "the previous Floria daemon"
+
+new_agent_inode="$(socket_inode "${AGENT_SOCKET}")"
+new_control_inode="$(socket_inode "${CONTROL_SOCKET}")"
+if [[ -z "${new_agent_inode}" ]]; then
+    echo "Agent socket is missing after daemon recovery" >&2
+    exit 1
+fi
+if [[ -z "${new_control_inode}" ]]; then
+    echo "Control socket is missing after daemon recovery" >&2
+    exit 1
+fi
+assert_daemon_owns_socket "${new_daemon_pid}" "${AGENT_SOCKET}"
+assert_daemon_owns_socket "${new_daemon_pid}" "${CONTROL_SOCKET}"
+
+# Give any delayed cleanup from the old generation a chance to run. The new daemon must retain
+# both pathname identities and ownership throughout the handoff.
+sleep 1
+if [[ "$(job_pid)" != "${new_daemon_pid}" ||
+    "$(socket_inode "${AGENT_SOCKET}")" != "${new_agent_inode}" ||
+    "$(socket_inode "${CONTROL_SOCKET}")" != "${new_control_inode}" ]]; then
+    echo "The recovered daemon generation changed during the handoff stability window" >&2
+    exit 1
+fi
+assert_daemon_owns_socket "${new_daemon_pid}" "${AGENT_SOCKET}"
+assert_daemon_owns_socket "${new_daemon_pid}" "${CONTROL_SOCKET}"
 
 echo "==> Verifying recovered installation health"
 wait_for_doctor "the recovered Floria installation to become healthy"

@@ -234,14 +234,15 @@ final class AppState {
         }
     }
 
-    /// The socket closes before the mount process has necessarily exited. Reconcile after a
-    /// short delay so a clean daemon exit cannot leave a running app permanently offline.
-    /// `ensureRunning` is idempotent when launchd has already restarted the process.
+    /// The socket closes before the mount process has necessarily exited. Let the daemon manager
+    /// observe launchd's KeepAlive restart before it actively reconciles the job; immediately
+    /// kickstarting a loaded job would leave launchd's throttled restart queued and cause a
+    /// second unnecessary daemon generation.
     private func scheduleDaemonRecoveryAfterDisconnect() {
         guard DaemonManager.isProductionApp, MacFuseSetupStage.isInstalled else { return }
         let manager = daemonManager
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1) {
-            manager.ensureRunning()
+            manager.recoverAfterDisconnect()
         }
     }
 

@@ -2,6 +2,23 @@ import Darwin
 import Foundation
 import os
 
+struct SocketPathIdentity: Equatable {
+    let device: dev_t
+    let inode: ino_t
+    let birthSeconds: Int
+    let birthNanoseconds: Int
+
+    static func read(from path: String) -> SocketPathIdentity? {
+        var value = stat()
+        guard lstat(path, &value) == 0 else { return nil }
+        return SocketPathIdentity(
+            device: value.st_dev,
+            inode: value.st_ino,
+            birthSeconds: value.st_birthtimespec.tv_sec,
+            birthNanoseconds: value.st_birthtimespec.tv_nsec)
+    }
+}
+
 /// Persistent Unix-socket client to the daemon. Runs a background read loop and
 /// auto-reconnects. Callbacks fire on the read thread; the UI layer re-dispatches to main.
 final class AgentClient {
@@ -12,9 +29,9 @@ final class AgentClient {
     /// may be sending a decision — an unguarded close would race a write onto a dead (or
     /// kernel-reused) descriptor.
     private var fd: Int32 = -1
-    /// (dev, inode) of the socket path when the current connection was made; guarded by
-    /// `writeLock`. Used to notice a daemon restart re-binding the path (see watchdog).
-    private var connectedIdentity: (dev: dev_t, ino: ino_t)?
+    /// Filesystem identity of the socket path when the current connection was made; guarded by
+    /// `writeLock`. Birth time distinguishes an immediate re-bind even when APFS reuses the inode.
+    private var connectedIdentity: SocketPathIdentity?
     /// Serializes writes and fd lifecycle: decisions come from the main thread while hello
     /// and close/reconnect come from the reconnect thread — interleaved bytes would corrupt
     /// the frame stream.
@@ -66,7 +83,7 @@ final class AgentClient {
             let recorded = connectedIdentity
             writeLock.unlock()
             guard f >= 0, let recorded, let current = pathIdentity() else { continue }
-            if current.dev != recorded.dev || current.ino != recorded.ino {
+            if current != recorded {
                 Self.log.warning("agent socket was re-bound by a new daemon; dropping stale connection")
                 // shutdown (not close) wakes the blocked read without freeing the fd number,
                 // so a concurrent send cannot race onto a reused descriptor.
@@ -75,10 +92,8 @@ final class AgentClient {
         }
     }
 
-    private func pathIdentity() -> (dev: dev_t, ino: ino_t)? {
-        var st = stat()
-        guard stat(socketPath, &st) == 0 else { return nil }
-        return (st.st_dev, st.st_ino)
+    private func pathIdentity() -> SocketPathIdentity? {
+        SocketPathIdentity.read(from: socketPath)
     }
 
     private func connectOnce() -> Bool {

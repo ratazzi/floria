@@ -81,6 +81,41 @@ struct DaemonManager: Sendable {
         }
     }
 
+    /// Recover an unexpectedly disconnected daemon without racing launchd's KeepAlive restart.
+    ///
+    /// A stopped KeepAlive job remains loaded while launchd waits for its throttle interval.
+    /// Calling `kickstart` during that window starts one process immediately, but does not cancel
+    /// the pending restart; launchd then terminates that fresh process and creates a third
+    /// generation. Give the scheduled restart one full interval before reconciling manually.
+    func recoverAfterDisconnect() {
+        guard Self.isProductionApp else { return }
+
+        switch currentLaunchAgentState {
+        case .running:
+            return
+        case .notLoaded:
+            ensureRunning()
+            return
+        case .loaded:
+            break
+        }
+
+        for _ in 0..<24 {
+            Thread.sleep(forTimeInterval: 0.25)
+            switch currentLaunchAgentState {
+            case .running:
+                Self.log.info("daemon recovered through LaunchAgent KeepAlive")
+                return
+            case .notLoaded:
+                ensureRunning()
+                return
+            case .loaded:
+                continue
+            }
+        }
+        ensureRunning()
+    }
+
     /// Stop the managed daemon. Used while macFUSE setup is incomplete: without the kext the
     /// daemon can only fail to mount, and KeepAlive would keep it in a restart loop.
     func stop() {
