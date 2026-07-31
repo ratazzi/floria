@@ -79,6 +79,7 @@ struct DashboardView: View {
     @State private var isDiscovering = false
     @State private var discovery: DiscoveryPresentation?
     @State private var showingAccessLog = false
+    @State private var showingSystemHealth = false
     @State private var pendingAuditWindow: AuditOnlyWindow?
     @State private var showingAuditConfirmation = false
     @State private var backupNotice: BackupNotice?
@@ -158,6 +159,15 @@ struct DashboardView: View {
         .sheet(isPresented: $showingAccessLog) {
             AccessLogView(state: state)
                 .frame(minWidth: 920, minHeight: 620)
+        }
+        .sheet(isPresented: $showingSystemHealth) {
+            SystemHealthView(state: state)
+        }
+        .onAppear {
+            presentRequestedSystemHealth()
+        }
+        .onChange(of: state.systemHealthPresentationRequested) {
+            presentRequestedSystemHealth()
         }
         .confirmationDialog(
             "Enable Audit Only?", isPresented: $showingAuditConfirmation,
@@ -339,32 +349,44 @@ struct DashboardView: View {
                     showingAuditConfirmation = true
                 },
                 refresh: reload,
+                openSystemHealth: {
+                    showingSystemHealth = true
+                },
                 openAccessLog: {
                     showingAccessLog = true
                 })
         } label: {
+            let needsAttention =
+                state.systemHealth?.hasIssues == true || state.systemHealthError != nil
+            let statusColor = needsAttention || auditOnly ? Color.orange : Color.green
             HStack(spacing: 7) {
                 Image(
-                    systemName: auditOnly
+                    systemName: needsAttention
+                        ? "exclamationmark.shield.fill"
+                        : auditOnly
                         ? "eye.circle.fill"
                         : (state.connected ? "checkmark.shield.fill" : "shield.slash"))
-                Text(auditOnly ? "Audit Only" : (state.connected ? "Protected" : "Offline"))
+                Text(
+                    needsAttention
+                        ? "Needs Attention"
+                        : (auditOnly ? "Audit Only" : (state.connected ? "Protected" : "Offline")))
                     .lineLimit(1)
             }
             .font(.callout.weight(.medium))
             .foregroundStyle(
-                auditOnly ? Color.orange : (state.connected ? Color.green : Color.secondary)
+                needsAttention
+                    ? Color.orange
+                    : (auditOnly ? Color.orange : (state.connected ? Color.green : Color.secondary))
             )
             .padding(.horizontal, 11)
             .frame(height: 34)
             .background(
-                (auditOnly ? Color.orange : Color.green).opacity(state.connected ? 0.09 : 0.04),
+                statusColor.opacity(state.connected ? 0.09 : 0.04),
                 in: RoundedRectangle(cornerRadius: 9))
             .overlay {
                 RoundedRectangle(cornerRadius: 9)
                     .stroke(
-                        (auditOnly ? Color.orange : Color.green).opacity(
-                            state.connected ? 0.22 : 0.08),
+                        statusColor.opacity(state.connected ? 0.22 : 0.08),
                         lineWidth: 1)
             }
         }
@@ -373,11 +395,13 @@ struct DashboardView: View {
         .fixedSize()
         .accessibilityLabel("Security mode")
         .accessibilityValue(
-            auditOnly
-                ? "Audit Only"
-                : (state.connected
-                    ? "Protected; using each item's security level"
-                    : "Daemon offline"))
+            state.systemHealth?.hasIssues == true || state.systemHealthError != nil
+                ? "System health needs attention"
+                : (auditOnly
+                    ? "Audit Only"
+                    : (state.connected
+                        ? "Protected; using each item's security level"
+                        : "Daemon offline")))
     }
 
     private var projectsSection: some View {
@@ -729,8 +753,15 @@ struct DashboardView: View {
     private func reload() {
         Task {
             await state.workspace.reload(reportErrors: true)
+            await state.reloadSystemHealth()
             await state.reloadPolicyMode()
         }
+    }
+
+    private func presentRequestedSystemHealth() {
+        guard state.systemHealthPresentationRequested else { return }
+        state.systemHealthPresentationRequested = false
+        showingSystemHealth = true
     }
 
     private func chooseDiscoverySource() {

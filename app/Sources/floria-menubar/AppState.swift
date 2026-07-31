@@ -75,6 +75,9 @@ final class AppState {
     var workspace: WorkspaceStore
     var policyMode = RuntimePolicyStatus.normal
     var policyModeError: String?
+    var systemHealth: SystemHealthReport?
+    var systemHealthError: String?
+    var systemHealthPresentationRequested = false
     var activeGrants: [ActiveGrant] = []
     var activeGrantsError: String?
     var accessHistoryLoading = false
@@ -86,6 +89,7 @@ final class AppState {
     @ObservationIgnored private var client: AgentClient!
     @ObservationIgnored private let controlClient: ControlClient
     @ObservationIgnored private var policyRefreshTask: Task<Void, Never>?
+    @ObservationIgnored private var healthRefreshTask: Task<Void, Never>?
     @ObservationIgnored private var checkoutRefreshTask: Task<Void, Never>?
     @ObservationIgnored private let prompter = PromptPresenter()
     @ObservationIgnored private let daemonManager = DaemonManager()
@@ -121,11 +125,14 @@ final class AppState {
                     Task {
                         await self.workspace.reload()
                         await self.workspace.refreshProjectCheckoutDiscoveries()
+                        await self.reloadSystemHealth()
                         await self.reloadPolicyMode()
                         await self.reloadActiveGrants()
                         await self.loadAccessHistoryIfNeeded()
                     }
                 } else {
+                    self.systemHealth = nil
+                    self.systemHealthError = nil
                     self.scheduleDaemonRecoveryAfterDisconnect()
                 }
             }
@@ -159,6 +166,7 @@ final class AppState {
         Task {
             await workspace.reload()
             await workspace.refreshProjectCheckoutDiscoveries()
+            await reloadSystemHealth()
             await reloadPolicyMode()
             await reloadActiveGrants()
             await loadAccessHistoryIfNeeded()
@@ -169,6 +177,13 @@ final class AppState {
                 guard let self, !Task.isCancelled else { return }
                 await self.reloadPolicyMode()
                 await self.reloadActiveGrants()
+            }
+        }
+        healthRefreshTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 60_000_000_000)
+                guard let self, !Task.isCancelled else { return }
+                await self.reloadSystemHealth()
             }
         }
         checkoutRefreshTask = Task { [weak self] in
@@ -265,6 +280,16 @@ final class AppState {
             policyModeError = nil
         } catch {
             policyModeError = error.localizedDescription
+        }
+    }
+
+    func reloadSystemHealth() async {
+        guard connected else { return }
+        do {
+            systemHealth = try await controlClient.health()
+            systemHealthError = nil
+        } catch {
+            systemHealthError = error.localizedDescription
         }
     }
 

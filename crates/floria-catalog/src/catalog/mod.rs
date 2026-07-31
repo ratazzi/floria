@@ -87,6 +87,15 @@ impl Catalog {
         Ok(snapshot)
     }
 
+    /// Check SQLite integrity and validate the complete live catalog without modifying it.
+    ///
+    /// This is intentionally deeper than [`Catalog::snapshot`]: health checks use it to
+    /// distinguish a readable catalog from one whose underlying SQLite pages are damaged.
+    pub fn verify_integrity(&self) -> CatalogResult<CatalogSnapshot> {
+        let conn = self.connection()?;
+        inspect_connection(&conn)
+    }
+
     /// Create a transactionally consistent SQLite copy without pausing readers or writers.
     ///
     /// The destination must not exist. It is created private and is a standalone database:
@@ -123,21 +132,25 @@ impl Catalog {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
                 | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version != SCHEMA_VERSION {
-            return Err(CatalogError::UnsupportedSchema {
-                found: version,
-                expected: SCHEMA_VERSION,
-            });
-        }
-        let quick_check: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
-        if quick_check != "ok" {
-            return Err(CatalogError::Validation(format!(
-                "catalog integrity check failed: {quick_check}"
-            )));
-        }
-        snapshot_from(&conn)
+        inspect_connection(&conn)
     }
+}
+
+fn inspect_connection(conn: &Connection) -> CatalogResult<CatalogSnapshot> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != SCHEMA_VERSION {
+        return Err(CatalogError::UnsupportedSchema {
+            found: version,
+            expected: SCHEMA_VERSION,
+        });
+    }
+    let quick_check: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
+    if quick_check != "ok" {
+        return Err(CatalogError::Validation(format!(
+            "catalog integrity check failed: {quick_check}"
+        )));
+    }
+    snapshot_from(conn)
 }
 
 mod projects;
@@ -299,6 +312,16 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(persisted, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn live_integrity_check_returns_the_validated_snapshot() {
+        let (_dir, catalog) = catalog();
+
+        let snapshot = catalog.verify_integrity().unwrap();
+
+        assert_eq!(snapshot.projects, vec![project()]);
+        assert_eq!(snapshot.environments, vec![environment()]);
     }
 
     #[test]

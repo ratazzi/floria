@@ -13,6 +13,7 @@ pub(super) fn dispatch(
         ssh_discovery,
         ssh_config,
         backup,
+        health,
         checkout_monitor,
         audit_log,
         ssh_runtime_dir,
@@ -27,6 +28,13 @@ pub(super) fn dispatch(
             store_format_version: floria_store::STORE_FORMAT_VERSION,
             minimum_store_format_version: floria_store::MIN_SUPPORTED_STORE_FORMAT_VERSION,
         }),
+        ControlCommand::Health => health
+            .map(|reporter| ControlResult::Health(reporter.report()))
+            .ok_or_else(|| {
+                DispatchError::Validation(
+                    "runtime health is unavailable on this control server".to_string(),
+                )
+            }),
         ControlCommand::PolicyModeGet => policy
             .map(|controller| ControlResult::PolicyMode(controller.policy_mode()))
             .ok_or_else(|| {

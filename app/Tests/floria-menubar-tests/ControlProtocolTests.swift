@@ -15,7 +15,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertNil(request["params"])
 
         let response = Data(
-            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":1,"daemon_version":"0.1.0","schema_version":12,"minimum_schema_version":12,"store_format_version":2,"minimum_store_format_version":1}}}"#.utf8)
+            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":2,"daemon_version":"0.1.0","schema_version":12,"minimum_schema_version":12,"store_format_version":2,"minimum_store_format_version":1}}}"#.utf8)
         let decoded = try JSONDecoder().decode(
             ControlResponseEnvelope<ControlServerInfo>.self, from: response)
         let info = try XCTUnwrap(decoded.result?.value)
@@ -26,6 +26,27 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(info.minimumSchemaVersion, 12)
         XCTAssertEqual(info.storeFormatVersion, 2)
         XCTAssertEqual(info.minimumStoreFormatVersion, 1)
+    }
+
+    func testHealthRequestAndRedactedReportMatchRustWireShape() throws {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let data = try ControlCommand.health.requestData(requestID: 61, encoder: encoder)
+        let request = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        XCTAssertEqual(request["method"] as? String, "health")
+        XCTAssertNil(request["params"])
+
+        let response = Data(
+            #"{"request_id":61,"status":"ok","result":{"type":"health","value":{"status":"warning","checks":[{"id":"disk","status":"warning","title":"Storage space","message":"512 MB available.","guidance":"Free disk space soon."}]}}}"#.utf8)
+        let decoded = try JSONDecoder().decode(
+            ControlResponseEnvelope<SystemHealthReport>.self, from: response)
+        let report = try XCTUnwrap(decoded.result?.value)
+
+        XCTAssertEqual(report.status, .warning)
+        XCTAssertEqual(report.issues.map(\.id), ["disk"])
+        XCTAssertFalse(String(decoding: response, as: UTF8.self).contains("/Users/"))
     }
 
     func testControlProtocolCompatibilityRejectsOldOrNewDaemons() throws {

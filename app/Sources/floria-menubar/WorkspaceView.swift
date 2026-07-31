@@ -206,11 +206,18 @@ struct ProtectionMenuContent: View {
     @Bindable var state: AppState
     let requestAuditOnly: (AuditOnlyWindow) -> Void
     let refresh: () -> Void
+    let openSystemHealth: () -> Void
     let openAccessLog: () -> Void
 
     var body: some View {
         Button(state.connected ? "Daemon connected" : "Daemon disconnected") {}
             .disabled(true)
+
+        if state.systemHealth?.hasIssues == true || state.systemHealthError != nil {
+            Button("System Health…", systemImage: "exclamationmark.triangle.fill") {
+                openSystemHealth()
+            }
+        }
 
         if state.policyMode.isAuditOnly() {
             Button("Audit Only is active", systemImage: "eye.fill") {}
@@ -247,21 +254,29 @@ struct ProtectionMenuContent: View {
 private struct WorkspaceProtectionMenuLabel: View {
     let connected: Bool
     let auditOnly: Bool
+    let needsAttention: Bool
 
     var body: some View {
         HStack(spacing: 7) {
             Image(
-                systemName: auditOnly
+                systemName: needsAttention
+                    ? "exclamationmark.shield.fill"
+                    : auditOnly
                     ? "eye.circle.fill"
                     : (connected ? "checkmark.shield.fill" : "shield.slash"))
-            Text(auditOnly ? "Audit Only" : (connected ? "Protected" : "Offline"))
+            Text(
+                needsAttention
+                    ? "Needs Attention"
+                    : (auditOnly ? "Audit Only" : (connected ? "Protected" : "Offline")))
                 .lineLimit(1)
             Image(systemName: "chevron.down")
                 .font(.caption)
         }
         .font(.callout.weight(.medium))
         .foregroundStyle(
-            auditOnly ? Color.orange : (connected ? Color.green : Color.secondary)
+            needsAttention
+                ? Color.orange
+                : (auditOnly ? Color.orange : (connected ? Color.green : Color.secondary))
         )
         .frame(height: 30)
     }
@@ -311,6 +326,7 @@ struct AdvancedWorkspaceView: View {
     @State private var showingNewEnvFile = false
     @State private var showingImportSshIdentity = false
     @State private var showingConnectExternalAgent = false
+    @State private var showingSystemHealth = false
     @State private var pendingAuditWindow: AuditOnlyWindow?
     @State private var showingAuditConfirmation = false
     @FocusState private var searchIsFocused: Bool
@@ -368,6 +384,9 @@ struct AdvancedWorkspaceView: View {
         }
         .sheet(isPresented: $showingConnectExternalAgent) {
             NewSshAgentSheet(store: state.workspace)
+        }
+        .sheet(isPresented: $showingSystemHealth) {
+            SystemHealthView(state: state)
         }
         .alert(
             "Floria could not update the workspace",
@@ -459,8 +478,12 @@ struct AdvancedWorkspaceView: View {
                     refresh: {
                         Task {
                             await state.workspace.reload(reportErrors: true)
+                            await state.reloadSystemHealth()
                             await state.reloadPolicyMode()
                         }
+                    },
+                    openSystemHealth: {
+                        showingSystemHealth = true
                     },
                     openAccessLog: {
                         selection = .accessLog
@@ -468,13 +491,17 @@ struct AdvancedWorkspaceView: View {
             } label: {
                 WorkspaceProtectionMenuLabel(
                     connected: state.connected,
-                    auditOnly: state.policyMode.isAuditOnly())
+                    auditOnly: state.policyMode.isAuditOnly(),
+                    needsAttention: state.systemHealth?.hasIssues == true
+                        || state.systemHealthError != nil)
             }
             .buttonStyle(.bordered)
             .accessibilityLabel(
-                state.policyMode.isAuditOnly()
-                    ? "Audit Only policy"
-                    : (state.connected ? "Protected policy" : "Daemon offline"))
+                state.systemHealth?.hasIssues == true || state.systemHealthError != nil
+                    ? "System health needs attention"
+                    : (state.policyMode.isAuditOnly()
+                        ? "Audit Only policy"
+                        : (state.connected ? "Protected policy" : "Daemon offline")))
         }
         .padding(.horizontal, 18)
         .frame(height: 90)

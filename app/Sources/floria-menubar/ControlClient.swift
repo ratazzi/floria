@@ -20,6 +20,15 @@ final class ControlClient: @unchecked Sendable {
         return info
     }
 
+    func health() async throws -> SystemHealthReport {
+        guard let report: SystemHealthReport = try await request(
+            .health, expecting: "health", as: SystemHealthReport.self)
+        else {
+            throw ControlClientError.missingResult("health")
+        }
+        return report
+    }
+
     func policyMode() async throws -> RuntimePolicyStatus {
         guard let status: RuntimePolicyStatus = try await request(
             .policyModeGet, expecting: "policy_mode", as: RuntimePolicyStatus.self)

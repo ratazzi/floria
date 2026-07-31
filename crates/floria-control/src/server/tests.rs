@@ -70,6 +70,20 @@
         }
     }
 
+    struct FixtureHealthReporter;
+
+    impl RuntimeHealthReporter for FixtureHealthReporter {
+        fn report(&self) -> HealthReport {
+            HealthReport::new(vec![crate::protocol::HealthCheck {
+                id: "catalog".to_string(),
+                status: crate::protocol::HealthStatus::Healthy,
+                title: "Catalog".to_string(),
+                message: "Ready".to_string(),
+                guidance: None,
+            }])
+        }
+    }
+
     const FIXTURE_SECRET_ID: &str = "00000000-0000-0000-0000-000000000101";
 
     struct FixtureSecretMetadata {
@@ -188,6 +202,31 @@
         )
         .unwrap_err();
         assert!(matches!(relative, DispatchError::Validation(_)));
+    }
+
+    #[test]
+    fn health_uses_the_runtime_reporter() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite")).unwrap();
+        let health = FixtureHealthReporter;
+
+        let result = dispatch(
+            &catalog,
+            DispatchServices {
+                health: Some(&health),
+                ..DispatchServices::default()
+            },
+            ControlCommand::Health,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            result,
+            ControlResult::Health(HealthReport {
+                status: crate::protocol::HealthStatus::Healthy,
+                checks,
+            }) if checks.len() == 1 && checks[0].id == "catalog"
+        ));
     }
 
     fn project_outputs_import(

@@ -14,8 +14,8 @@ use floria_agent::{ManagedObject, ManagedPolicyItem};
 use floria_control::{
     ActiveGrant as ControlActiveGrant, BackupReport as ControlBackupReport, BackupService,
     CatalogObserver, ControlClient, ControlCommand, ControlResult, ControlRuntimeServices,
-    ControlServer, ManagedSshConfig, ProtectedFile, RuntimePolicyController, SshConfigManager,
-    SshIdentity, SshIdentityDiscovery,
+    ControlServer, ManagedSshConfig, ProtectedFile, RuntimeHealthReporter,
+    RuntimePolicyController, SshConfigManager, SshIdentity, SshIdentityDiscovery,
 };
 use floria_core::audit::AuditLog;
 use floria_core::authz::{Authorizer, PolicyMode, PolicyModeStatus};
@@ -34,6 +34,10 @@ use floria_surface::{
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
+
+mod health;
+
+use health::RuntimeHealth;
 
 /// Floria: a userspace filesystem that exposes dynamic content as plain local files (macOS/macFUSE).
 #[derive(Parser)]
@@ -198,6 +202,8 @@ enum KeysCmd {
 enum ControlCmd {
     /// Check that the daemon control socket and catalog schema are available.
     Ping,
+    /// Report the running daemon's redacted system health as JSON.
+    Health,
     /// Show or change the daemon-wide runtime policy mode.
     Policy {
         /// Omit to show the current mode. Audit-only without a duration stays active until reset.
@@ -309,11 +315,17 @@ fn store_key_provider(cfg: &ResolvedConfig) -> (Arc<dyn floria_store::KeyProvide
 /// Open the secret store from config. The private key passphrase, if any, comes from
 /// `FLORIA_KEY_PASSPHRASE` (dev convenience; interactive/Touch ID unlock is a later milestone).
 fn open_store(cfg: &ResolvedConfig) -> Result<AgeDirStore> {
+    open_store_with_provider(cfg).map(|(store, _)| store)
+}
+
+fn open_store_with_provider(
+    cfg: &ResolvedConfig,
+) -> Result<(AgeDirStore, Arc<dyn floria_store::KeyProvider>)> {
     let (keys, source) = store_key_provider(cfg);
     tracing::info!(source, "store key source");
-    let store = AgeDirStore::open(cfg.store_root.clone(), keys)
+    let store = AgeDirStore::open(cfg.store_root.clone(), Arc::clone(&keys))
         .with_context(|| format!("opening store at {}", cfg.store_root.display()))?;
-    Ok(store)
+    Ok((store, keys))
 }
 
 fn initialize_store_key_if_needed(cfg: &ResolvedConfig) -> Result<()> {
@@ -753,7 +765,7 @@ fn cmd_mount(config: &Path) -> Result<()> {
     initialize_store_key_if_needed(&cfg)?;
     recover_stale_mount(&cfg.mount_path)?;
     let catalog_path = support_dir.join("catalog.sqlite");
-    let store = open_store(&cfg)?;
+    let (store, key_provider) = open_store_with_provider(&cfg)?;
     if catalog_path.exists() {
         if let Some(report) =
             floria_backup::recover_interrupted_activation(&catalog_path, &store)
@@ -796,6 +808,13 @@ fn cmd_mount(config: &Path) -> Result<()> {
     let backup: Arc<dyn BackupService> =
         Arc::new(DaemonBackupService { store: Arc::clone(&concrete_store) });
     let store: Arc<dyn SecretStore> = concrete_store;
+    let health: Arc<dyn RuntimeHealthReporter> = Arc::new(RuntimeHealth::new(
+        catalog.clone(),
+        Arc::clone(&store),
+        key_provider,
+        cfg.mount_path.clone(),
+        cfg.store_root.clone(),
+    ));
     let records = store.list()?;
     release_protected_links_for_file_surfaces(
         &snapshot,
@@ -865,6 +884,7 @@ fn cmd_mount(config: &Path) -> Result<()> {
             ssh_discovery,
             ssh_config,
             backup,
+            health,
             audit_log: cfg.audit_log.clone(),
             ssh_runtime_dir,
             peer_verifier: control_peer_verifier,
@@ -1183,6 +1203,7 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
     };
     let command = match command {
         ControlCmd::Ping => ControlCommand::Ping,
+        ControlCmd::Health => ControlCommand::Health,
         ControlCmd::Policy { mode: None, duration_secs: None } => ControlCommand::PolicyModeGet,
         ControlCmd::Policy { mode: None, duration_secs: Some(_) } => {
             anyhow::bail!("--duration-secs requires a policy mode")
@@ -1224,6 +1245,9 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
             println!(
                 "daemon v{daemon_version} ready; control protocol v{protocol_version}; catalog schema v{schema_version} (supports {minimum_schema_version}..={schema_version}); store format v{store_format_version} (supports {minimum_store_format_version}..={store_format_version})"
             );
+        }
+        ControlResult::Health(report) => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         ControlResult::PolicyMode(status) => {
             println!("{}", serde_json::to_string_pretty(&status)?);

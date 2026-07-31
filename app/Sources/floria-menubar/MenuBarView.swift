@@ -64,6 +64,7 @@ private extension ActiveGrant {
 
 /// The window-style dropdown: search header, recent-access list, footer actions.
 struct MenuBarView: View {
+    @Environment(\.openWindow) private var openWindow
     @Bindable var state: AppState
     @State private var searchText = ""
     @State private var listContentHeight: CGFloat = 0
@@ -104,9 +105,16 @@ struct MenuBarView: View {
                 MacFuseSetupBanner()
                 Divider()
             }
-            PolicyModeControl(state: state) { window in
-                pendingConfirmation = .auditOnly(window)
-            }
+            PolicyModeControl(
+                state: state,
+                requestConfirmation: { window in
+                    pendingConfirmation = .auditOnly(window)
+                },
+                openSystemHealth: {
+                    state.systemHealthPresentationRequested = true
+                    DockVisibilityController.shared.prepareToShowDashboard()
+                    openWindow(id: "dashboard")
+                })
             Divider()
             if hasListContent {
                 accessList
@@ -120,6 +128,7 @@ struct MenuBarView: View {
         }
         .frame(width: 360)
         .task {
+            await state.reloadSystemHealth()
             await state.reloadPolicyMode()
             await state.reloadActiveGrants()
         }
@@ -346,10 +355,19 @@ private struct MenuBarConfirmationOverlay: View {
 private struct PolicyModeControl: View {
     @Bindable var state: AppState
     let requestConfirmation: (AuditOnlyWindow) -> Void
+    let openSystemHealth: () -> Void
 
     var body: some View {
         let auditOnly = state.policyMode.isAuditOnly()
+        let needsAttention =
+            state.systemHealth?.hasIssues == true || state.systemHealthError != nil
         Menu {
+            if needsAttention {
+                Button("Review System Health…", systemImage: "exclamationmark.triangle.fill") {
+                    openSystemHealth()
+                }
+                Divider()
+            }
             if auditOnly {
                 Button("Return to Normal", systemImage: "checkmark.shield") {
                     Task { await state.setPolicyMode(.normal, durationSecs: nil) }
@@ -374,15 +392,21 @@ private struct PolicyModeControl: View {
             }
         } label: {
             HStack(spacing: 10) {
-                Image(systemName: auditOnly ? "eye.circle.fill" : "checkmark.shield.fill")
+                Image(
+                    systemName: needsAttention
+                        ? "exclamationmark.shield.fill"
+                        : (auditOnly ? "eye.circle.fill" : "checkmark.shield.fill"))
                     .font(.title3)
-                    .foregroundStyle(auditOnly ? Color.orange : Color.green)
+                    .foregroundStyle(needsAttention || auditOnly ? Color.orange : Color.green)
                     .frame(width: 24)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(auditOnly ? "Audit Only" : "Protection: Normal")
+                    Text(
+                        needsAttention
+                            ? "Needs Attention"
+                            : (auditOnly ? "Audit Only" : "Protection: Normal"))
                         .font(.callout.weight(.semibold))
-                        .foregroundStyle(auditOnly ? Color.orange : Color.primary)
-                    Text(statusDetail(at: Date()))
+                        .foregroundStyle(needsAttention || auditOnly ? Color.orange : Color.primary)
+                    Text(needsAttention ? "Review system health" : statusDetail(at: Date()))
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

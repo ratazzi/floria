@@ -38,9 +38,10 @@ use crate::protocol::{
     DiscoveryApplyResult, DiscoveryImport, DiscoveryImportDestination, DiscoveryJobPhase,
     DiscoveryJobProgress, DiscoveryJobState, DiscoveryJobStatus, DiscoveryManagedItem,
     DiscoveryManagedItemKind, DiscoveryReferenceResolution, DiscoveryReferenceSource,
-    DiscoveryReviewPlan, DiscoverySourceDisposition, ManagedLink, ManagedLinkStatus,
-    ProjectCheckoutCandidate, ProjectCheckoutDiscovery, ProjectCheckoutInventory, ProtectedFile,
-    ProtectedFileVersion, SecretValue, SshConfigStatus, SshIdentity, WorkspaceSnapshot,
+    DiscoveryReviewPlan, DiscoverySourceDisposition, HealthReport, ManagedLink,
+    ManagedLinkStatus, ProjectCheckoutCandidate, ProjectCheckoutDiscovery,
+    ProjectCheckoutInventory, ProtectedFile, ProtectedFileVersion, SecretValue, SshConfigStatus,
+    SshIdentity, WorkspaceSnapshot,
 };
 
 pub struct ControlServer {
@@ -87,6 +88,13 @@ pub trait BackupService: Send + Sync + 'static {
     fn verify(&self, backup: &Path) -> Result<BackupReport, String>;
 }
 
+/// One deep, read-only health interface for every control-plane caller.
+///
+/// Production owns the platform checks; the control server only transports their redacted result.
+pub trait RuntimeHealthReporter: Send + Sync + 'static {
+    fn report(&self) -> HealthReport;
+}
+
 pub struct ControlRuntimeServices {
     pub observer: Arc<dyn CatalogObserver>,
     pub checkout_monitor: Arc<GitCheckoutMonitor>,
@@ -94,6 +102,7 @@ pub struct ControlRuntimeServices {
     pub ssh_discovery: Arc<dyn SshIdentityDiscovery>,
     pub ssh_config: Arc<dyn SshConfigManager>,
     pub backup: Arc<dyn BackupService>,
+    pub health: Arc<dyn RuntimeHealthReporter>,
     pub audit_log: PathBuf,
     pub ssh_runtime_dir: PathBuf,
     pub peer_verifier: Arc<dyn SocketPeerVerifier>,
@@ -109,6 +118,7 @@ struct ControlDependencies {
     ssh_discovery: Option<Arc<dyn SshIdentityDiscovery>>,
     ssh_config: Option<Arc<dyn SshConfigManager>>,
     backup: Option<Arc<dyn BackupService>>,
+    health: Option<Arc<dyn RuntimeHealthReporter>>,
     audit_log: Option<PathBuf>,
     ssh_runtime_dir: Option<PathBuf>,
     discovery_jobs: Option<Arc<DiscoveryJobManager>>,
@@ -202,6 +212,7 @@ impl ControlServer {
                 ssh_discovery: Some(services.ssh_discovery),
                 ssh_config: Some(services.ssh_config),
                 backup: Some(services.backup),
+                health: Some(services.health),
                 audit_log: Some(services.audit_log),
                 ssh_runtime_dir: Some(services.ssh_runtime_dir),
                 discovery_jobs: None,
@@ -312,6 +323,7 @@ fn handle_connection(
             ssh_discovery: dependencies.ssh_discovery.as_deref(),
             ssh_config: dependencies.ssh_config.as_deref(),
             backup: dependencies.backup.as_deref(),
+            health: dependencies.health.as_deref(),
             checkout_monitor: dependencies.checkout_monitor.as_deref(),
             audit_log: dependencies.audit_log.as_deref(),
             ssh_runtime_dir: dependencies.ssh_runtime_dir.as_deref(),
@@ -343,6 +355,7 @@ fn is_read_only(command: &ControlCommand) -> bool {
     matches!(
         command,
         ControlCommand::Ping
+            | ControlCommand::Health
             | ControlCommand::PolicyModeGet
             | ControlCommand::GrantList
             | ControlCommand::AccessHistory { .. }
@@ -400,6 +413,7 @@ struct DispatchServices<'a> {
     ssh_discovery: Option<&'a dyn SshIdentityDiscovery>,
     ssh_config: Option<&'a dyn SshConfigManager>,
     backup: Option<&'a dyn BackupService>,
+    health: Option<&'a dyn RuntimeHealthReporter>,
     checkout_monitor: Option<&'a GitCheckoutMonitor>,
     audit_log: Option<&'a Path>,
     ssh_runtime_dir: Option<&'a Path>,

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 const MAX_MSG: usize = 8 << 20;
-pub const CONTROL_PROTOCOL_VERSION: u32 = 1;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRequest {
@@ -57,6 +57,7 @@ impl Drop for SecretValue {
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum ControlCommand {
     Ping,
+    Health,
     PolicyModeGet,
     PolicyModeSet { mode: PolicyMode, duration_secs: Option<u64> },
     GrantList,
@@ -200,6 +201,7 @@ pub enum ControlResult {
         store_format_version: u32,
         minimum_store_format_version: u32,
     },
+    Health(HealthReport),
     PolicyMode(PolicyModeStatus),
     ActiveGrants(Vec<ActiveGrant>),
     AccessHistory(Vec<AccessHistoryEvent>),
@@ -228,6 +230,44 @@ pub enum ControlResult {
     SharedSecretRotated { resource_id: String, version: u32 },
     EnvFileCreated { resource: Resource, version: u32 },
     Empty,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum HealthStatus {
+    Healthy,
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthCheck {
+    /// Stable machine-readable identifier used to keep UI presentation independent of wording.
+    pub id: String,
+    pub status: HealthStatus,
+    pub title: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthReport {
+    pub status: HealthStatus,
+    pub checks: Vec<HealthCheck>,
+}
+
+impl HealthReport {
+    pub fn new(checks: Vec<HealthCheck>) -> Self {
+        let status = checks
+            .iter()
+            .map(|check| check.status)
+            .max()
+            .unwrap_or(HealthStatus::Healthy);
+        HealthReport { status, checks }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -684,6 +724,32 @@ mod tests {
         assert_eq!(value["value"]["minimum_schema_version"], 12);
         assert_eq!(value["value"]["store_format_version"], 2);
         assert_eq!(value["value"]["minimum_store_format_version"], 1);
+    }
+
+    #[test]
+    fn health_report_uses_the_most_severe_check() {
+        let result = ControlResult::Health(HealthReport::new(vec![
+            HealthCheck {
+                id: "catalog".to_string(),
+                status: HealthStatus::Healthy,
+                title: "Catalog".to_string(),
+                message: "Ready".to_string(),
+                guidance: None,
+            },
+            HealthCheck {
+                id: "disk".to_string(),
+                status: HealthStatus::Warning,
+                title: "Storage".to_string(),
+                message: "Running low".to_string(),
+                guidance: Some("Free disk space".to_string()),
+            },
+        ]));
+        let value = serde_json::to_value(result).unwrap();
+
+        assert_eq!(value["type"], "health");
+        assert_eq!(value["value"]["status"], "warning");
+        assert_eq!(value["value"]["checks"][1]["id"], "disk");
+        assert_eq!(value["value"]["checks"][1]["guidance"], "Free disk space");
     }
 
     #[test]

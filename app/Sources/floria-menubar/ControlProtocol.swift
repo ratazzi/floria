@@ -1,6 +1,6 @@
 import Foundation
 
-let supportedControlProtocolVersion: UInt32 = 1
+let supportedControlProtocolVersion: UInt32 = 2
 
 struct ControlServerInfo: Decodable, Equatable, Sendable {
     let protocolVersion: UInt32?
@@ -17,6 +17,38 @@ struct ControlServerInfo: Decodable, Equatable, Sendable {
         case minimumSchemaVersion = "minimum_schema_version"
         case storeFormatVersion = "store_format_version"
         case minimumStoreFormatVersion = "minimum_store_format_version"
+    }
+}
+
+enum SystemHealthStatus: String, Codable, Comparable, Sendable {
+    case healthy
+    case warning
+    case error
+
+    static func < (lhs: SystemHealthStatus, rhs: SystemHealthStatus) -> Bool {
+        let rank: [SystemHealthStatus: Int] = [.healthy: 0, .warning: 1, .error: 2]
+        return rank[lhs, default: 0] < rank[rhs, default: 0]
+    }
+}
+
+struct SystemHealthCheck: Codable, Equatable, Identifiable, Sendable {
+    let id: String
+    let status: SystemHealthStatus
+    let title: String
+    let message: String
+    let guidance: String?
+}
+
+struct SystemHealthReport: Codable, Equatable, Sendable {
+    let status: SystemHealthStatus
+    let checks: [SystemHealthCheck]
+
+    var issues: [SystemHealthCheck] {
+        checks.filter { $0.status != .healthy }
+    }
+
+    var hasIssues: Bool {
+        !issues.isEmpty
     }
 }
 
@@ -915,6 +947,7 @@ struct BackupReport: Codable, Equatable, Sendable {
 
 enum ControlCommand: Sendable {
     case ping
+    case health
     case policyModeGet
     case policyModeSet(mode: RuntimePolicyMode, durationSecs: UInt64?)
     case grantList
@@ -986,6 +1019,7 @@ enum ControlCommand: Sendable {
     var method: String {
         switch self {
         case .ping: "ping"
+        case .health: "health"
         case .policyModeGet: "policy_mode_get"
         case .policyModeSet: "policy_mode_set"
         case .grantList: "grant_list"
@@ -1043,7 +1077,7 @@ enum ControlCommand: Sendable {
 
     func requestData(requestID: UInt64, encoder: JSONEncoder) throws -> Data {
         switch self {
-        case .ping, .policyModeGet, .grantList, .grantClear, .snapshot, .projectCheckoutInventory,
+        case .ping, .health, .policyModeGet, .grantList, .grantClear, .snapshot, .projectCheckoutInventory,
             .sshConfigStatus, .sshConfigInstall, .sshConfigRemove, .protectedFiles:
             return try encoder.encode(ControlRequestWithoutParams(requestID: requestID, method: method))
         case .policyModeSet(let mode, let durationSecs):
