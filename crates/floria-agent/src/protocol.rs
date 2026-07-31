@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 
 /// Reject frames larger than this to bound memory on a hostile/broken peer.
 const MAX_MSG: usize = 1 << 20;
+pub const AGENT_PROTOCOL_VERSION: u32 = 1;
 
 /// Messages the app (client) sends to the daemon.
 #[derive(Debug, Deserialize)]
@@ -36,6 +37,16 @@ pub enum ClientMsg {
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DaemonMsg<'a> {
+    /// Handshake acknowledgement. The connection is not eligible for prompts before this.
+    Hello {
+        version: u32,
+        daemon_version: &'a str,
+    },
+    /// The peer must reconnect with a compatible app/daemon pair.
+    ProtocolError {
+        expected_version: u32,
+        received_version: Option<u32>,
+    },
     /// A blocking authorization request: the app must reply with a `decision`.
     Prompt {
         req_id: u64,

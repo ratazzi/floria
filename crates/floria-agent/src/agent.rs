@@ -524,7 +524,20 @@ mod tests {
     fn connect_test_app(agent: &SocketAgent, socket_path: &std::path::Path) -> UnixStream {
         let mut app = UnixStream::connect(socket_path).unwrap();
         app.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        write_msg(&mut app, &json!({"type": "hello", "version": 1})).unwrap();
+        write_msg(
+            &mut app,
+            &json!({
+                "type": "hello",
+                "version": crate::protocol::AGENT_PROTOCOL_VERSION
+            }),
+        )
+        .unwrap();
+        let hello: serde_json::Value = read_msg(&mut app).unwrap();
+        assert_eq!(hello["type"], "hello");
+        assert_eq!(
+            hello["version"],
+            crate::protocol::AGENT_PROTOCOL_VERSION
+        );
         let connected_deadline = Instant::now() + Duration::from_secs(5);
         while !agent.server.has_connection() {
             assert!(

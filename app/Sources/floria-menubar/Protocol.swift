@@ -3,6 +3,8 @@ import Foundation
 // Wire types mirroring `floria-agent::protocol`. Framing is a 4-byte big-endian
 // length prefix followed by that many bytes of JSON.
 
+let supportedAgentProtocolVersion: UInt32 = 1
+
 struct ProcessView: Codable, Hashable, Sendable {
     let pid: Int32
     let name: String
@@ -63,6 +65,16 @@ struct SshSignView: Codable, Sendable {
 
 // Incoming (daemon -> app)
 
+struct AgentHelloMsg: Decodable {
+    let version: UInt32
+    let daemon_version: String?
+}
+
+struct AgentProtocolErrorMsg: Decodable {
+    let expected_version: UInt32
+    let received_version: UInt32?
+}
+
 struct PromptMsg: Decodable {
     let req_id: UInt64
     let path: String
@@ -92,7 +104,7 @@ struct AccessEventMsg: Decodable, Sendable {
 
 struct HelloMsg: Encodable {
     let type = "hello"
-    let version = 1
+    let version = supportedAgentProtocolVersion
 }
 
 struct DecisionMsg: Encodable {

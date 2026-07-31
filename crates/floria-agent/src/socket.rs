@@ -17,7 +17,9 @@ use floria_platform::SocketPeerVerifier;
 use dashmap::DashMap;
 use serde::Serialize;
 
-use crate::protocol::{read_msg, write_msg, ClientDecision, ClientMsg, DaemonMsg};
+use crate::protocol::{
+    read_msg, write_msg, ClientDecision, ClientMsg, DaemonMsg, AGENT_PROTOCOL_VERSION,
+};
 
 /// Outcome of asking the app to authorize an access.
 pub enum PromptResult {
@@ -34,6 +36,7 @@ pub enum PromptResult {
 /// open-pool threads (and the accept loop) would pile up on that mutex, freezing the mount.
 /// On timeout the write errors and the connection is dropped (fail-closed / app reconnects).
 const SEND_TIMEOUT: Duration = Duration::from_secs(2);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub struct SocketServer {
     peer_verifier: Arc<dyn SocketPeerVerifier>,
@@ -103,7 +106,7 @@ impl SocketServer {
                     continue;
                 }
             };
-            let writer = match stream.try_clone() {
+            let mut writer = match stream.try_clone() {
                 Ok(w) => w,
                 Err(e) => {
                     tracing::warn!("clone stream failed: {e}");
@@ -114,21 +117,29 @@ impl SocketServer {
                 tracing::warn!("set write timeout failed: {e}");
                 continue;
             }
-            let gen = self.conn_gen.fetch_add(1, Ordering::Relaxed);
-            *self.conn.lock().expect("conn poisoned") = Some(Conn { gen, stream: writer });
-            tracing::info!(
-                gen,
-                pid = peer.identity.pid,
-                executable = ?peer.identity.exe_path,
-                bundle_id = ?peer.identity.bundle_id,
-                team_id = ?peer.identity.team_id,
-                "trusted menubar app connected"
-            );
 
             let srv = Arc::clone(&self);
             let spawned = std::thread::Builder::new()
                 .name("floria-agent-conn".into())
                 .spawn(move || {
+                    let mut stream = stream;
+                    if let Err(error) = srv.handshake(&mut stream, &mut writer) {
+                        tracing::warn!(%error, "rejecting incompatible agent connection");
+                        return;
+                    }
+                    let gen = srv.conn_gen.fetch_add(1, Ordering::Relaxed);
+                    *srv.conn.lock().expect("conn poisoned") = Some(Conn {
+                        gen,
+                        stream: writer,
+                    });
+                    tracing::info!(
+                        gen,
+                        pid = peer.identity.pid,
+                        executable = ?peer.identity.exe_path,
+                        bundle_id = ?peer.identity.bundle_id,
+                        team_id = ?peer.identity.team_id,
+                        "trusted menubar app connected"
+                    );
                     srv.read_loop(stream);
                     // Clear the writer only if it is still ours — a newer connection may
                     // have replaced it while we were serving.
@@ -140,16 +151,44 @@ impl SocketServer {
                 });
             if let Err(e) = spawned {
                 tracing::warn!("spawn conn thread failed: {e}");
-                *self.conn.lock().expect("conn poisoned") = None;
             }
         }
+    }
+
+    fn handshake(&self, reader: &mut UnixStream, writer: &mut UnixStream) -> io::Result<()> {
+        reader.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
+        let received_version = match read_msg::<_, ClientMsg>(reader)? {
+            ClientMsg::Hello { version } => Some(version),
+            ClientMsg::Decision { .. } => None,
+        };
+        if received_version != Some(AGENT_PROTOCOL_VERSION) {
+            write_msg(
+                writer,
+                &DaemonMsg::ProtocolError {
+                    expected_version: AGENT_PROTOCOL_VERSION,
+                    received_version,
+                },
+            )?;
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "agent protocol version mismatch",
+            ));
+        }
+        write_msg(
+            writer,
+            &DaemonMsg::Hello {
+                version: AGENT_PROTOCOL_VERSION,
+                daemon_version: env!("CARGO_PKG_VERSION"),
+            },
+        )?;
+        reader.set_read_timeout(None)
     }
 
     fn read_loop(&self, mut reader: UnixStream) {
         loop {
             match read_msg::<_, ClientMsg>(&mut reader) {
                 Ok(ClientMsg::Hello { version }) => {
-                    tracing::info!(version, "agent hello");
+                    tracing::warn!(version, "ignoring duplicate agent hello");
                 }
                 Ok(ClientMsg::Decision {
                     req_id,
@@ -237,9 +276,16 @@ mod tests {
     /// Connect a fake app and send the hello, like the real client does. A read timeout
     /// bounds every blocking assertion so a regression fails instead of hanging the suite.
     fn connect(path: &std::path::Path) -> UnixStream {
-        let s = UnixStream::connect(path).expect("connect");
+        let mut s = UnixStream::connect(path).expect("connect");
         s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        write_msg(&mut &s, &json!({"type": "hello", "version": 1})).expect("hello");
+        write_msg(
+            &mut s,
+            &json!({"type": "hello", "version": AGENT_PROTOCOL_VERSION}),
+        )
+        .expect("hello");
+        let hello: Value = read_msg(&mut s).expect("daemon hello");
+        assert_eq!(hello["type"], "hello");
+        assert_eq!(hello["version"], AGENT_PROTOCOL_VERSION);
         s
     }
 
@@ -305,6 +351,48 @@ mod tests {
         let _client = UnixStream::connect(&path).expect("connect");
         std::thread::sleep(Duration::from_millis(50));
 
+        assert!(current_gen(&srv).is_none());
+        assert!(matches!(
+            srv.prompt_and_wait(prompt_msg, Duration::from_millis(50)),
+            PromptResult::NoApp
+        ));
+    }
+
+    #[test]
+    fn connection_is_not_published_before_hello() {
+        let path = sock_path("missing-hello");
+        let srv = start(&path);
+        let _client = UnixStream::connect(&path).expect("connect");
+        std::thread::sleep(Duration::from_millis(50));
+
+        assert!(current_gen(&srv).is_none());
+        assert!(matches!(
+            srv.prompt_and_wait(prompt_msg, Duration::from_millis(50)),
+            PromptResult::NoApp
+        ));
+    }
+
+    #[test]
+    fn incompatible_protocol_is_rejected_with_version_details() {
+        let path = sock_path("wrong-version");
+        let srv = start(&path);
+        let mut client = UnixStream::connect(&path).expect("connect");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        write_msg(
+            &mut client,
+            &json!({"type": "hello", "version": AGENT_PROTOCOL_VERSION + 1}),
+        )
+        .unwrap();
+
+        let response: Value = read_msg(&mut client).unwrap();
+        assert_eq!(response["type"], "protocol_error");
+        assert_eq!(response["expected_version"], AGENT_PROTOCOL_VERSION);
+        assert_eq!(
+            response["received_version"],
+            AGENT_PROTOCOL_VERSION + 1
+        );
         assert!(current_gen(&srv).is_none());
         assert!(matches!(
             srv.prompt_and_wait(prompt_msg, Duration::from_millis(50)),

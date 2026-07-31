@@ -108,7 +108,30 @@ final class ProtocolTests: XCTestCase {
         let v = try XCTUnwrap(
             try JSONSerialization.jsonObject(with: JSONEncoder().encode(HelloMsg())) as? [String: Any])
         XCTAssertEqual(v["type"] as? String, "hello")
-        XCTAssertEqual(v["version"] as? Int, 1)
+        XCTAssertEqual(v["version"] as? UInt32, supportedAgentProtocolVersion)
+    }
+
+    func testDecodeDaemonHelloAndRejectMismatchedAgentProtocol() throws {
+        let hello = try JSONDecoder().decode(
+            AgentHelloMsg.self,
+            from: Data(#"{"type":"hello","version":1,"daemon_version":"0.1.0"}"#.utf8))
+        XCTAssertEqual(hello.version, supportedAgentProtocolVersion)
+        XCTAssertEqual(hello.daemon_version, "0.1.0")
+        XCTAssertNoThrow(try validateAgentProtocolVersion(hello.version))
+
+        XCTAssertThrowsError(
+            try validateAgentProtocolVersion(supportedAgentProtocolVersion + 1)
+        ) { error in
+            XCTAssertTrue(error.localizedDescription.contains("Restart Floria"))
+        }
+    }
+
+    func testDecodeAgentProtocolErrorMatchesRustSchema() throws {
+        let error = try JSONDecoder().decode(
+            AgentProtocolErrorMsg.self,
+            from: Data(#"{"type":"protocol_error","expected_version":2,"received_version":1}"#.utf8))
+        XCTAssertEqual(error.expected_version, 2)
+        XCTAssertEqual(error.received_version, 1)
     }
 
     func testRecentAccessParsesFractionalSecondTimestamp() {

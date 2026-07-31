@@ -130,6 +130,11 @@ final class AppState {
                 }
             }
         }
+        client.onCompatibilityError = { [weak self] message in
+            DispatchQueue.main.async {
+                self?.workspace.lastError = message
+            }
+        }
         client.onAccessEvent = { [weak self] ev in
             DispatchQueue.main.async { self?.add(ev) }
         }

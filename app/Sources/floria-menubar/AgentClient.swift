@@ -23,6 +23,7 @@ final class AgentClient {
     var onPrompt: ((PromptMsg) -> Void)?
     var onAccessEvent: ((AccessEventMsg) -> Void)?
     var onStateChange: ((Bool) -> Void)?
+    var onCompatibilityError: ((String) -> Void)?
 
     init(socketPath: String) {
         self.socketPath = socketPath
@@ -36,12 +37,13 @@ final class AgentClient {
     private func runForever() {
         while true {
             if connectOnce() {
-                Self.log.info("connected to daemon")
-                send(HelloMsg())
-                onStateChange?(true)
-                readLoop()
-                Self.log.warning("read loop ended, reconnecting")
-                onStateChange?(false)
+                if performHandshake() {
+                    Self.log.info("connected to daemon")
+                    onStateChange?(true)
+                    readLoop()
+                    Self.log.warning("read loop ended, reconnecting")
+                    onStateChange?(false)
+                }
                 writeLock.lock()
                 if fd >= 0 { close(fd); fd = -1 }
                 connectedIdentity = nil
@@ -111,14 +113,53 @@ final class AgentClient {
         return true
     }
 
+    private func performHandshake() -> Bool {
+        guard send(HelloMsg()), let body = readFrame() else { return false }
+        struct Envelope: Decodable { let type: String }
+        guard let envelope = try? JSONDecoder().decode(Envelope.self, from: body) else {
+            return false
+        }
+        switch envelope.type {
+        case "hello":
+            guard let hello = try? JSONDecoder().decode(AgentHelloMsg.self, from: body) else {
+                return false
+            }
+            do {
+                try validateAgentProtocolVersion(hello.version)
+                return true
+            } catch {
+                onCompatibilityError?(error.localizedDescription)
+                return false
+            }
+        case "protocol_error":
+            guard
+                let error = try? JSONDecoder().decode(AgentProtocolErrorMsg.self, from: body)
+            else {
+                return false
+            }
+            let compatibilityError = AgentProtocolCompatibilityError.incompatible(
+                app: error.received_version ?? supportedAgentProtocolVersion,
+                daemon: error.expected_version)
+            onCompatibilityError?(compatibilityError.localizedDescription)
+            return false
+        default:
+            return false
+        }
+    }
+
     private func readLoop() {
         while true {
-            guard let header = readExact(4) else { return }
-            let len = (UInt32(header[0]) << 24) | (UInt32(header[1]) << 16)
-                | (UInt32(header[2]) << 8) | UInt32(header[3])
-            guard len > 0, len < (1 << 20), let body = readExact(Int(len)) else { return }
-            dispatch(Data(body))
+            guard let body = readFrame() else { return }
+            dispatch(body)
         }
+    }
+
+    private func readFrame() -> Data? {
+        guard let header = readExact(4) else { return nil }
+        let len = (UInt32(header[0]) << 24) | (UInt32(header[1]) << 16)
+            | (UInt32(header[2]) << 8) | UInt32(header[3])
+        guard len > 0, len < (1 << 20), let body = readExact(Int(len)) else { return nil }
+        return Data(body)
     }
 
     private func dispatch(_ body: Data) {
@@ -139,10 +180,11 @@ final class AgentClient {
         }
     }
 
-    func send<T: Encodable>(_ msg: T) {
+    @discardableResult
+    func send<T: Encodable>(_ msg: T) -> Bool {
         writeLock.lock()
         defer { writeLock.unlock() }
-        guard fd >= 0, let body = try? JSONEncoder().encode(msg) else { return }
+        guard fd >= 0, let body = try? JSONEncoder().encode(msg) else { return false }
         var frame = Data(count: 4)
         let n = UInt32(body.count)
         frame[0] = UInt8((n >> 24) & 0xff)
@@ -150,7 +192,7 @@ final class AgentClient {
         frame[2] = UInt8((n >> 8) & 0xff)
         frame[3] = UInt8(n & 0xff)
         frame.append(body)
-        writeAll(frame)
+        return writeAll(frame)
     }
 
     // MARK: - low-level IO
@@ -171,16 +213,35 @@ final class AgentClient {
         return buf
     }
 
-    private func writeAll(_ data: Data) {
-        data.withUnsafeBytes { raw in
-            guard let base = raw.baseAddress else { return }
+    private func writeAll(_ data: Data) -> Bool {
+        data.withUnsafeBytes { raw -> Bool in
+            guard let base = raw.baseAddress else { return false }
             var sent = 0
             while sent < raw.count {
                 let n = write(fd, base.advanced(by: sent), raw.count - sent)
                 if n < 0 && errno == EINTR { continue }
-                if n <= 0 { break }
+                if n <= 0 { return false }
                 sent += n
             }
+            return true
+        }
+    }
+}
+
+func validateAgentProtocolVersion(_ daemonVersion: UInt32) throws {
+    guard daemonVersion == supportedAgentProtocolVersion else {
+        throw AgentProtocolCompatibilityError.incompatible(
+            app: supportedAgentProtocolVersion, daemon: daemonVersion)
+    }
+}
+
+enum AgentProtocolCompatibilityError: LocalizedError {
+    case incompatible(app: UInt32, daemon: UInt32)
+
+    var errorDescription: String? {
+        switch self {
+        case .incompatible(let app, let daemon):
+            "This version of Floria cannot authorize access with the running daemon (app protocol \(app), daemon protocol \(daemon)). Restart Floria to update its daemon."
         }
     }
 }
