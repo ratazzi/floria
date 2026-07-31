@@ -40,13 +40,13 @@ rsa = "0.9.10"
 ssh-key = { version = "0.6.7", features = ["ed25519", "encryption", "getrandom", "p256", "p384", "p521", "rsa"] }
 security-framework = "3"
 
-accessfs-core = { path = "crates/accessfs-core" }
-accessfs-platform = { path = "crates/accessfs-platform" }
-accessfs-agent = { path = "crates/accessfs-agent" }
-accessfs-fs = { path = "crates/accessfs-fs" }
-accessfs-store = { path = "crates/accessfs-store" }
-accessfs-catalog = { path = "crates/accessfs-catalog" }
-accessfs-control = { path = "crates/accessfs-control" }
-accessfs-discover = { path = "crates/accessfs-discover" }
-accessfs-surface = { path = "crates/accessfs-surface" }
-accessfs-ssh = { path = "crates/accessfs-ssh" }
+floria-core = { path = "crates/floria-core" }
+floria-platform = { path = "crates/floria-platform" }
+floria-agent = { path = "crates/floria-agent" }
+floria-fs = { path = "crates/floria-fs" }
+floria-store = { path = "crates/floria-store" }
+floria-catalog = { path = "crates/floria-catalog" }
+floria-control = { path = "crates/floria-control" }
+floria-discover = { path = "crates/floria-discover" }
+floria-surface = { path = "crates/floria-surface" }
+floria-ssh = { path = "crates/floria-ssh" }

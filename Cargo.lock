@@ -3,203 +3,6 @@
 version = 4
 
 [[package]]
-name = "accessfs"
-version = "0.1.0"
-dependencies = [
- "accessfs-agent",
- "accessfs-catalog",
- "accessfs-control",
- "accessfs-core",
- "accessfs-discover",
- "accessfs-fs",
- "accessfs-platform",
- "accessfs-store",
- "accessfs-surface",
- "anyhow",
- "clap",
- "libc",
- "serde_json",
- "ssh-key",
- "tempfile",
- "tracing",
- "tracing-subscriber",
- "zeroize",
-]
-
-[[package]]
-name = "accessfs-agent"
-version = "0.1.0"
-dependencies = [
- "accessfs-catalog",
- "accessfs-core",
- "accessfs-platform",
- "accessfs-ssh",
- "base64 0.22.1",
- "chrono",
- "dashmap 6.2.1",
- "libc",
- "rsa",
- "serde",
- "serde_json",
- "sha2",
- "signature",
- "ssh-key",
- "tempfile",
- "threadpool",
- "tracing",
- "zeroize",
-]
-
-[[package]]
-name = "accessfs-catalog"
-version = "0.1.0"
-dependencies = [
- "accessfs-core",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "accessfs-control"
-version = "0.1.0"
-dependencies = [
- "accessfs-catalog",
- "accessfs-core",
- "accessfs-discover",
- "accessfs-platform",
- "accessfs-ssh",
- "accessfs-store",
- "accessfs-surface",
- "chrono",
- "libc",
- "serde",
- "serde_json",
- "ssh-key",
- "tempfile",
- "tracing",
- "zeroize",
-]
-
-[[package]]
-name = "accessfs-core"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "dashmap 6.2.1",
- "globset",
- "humantime",
- "libc",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.18",
- "toml 0.8.23",
- "tracing",
- "wait-timeout",
- "zeroize",
-]
-
-[[package]]
-name = "accessfs-discover"
-version = "0.1.0"
-dependencies = [
- "accessfs-catalog",
- "accessfs-surface",
- "notify",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "toml 0.8.23",
- "tracing",
- "zeroize",
-]
-
-[[package]]
-name = "accessfs-fs"
-version = "0.1.0"
-dependencies = [
- "accessfs-catalog",
- "accessfs-core",
- "accessfs-platform",
- "accessfs-store",
- "accessfs-surface",
- "anyhow",
- "ctrlc",
- "dashmap 6.2.1",
- "fuser",
- "libc",
- "tempfile",
- "threadpool",
- "tracing",
- "zeroize",
-]
-
-[[package]]
-name = "accessfs-platform"
-version = "0.1.0"
-dependencies = [
- "accessfs-core",
- "core-foundation",
- "core-foundation-sys",
- "libc",
- "libproc",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
-name = "accessfs-ssh"
-version = "0.1.0"
-dependencies = [
- "base64 0.22.1",
- "rsa",
- "sha2",
- "signature",
- "ssh-key",
- "thiserror 2.0.18",
- "zeroize",
-]
-
-[[package]]
-name = "accessfs-store"
-version = "0.1.0"
-dependencies = [
- "accessfs-core",
- "age",
- "chrono",
- "libc",
- "security-framework",
- "serde",
- "ssh-key",
- "tempfile",
- "thiserror 2.0.18",
- "toml 0.8.23",
- "tracing",
- "uuid",
- "zeroize",
-]
-
-[[package]]
-name = "accessfs-surface"
-version = "0.1.0"
-dependencies = [
- "accessfs-catalog",
- "accessfs-core",
- "accessfs-store",
- "age",
- "libc",
- "tempfile",
- "thiserror 2.0.18",
- "tracing",
- "zeroize",
-]
-
-[[package]]
 name = "aead"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -964,6 +767,203 @@ name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+
+[[package]]
+name = "floria"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "floria-agent",
+ "floria-catalog",
+ "floria-control",
+ "floria-core",
+ "floria-discover",
+ "floria-fs",
+ "floria-platform",
+ "floria-store",
+ "floria-surface",
+ "libc",
+ "serde_json",
+ "ssh-key",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "zeroize",
+]
+
+[[package]]
+name = "floria-agent"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "dashmap 6.2.1",
+ "floria-catalog",
+ "floria-core",
+ "floria-platform",
+ "floria-ssh",
+ "libc",
+ "rsa",
+ "serde",
+ "serde_json",
+ "sha2",
+ "signature",
+ "ssh-key",
+ "tempfile",
+ "threadpool",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "floria-catalog"
+version = "0.1.0"
+dependencies = [
+ "floria-core",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "floria-control"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "floria-catalog",
+ "floria-core",
+ "floria-discover",
+ "floria-platform",
+ "floria-ssh",
+ "floria-store",
+ "floria-surface",
+ "libc",
+ "serde",
+ "serde_json",
+ "ssh-key",
+ "tempfile",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "floria-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "dashmap 6.2.1",
+ "globset",
+ "humantime",
+ "libc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml 0.8.23",
+ "tracing",
+ "wait-timeout",
+ "zeroize",
+]
+
+[[package]]
+name = "floria-discover"
+version = "0.1.0"
+dependencies = [
+ "floria-catalog",
+ "floria-surface",
+ "notify",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml 0.8.23",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "floria-fs"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ctrlc",
+ "dashmap 6.2.1",
+ "floria-catalog",
+ "floria-core",
+ "floria-platform",
+ "floria-store",
+ "floria-surface",
+ "fuser",
+ "libc",
+ "tempfile",
+ "threadpool",
+ "tracing",
+ "zeroize",
+]
+
+[[package]]
+name = "floria-platform"
+version = "0.1.0"
+dependencies = [
+ "core-foundation",
+ "core-foundation-sys",
+ "floria-core",
+ "libc",
+ "libproc",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "floria-ssh"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "rsa",
+ "sha2",
+ "signature",
+ "ssh-key",
+ "thiserror 2.0.18",
+ "zeroize",
+]
+
+[[package]]
+name = "floria-store"
+version = "0.1.0"
+dependencies = [
+ "age",
+ "chrono",
+ "floria-core",
+ "libc",
+ "security-framework",
+ "serde",
+ "ssh-key",
+ "tempfile",
+ "thiserror 2.0.18",
+ "toml 0.8.23",
+ "tracing",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "floria-surface"
+version = "0.1.0"
+dependencies = [
+ "age",
+ "floria-catalog",
+ "floria-core",
+ "floria-store",
+ "libc",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "zeroize",
+]
 
 [[package]]
 name = "fluent"

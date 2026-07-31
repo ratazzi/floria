@@ -1,0 +1,28 @@
+[package]
+name = "floria-fs"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+floria-core = { workspace = true }
+floria-platform = { workspace = true }
+floria-store = { workspace = true }
+floria-catalog = { workspace = true }
+floria-surface = { workspace = true }
+fuser = { workspace = true }
+libc = { workspace = true }
+dashmap = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+ctrlc = { workspace = true }
+threadpool = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+# Typecheck-only on machines without macFUSE: makes fuser skip its pkg-config probe.
+# Do NOT enable for an actual mount (the default feature probes macFUSE via libfuse2).
+macos-no-mount = ["fuser/macos-no-mount"]

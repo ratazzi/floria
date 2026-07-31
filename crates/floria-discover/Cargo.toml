@@ -1,0 +1,19 @@
+[package]
+name = "floria-discover"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+floria-catalog = { workspace = true }
+floria-surface = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+zeroize = { workspace = true }
+notify = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = { workspace = true }

@@ -3,10 +3,10 @@ set -euo pipefail
 
 APP_PATH="${FLORIA_APP_PATH:-/Applications/Floria.app}"
 APP_NAME="Floria"
-DAEMON_PATH="${APP_PATH}/Contents/Resources/accessfs"
+DAEMON_PATH="${APP_PATH}/Contents/Resources/floria"
 INFO_PLIST="${APP_PATH}/Contents/Info.plist"
 RUNTIME_DIRECTORY="${HOME}/Library/Application Support/floria"
-CONFIG_PATH="${RUNTIME_DIRECTORY}/accessfs.toml"
+CONFIG_PATH="${RUNTIME_DIRECTORY}/floria.toml"
 SERVICE_LABEL="dev.floria.hola.ac.daemon"
 SERVICE_TARGET="gui/$(id -u)/${SERVICE_LABEL}"
 LAUNCH_AGENT_PLIST="${HOME}/Library/LaunchAgents/${SERVICE_LABEL}.plist"

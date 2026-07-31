@@ -1,0 +1,66 @@
+# Floria step-one example config.
+# After mounting: two read-only virtual files appear under ~/.floria.
+
+[mount]
+path = "~/.floria"
+volname = "Floria"
+# audit_log defaults to <name>.audit.jsonl next to the mount point, i.e. ~/.floria.audit.jsonl
+
+# Built-in constant demo file: all bytes are known at mount time, so size is exact -- the strongest "plain file" evidence.
+[[file]]
+path = "demo/hello.txt"
+mode = "0444"
+content = "hello from floria\nstep-one demo\n"
+
+# Script-handler dynamic file: the script runs on open and its stdout is the content. size is a declared upper bound + direct-io.
+# enforcement gates each open through the menubar app. "prompt" = allow/deny dialog;
+# "touchid" additionally requires Touch ID to allow. Both are subject to the grant cache.
+[[file]]
+path = "env/demo/dev.env"
+mode = "0444"
+ttl  = "0s"
+size = 4096
+enforcement = "touchid"
+read = ["./scripts/render-env", "demo", "dev"]
+
+# Subject-aware rules. Evaluated first-match by descending priority; a per-file `enforcement`
+# above is an implicit rule at priority 0 with subject = any. A trailing read-only `allow`
+# catch-all is always appended, so unmatched *reads* are allowed (monitor mode).
+#
+# Each rule matches a `path` glob AND a subject AND an operation. `operation` is `"read"`
+# (the default), `"write"`, or `"readwrite"` — write access never rides a read rule; it must
+# be opted into explicitly. Writes that match no rule are denied (fail-closed); store-backed
+# secrets are prompted for both read and write by a built-in default.
+#
+# Subject facets are all optional and AND together:
+#   team_id     code-signing team of a compiled/GUI app (stable across its helper processes)
+#   bundle_id   code-signing bundle id (finer than team)
+#   exe         glob over the reader's executable path (`*` does not cross `/`; use `**/foo`)
+#   repo        git checkout the reader runs from (use this for node/python/ruby interpreters)
+#   cwd_prefix  the reader's working directory must start with this
+#
+# [[rule]]
+# id = "prod-lockdown"
+# priority = 100
+# path = "env/*/prod.env"
+# enforcement = "deny"
+#
+# [[rule]]
+# id = "chrome-prompts"
+# path = "env/**"
+# enforcement = "prompt"
+# team_id = "EQHXZ8M8AV"        # Google Chrome and all its helpers
+#
+# [[rule]]
+# id = "this-project-node"
+# path = "env/**"
+# enforcement = "touchid"
+# repo = "~/workspace/floria"   # `node script.js` run from this checkout
+# exe = "**/node"
+#
+# [[rule]]
+# id = "editor-writes"
+# path = "secrets/**"
+# operation = "readwrite"        # without this, the rule would cover reads only
+# enforcement = "prompt"
+# exe = "**/nvim"
