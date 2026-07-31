@@ -14,8 +14,8 @@ use floria_agent::{ManagedObject, ManagedPolicyItem};
 use floria_control::{
     ActiveGrant as ControlActiveGrant, BackupReport as ControlBackupReport, BackupService,
     CatalogObserver, ControlClient, ControlCommand, ControlResult, ControlRuntimeServices,
-    ControlServer, ManagedSshConfig, RuntimePolicyController, SshConfigManager, SshIdentity,
-    SshIdentityDiscovery,
+    ControlServer, ManagedSshConfig, ProtectedFile, RuntimePolicyController, SshConfigManager,
+    SshIdentity, SshIdentityDiscovery,
 };
 use floria_core::audit::AuditLog;
 use floria_core::authz::{Authorizer, PolicyMode, PolicyModeStatus};
@@ -28,8 +28,8 @@ use floria_store::{
 use floria_surface::{
     ensure_file_surface_link, file_surface_instances, protected_checkout_links,
     refresh_protected_checkout_links, release_protected_links_for_file_surfaces,
-    remove_file_surface_link, validate_secret_bytes, ProtectedCheckoutLink, SurfaceLinkRemoval,
-    SurfaceLinkState, SurfaceRegistry,
+    remove_file_surface_link, ProtectedCheckoutLink, SurfaceLinkRemoval, SurfaceLinkState,
+    SurfaceRegistry,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -550,16 +550,8 @@ fn recovery_passphrase(confirm: bool) -> Result<zeroize::Zeroizing<String>> {
 
 fn cmd_protect(path: &Path, config: &Path) -> Result<()> {
     let cfg = load(config)?;
-    let socket = support_dir(&cfg)?.join("control.sock");
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .context("resolving the current directory")?
-            .join(path)
-    };
-    let mut client = ControlClient::connect(&socket)
-        .with_context(|| format!("connecting to control socket {}", socket.display()))?;
+    let absolute = absolute_cli_path(path)?;
+    let mut client = connect_control(&cfg)?;
     match client.request(ControlCommand::FileProtect { path: absolute })? {
         ControlResult::FileProtected { file, created } => {
             let action = if created { "protected" } else { "already protected" };
@@ -601,64 +593,102 @@ fn cmd_reveal(target: &str, version: Option<u32>, to: Option<PathBuf>, config: &
 
 fn cmd_history(target: &str, config: &Path) -> Result<()> {
     let cfg = load(config)?;
-    let store = open_store(&cfg)?;
-    let record = resolve_target(&store, target)?;
-    println!("{}  {}", record.id, record.display_name());
-    for v in store.history(&record.id)? {
-        let head = if v.version == record.current_version { " (current)" } else { "" };
-        let note = v.note.map(|n| format!("  {n}")).unwrap_or_default();
-        println!("  v{}  {} bytes  {}{head}{note}", v.version, v.size, v.created);
+    let mut client = connect_control(&cfg)?;
+    let file = resolve_protected_file(&mut client, target)?;
+    let result = client.request(ControlCommand::ProtectedFileHistory { id: file.id.clone() })?;
+    let ControlResult::ProtectedFileHistory { id, versions } = result else {
+        anyhow::bail!("daemon returned an unexpected history result: {result:?}");
+    };
+    println!("{}  {}", id, file.source_path.display());
+    for version in versions {
+        let head = if version.current { " (current)" } else { "" };
+        let note = version.note.map(|note| format!("  {note}")).unwrap_or_default();
+        println!(
+            "  v{}  {} bytes  {}{head}{note}",
+            version.version, version.size, version.created
+        );
     }
     Ok(())
 }
 
 fn cmd_rollback(target: &str, version: u32, config: &Path) -> Result<()> {
     let cfg = load(config)?;
-    let store = open_store(&cfg)?;
-    let record = resolve_target(&store, target)?;
-    let plaintext = store.get_version(&record.id, version)?;
-    validate_catalog_secret_bytes(&cfg, &record.id, &plaintext)?;
-    store.set_head(&record.id, version)?;
-    println!("{} → head is now v{version}", record.id);
-    Ok(())
-}
-
-fn validate_catalog_secret_bytes(
-    cfg: &ResolvedConfig,
-    secret_id: &SecretId,
-    bytes: &[u8],
-) -> Result<()> {
-    let catalog_path = support_dir(cfg)?.join("catalog.sqlite");
-    if !catalog_path.exists() {
-        return Ok(());
+    let mut client = connect_control(&cfg)?;
+    let file = resolve_protected_file(&mut client, target)?;
+    match client.request(ControlCommand::ProtectedFileRollback {
+        id: file.id,
+        version,
+    })? {
+        ControlResult::ProtectedFileRolledBack { file } => {
+            println!("{} → head is now v{}", file.id, file.current_version);
+            Ok(())
+        }
+        result => anyhow::bail!("daemon returned an unexpected rollback result: {result:?}"),
     }
-    let catalog = Catalog::open(&catalog_path)
-        .with_context(|| format!("opening catalog at {}", catalog_path.display()))?;
-    let snapshot = catalog.snapshot().context("loading catalog for secret validation")?;
-    validate_secret_bytes(&snapshot, secret_id.as_str(), bytes)
-        .with_context(|| format!("validating replacement bytes for secret {secret_id}"))
 }
 
 fn cmd_list(config: &Path) -> Result<()> {
     let cfg = load(config)?;
-    let store = open_store(&cfg)?;
-    let records = store.list()?;
-    if records.is_empty() {
-        println!("no protected secrets");
+    let mut client = connect_control(&cfg)?;
+    let result = client.request(ControlCommand::ProtectedFiles)?;
+    let ControlResult::ProtectedFiles(files) = result else {
+        anyhow::bail!("daemon returned an unexpected list result: {result:?}");
+    };
+    if files.is_empty() {
+        println!("no protected files");
         return Ok(());
     }
-    for r in records {
+    for file in files {
         println!(
-            "{}  {}  (v{}, {} bytes, mode {:04o}, {})",
-            r.id,
-            r.display_name(),
-            r.current_version,
-            r.size,
-            r.mode,
-            r.created
+            "{}  {}  (v{}, {} bytes, mode {:04o})",
+            file.id,
+            file.source_path.display(),
+            file.current_version,
+            file.size,
+            file.mode
         );
     }
     Ok(())
+}
+
+fn connect_control(cfg: &ResolvedConfig) -> Result<ControlClient> {
+    let socket = support_dir(cfg)?.join("control.sock");
+    ControlClient::connect(&socket)
+        .with_context(|| format!("connecting to control socket {}", socket.display()))
+}
+
+fn resolve_protected_file(client: &mut ControlClient, target: &str) -> Result<ProtectedFile> {
+    let result = client.request(ControlCommand::ProtectedFiles)?;
+    let ControlResult::ProtectedFiles(files) = result else {
+        anyhow::bail!("daemon returned an unexpected file lookup result: {result:?}");
+    };
+    if let Some(file) = files.iter().find(|file| file.id == target) {
+        return Ok(file.clone());
+    }
+    let path = absolute_cli_path(Path::new(target))?;
+    files
+        .into_iter()
+        .find(|file| file.source_path == path)
+        .with_context(|| format!("no protected file for {target:?}"))
+}
+
+/// Make a user-supplied path absolute without following the final component, which may already be
+/// a Floria-managed symlink.
+fn absolute_cli_path(path: &Path) -> Result<PathBuf> {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("resolving the current directory")?
+            .join(path)
+    };
+    let name = path
+        .file_name()
+        .with_context(|| format!("path must name a file: {}", path.display()))?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("/"));
+    let parent = std::fs::canonicalize(parent)
+        .with_context(|| format!("resolving parent directory {}", parent.display()))?;
+    Ok(parent.join(name))
 }
 
 /// Resolve a reveal target that may be a store id or a source path.
@@ -1114,12 +1144,11 @@ fn reconcile_file_links(surfaces: &[Surface], mount_path: &Path) {
 
 fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> Result<()> {
     let cfg = load(config)?;
-    let socket = match socket {
-        Some(socket) => socket,
-        None => support_dir(&cfg)?.join("control.sock"),
+    let mut client = match socket {
+        Some(socket) => ControlClient::connect(&socket)
+            .with_context(|| format!("connecting to control socket {}", socket.display()))?,
+        None => connect_control(&cfg)?,
     };
-    let mut client = ControlClient::connect(&socket)
-        .with_context(|| format!("connecting to control socket {}", socket.display()))?;
     let command = match command {
         ControlCmd::Ping => ControlCommand::Ping,
         ControlCmd::Policy { mode: None, duration_secs: None } => ControlCommand::PolicyModeGet,
