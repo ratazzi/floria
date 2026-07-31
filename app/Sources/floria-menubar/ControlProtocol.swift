@@ -1,6 +1,6 @@
 import Foundation
 
-let supportedControlProtocolVersion: UInt32 = 3
+let supportedControlProtocolVersion: UInt32 = 4
 
 struct ControlServerInfo: Decodable, Equatable, Sendable {
     let protocolVersion: UInt32?
@@ -945,6 +945,10 @@ struct BackupReport: Codable, Equatable, Sendable {
     }
 }
 
+struct RecoveryKeyReport: Codable, Equatable, Sendable {
+    let path: String
+}
+
 struct DiagnosticsReport: Codable, Equatable, Sendable {
     let path: String
     let pathsIncluded: Bool
@@ -968,6 +972,7 @@ enum ControlCommand: Sendable {
     case accessHistory(limit: Int)
     case backupCreate(destination: String)
     case backupVerify(backup: String)
+    case recoveryKeyExport(destination: String, passphrase: String)
     case diagnosticsExport(destination: String, includePaths: Bool)
     case snapshot
     case discover(paths: [String])
@@ -1041,6 +1046,7 @@ enum ControlCommand: Sendable {
         case .accessHistory: "access_history"
         case .backupCreate: "backup_create"
         case .backupVerify: "backup_verify"
+        case .recoveryKeyExport: "recovery_key_export"
         case .diagnosticsExport: "diagnostics_export"
         case .snapshot: "snapshot"
         case .discover: "discover"
@@ -1119,6 +1125,12 @@ enum ControlCommand: Sendable {
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: BackupVerifyParams(backup: backup)))
+        case .recoveryKeyExport(let destination, let passphrase):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: RecoveryKeyExportParams(
+                        destination: destination, passphrase: passphrase)))
         case .diagnosticsExport(let destination, let includePaths):
             return try encoder.encode(
                 ControlRequest(
@@ -1319,6 +1331,10 @@ private struct GrantIDParams: Encodable { let id: String }
 private struct AccessHistoryParams: Encodable { let limit: Int }
 private struct BackupCreateParams: Encodable { let destination: String }
 private struct BackupVerifyParams: Encodable { let backup: String }
+private struct RecoveryKeyExportParams: Encodable {
+    let destination: String
+    let passphrase: String
+}
 private struct DiagnosticsExportParams: Encodable {
     let destination: String
     let includePaths: Bool

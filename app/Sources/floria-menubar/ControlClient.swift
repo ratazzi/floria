@@ -108,6 +108,19 @@ final class ControlClient: @unchecked Sendable {
         return report
     }
 
+    func exportRecoveryKey(
+        destination: String,
+        passphrase: String
+    ) async throws -> RecoveryKeyReport {
+        guard let report: RecoveryKeyReport = try await request(
+            .recoveryKeyExport(destination: destination, passphrase: passphrase),
+            expecting: "recovery_key", as: RecoveryKeyReport.self)
+        else {
+            throw ControlClientError.missingResult("recovery_key")
+        }
+        return report
+    }
+
     func exportDiagnostics(
         destination: String,
         includePaths: Bool

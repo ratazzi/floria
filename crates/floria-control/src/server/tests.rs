@@ -70,6 +70,21 @@
         }
     }
 
+    struct FixtureRecoveryKeyExporter;
+
+    impl RecoveryKeyExporter for FixtureRecoveryKeyExporter {
+        fn export(
+            &self,
+            destination: &Path,
+            passphrase: &str,
+        ) -> Result<RecoveryKeyReport, String> {
+            if passphrase != "fixture recovery phrase" {
+                return Err("unexpected recovery passphrase".to_string());
+            }
+            Ok(RecoveryKeyReport { path: destination.to_path_buf() })
+        }
+    }
+
     struct FixtureHealthReporter;
 
     impl RuntimeHealthReporter for FixtureHealthReporter {
@@ -215,6 +230,46 @@
             services,
             ControlCommand::BackupCreate {
                 destination: PathBuf::from("relative-backup"),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(relative, DispatchError::Validation(_)));
+    }
+
+    #[test]
+    fn recovery_key_export_uses_the_runtime_service_and_requires_an_absolute_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite")).unwrap();
+        let recovery_key = FixtureRecoveryKeyExporter;
+        let destination = directory.path().join("Floria Recovery Key.age");
+
+        let result = dispatch(
+            &catalog,
+            DispatchServices {
+                recovery_key: Some(&recovery_key),
+                ..DispatchServices::default()
+            },
+            ControlCommand::RecoveryKeyExport {
+                destination: destination.clone(),
+                passphrase: SecretValue::new("fixture recovery phrase"),
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            result,
+            ControlResult::RecoveryKey(RecoveryKeyReport { path }) if path == destination
+        ));
+
+        let relative = dispatch(
+            &catalog,
+            DispatchServices {
+                recovery_key: Some(&recovery_key),
+                ..DispatchServices::default()
+            },
+            ControlCommand::RecoveryKeyExport {
+                destination: PathBuf::from("Floria Recovery Key.age"),
+                passphrase: SecretValue::new("fixture recovery phrase"),
             },
         )
         .unwrap_err();

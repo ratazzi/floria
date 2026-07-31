@@ -7,8 +7,20 @@ final class ProductLanguageTests: XCTestCase {
 
         XCTAssertTrue(source.contains(#""Create Backup…""#))
         XCTAssertTrue(source.contains(#""Verify Backup…""#))
+        XCTAssertTrue(source.contains(#""Export Recovery Key…""#))
         XCTAssertFalse(source.contains(#""Restore Backup…""#))
         XCTAssertFalse(source.contains(#""Activate Backup…""#))
+    }
+
+    func testRecoveryKeyExportConfirmsThePassphraseWithoutPersistingIt() throws {
+        let source = try source("RecoveryKeyExportSheet.swift")
+
+        XCTAssertEqual(source.components(separatedBy: "SecureField(").count - 1, 2)
+        XCTAssertTrue(source.contains(#""Use at least 12 characters.""#))
+        XCTAssertTrue(source.contains(#""Passphrases do not match.""#))
+        XCTAssertTrue(source.contains("clearPassphrases()"))
+        XCTAssertFalse(source.contains("UserDefaults"))
+        XCTAssertFalse(source.contains("AppStorage"))
     }
 
     func testFirstProjectEmptyStateOffersDiscoveryDirectly() throws {

@@ -15,8 +15,8 @@ use floria_control::{
     ActiveGrant as ControlActiveGrant, BackupReport as ControlBackupReport, BackupService,
     CatalogObserver, ControlClient, ControlCommand, ControlResult, ControlRuntimeServices,
     ControlServer, ManagedSshConfig, ProtectedFile, RuntimeDiagnosticsExporter,
-    RuntimeHealthReporter, RuntimePolicyController, SshConfigManager, SshIdentity,
-    SshIdentityDiscovery,
+    RecoveryKeyExporter, RuntimeHealthReporter, RuntimePolicyController, SshConfigManager,
+    SshIdentity, SshIdentityDiscovery,
 };
 use floria_core::audit::AuditLog;
 use floria_core::authz::{Authorizer, PolicyMode, PolicyModeStatus};
@@ -38,9 +38,11 @@ use tracing_subscriber::EnvFilter;
 
 mod diagnostics;
 mod health;
+mod recovery;
 
 use diagnostics::RuntimeDiagnostics;
 use health::RuntimeHealth;
+use recovery::RuntimeRecoveryKeyExporter;
 
 /// Floria: a userspace filesystem that exposes dynamic content as plain local files (macOS/macFUSE).
 #[derive(Parser)]
@@ -506,7 +508,7 @@ fn cmd_keys_import(remove_file: bool, config: &Path) -> Result<()> {
         anyhow::bail!("the configured store already reads its key from Keychain");
     }
     let key_path = &cfg.store_ssh_key;
-    let decrypted = read_ssh_private_key(key_path)?;
+    let decrypted = recovery::read_ssh_private_key(key_path)?;
     open_store(&cfg)?
         .verify_all()
         .context("verifying that the configured SSH key decrypts every store version")?;
@@ -539,36 +541,15 @@ fn cmd_keys_import(remove_file: bool, config: &Path) -> Result<()> {
     Ok(())
 }
 
-fn read_ssh_private_key(key_path: &Path) -> Result<zeroize::Zeroizing<Vec<u8>>> {
-    let data = std::fs::read(key_path)
-        .with_context(|| format!("reading ssh private key {}", key_path.display()))?;
-    let key = ssh_key::PrivateKey::from_openssh(&data[..])
-        .with_context(|| format!("parsing ssh private key {}", key_path.display()))?;
-    let key = if key.is_encrypted() {
-        let passphrase = std::env::var("FLORIA_KEY_PASSPHRASE").context(
-            "the key is passphrase-protected; set FLORIA_KEY_PASSPHRASE for the import",
-        )?;
-        let passphrase = zeroize::Zeroizing::new(passphrase);
-        key.decrypt(passphrase.as_bytes())
-            .context("decrypting ssh private key (wrong FLORIA_KEY_PASSPHRASE?)")?
-    } else {
-        key
-    };
-    let decrypted = key
-        .to_openssh(ssh_key::LineEnding::LF)
-        .context("re-encoding decrypted ssh private key")?;
-    Ok(zeroize::Zeroizing::new(decrypted.as_bytes().to_vec()))
-}
-
 fn cmd_keys_export_recovery(destination: &Path, config: &Path) -> Result<()> {
     let cfg = load(config)?;
     open_store(&cfg)?
         .verify_all()
         .context("verifying that the active key decrypts every store version")?;
     let private_key = match cfg.store_key_source {
-        StoreKeySource::Ssh => read_ssh_private_key(&cfg.store_ssh_key)?,
+        StoreKeySource::Ssh => recovery::read_ssh_private_key(&cfg.store_ssh_key)?,
         StoreKeySource::Auto if cfg.store_ssh_key.exists() => {
-            read_ssh_private_key(&cfg.store_ssh_key)?
+            recovery::read_ssh_private_key(&cfg.store_ssh_key)?
         }
         StoreKeySource::Auto | StoreKeySource::Keychain => {
             KeychainKeyProvider::export_private_key().context("reading the store key from Keychain")?
@@ -862,6 +843,13 @@ fn cmd_mount(config: &Path) -> Result<()> {
     let concrete_store = Arc::new(store);
     let backup: Arc<dyn BackupService> =
         Arc::new(DaemonBackupService { store: Arc::clone(&concrete_store) });
+    let recovery_key: Arc<dyn RecoveryKeyExporter> = Arc::new(
+        RuntimeRecoveryKeyExporter::new(
+            Arc::clone(&concrete_store),
+            cfg.store_key_source,
+            cfg.store_ssh_key.clone(),
+        ),
+    );
     let store: Arc<dyn SecretStore> = concrete_store;
     let health: Arc<dyn RuntimeHealthReporter> = Arc::new(RuntimeHealth::new(
         catalog.clone(),
@@ -945,6 +933,7 @@ fn cmd_mount(config: &Path) -> Result<()> {
             ssh_discovery,
             ssh_config,
             backup,
+            recovery_key,
             health,
             diagnostics,
             audit_log: cfg.audit_log.clone(),
@@ -1321,6 +1310,9 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
             println!("{}", serde_json::to_string_pretty(&events)?);
         }
         ControlResult::Backup(report) => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        ControlResult::RecoveryKey(report) => {
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         ControlResult::Diagnostics(report) => {

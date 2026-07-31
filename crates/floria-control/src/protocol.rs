@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 const MAX_MSG: usize = 8 << 20;
-pub const CONTROL_PROTOCOL_VERSION: u32 = 3;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRequest {
@@ -66,6 +66,7 @@ pub enum ControlCommand {
     AccessHistory { limit: usize },
     BackupCreate { destination: PathBuf },
     BackupVerify { backup: PathBuf },
+    RecoveryKeyExport { destination: PathBuf, passphrase: SecretValue },
     DiagnosticsExport { destination: PathBuf, include_paths: bool },
     Snapshot,
     Discover { paths: Vec<PathBuf> },
@@ -207,6 +208,7 @@ pub enum ControlResult {
     ActiveGrants(Vec<ActiveGrant>),
     AccessHistory(Vec<AccessHistoryEvent>),
     Backup(BackupReport),
+    RecoveryKey(RecoveryKeyReport),
     Diagnostics(DiagnosticsReport),
     Snapshot(WorkspaceSnapshot),
     Discovery(DiscoveryReviewPlan),
@@ -282,6 +284,11 @@ pub struct BackupReport {
     pub versions: usize,
     pub plaintext_bytes: u64,
     pub files: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryKeyReport {
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -786,6 +793,31 @@ mod tests {
         assert_eq!(value["type"], "diagnostics");
         assert_eq!(value["value"]["paths_included"], false);
         assert_eq!(value["value"]["files"], 4);
+    }
+
+    #[test]
+    fn recovery_key_export_redacts_the_passphrase_from_debug_output() {
+        let request = ControlRequest {
+            request_id: 10,
+            command: ControlCommand::RecoveryKeyExport {
+                destination: PathBuf::from("/tmp/Floria Recovery Key.age"),
+                passphrase: SecretValue::new("fixture recovery phrase"),
+            },
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        let debug = format!("{request:?}");
+
+        assert_eq!(value["method"], "recovery_key_export");
+        assert_eq!(
+            value["params"]["destination"],
+            "/tmp/Floria Recovery Key.age"
+        );
+        assert_eq!(
+            value["params"]["passphrase"],
+            "fixture recovery phrase"
+        );
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("fixture recovery phrase"));
     }
 
     #[test]

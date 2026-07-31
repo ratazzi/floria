@@ -928,6 +928,16 @@ final class WorkspaceStore {
             at: (path as NSString).standardizingPath)
     }
 
+    func exportRecoveryKey(
+        at path: String,
+        passphrase: String
+    ) async throws -> RecoveryKeyReport {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        return try await controlClient.exportRecoveryKey(
+            destination: (path as NSString).standardizingPath,
+            passphrase: passphrase)
+    }
+
     func exportDiagnostics(
         at path: String,
         includePaths: Bool

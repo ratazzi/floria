@@ -13,6 +13,7 @@ pub(super) fn dispatch(
         ssh_discovery,
         ssh_config,
         backup,
+        recovery_key,
         health,
         diagnostics,
         checkout_monitor,
@@ -144,6 +145,22 @@ pub(super) fn dispatch(
                 .verify(&backup_path)
                 .map(ControlResult::Backup)
                 .map_err(DispatchError::Backup)
+        }
+        ControlCommand::RecoveryKeyExport { destination, passphrase } => {
+            if !destination.is_absolute() {
+                return Err(DispatchError::Validation(
+                    "recovery key destination must be absolute".to_string(),
+                ));
+            }
+            recovery_key
+                .ok_or_else(|| {
+                    DispatchError::Validation(
+                        "recovery key export is unavailable on this control server".to_string(),
+                    )
+                })?
+                .export(&destination, passphrase.as_str())
+                .map(ControlResult::RecoveryKey)
+                .map_err(DispatchError::RecoveryKey)
         }
         ControlCommand::Snapshot => {
             workspace_snapshot(catalog, store, mount_path, ssh_runtime_dir)

@@ -15,11 +15,12 @@ pub use protocol::{
     ControlResult, DiagnosticsReport, DiscoveryJobPhase, DiscoveryJobProgress, DiscoveryJobState,
     DiscoveryJobStatus, HealthCheck, HealthReport, HealthStatus, ProjectCheckoutCandidate,
     ProjectCheckoutDiscovery, ProjectCheckoutInventory, ProtectedFile, ProtectedFileVersion,
-    SecretValue, SshConfigState, SshConfigStatus, SshIdentity, CONTROL_PROTOCOL_VERSION,
+    RecoveryKeyReport, SecretValue, SshConfigState, SshConfigStatus, SshIdentity,
+    CONTROL_PROTOCOL_VERSION,
 };
 pub use server::{
     BackupService, CatalogObserver, ControlRuntimeServices, ControlServer,
-    RuntimeDiagnosticsExporter, RuntimeHealthReporter, RuntimePolicyController, SshConfigManager,
-    SshIdentityDiscovery,
+    RecoveryKeyExporter, RuntimeDiagnosticsExporter, RuntimeHealthReporter,
+    RuntimePolicyController, SshConfigManager, SshIdentityDiscovery,
 };
 pub use ssh_config::ManagedSshConfig;

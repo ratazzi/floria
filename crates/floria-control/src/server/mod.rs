@@ -41,7 +41,7 @@ use crate::protocol::{
     DiagnosticsReport, DiscoveryReviewPlan, DiscoverySourceDisposition, HealthReport, ManagedLink,
     ManagedLinkStatus, ProjectCheckoutCandidate, ProjectCheckoutDiscovery,
     ProjectCheckoutInventory, ProtectedFile, ProtectedFileVersion, SecretValue, SshConfigStatus,
-    SshIdentity, WorkspaceSnapshot,
+    RecoveryKeyReport, SshIdentity, WorkspaceSnapshot,
 };
 
 pub struct ControlServer {
@@ -88,6 +88,19 @@ pub trait BackupService: Send + Sync + 'static {
     fn verify(&self, backup: &Path) -> Result<BackupReport, String>;
 }
 
+/// Export the active store key as one independently passphrase-encrypted recovery file.
+///
+/// The implementation owns key retrieval, store verification, file permissions, overwrite
+/// protection, and atomic publication. The control caller supplies only a new absolute path and
+/// the passphrase it collected from the user.
+pub trait RecoveryKeyExporter: Send + Sync + 'static {
+    fn export(
+        &self,
+        destination: &Path,
+        passphrase: &str,
+    ) -> Result<RecoveryKeyReport, String>;
+}
+
 /// One deep, read-only health interface for every control-plane caller.
 ///
 /// Production owns the platform checks; the control server only transports their redacted result.
@@ -113,6 +126,7 @@ pub struct ControlRuntimeServices {
     pub ssh_discovery: Arc<dyn SshIdentityDiscovery>,
     pub ssh_config: Arc<dyn SshConfigManager>,
     pub backup: Arc<dyn BackupService>,
+    pub recovery_key: Arc<dyn RecoveryKeyExporter>,
     pub health: Arc<dyn RuntimeHealthReporter>,
     pub diagnostics: Arc<dyn RuntimeDiagnosticsExporter>,
     pub audit_log: PathBuf,
@@ -130,6 +144,7 @@ struct ControlDependencies {
     ssh_discovery: Option<Arc<dyn SshIdentityDiscovery>>,
     ssh_config: Option<Arc<dyn SshConfigManager>>,
     backup: Option<Arc<dyn BackupService>>,
+    recovery_key: Option<Arc<dyn RecoveryKeyExporter>>,
     health: Option<Arc<dyn RuntimeHealthReporter>>,
     diagnostics: Option<Arc<dyn RuntimeDiagnosticsExporter>>,
     audit_log: Option<PathBuf>,
@@ -225,6 +240,7 @@ impl ControlServer {
                 ssh_discovery: Some(services.ssh_discovery),
                 ssh_config: Some(services.ssh_config),
                 backup: Some(services.backup),
+                recovery_key: Some(services.recovery_key),
                 health: Some(services.health),
                 diagnostics: Some(services.diagnostics),
                 audit_log: Some(services.audit_log),
@@ -337,6 +353,7 @@ fn handle_connection(
             ssh_discovery: dependencies.ssh_discovery.as_deref(),
             ssh_config: dependencies.ssh_config.as_deref(),
             backup: dependencies.backup.as_deref(),
+            recovery_key: dependencies.recovery_key.as_deref(),
             health: dependencies.health.as_deref(),
             diagnostics: dependencies.diagnostics.as_deref(),
             checkout_monitor: dependencies.checkout_monitor.as_deref(),
@@ -377,6 +394,7 @@ fn is_read_only(command: &ControlCommand) -> bool {
             | ControlCommand::AccessHistory { .. }
             | ControlCommand::BackupCreate { .. }
             | ControlCommand::BackupVerify { .. }
+            | ControlCommand::RecoveryKeyExport { .. }
             | ControlCommand::Snapshot
             | ControlCommand::Discover { .. }
             | ControlCommand::DiscoverStart { .. }
@@ -411,6 +429,7 @@ enum DispatchError {
     Policy(io::Error),
     SshConfig(io::Error),
     Backup(String),
+    RecoveryKey(String),
     Diagnostics(String),
     Validation(String),
     StoreUnavailable,
@@ -430,6 +449,7 @@ struct DispatchServices<'a> {
     ssh_discovery: Option<&'a dyn SshIdentityDiscovery>,
     ssh_config: Option<&'a dyn SshConfigManager>,
     backup: Option<&'a dyn BackupService>,
+    recovery_key: Option<&'a dyn RecoveryKeyExporter>,
     health: Option<&'a dyn RuntimeHealthReporter>,
     diagnostics: Option<&'a dyn RuntimeDiagnosticsExporter>,
     checkout_monitor: Option<&'a GitCheckoutMonitor>,
@@ -473,6 +493,10 @@ impl DispatchError {
             },
             DispatchError::Backup(message) => ControlErrorBody {
                 code: "backup".to_string(),
+                message: message.clone(),
+            },
+            DispatchError::RecoveryKey(message) => ControlErrorBody {
+                code: "recovery_key".to_string(),
                 message: message.clone(),
             },
             DispatchError::Diagnostics(message) => ControlErrorBody {

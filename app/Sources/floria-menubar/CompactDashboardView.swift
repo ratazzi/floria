@@ -86,6 +86,7 @@ struct DashboardView: View {
     @State private var uninstallInProgress = false
     @State private var backupNotice: BackupNotice?
     @State private var backupOperationInProgress = false
+    @State private var showingRecoveryKeyExport = false
     @FocusState private var searchIsFocused: Bool
     @Environment(\.openWindow) private var openWindow
 
@@ -164,6 +165,20 @@ struct DashboardView: View {
         }
         .sheet(isPresented: $showingSystemHealth) {
             SystemHealthView(state: state)
+        }
+        .sheet(isPresented: $showingRecoveryKeyExport) {
+            RecoveryKeyExportSheet(
+                export: { destination, passphrase in
+                    try await state.workspace.exportRecoveryKey(
+                        at: destination, passphrase: passphrase)
+                },
+                completed: { report in
+                    backupNotice = BackupNotice(
+                        title: "Recovery Key Exported",
+                        message:
+                            "Store this file and its passphrase separately from this Mac.\n\(report.path)"
+                    )
+                })
         }
         .onAppear {
             presentRequestedSystemHealth()
@@ -284,6 +299,10 @@ struct DashboardView: View {
                 .disabled(backupOperationInProgress || !state.connected)
                 Button("Verify Backup…", systemImage: "checkmark.circle") {
                     chooseBackupToVerify()
+                }
+                .disabled(backupOperationInProgress || !state.connected)
+                Button("Export Recovery Key…", systemImage: "key.horizontal") {
+                    showingRecoveryKeyExport = true
                 }
                 .disabled(backupOperationInProgress || !state.connected)
                 Divider()
