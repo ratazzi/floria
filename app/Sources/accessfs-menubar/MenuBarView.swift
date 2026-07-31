@@ -691,7 +691,7 @@ private struct MenuBarFooter: View {
             .padding(.horizontal, 10)
             .padding(.top, 2)
             .padding(.bottom, 4)
-            MenuItemButton(title: "Open Library", icon: "rectangle.grid.2x2", shortcut: "D") {
+            MenuItemButton(title: "Open Floria", icon: "macwindow", shortcut: "D") {
                 // The window-style extra panel stays up on its own; close it
                 // like a menu would before handing focus to the dashboard.
                 dismiss()
