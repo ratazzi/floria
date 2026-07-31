@@ -102,7 +102,7 @@ mod tests {
             id: "floria".to_string(),
             name: "floria".to_string(),
             path: PathBuf::from("/workspace/floria"),
-            default_environment_id: None,
+            ..Default::default()
         }
     }
 

@@ -5,7 +5,7 @@ use accessfs_core::authz::Enforcement;
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 pub use accessfs_core::metadata::{ItemLink, ItemMetadata};
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Project {
     pub id: String,
     pub name: String,
@@ -18,10 +18,13 @@ pub struct Project {
     pub default_environment_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectCheckoutKind {
     Primary,
+    /// The default: worktrees are the many, the primary is the singleton
+    /// `upsert_project` creates itself.
+    #[default]
     Worktree,
 }
 
@@ -42,7 +45,7 @@ impl ProjectCheckoutKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectCheckout {
     pub id: String,
     pub project_id: String,
@@ -56,7 +59,7 @@ pub struct ProjectCheckout {
     pub git_common_dir: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Environment {
     pub id: String,
     pub project_id: String,
@@ -246,9 +249,10 @@ pub struct OriginSource {
     pub imported_at: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BindingScope {
+    #[default]
     Common,
     Environment { environment_id: String },
 }
@@ -274,6 +278,24 @@ pub struct Binding {
 
 fn enabled_by_default() -> bool {
     true
+}
+
+// Hand-written so `enabled` matches the serde default (true); a derived
+// Default would silently construct disabled bindings.
+impl Default for Binding {
+    fn default() -> Self {
+        Binding {
+            id: String::new(),
+            project_id: String::new(),
+            scope: BindingScope::default(),
+            resource_id: String::new(),
+            selection: EntrySelection::default(),
+            key_override: None,
+            enabled: true,
+            allow_override: false,
+            position: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
