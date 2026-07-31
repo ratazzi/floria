@@ -224,7 +224,14 @@ struct ProtectionMenuContent: View {
                     [AuditOnlyWindow.oneHour, .eightHours, .untilChanged]
                 ) { window in
                     Button(window.title) {
-                        requestAuditOnly(window)
+                        // Touch ID's own system prompt already reads as a confirmation, so
+                        // skip the redundant in-app dialog when it's available; machines with
+                        // no biometric sensor still get the plain confirmation.
+                        if BiometricAuth.biometricsAvailable() {
+                            Task { await state.setPolicyMode(.auditOnly, durationSecs: window.durationSecs) }
+                        } else {
+                            requestAuditOnly(window)
+                        }
                     }
                 }
             }

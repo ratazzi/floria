@@ -290,7 +290,22 @@ final class AppState {
         }
     }
 
+    /// Entering audit-only relaxes every Ask/Touch ID rule daemon-wide, so on a Mac with Touch ID
+    /// enrolled it always demands a fresh one, regardless of how recently the user last
+    /// authenticated -- unlike per-file touchid grants, there is no narrower scope to fall back
+    /// on if this gate is spoofed. Machines with no biometric sensor skip this (callers show a
+    /// plain in-app confirmation instead) rather than substituting a device-password prompt.
+    /// Leaving audit-only only tightens enforcement, so it stays ungated either way.
     func setPolicyMode(_ mode: RuntimePolicyMode, durationSecs: UInt64?) async {
+        if mode == .auditOnly && BiometricAuth.biometricsAvailable() {
+            let authenticated = await BiometricAuth.authenticate(
+                reason: "enable Audit Only, which allows every Ask and Touch ID item without interaction"
+            )
+            guard authenticated else {
+                policyModeError = "Touch ID is required to enable Audit Only."
+                return
+            }
+        }
         do {
             policyMode = try await controlClient.setPolicyMode(mode, durationSecs: durationSecs)
             policyModeError = nil
