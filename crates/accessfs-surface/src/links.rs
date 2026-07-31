@@ -273,6 +273,7 @@ mod tests {
                 id: "fixture-project".to_string(),
                 name: "Fixture".to_string(),
                 path: primary.clone(),
+                default_environment_id: None,
             }],
             checkouts: vec![
                 ProjectCheckout {

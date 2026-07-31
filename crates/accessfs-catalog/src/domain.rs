@@ -12,6 +12,10 @@ pub struct Project {
     /// Materialized path of the primary checkout. The catalog persists this on the corresponding
     /// `ProjectCheckout`, keeping Project itself independent from local working directories.
     pub path: PathBuf,
+    /// Environment newly discovered worktrees are provisioned with automatically.
+    /// `None` keeps worktree linking manual.
+    #[serde(default)]
+    pub default_environment_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

@@ -334,6 +334,7 @@
                 id: "fixture-project".to_string(),
                 name: "Fixture".to_string(),
                 path: primary.clone(),
+                default_environment_id: None,
             })
             .unwrap();
         catalog
@@ -568,6 +569,7 @@
                 id: "fixture-project".to_string(),
                 name: "Fixture Project".to_string(),
                 path: dir.path().join("project"),
+                default_environment_id: None,
             })
             .unwrap();
         catalog
@@ -955,6 +957,7 @@
                 id: "fixture-project".to_string(),
                 name: "Fixture Project".to_string(),
                 path: project_path.clone(),
+                default_environment_id: None,
             })
             .unwrap();
         let import = library_import(
@@ -2220,7 +2223,7 @@
         let mut client = ControlClient::connect(&socket).unwrap();
         assert_eq!(
             client.request(ControlCommand::Ping).unwrap(),
-            ControlResult::Pong { schema_version: 11 }
+            ControlResult::Pong { schema_version: 12 }
         );
         client
             .request(ControlCommand::ProjectUpsert {
@@ -2228,6 +2231,7 @@
                     id: "floria".to_string(),
                     name: "floria".to_string(),
                     path: PathBuf::from("/workspace/floria"),
+                    default_environment_id: None,
                 },
             })
             .unwrap();
@@ -2287,6 +2291,7 @@
                     id: "fixture-project".to_string(),
                     name: "Fixture Project".to_string(),
                     path: PathBuf::from("/fixture/project"),
+                    default_environment_id: None,
                 },
                 environment: Environment {
                     id: "fixture-development".to_string(),
@@ -2329,6 +2334,7 @@
                     id: "fixture-project".to_string(),
                     name: "Fixture Project".to_string(),
                     path: PathBuf::from("/fixture/project"),
+                    default_environment_id: None,
                 },
                 environment: Environment {
                     id: "fixture-development".to_string(),
@@ -2372,6 +2378,7 @@
                         id: "bad project".to_string(),
                         name: "Bad".to_string(),
                         path: PathBuf::from("relative"),
+                        default_environment_id: None,
                     },
                 },
             },
@@ -2411,6 +2418,7 @@
                     id: "fixture-project".to_string(),
                     name: "Fixture Project".to_string(),
                     path: PathBuf::from("/fixture/project"),
+                    default_environment_id: None,
                 },
             })
             .unwrap();
@@ -2609,6 +2617,7 @@
                     id: "fixture-project".to_string(),
                     name: "Fixture Project".to_string(),
                     path: PathBuf::from("/fixture/project"),
+                    default_environment_id: None,
                 },
             })
             .unwrap();

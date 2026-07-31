@@ -23,6 +23,49 @@ impl Catalog {
         Ok(())
     }
 
+    /// A dedicated setter (not part of `upsert_project`) so idempotent project
+    /// re-upserts from discovery can never wipe a user-configured default.
+    pub fn set_project_default_environment(
+        &self,
+        project_id: &str,
+        environment_id: Option<&str>,
+    ) -> CatalogResult<()> {
+        require_id(project_id, "project id")?;
+        let mut conn = self.connection()?;
+        let tx = conn.transaction()?;
+        require_exists(&tx, "projects", project_id, "project")?;
+        if let Some(environment_id) = environment_id {
+            let owner = tx
+                .query_row(
+                    "SELECT project_id FROM environments WHERE id = ?1",
+                    [environment_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            match owner {
+                Some(owner) if owner == project_id => {}
+                Some(_) => {
+                    return Err(CatalogError::Validation(format!(
+                        "environment {environment_id:?} does not belong to project {project_id:?}"
+                    )))
+                }
+                None => {
+                    return Err(CatalogError::NotFound(format!(
+                        "environment {environment_id}"
+                    )))
+                }
+            }
+        }
+        tx.execute(
+            "UPDATE projects SET default_environment_id = ?2,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE id = ?1",
+            params![project_id, environment_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn remove_project(&self, id: &str) -> CatalogResult<()> {
         require_id(id, "project id")?;
         remove_one(&self.connection()?, "projects", id, "project")

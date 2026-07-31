@@ -3,7 +3,8 @@ use super::*;
 pub(super) fn snapshot_from(conn: &Connection) -> CatalogResult<CatalogSnapshot> {
     let projects = {
         let mut stmt = conn.prepare(
-            "SELECT projects.id, projects.name, project_checkouts.path
+            "SELECT projects.id, projects.name, project_checkouts.path,
+                    projects.default_environment_id
              FROM projects
              JOIN project_checkouts
                ON project_checkouts.project_id = projects.id
@@ -15,6 +16,7 @@ pub(super) fn snapshot_from(conn: &Connection) -> CatalogResult<CatalogSnapshot>
                 id: row.get(0)?,
                 name: row.get(1)?,
                 path: PathBuf::from(row.get::<_, String>(2)?),
+                default_environment_id: row.get(3)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;

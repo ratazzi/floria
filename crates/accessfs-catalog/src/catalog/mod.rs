@@ -15,7 +15,7 @@ use crate::domain::{
 };
 use crate::error::{CatalogError, CatalogResult};
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 
 #[derive(Debug, Clone)]
 pub struct Catalog {
@@ -102,6 +102,7 @@ mod tests {
             id: "floria".to_string(),
             name: "floria".to_string(),
             path: PathBuf::from("/workspace/floria"),
+            default_environment_id: None,
         }
     }
 

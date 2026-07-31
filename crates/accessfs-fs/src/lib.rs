@@ -1802,6 +1802,7 @@ mod tests {
                 id: "fixture-project".to_string(),
                 name: "Fixture Project".to_string(),
                 path: PathBuf::from("/fixture/project"),
+                default_environment_id: None,
             })
             .unwrap();
         catalog

@@ -1175,6 +1175,7 @@ pub(super) fn ensure_discovered_project(
         id: id.clone(),
         name: project.name.clone(),
         path: project.path.clone(),
+        default_environment_id: None,
     })?;
     Ok((id, true))
 }

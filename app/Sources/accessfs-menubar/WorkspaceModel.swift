@@ -466,6 +466,8 @@ struct WorkspaceProject: Identifiable, Hashable, Sendable {
     let path: String
     var commonBindings: [WorkspaceBinding]
     var environments: [WorkspaceEnvironment]
+    /// Newly discovered worktrees auto-link to this environment; nil keeps linking manual.
+    var defaultEnvironmentID: WorkspaceEnvironment.ID? = nil
 }
 
 struct ResolvedWorkspaceExport: Identifiable, Hashable, Sendable {
@@ -564,6 +566,7 @@ final class WorkspaceStore {
     var lastError: String?
 
     @ObservationIgnored private let controlClient: ControlClient?
+    @ObservationIgnored private var autoProvisionAttempted: Set<String> = []
 
     init(
         projects: [WorkspaceProject], resources: [WorkspaceResource],
@@ -918,6 +921,51 @@ final class WorkspaceStore {
             })
         if checkoutDiscoveries != next {
             checkoutDiscoveries = next
+            await autoProvisionDiscoveredWorktrees()
+        }
+    }
+
+    func setProjectDefaultEnvironment(
+        projectID: WorkspaceProject.ID, environmentID: WorkspaceEnvironment.ID?
+    ) async throws {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        guard let project = projects.first(where: { $0.id == projectID }) else {
+            throw WorkspaceStoreError.invalid("Choose a project first")
+        }
+        if let environmentID {
+            guard project.environments.contains(where: { $0.id == environmentID }) else {
+                throw WorkspaceStoreError.invalid("Choose an environment of this project")
+            }
+        }
+        try await controlClient.setProjectDefaultEnvironment(
+            projectID: projectID, environmentID: environmentID)
+        apply(try await controlClient.snapshot())
+        lastError = nil
+        await autoProvisionDiscoveredWorktrees()
+    }
+
+    /// Link every discovered-but-unmanaged worktree of projects that opted into
+    /// a default environment. Failed paths are remembered so a broken checkout
+    /// doesn't get retried every poll.
+    private func autoProvisionDiscoveredWorktrees() async {
+        for (projectID, discovery) in checkoutDiscoveries {
+            guard let project = projects.first(where: { $0.id == projectID }),
+                let environmentID = project.defaultEnvironmentID,
+                project.environments.contains(where: { $0.id == environmentID })
+            else { continue }
+            for candidate in discovery.checkouts
+            where !candidate.gitPrimary && candidate.managedCheckoutID == nil {
+                guard !autoProvisionAttempted.contains(candidate.path) else { continue }
+                autoProvisionAttempted.insert(candidate.path)
+                do {
+                    try await provisionProjectCheckout(
+                        projectID: projectID, path: candidate.path,
+                        environmentID: environmentID, commonDir: discovery.commonDir)
+                } catch {
+                    // Leave the path marked as attempted; surfaces in the sheet
+                    // as still-unlinked where it can be linked manually.
+                }
+            }
         }
     }
 
@@ -1912,7 +1960,8 @@ final class WorkspaceStore {
                 }
             return WorkspaceProject(
                 id: project.id, name: project.name, path: project.path,
-                commonBindings: common, environments: projectEnvironments)
+                commonBindings: common, environments: projectEnvironments,
+                defaultEnvironmentID: project.defaultEnvironmentID)
         }
 
         let selectedProject = projects.first(where: { $0.id == previousProjectID }) ?? projects.first

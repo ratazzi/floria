@@ -1322,6 +1322,24 @@ private struct ProjectCheckoutsSheet: View {
         return min(560, max(270, CGFloat(rowCount * 66 + 190)))
     }
 
+    // "" tags the manual mode; Picker tags must be non-optional.
+    private var defaultEnvironmentSelection: Binding<String> {
+        Binding(
+            get: { project?.defaultEnvironmentID ?? "" },
+            set: { newValue in
+                let environmentID = newValue.isEmpty ? nil : newValue
+                guard environmentID != project?.defaultEnvironmentID else { return }
+                Task {
+                    do {
+                        try await store.setProjectDefaultEnvironment(
+                            projectID: projectID, environmentID: environmentID)
+                    } catch {
+                        errorMessage = error.localizedDescription
+                    }
+                }
+            })
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -1353,6 +1371,21 @@ private struct ProjectCheckoutsSheet: View {
                 Text("Expose one project environment in each Git checkout.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
+                HStack(spacing: 6) {
+                    Text("New worktrees")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Picker("New worktrees", selection: defaultEnvironmentSelection) {
+                        Text("Ask every time").tag("")
+                        ForEach(project?.environments ?? []) { environment in
+                            Text(environment.name).tag(environment.id)
+                        }
+                    }
+                    .labelsHidden()
+                    .controlSize(.small)
+                    .fixedSize()
+                }
+                .padding(.top, 5)
             }
             Spacer()
             Button {

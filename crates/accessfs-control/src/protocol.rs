@@ -146,6 +146,7 @@ pub enum ControlCommand {
     },
     ProjectCreate { project: Project, environment: Environment, surface: Surface },
     ProjectUpsert { project: Project },
+    ProjectDefaultEnvironmentSet { project_id: String, environment_id: Option<String> },
     ProjectRemove { id: String },
     EnvironmentUpsert { environment: Environment },
     EnvironmentRemove { id: String },

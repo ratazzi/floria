@@ -18,6 +18,7 @@ pub(super) fn migrate(conn: &mut Connection) -> CatalogResult<()> {
         "CREATE TABLE projects (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
+            default_environment_id TEXT REFERENCES environments(id) ON DELETE SET NULL,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
@@ -98,7 +99,7 @@ pub(super) fn migrate(conn: &mut Connection) -> CatalogResult<()> {
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         CREATE INDEX surfaces_environment_idx ON surfaces(environment_id, position);
-        PRAGMA user_version = 11;",
+        PRAGMA user_version = 12;",
     )?;
     tx.commit()?;
     Ok(())

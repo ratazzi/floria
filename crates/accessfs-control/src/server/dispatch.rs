@@ -347,6 +347,10 @@ pub(super) fn dispatch(
             catalog.upsert_project(&project)?;
             Ok(ControlResult::Empty)
         }
+        ControlCommand::ProjectDefaultEnvironmentSet { project_id, environment_id } => {
+            catalog.set_project_default_environment(&project_id, environment_id.as_deref())?;
+            Ok(ControlResult::Empty)
+        }
         ControlCommand::ProjectRemove { id } => {
             catalog.remove_project(&id)?;
             Ok(ControlResult::Empty)

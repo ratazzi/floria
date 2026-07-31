@@ -351,6 +351,11 @@ final class ControlClient: @unchecked Sendable {
         try await requestEmpty(.projectUpsert(project))
     }
 
+    func setProjectDefaultEnvironment(projectID: String, environmentID: String?) async throws {
+        try await requestEmpty(
+            .projectDefaultEnvironmentSet(projectID: projectID, environmentID: environmentID))
+    }
+
     func removeProject(_ id: String) async throws {
         try await requestEmpty(.projectRemove(id))
     }

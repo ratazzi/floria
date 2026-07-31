@@ -84,6 +84,12 @@ struct CatalogProject: Codable, Sendable {
     let id: String
     let name: String
     let path: String
+    var defaultEnvironmentID: String? = nil
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, path
+        case defaultEnvironmentID = "default_environment_id"
+    }
 }
 
 enum CatalogProjectCheckoutKind: String, Codable, Sendable {
@@ -879,6 +885,7 @@ enum ControlCommand: Sendable {
     case resourceRemove(String)
     case projectCreate(CatalogProject, CatalogEnvironment, CatalogSurface)
     case projectUpsert(CatalogProject)
+    case projectDefaultEnvironmentSet(projectID: String, environmentID: String?)
     case projectRemove(String)
     case environmentUpsert(CatalogEnvironment)
     case environmentRemove(String)
@@ -927,6 +934,7 @@ enum ControlCommand: Sendable {
         case .resourceRemove: "resource_remove"
         case .projectCreate: "project_create"
         case .projectUpsert: "project_upsert"
+        case .projectDefaultEnvironmentSet: "project_default_environment_set"
         case .projectRemove: "project_remove"
         case .environmentUpsert: "environment_upsert"
         case .environmentRemove: "environment_remove"
@@ -1094,6 +1102,12 @@ enum ControlCommand: Sendable {
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: ProjectUpsertParams(project: project)))
+        case .projectDefaultEnvironmentSet(let projectID, let environmentID):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: ProjectDefaultEnvironmentSetParams(
+                        projectID: projectID, environmentID: environmentID)))
         case .projectRemove(let id), .environmentRemove(let id), .resourceRemove(let id),
             .bindingRemove(let id), .surfaceRemove(let id):
             return try encoder.encode(
@@ -1225,6 +1239,10 @@ private struct ResourceUpsertParams: Encodable {
 }
 
 private struct ProjectUpsertParams: Encodable { let project: CatalogProject }
+private struct ProjectDefaultEnvironmentSetParams: Encodable {
+    let projectID: String
+    let environmentID: String?
+}
 private struct RemoveParams: Encodable { let id: String }
 private struct ProjectCreateParams: Encodable {
     let project: CatalogProject
