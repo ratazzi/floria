@@ -100,15 +100,14 @@ impl ManagedSymlink {
             ManagedLinkInspection::Ready => Ok(SurfaceLinkState::Ready),
             ManagedLinkInspection::Missing => {
                 if let Some(parent) = self.path.parent() {
-                    if !parent.is_dir() {
-                        return Err(link_conflict(
-                            &self.path,
-                            &self.expected,
-                            format!(
-                                "the containing directory {} does not exist; create it before repairing",
-                                parent.display()
-                            ),
-                        ));
+                    if !parent.as_os_str().is_empty() {
+                        std::fs::create_dir_all(parent).map_err(|source| {
+                            SurfaceError::LinkIo {
+                                operation: "creating containing directory",
+                                path: parent.to_path_buf(),
+                                source,
+                            }
+                        })?;
                     }
                 }
                 create_link(&self.path, &self.expected)
@@ -1107,19 +1106,18 @@ mod tests {
     }
 
     #[test]
-    fn explicit_repair_explains_when_the_containing_directory_is_missing() {
+    fn explicit_repair_creates_missing_containing_directories() {
         let dir = tempfile::tempdir().unwrap();
-        let parent = dir.path().join("missing");
+        let parent = dir.path().join("missing/nested");
         let path = parent.join(".env");
         let expected = dir.path().join("mount/surfaces/fixture-dotenv");
 
-        let error = ManagedSymlink::new(&path, &expected).repair().unwrap_err();
-        assert!(matches!(error, SurfaceError::LinkConflict { .. }));
-        assert!(error.to_string().contains(&format!(
-            "the containing directory {} does not exist; create it before repairing",
-            parent.display()
-        )));
-        assert!(!parent.exists());
+        assert_eq!(
+            ManagedSymlink::new(&path, &expected).repair().unwrap(),
+            SurfaceLinkState::Created
+        );
+        assert!(parent.is_dir());
+        assert_eq!(std::fs::read_link(path).unwrap(), expected);
     }
 
     #[test]

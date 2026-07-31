@@ -166,6 +166,18 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertTrue(dashboard.contains("revealWorktreeIssue("))
     }
 
+    func testWorktreeOperationErrorsRenderOnlyOnce() throws {
+        let dashboard = try source("CompactDashboardView.swift")
+
+        XCTAssertEqual(
+            dashboard.components(
+                separatedBy:
+                    #"Label(errorMessage, systemImage: "exclamationmark.triangle.fill")"#
+            ).count - 1,
+            1
+        )
+    }
+
     func testEveryManagedPathUsesTheSharedRepairAction() throws {
         let dashboard = try source("CompactDashboardView.swift")
         let workspace = try source("WorkspaceView.swift")

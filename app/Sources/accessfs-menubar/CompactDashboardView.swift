@@ -1738,23 +1738,15 @@ private struct ProjectCheckoutsSheet: View {
     }
 
     private var footer: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            if let errorMessage, discovery != nil {
-                Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                    .lineLimit(2)
-            }
-            HStack(alignment: .center, spacing: 12) {
-                Image(systemName: "checkmark.shield")
-                    .foregroundStyle(.green)
-                Text("Managed worktrees receive this project's files. Existing local changes are never replaced.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button("Done") { dismiss() }
-                    .keyboardShortcut(.defaultAction)
-            }
+        HStack(alignment: .center, spacing: 12) {
+            Image(systemName: "checkmark.shield")
+                .foregroundStyle(.green)
+            Text("Managed worktrees receive this project's files. Existing local changes are never replaced.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button("Done") { dismiss() }
+                .keyboardShortcut(.defaultAction)
         }
         .padding(.horizontal, 22)
         .padding(.vertical, 16)
