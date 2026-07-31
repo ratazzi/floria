@@ -1213,8 +1213,10 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
         ControlCmd::SshDiscover { endpoint } => ControlCommand::SshAgentDiscover { endpoint },
     };
     match client.request(command)? {
-        ControlResult::Pong { schema_version } => {
-            println!("daemon ready; catalog schema v{schema_version}");
+        ControlResult::Pong { protocol_version, daemon_version, schema_version } => {
+            println!(
+                "daemon v{daemon_version} ready; control protocol v{protocol_version}; catalog schema v{schema_version}"
+            );
         }
         ControlResult::PolicyMode(status) => {
             println!("{}", serde_json::to_string_pretty(&status)?);

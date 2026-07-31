@@ -3,6 +3,42 @@ import XCTest
 @testable import floria_menubar
 
 final class ControlProtocolTests: XCTestCase {
+    func testPingReportsCompatibilityVersions() throws {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let data = try ControlCommand.ping.requestData(requestID: 6, encoder: encoder)
+        let request = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any])
+
+        XCTAssertEqual(request["request_id"] as? UInt64, 6)
+        XCTAssertEqual(request["method"] as? String, "ping")
+        XCTAssertNil(request["params"])
+
+        let response = Data(
+            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":1,"daemon_version":"0.1.0","schema_version":12}}}"#.utf8)
+        let decoded = try JSONDecoder().decode(
+            ControlResponseEnvelope<ControlServerInfo>.self, from: response)
+        let info = try XCTUnwrap(decoded.result?.value)
+
+        XCTAssertEqual(info.protocolVersion, supportedControlProtocolVersion)
+        XCTAssertEqual(info.daemonVersion, "0.1.0")
+        XCTAssertEqual(info.schemaVersion, 12)
+    }
+
+    func testControlProtocolCompatibilityRejectsOldOrNewDaemons() throws {
+        XCTAssertNoThrow(try validateControlProtocolVersion(supportedControlProtocolVersion))
+
+        for daemonVersion: UInt32? in [nil, supportedControlProtocolVersion + 1] {
+            XCTAssertThrowsError(try validateControlProtocolVersion(daemonVersion)) { error in
+                guard let error = error as? ControlClientError else {
+                    return XCTFail("Expected ControlClientError, received \(error)")
+                }
+                XCTAssertTrue(error.isCompatibilityFailure)
+                XCTAssertTrue(error.localizedDescription.contains("Restart Floria"))
+            }
+        }
+    }
+
     func testSnapshotRequestMatchesRustWireShape() throws {
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase

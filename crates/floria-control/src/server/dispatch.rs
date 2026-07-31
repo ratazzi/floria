@@ -19,9 +19,11 @@ pub(super) fn dispatch(
         discovery_jobs,
     } = services;
     match command {
-        ControlCommand::Ping => {
-            Ok(ControlResult::Pong { schema_version: catalog.schema_version() })
-        }
+        ControlCommand::Ping => Ok(ControlResult::Pong {
+            protocol_version: crate::protocol::CONTROL_PROTOCOL_VERSION,
+            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+            schema_version: catalog.schema_version(),
+        }),
         ControlCommand::PolicyModeGet => policy
             .map(|controller| ControlResult::PolicyMode(controller.policy_mode()))
             .ok_or_else(|| {

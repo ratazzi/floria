@@ -2659,7 +2659,11 @@
         let mut client = ControlClient::connect(&socket).unwrap();
         assert_eq!(
             client.request(ControlCommand::Ping).unwrap(),
-            ControlResult::Pong { schema_version: 12 }
+            ControlResult::Pong {
+                protocol_version: crate::protocol::CONTROL_PROTOCOL_VERSION,
+                daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+                schema_version: 12,
+            }
         );
         client
             .request(ControlCommand::ProjectUpsert {

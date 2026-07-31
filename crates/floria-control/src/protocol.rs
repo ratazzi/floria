@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 const MAX_MSG: usize = 8 << 20;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRequest {
@@ -191,7 +192,11 @@ pub enum ControlOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum ControlResult {
-    Pong { schema_version: i64 },
+    Pong {
+        protocol_version: u32,
+        daemon_version: String,
+        schema_version: i64,
+    },
     PolicyMode(PolicyModeStatus),
     ActiveGrants(Vec<ActiveGrant>),
     AccessHistory(Vec<AccessHistoryEvent>),
@@ -656,6 +661,21 @@ pub(crate) fn read_msg<R: Read, T: DeserializeOwned>(reader: &mut R) -> io::Resu
 mod tests {
     use super::*;
     use floria_catalog::{EntrySpec, ResourceKind, ResourceSource, ValueShape};
+
+    #[test]
+    fn ping_reports_protocol_daemon_and_catalog_versions() {
+        let result = ControlResult::Pong {
+            protocol_version: CONTROL_PROTOCOL_VERSION,
+            daemon_version: "0.1.0".to_string(),
+            schema_version: 12,
+        };
+        let value = serde_json::to_value(result).unwrap();
+
+        assert_eq!(value["type"], "pong");
+        assert_eq!(value["value"]["protocol_version"], CONTROL_PROTOCOL_VERSION);
+        assert_eq!(value["value"]["daemon_version"], "0.1.0");
+        assert_eq!(value["value"]["schema_version"], 12);
+    }
 
     #[test]
     fn request_wire_shape_is_stable_for_swift_client() {

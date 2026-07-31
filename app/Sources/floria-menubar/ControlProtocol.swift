@@ -1,5 +1,19 @@
 import Foundation
 
+let supportedControlProtocolVersion: UInt32 = 1
+
+struct ControlServerInfo: Decodable, Equatable, Sendable {
+    let protocolVersion: UInt32?
+    let daemonVersion: String?
+    let schemaVersion: Int64
+
+    enum CodingKeys: String, CodingKey {
+        case protocolVersion = "protocol_version"
+        case daemonVersion = "daemon_version"
+        case schemaVersion = "schema_version"
+    }
+}
+
 enum RuntimePolicyMode: String, Codable, Sendable {
     case normal
     case auditOnly = "audit_only"
@@ -894,6 +908,7 @@ struct BackupReport: Codable, Equatable, Sendable {
 }
 
 enum ControlCommand: Sendable {
+    case ping
     case policyModeGet
     case policyModeSet(mode: RuntimePolicyMode, durationSecs: UInt64?)
     case grantList
@@ -964,6 +979,7 @@ enum ControlCommand: Sendable {
 
     var method: String {
         switch self {
+        case .ping: "ping"
         case .policyModeGet: "policy_mode_get"
         case .policyModeSet: "policy_mode_set"
         case .grantList: "grant_list"
@@ -1021,7 +1037,7 @@ enum ControlCommand: Sendable {
 
     func requestData(requestID: UInt64, encoder: JSONEncoder) throws -> Data {
         switch self {
-        case .policyModeGet, .grantList, .grantClear, .snapshot, .projectCheckoutInventory,
+        case .ping, .policyModeGet, .grantList, .grantClear, .snapshot, .projectCheckoutInventory,
             .sshConfigStatus, .sshConfigInstall, .sshConfigRemove, .protectedFiles:
             return try encoder.encode(ControlRequestWithoutParams(requestID: requestID, method: method))
         case .policyModeSet(let mode, let durationSecs):

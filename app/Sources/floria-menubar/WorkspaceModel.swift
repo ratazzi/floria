@@ -871,13 +871,18 @@ final class WorkspaceStore {
         isLoading = true
         defer { isLoading = false }
         do {
+            _ = try await controlClient.checkCompatibility()
             async let catalog = controlClient.snapshot()
             async let files = controlClient.protectedFiles()
             apply(try await catalog)
             protectedFiles = protectedFileModels(try await files)
             lastError = nil
         } catch {
-            if reportErrors { lastError = error.localizedDescription }
+            let compatibilityFailure =
+                (error as? ControlClientError)?.isCompatibilityFailure == true
+            if reportErrors || compatibilityFailure {
+                lastError = error.localizedDescription
+            }
         }
     }
 

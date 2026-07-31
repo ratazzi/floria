@@ -15,6 +15,7 @@ pub use protocol::{
     ControlResult, DiscoveryJobPhase, DiscoveryJobProgress, DiscoveryJobState, DiscoveryJobStatus,
     ProjectCheckoutCandidate, ProjectCheckoutDiscovery, ProjectCheckoutInventory, ProtectedFile,
     ProtectedFileVersion, SecretValue, SshConfigState, SshConfigStatus, SshIdentity,
+    CONTROL_PROTOCOL_VERSION,
 };
 pub use server::{
     BackupService, CatalogObserver, ControlRuntimeServices, ControlServer,

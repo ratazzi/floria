@@ -10,6 +10,16 @@ final class ControlClient: @unchecked Sendable {
         self.socketPath = socketPath
     }
 
+    func checkCompatibility() async throws -> ControlServerInfo {
+        guard let info: ControlServerInfo = try await request(
+            .ping, expecting: "pong", as: ControlServerInfo.self)
+        else {
+            throw ControlClientError.missingResult("pong")
+        }
+        try validateControlProtocolVersion(info.protocolVersion)
+        return info
+    }
+
     func policyMode() async throws -> RuntimePolicyStatus {
         guard let status: RuntimePolicyStatus = try await request(
             .policyModeGet, expecting: "policy_mode", as: RuntimePolicyStatus.self)
@@ -612,6 +622,13 @@ final class ControlClient: @unchecked Sendable {
 
 }
 
+func validateControlProtocolVersion(_ daemonVersion: UInt32?) throws {
+    guard daemonVersion == supportedControlProtocolVersion else {
+        throw ControlClientError.incompatibleProtocol(
+            app: supportedControlProtocolVersion, daemon: daemonVersion)
+    }
+}
+
 enum ControlClientError: LocalizedError {
     case socketPathTooLong
     case requestTooLarge
@@ -621,6 +638,12 @@ enum ControlClientError: LocalizedError {
     case missingResult(String)
     case unexpectedResult(expected: String, actual: String)
     case daemon(code: String, message: String)
+    case incompatibleProtocol(app: UInt32, daemon: UInt32?)
+
+    var isCompatibilityFailure: Bool {
+        if case .incompatibleProtocol = self { return true }
+        return false
+    }
 
     var errorDescription: String? {
         switch self {
@@ -635,6 +658,8 @@ enum ControlClientError: LocalizedError {
         case .unexpectedResult(let expected, let actual):
             "Expected daemon result \(expected), received \(actual)"
         case .daemon(_, let message): message
+        case .incompatibleProtocol(let app, let daemon):
+            "This version of Floria cannot use the running daemon (app protocol \(app), daemon protocol \(daemon.map(String.init) ?? "unknown")). Restart Floria to update its daemon."
         }
     }
 }
