@@ -673,6 +673,7 @@ private struct AccessRow: View {
 private struct MenuBarFooter: View {
     @Bindable var state: AppState
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismiss) private var dismiss
     let requestClearConfirmation: () -> Void
 
     var body: some View {
@@ -691,6 +692,9 @@ private struct MenuBarFooter: View {
             .padding(.top, 2)
             .padding(.bottom, 4)
             MenuItemButton(title: "Open Library", icon: "rectangle.grid.2x2", shortcut: "D") {
+                // The window-style extra panel stays up on its own; close it
+                // like a menu would before handing focus to the dashboard.
+                dismiss()
                 DockVisibilityController.shared.prepareToShowDashboard()
                 openWindow(id: "dashboard")
                 // Changing an accessory app back to regular doesn't make it frontmost.
