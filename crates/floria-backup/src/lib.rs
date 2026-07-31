@@ -99,6 +99,16 @@ fn create_with_locked_store(
     store_lock: &StoreMaintenanceGuard,
     destination: &Path,
 ) -> BackupResult<BackupReport> {
+    create_with_manifest_writer(catalog, store, store_lock, destination, write_manifest)
+}
+
+fn create_with_manifest_writer(
+    catalog: &Catalog,
+    store: &AgeDirStore,
+    store_lock: &StoreMaintenanceGuard,
+    destination: &Path,
+    manifest_writer: impl FnOnce(&Path, &BackupManifest) -> BackupResult<()>,
+) -> BackupResult<BackupReport> {
     let destination = normalized_new_destination(destination)?;
     if destination.exists() {
         return Err(BackupError::Manifest(format!(
@@ -134,7 +144,7 @@ fn create_with_locked_store(
         plaintext_bytes: store_report.plaintext_bytes,
         files,
     };
-    write_manifest(temporary.path(), &manifest)?;
+    manifest_writer(temporary.path(), &manifest)?;
     let report = verify(temporary.path(), store)?;
     publish_without_overwrite(temporary.path(), &destination)?;
     temporary.publish();
@@ -551,7 +561,7 @@ mod tests {
     };
     use floria_core::authz::Enforcement;
     use floria_core::metadata::ItemMetadata;
-    use floria_store::{KeyProvider, NewSecret, SecretStore, StoreResult};
+    use floria_store::{KeyProvider, NewSecret, SecretStore, StoreError, StoreResult};
     use std::sync::Arc;
 
     struct TestKeys(age::x25519::Identity);
@@ -564,6 +574,19 @@ mod tests {
 
         fn identity(&self) -> StoreResult<Box<dyn age::Identity>> {
             Ok(Box::new(self.0.clone()))
+        }
+    }
+
+    struct MissingIdentityKeys(age::x25519::Identity);
+
+    impl KeyProvider for MissingIdentityKeys {
+        #[allow(clippy::type_complexity)]
+        fn recipients(&self) -> StoreResult<Vec<Box<dyn age::Recipient + Send>>> {
+            Ok(vec![Box::new(self.0.to_public())])
+        }
+
+        fn identity(&self) -> StoreResult<Box<dyn age::Identity>> {
+            Err(StoreError::Key("fixture decryption key is unavailable".to_string()))
         }
     }
 
@@ -668,6 +691,73 @@ mod tests {
         let error = verify(&destination, &wrong_key_store).unwrap_err();
 
         assert!(matches!(error, BackupError::Store(_)));
+    }
+
+    #[test]
+    fn verification_fails_closed_when_the_decryption_key_is_unavailable() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite")).unwrap();
+        let store = fixture_store(&directory.path().join("store"));
+        store.put(NewSecret::managed("Fixture"), b"fixture-value").unwrap();
+        let destination = directory.path().join("backup");
+        create(&catalog, &store, &destination).unwrap();
+        let unavailable_key_store = AgeDirStore::open(
+            directory.path().join("unavailable-key-store"),
+            Arc::new(MissingIdentityKeys(age::x25519::Identity::generate())),
+        )
+        .unwrap();
+
+        let error = verify(&destination, &unavailable_key_store).unwrap_err();
+
+        assert!(matches!(error, BackupError::Store(StoreError::Key(_))));
+    }
+
+    #[test]
+    fn checksum_rejects_a_corrupted_catalog() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite")).unwrap();
+        let store = fixture_store(&directory.path().join("store"));
+        let destination = directory.path().join("backup");
+        create(&catalog, &store, &destination).unwrap();
+        std::fs::write(destination.join(CATALOG_FILE), b"corrupted-catalog").unwrap();
+
+        let error = verify(&destination, &store).unwrap_err();
+
+        assert!(error.to_string().contains("checksum does not match"));
+    }
+
+    #[test]
+    fn storage_exhaustion_does_not_publish_or_leave_a_temporary_backup() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite")).unwrap();
+        let store = fixture_store(&directory.path().join("store"));
+        store.put(NewSecret::managed("Fixture"), b"fixture-value").unwrap();
+        let destination = directory.path().join("backup");
+        let store_lock = store.lock_for_maintenance().unwrap();
+
+        let error = create_with_manifest_writer(
+            &catalog,
+            &store,
+            &store_lock,
+            &destination,
+            |temporary, _| {
+                Err(BackupError::io(
+                    temporary.join(MANIFEST_FILE),
+                    std::io::Error::from_raw_os_error(libc::ENOSPC),
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            BackupError::Io { source, .. } if source.raw_os_error() == Some(libc::ENOSPC)
+        ));
+        assert!(!destination.exists());
+        assert!(!std::fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains("floria-tmp")));
     }
 
     #[test]
