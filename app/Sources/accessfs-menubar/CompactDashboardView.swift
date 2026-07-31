@@ -1858,11 +1858,11 @@ private struct CompactSecurityLevelMenu: View {
             Label(level.compactTitle, systemImage: level.systemImage)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .frame(width: 78, alignment: .leading)
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .fixedSize()
+        .frame(width: 108, alignment: .leading)
     }
 }
 

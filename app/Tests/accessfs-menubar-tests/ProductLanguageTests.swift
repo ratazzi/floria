@@ -164,6 +164,19 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertFalse(dashboard.contains(".frame(width: 126, alignment: .leading)"))
     }
 
+    func testManagedRowsUseAStableSecurityColumn() throws {
+        let dashboard = try source("CompactDashboardView.swift")
+        let menuParts = dashboard.components(
+            separatedBy: "private struct CompactSecurityLevelMenu: View {")
+        XCTAssertEqual(menuParts.count, 2)
+        let menu = try XCTUnwrap(
+            menuParts.last?.components(
+                separatedBy: "private func compactManagedPath").first)
+
+        XCTAssertTrue(menu.contains(".frame(width: 108, alignment: .leading)"))
+        XCTAssertFalse(menu.contains(".frame(width: 78, alignment: .leading)"))
+    }
+
     func testLibraryWindowDoesNotAddATitleBarAboveItsOwnNavigation() throws {
         let app = try source("App.swift")
         let scenes = app.components(
