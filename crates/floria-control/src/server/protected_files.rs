@@ -230,7 +230,7 @@ pub(super) fn configure_managed_file(
         environment_id,
         name,
         kind: SurfaceKind::File(FileBacking::Composed(format)),
-        path: source_path.clone(),
+        path: Some(source_path.clone()),
         input: SurfaceInput::Bindings { binding_ids: vec![binding_id.clone()] },
         enforcement: record.enforcement,
         position: 0,
@@ -272,20 +272,23 @@ pub(super) fn restore_managed_file(
     if !surface.kind.is_file() {
         return Err(DispatchError::Validation(format!(
             "{} is not a managed file",
-            surface.path.display()
+            surface.name
         )));
     }
+    let surface_path = surface.path.clone().ok_or_else(|| {
+        DispatchError::Validation(format!("managed file {surface_id:?} has no path"))
+    })?;
 
     let mut origins = Vec::new();
     for resource in snapshot.resources.iter().filter(|resource| {
         resource.origin.kind == OriginKind::Discovered
             && resource.origin.sources.len() == 1
-            && resource.origin.sources[0].path == surface.path
+            && resource.origin.sources[0].path == surface_path
     }) {
         let ResourceSource::SecretRef { secret_id } = &resource.source else { continue };
         let parsed: SecretId = secret_id.parse()?;
         let Some(record) = store.record(&parsed)? else { continue };
-        if matches!(&record.origin, SecretOrigin::File { source_path } if source_path == &surface.path)
+        if matches!(&record.origin, SecretOrigin::File { source_path } if source_path == &surface_path)
         {
             origins.push((resource, parsed, record));
         }
@@ -293,7 +296,7 @@ pub(super) fn restore_managed_file(
     if origins.len() > 1 {
         return Err(DispatchError::Validation(format!(
             "{} has {} discovered backing resources; expected at most one",
-            surface.path.display(),
+            surface_path.display(),
             origins.len()
         )));
     }
@@ -314,13 +317,13 @@ pub(super) fn restore_managed_file(
             ([], []) => {
                 return Err(DispatchError::Validation(format!(
                     "{} no longer has a binding to its discovered backing resource",
-                    surface.path.display()
+                    surface_path.display()
                 )));
             }
             _ => {
                 return Err(DispatchError::Validation(format!(
                     "{} has ambiguous bindings to its discovered backing resource",
-                    surface.path.display()
+                    surface_path.display()
                 )));
             }
         };
@@ -397,7 +400,7 @@ pub(super) fn restore_managed_file(
         false
     };
     Ok(ControlResult::FileRestored {
-        path: surface.path,
+        path: surface_path,
         storage_deleted,
     })
 }
@@ -419,9 +422,12 @@ fn restore_configured_file_links(
         .collect::<Vec<_>>();
     let mut restored = Vec::new();
     for instance in instances {
-        match replace_symlink_with_file_if_target(&instance.path, &target, plaintext, mode) {
-            Ok(true) => restored.push(instance.path),
-            Ok(false) if instance.path == surface.path => {
+        let instance_path = instance.path.ok_or_else(|| {
+            DispatchError::Validation(format!("file surface {:?} has no path", instance.id))
+        })?;
+        match replace_symlink_with_file_if_target(&instance_path, &target, plaintext, mode) {
+            Ok(true) => restored.push(instance_path),
+            Ok(false) if Some(&instance_path) == surface.path.as_ref() => {
                 rollback_configured_file_links(
                     &restored,
                     mount_path,
@@ -430,7 +436,7 @@ fn restore_configured_file_links(
                 );
                 return Err(DispatchError::Validation(format!(
                     "{} no longer points to its configured managed file",
-                    surface.path.display()
+                    instance_path.display()
                 )));
             }
             Ok(false) => {}
@@ -442,7 +448,7 @@ fn restore_configured_file_links(
                     plaintext,
                 );
                 return Err(DispatchError::Io {
-                    path: instance.path,
+                    path: instance_path,
                     source,
                 });
             }

@@ -46,7 +46,13 @@ pub(super) fn history_display(
             .surfaces
             .iter()
             .find(|surface| surface.id == surface_id)
-            .map(|surface| surface.path.display().to_string());
+            .map(|surface| {
+                surface
+                    .path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| surface.name.clone())
+            });
     }
     path.strip_prefix("secrets/").and_then(|secret_id| {
         stored

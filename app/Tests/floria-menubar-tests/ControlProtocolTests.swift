@@ -15,15 +15,15 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertNil(request["params"])
 
         let response = Data(
-            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":4,"daemon_version":"0.1.0","schema_version":12,"minimum_schema_version":12,"store_format_version":2,"minimum_store_format_version":1}}}"#.utf8)
+            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":4,"daemon_version":"0.1.0","schema_version":13,"minimum_schema_version":13,"store_format_version":2,"minimum_store_format_version":1}}}"#.utf8)
         let decoded = try JSONDecoder().decode(
             ControlResponseEnvelope<ControlServerInfo>.self, from: response)
         let info = try XCTUnwrap(decoded.result?.value)
 
         XCTAssertEqual(info.protocolVersion, supportedControlProtocolVersion)
         XCTAssertEqual(info.daemonVersion, "0.1.0")
-        XCTAssertEqual(info.schemaVersion, 12)
-        XCTAssertEqual(info.minimumSchemaVersion, 12)
+        XCTAssertEqual(info.schemaVersion, 13)
+        XCTAssertEqual(info.minimumSchemaVersion, 13)
         XCTAssertEqual(info.storeFormatVersion, 2)
         XCTAssertEqual(info.minimumStoreFormatVersion, 1)
     }
@@ -964,8 +964,8 @@ final class ControlProtocolTests: XCTestCase {
 
     func testSshAgentSurfaceRouteMatchesRustWireShape() throws {
         let surface = CatalogSurface(
-            id: "fixture-agent", environmentID: "fixture-development", name: "agent.sock",
-            kind: "unix_socket", path: "/tmp/fixture/agent.sock",
+            id: "fixture-agent", environmentID: "fixture-development", name: "Fixture identities",
+            kind: "unix_socket", path: nil,
             input: .sshAgent(
                 ["fixture-binding"],
                 route: CatalogSshRoute(
@@ -983,6 +983,7 @@ final class ControlProtocolTests: XCTestCase {
         let route = try XCTUnwrap(input["route"] as? [String: Any])
 
         XCTAssertEqual(input["type"] as? String, "ssh_agent")
+        XCTAssertNil(encodedSurface["path"])
         XCTAssertEqual(input["binding_ids"] as? [String], ["fixture-binding"])
         XCTAssertEqual(route["host_patterns"] as? [String], ["ec2-*", "bastion"])
         XCTAssertEqual(route["user"] as? String, "ubuntu")

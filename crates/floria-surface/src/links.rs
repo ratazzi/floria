@@ -167,6 +167,7 @@ pub fn file_surface_instances(snapshot: &CatalogSnapshot) -> SurfaceResult<Vec<S
     let mut instances = Vec::new();
     for surface in snapshot.surfaces.iter().filter(|surface| is_file_surface(surface.kind)) {
         instances.push(surface.clone());
+        let surface_path = file_surface_path(surface)?;
         let environment = snapshot
             .environments
             .iter()
@@ -183,12 +184,12 @@ pub fn file_surface_instances(snapshot: &CatalogSnapshot) -> SurfaceResult<Vec<S
                 surface_id: surface.id.clone(),
                 reason: format!("project {:?} is missing", environment.project_id),
             })?;
-        let relative = surface.path.strip_prefix(&project.path).map_err(|_| {
+        let relative = surface_path.strip_prefix(&project.path).map_err(|_| {
             SurfaceError::CheckoutMaterialization {
                 surface_id: surface.id.clone(),
                 reason: format!(
                     "path {} is outside primary checkout {}",
-                    surface.path.display(),
+                    surface_path.display(),
                     project.path.display()
                 ),
             }
@@ -209,7 +210,7 @@ pub fn file_surface_instances(snapshot: &CatalogSnapshot) -> SurfaceResult<Vec<S
                 && checkout.environment_id.as_deref() == Some(environment.id.as_str())
         }) {
             let mut instance = surface.clone();
-            instance.path = checkout.path.join(relative);
+            instance.path = Some(checkout.path.join(relative));
             instances.push(instance);
         }
     }
@@ -229,8 +230,9 @@ pub fn ensure_file_surface_link(
         });
     }
     validate_surface_id(&surface.id)?;
+    let path = file_surface_path(surface)?;
     let expected = mount_path.join(SURFACES_DIR).join(&surface.id);
-    ManagedSymlink::new(&surface.path, expected).ensure()
+    ManagedSymlink::new(path, expected).ensure()
 }
 
 /// Remove a project-facing link only when it still points to this exact mounted surface.
@@ -243,8 +245,9 @@ pub fn remove_file_surface_link(
         return Ok(SurfaceLinkRemoval::Preserved);
     }
     validate_surface_id(&surface.id)?;
+    let path = file_surface_path(surface)?;
     let expected = mount_path.join(SURFACES_DIR).join(&surface.id);
-    let metadata = match std::fs::symlink_metadata(&surface.path) {
+    let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(SurfaceLinkRemoval::Missing);
@@ -252,7 +255,7 @@ pub fn remove_file_surface_link(
         Err(source) => {
             return Err(SurfaceError::LinkIo {
                 operation: "inspecting before removal",
-                path: surface.path.clone(),
+                path: path.to_path_buf(),
                 source,
             });
         }
@@ -260,17 +263,17 @@ pub fn remove_file_surface_link(
     if !metadata.file_type().is_symlink() {
         return Ok(SurfaceLinkRemoval::Preserved);
     }
-    let actual = std::fs::read_link(&surface.path).map_err(|source| SurfaceError::LinkIo {
+    let actual = std::fs::read_link(path).map_err(|source| SurfaceError::LinkIo {
         operation: "reading before removal",
-        path: surface.path.clone(),
+        path: path.to_path_buf(),
         source,
     })?;
     if actual != expected {
         return Ok(SurfaceLinkRemoval::Preserved);
     }
-    std::fs::remove_file(&surface.path).map_err(|source| SurfaceError::LinkIo {
+    std::fs::remove_file(path).map_err(|source| SurfaceError::LinkIo {
         operation: "removing",
-        path: surface.path.clone(),
+        path: path.to_path_buf(),
         source,
     })?;
     Ok(SurfaceLinkRemoval::Removed)
@@ -278,6 +281,13 @@ pub fn remove_file_surface_link(
 
 fn is_file_surface(kind: SurfaceKind) -> bool {
     kind.is_file()
+}
+
+fn file_surface_path(surface: &Surface) -> SurfaceResult<&Path> {
+    surface.path.as_deref().ok_or_else(|| SurfaceError::CheckoutMaterialization {
+        surface_id: surface.id.clone(),
+        reason: "file surface has no project path".to_string(),
+    })
 }
 
 fn validate_surface_id(id: &str) -> SurfaceResult<()> {
@@ -337,7 +347,7 @@ pub fn protected_checkout_links(
     let configured_paths = file_surface_instances(snapshot)
         .unwrap_or_default()
         .into_iter()
-        .map(|surface| surface.path)
+        .filter_map(|surface| surface.path)
         .collect::<HashSet<_>>();
     protected_checkout_links_excluding(snapshot, records, mount_path, &configured_paths)
 }
@@ -356,9 +366,10 @@ pub fn managed_file_links(
     let mut links = BTreeMap::<PathBuf, PathBuf>::new();
 
     for surface in surfaces {
+        let path = file_surface_path(&surface)?.to_path_buf();
         insert_managed_link(
             &mut links,
-            surface.path,
+            path,
             mount_path.join(SURFACES_DIR).join(surface.id),
         )?;
     }
@@ -490,7 +501,10 @@ pub fn release_protected_links_for_file_surfaces(
     surfaces: &[Surface],
     mount_path: &Path,
 ) -> io::Result<bool> {
-    let surfaced_paths = surfaces.iter().map(|surface| &surface.path).collect::<HashSet<_>>();
+    let surfaced_paths = surfaces
+        .iter()
+        .filter_map(|surface| surface.path.clone())
+        .collect::<HashSet<_>>();
     let candidates =
         protected_checkout_links_excluding(snapshot, records, mount_path, &HashSet::new());
     let mut changed = false;
@@ -985,7 +999,7 @@ mod tests {
             environment_id: "fixture-development".to_string(),
             name: ".env".to_string(),
             kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
-            path,
+            path: Some(path),
             input: SurfaceInput::Bindings { binding_ids: Vec::new() },
             enforcement: floria_core::authz::Enforcement::Prompt,
             position: 0,
@@ -1005,7 +1019,10 @@ mod tests {
             ensure_file_surface_link(&surface, &mount).unwrap(),
             SurfaceLinkState::Created
         );
-        assert_eq!(std::fs::read_link(&surface.path).unwrap(), expected);
+        assert_eq!(
+            std::fs::read_link(surface.path.as_ref().unwrap()).unwrap(),
+            expected
+        );
         assert_eq!(
             ensure_file_surface_link(&surface, &mount).unwrap(),
             SurfaceLinkState::Ready
@@ -1066,7 +1083,12 @@ mod tests {
         assert_eq!(
             instances
                 .iter()
-                .map(|surface| (surface.id.as_str(), surface.path.as_path()))
+                .map(|surface| {
+                    (
+                        surface.id.as_str(),
+                        surface.path.as_ref().unwrap().as_path(),
+                    )
+                })
                 .collect::<Vec<_>>(),
             vec![
                 ("fixture-dotenv", Path::new("/workspace/floria/.env")),
@@ -1213,21 +1235,22 @@ mod tests {
         let surface = fixture_surface(project.join(".env"));
         let mount = dir.path().join("mount");
 
-        std::fs::write(&surface.path, b"FIXTURE=local\n").unwrap();
+        let surface_path = surface.path.as_ref().unwrap();
+        std::fs::write(surface_path, b"FIXTURE=local\n").unwrap();
         assert!(matches!(
             ensure_file_surface_link(&surface, &mount),
             Err(SurfaceError::LinkConflict { .. })
         ));
-        assert_eq!(std::fs::read(&surface.path).unwrap(), b"FIXTURE=local\n");
+        assert_eq!(std::fs::read(surface_path).unwrap(), b"FIXTURE=local\n");
 
-        std::fs::remove_file(&surface.path).unwrap();
-        symlink("/fixture/different-target", &surface.path).unwrap();
+        std::fs::remove_file(surface_path).unwrap();
+        symlink("/fixture/different-target", surface_path).unwrap();
         assert!(matches!(
             ensure_file_surface_link(&surface, &mount),
             Err(SurfaceError::LinkConflict { .. })
         ));
         assert_eq!(
-            std::fs::read_link(&surface.path).unwrap(),
+            std::fs::read_link(surface_path).unwrap(),
             PathBuf::from("/fixture/different-target")
         );
     }
@@ -1241,7 +1264,7 @@ mod tests {
             ensure_file_surface_link(&surface, dir.path()),
             Err(SurfaceError::InvalidSurfaceId(_))
         ));
-        assert!(!surface.path.exists());
+        assert!(!surface.path.as_ref().unwrap().exists());
     }
 
     #[test]
@@ -1261,15 +1284,16 @@ mod tests {
             remove_file_surface_link(&surface, &mount).unwrap(),
             SurfaceLinkRemoval::Removed
         );
-        assert!(!surface.path.exists());
+        let surface_path = surface.path.as_ref().unwrap();
+        assert!(!surface_path.exists());
 
-        symlink("/fixture/owned-elsewhere", &surface.path).unwrap();
+        symlink("/fixture/owned-elsewhere", surface_path).unwrap();
         assert_eq!(
             remove_file_surface_link(&surface, &mount).unwrap(),
             SurfaceLinkRemoval::Preserved
         );
         assert_eq!(
-            std::fs::read_link(&surface.path).unwrap(),
+            std::fs::read_link(surface_path).unwrap(),
             PathBuf::from("/fixture/owned-elsewhere")
         );
     }
@@ -1422,7 +1446,7 @@ mod tests {
         .unwrap());
         let development_surface = surface_instances
             .iter()
-            .find(|surface| surface.path == development_worktree.join(".env"))
+            .find(|surface| surface.path.as_ref() == Some(&development_worktree.join(".env")))
             .unwrap();
         ensure_file_surface_link(development_surface, &mount).unwrap();
 

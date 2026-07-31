@@ -846,7 +846,7 @@ mod tests {
                 environment_id: "fixture-development".to_string(),
                 name: ".env".to_string(),
                 kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
-                path: PathBuf::from("/fixture/project/.env"),
+                path: Some(PathBuf::from("/fixture/project/.env")),
                 input: SurfaceInput::Bindings {
                     binding_ids: vec![
                         "fixture-token-binding".to_string(),
@@ -864,7 +864,7 @@ mod tests {
                 environment_id: "fixture-development".to_string(),
                 name: ".env.source".to_string(),
                 kind: SurfaceKind::File(FileBacking::EnvFileDirect),
-                path: PathBuf::from("/fixture/project/.env.source"),
+                path: Some(PathBuf::from("/fixture/project/.env.source")),
                 input: SurfaceInput::Resource {
                     resource_id: "fixture-env-file".to_string(),
                 },
@@ -885,7 +885,7 @@ mod tests {
                 environment_id: "fixture-development".to_string(),
                 name: ".envrc".to_string(),
                 kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Direnv)),
-                path: PathBuf::from("/fixture/project/.envrc"),
+                path: Some(PathBuf::from("/fixture/project/.envrc")),
                 input: SurfaceInput::Bindings {
                     binding_ids: vec![
                         "fixture-token-binding".to_string(),
@@ -1202,7 +1202,7 @@ mod tests {
                 environment_id: "fixture-development".to_string(),
                 name: ".env.staging-profile".to_string(),
                 kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
-                path: PathBuf::from("/fixture/project/.env.staging-profile"),
+                path: Some(PathBuf::from("/fixture/project/.env.staging-profile")),
                 input: SurfaceInput::Bindings {
                     binding_ids: vec!["fixture-ini-binding".to_string()],
                 },
@@ -1216,7 +1216,7 @@ mod tests {
                 environment_id: "fixture-development".to_string(),
                 name: "fixture-credentials.ini".to_string(),
                 kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Ini)),
-                path: PathBuf::from("/fixture/project/fixture-credentials.ini"),
+                path: Some(PathBuf::from("/fixture/project/fixture-credentials.ini")),
                 input: SurfaceInput::Bindings {
                     binding_ids: vec!["fixture-ini-binding".to_string()],
                 },
@@ -1258,7 +1258,7 @@ mod tests {
             environment_id: "fixture-development".to_string(),
             name: "incompatible.ini".to_string(),
             kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Ini)),
-            path: PathBuf::from("/fixture/project/incompatible.ini"),
+            path: Some(PathBuf::from("/fixture/project/incompatible.ini")),
             input: SurfaceInput::Bindings {
                 binding_ids: vec!["fixture-env-binding".to_string()],
             },
@@ -1272,7 +1272,7 @@ mod tests {
             environment_id: "fixture-development".to_string(),
             name: "incompatible.lines".to_string(),
             kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Lines)),
-            path: PathBuf::from("/fixture/project/incompatible.lines"),
+            path: Some(PathBuf::from("/fixture/project/incompatible.lines")),
             input: SurfaceInput::Bindings {
                 binding_ids: vec!["fixture-token-binding".to_string()],
             },
@@ -1323,7 +1323,7 @@ mod tests {
             environment_id: "fixture-development".to_string(),
             name: "multiline.lines".to_string(),
             kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Lines)),
-            path: PathBuf::from("/fixture/project/multiline.lines"),
+            path: Some(PathBuf::from("/fixture/project/multiline.lines")),
             input: SurfaceInput::Bindings {
                 binding_ids: vec![binding.id.clone()],
             },
@@ -1486,7 +1486,7 @@ mod tests {
                 environment_id: "fixture-development".to_string(),
                 name: "common-first.ini".to_string(),
                 kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Ini)),
-                path: PathBuf::from("/fixture/project/common-first.ini"),
+                path: Some(PathBuf::from("/fixture/project/common-first.ini")),
                 input: SurfaceInput::Bindings {
                     binding_ids: vec![
                         environment_binding.id.clone(),
@@ -1503,7 +1503,7 @@ mod tests {
                 environment_id: "fixture-development".to_string(),
                 name: "root-first.ini".to_string(),
                 kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Ini)),
-                path: PathBuf::from("/fixture/project/root-first.ini"),
+                path: Some(PathBuf::from("/fixture/project/root-first.ini")),
                 input: SurfaceInput::Bindings {
                     binding_ids: vec![
                         environment_binding.id.clone(),
@@ -1607,7 +1607,7 @@ mod tests {
                 environment_id: "fixture-development".to_string(),
                 name: "common-first.lines".to_string(),
                 kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Lines)),
-                path: PathBuf::from("/fixture/project/common-first.lines"),
+                path: Some(PathBuf::from("/fixture/project/common-first.lines")),
                 input: SurfaceInput::Bindings {
                     binding_ids: vec![
                         environment_binding.id.clone(),
@@ -1667,7 +1667,7 @@ mod tests {
                 environment_id: "fixture-development".to_string(),
                 name: ".pgpass".to_string(),
                 kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Lines)),
-                path: PathBuf::from("/fixture/project/.pgpass"),
+                path: Some(PathBuf::from("/fixture/project/.pgpass")),
                 input: SurfaceInput::Bindings {
                     binding_ids: vec![
                         "fixture-line-one-binding".to_string(),
@@ -1684,7 +1684,7 @@ mod tests {
                 environment_id: "fixture-development".to_string(),
                 name: "credentials.lines".to_string(),
                 kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Lines)),
-                path: PathBuf::from("/fixture/project/credentials.lines"),
+                path: Some(PathBuf::from("/fixture/project/credentials.lines")),
                 input: SurfaceInput::Bindings {
                     binding_ids: vec!["fixture-line-two-binding".to_string()],
                 },

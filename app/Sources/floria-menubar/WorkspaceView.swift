@@ -1167,8 +1167,10 @@ private struct SurfaceInspector: View {
                                 Button("Edit Output…", systemImage: "pencil") {
                                     showingManageSurface = true
                                 }
-                                Button("Open in Finder", systemImage: "folder") {
-                                    revealSurface(surface)
+                                if surface.path != nil {
+                                    Button("Open in Finder", systemImage: "folder") {
+                                        revealSurface(surface)
+                                    }
                                 }
                                 Divider()
                                 Button(
@@ -1184,17 +1186,19 @@ private struct SurfaceInspector: View {
                             .menuStyle(.borderlessButton)
                             .fixedSize()
                             .accessibilityLabel("Output actions")
-                            SurfaceStatusBadge(
-                                link: surface.managedLink,
-                                readyTitle: surface.kind == .unixSocket ? "Listening" : "Ready")
+                            if let link = surface.managedLink {
+                                SurfaceStatusBadge(link: link, readyTitle: "Ready")
+                            }
                         }
                         HStack(spacing: 10) {
-                            Text(surface.path)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(2)
-                                .truncationMode(.middle)
-                                .textSelection(.enabled)
+                            if let path = surface.path {
+                                Text(path)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(2)
+                                    .truncationMode(.middle)
+                                    .textSelection(.enabled)
+                            }
                             Spacer(minLength: 4)
                             SecurityLevelMenu(level: surface.securityLevel) { securityLevel in
                                 try await store.updateSurfaceSecurityLevel(
@@ -1228,8 +1232,7 @@ private struct SurfaceInspector: View {
                             manageLink: { showingManageSurface = true })
                     case .unixSocket:
                         SocketSurfacePreview(
-                            store: store, copyPath: { copyToPasteboard(surface.path) },
-                            manageSocket: { showingManageSurface = true })
+                            store: store, manageSocket: { showingManageSurface = true })
                     }
                 }
                 .background(Color.primary.opacity(0.018))
@@ -1283,7 +1286,8 @@ private struct SurfaceInspector: View {
     }
 
     private func revealSurface(_ surface: WorkspaceSurface) {
-        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: surface.path)])
+        guard let path = surface.path else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
     }
 }
 
@@ -1478,54 +1482,48 @@ private struct DirectEnvFileSurfacePreview: View {
 
 private struct SocketSurfacePreview: View {
     @Bindable var store: WorkspaceStore
-    let copyPath: () -> Void
     let manageSocket: () -> Void
 
-    private var resource: WorkspaceResource? {
-        guard let resourceID = store.selectedSurface?.resourceID else { return nil }
-        return store.resource(resourceID)
+    private var resources: [WorkspaceResource] {
+        store.selectedSurfaceBindings.compactMap { store.resource($0.resourceID) }
+    }
+
+    private var capabilitySummary: String {
+        if resources.count == 1, let resource = resources.first {
+            return resource.metadata.note ?? resource.name
+        }
+        return "\(resources.count) SSH identity sources"
     }
 
     var body: some View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
-                    InspectorSection(title: "Endpoint") {
-                        Text(store.selectedSurface?.path ?? "")
-                            .font(.caption.monospaced())
-                            .lineLimit(3)
-                            .truncationMode(.middle)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .textSelection(.enabled)
-                    }
                     InspectorSection(title: "Capability") {
-                        Label(
-                            resource?.metadata.note ?? "SSH signing proxy",
-                            systemImage: "key.horizontal")
-                        Label("Exports SSH_AUTH_SOCK", systemImage: "arrow.turn.down.right")
-                        Label("0 active connections", systemImage: "network")
+                        Label(capabilitySummary, systemImage: "key.horizontal")
+                        Label("Available through generated SSH config", systemImage: "terminal")
                     }
                     InspectorSection(title: "Authorization") {
                         Text("Identify the peer on connect, then authorize and audit each SSH sign request.")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                     }
-                    HStack(spacing: 7) {
-                        Image(systemName: "info.circle")
-                        Text("Planned surface · daemon proxy is not implemented yet")
-                    }
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .padding(10)
-                    .background(Color.orange.opacity(0.08))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                    Text("The Unix socket stays in Floria's private runtime directory, not in the project.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
                 .padding(20)
             }
-            SurfaceFooter(
-                primaryTitle: "Manage Socket", secondaryTitle: "Copy Path",
-                note: "Real Unix socket · Policy on connect and sign",
-                primaryAction: manageSocket, secondaryAction: copyPath)
+            HStack {
+                Text("Policy applies to every signature request")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Manage SSH Agent", action: manageSocket)
+                    .buttonStyle(.borderedProminent)
+            }
+            .padding(16)
+            .background(.bar)
         }
     }
 }
@@ -1609,7 +1607,7 @@ private struct ManageSurfaceSheet: View {
 
     private var isSocketSurface: Bool { surface.kind == .unixSocket }
 
-    private var isManagedSurface: Bool { isFileSurface || isSocketSurface }
+    private var isManagedSurface: Bool { isFileSurface }
 
     private var isComposedSurface: Bool {
         selectedKind.isComposed || selectedKind == .unixSocket
@@ -1631,17 +1629,17 @@ private struct ManageSurfaceSheet: View {
     }
 
     private var linkCanBeRepaired: Bool {
-        surface.managedLink.needsAttention
+        surface.managedLink?.needsAttention == true
     }
 
     private var linkIssue: String? {
-        surface.managedLink.issueDescription
+        surface.managedLink?.issueDescription
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Configure \(URL(fileURLWithPath: surface.path).lastPathComponent)")
+                Text("Configure \(surface.path.map { URL(fileURLWithPath: $0).lastPathComponent } ?? surface.name)")
                     .font(.title2.bold())
                 if let linkIssue {
                     Label(linkIssue, systemImage: "exclamationmark.triangle.fill")
@@ -1668,13 +1666,15 @@ private struct ManageSurfaceSheet: View {
                 }
             }
 
-            InspectorSection(title: "Location") {
-                Text(
-                    ((surface.path as NSString).deletingLastPathComponent as NSString)
-                        .appendingPathComponent(fileName)
-                )
-                    .font(.callout.monospaced())
-                    .textSelection(.enabled)
+            if let path = surface.path {
+                InspectorSection(title: "Location") {
+                    Text(
+                        ((path as NSString).deletingLastPathComponent as NSString)
+                            .appendingPathComponent(fileName)
+                    )
+                        .font(.callout.monospaced())
+                        .textSelection(.enabled)
+                }
             }
 
             if isComposedSurface {
@@ -1762,11 +1762,12 @@ private struct ManageSurfaceSheet: View {
     }
 
     private func repairLink() {
+        guard let path = surface.path else { return }
         Task {
             isWorking = true
             defer { isWorking = false }
             do {
-                try await store.repairManagedLink(at: surface.path)
+                try await store.repairManagedLink(at: path)
             } catch {
                 errorMessage = error.localizedDescription
             }
@@ -1969,7 +1970,7 @@ enum LibraryCatalogItem: Identifiable {
         case .resource(let resource):
             resource.name
         case .surface(let surface):
-            URL(fileURLWithPath: surface.path).lastPathComponent
+            surface.path.map { URL(fileURLWithPath: $0).lastPathComponent } ?? surface.name
         }
     }
 
@@ -1985,7 +1986,13 @@ enum LibraryCatalogItem: Identifiable {
                 ? "Not used by a project"
                 : "Used by \(resource.usageCount) project\(resource.usageCount == 1 ? "" : "s")"
         case .surface(let surface):
-            return (surface.path as NSString).abbreviatingWithTildeInPath
+            if let path = surface.path {
+                return (path as NSString).abbreviatingWithTildeInPath
+            }
+            if let patterns = surface.sshRoute?.hostPatterns, !patterns.isEmpty {
+                return patterns.joined(separator: " · ")
+            }
+            return "Project SSH agent"
         }
     }
 
@@ -2006,7 +2013,8 @@ enum LibraryCatalogItem: Identifiable {
             case .command: "Command"
             }
         case .surface(let surface):
-            let recognized = WorkspaceProtectedFileKind.infer(from: surface.path)
+            guard let path = surface.path else { return surface.kind.managedTitle }
+            let recognized = WorkspaceProtectedFileKind.infer(from: path)
             return recognized == .file ? surface.kind.managedTitle : recognized.title
         }
     }
@@ -2020,7 +2028,8 @@ enum LibraryCatalogItem: Identifiable {
             }
             return resource.kind.systemImage
         case .surface(let surface):
-            let recognized = WorkspaceProtectedFileKind.infer(from: surface.path)
+            guard let path = surface.path else { return surface.kind.systemImage }
+            let recognized = WorkspaceProtectedFileKind.infer(from: path)
             return recognized == .file ? surface.kind.systemImage : recognized.systemImage
         }
     }
@@ -2172,14 +2181,16 @@ private struct LibraryCatalogView: View {
                                 copyToPasteboard(file.path)
                             }
                         case .surface(let surface):
-                            Divider()
-                            Button("Reveal in Finder", systemImage: "folder") {
-                                NSWorkspace.shared.activateFileViewerSelecting([
-                                    URL(fileURLWithPath: surface.path)
-                                ])
-                            }
-                            Button("Copy Path", systemImage: "doc.on.doc") {
-                                copyToPasteboard(surface.path)
+                            if let path = surface.path {
+                                Divider()
+                                Button("Reveal in Finder", systemImage: "folder") {
+                                    NSWorkspace.shared.activateFileViewerSelecting([
+                                        URL(fileURLWithPath: path)
+                                    ])
+                                }
+                                Button("Copy Path", systemImage: "doc.on.doc") {
+                                    copyToPasteboard(path)
+                                }
                             }
                         case .resource:
                             EmptyView()
@@ -2406,13 +2417,17 @@ struct LibraryItemDetailSheet: View {
                                 }
                             }
                         case .surface(let surface):
-                            LabeledContent("Path") {
-                                Text((surface.path as NSString).abbreviatingWithTildeInPath)
-                                    .textSelection(.enabled)
+                            if let path = surface.path {
+                                LabeledContent("Path") {
+                                    Text((path as NSString).abbreviatingWithTildeInPath)
+                                        .textSelection(.enabled)
+                                }
                             }
-                            LabeledContent(
-                                "Status",
-                                value: surface.managedLink.statusTitle)
+                            if let managedLink = surface.managedLink {
+                                LabeledContent(
+                                    "Status",
+                                    value: managedLink.statusTitle)
+                            }
                         }
                     }
 
@@ -2492,13 +2507,15 @@ struct LibraryItemDetailSheet: View {
                                 Button("Configure…", systemImage: "slider.horizontal.3") {
                                     editingSurface = surface
                                 }
-                                Button("Reveal in Finder", systemImage: "folder") {
-                                    NSWorkspace.shared.activateFileViewerSelecting([
-                                        URL(fileURLWithPath: surface.path)
-                                    ])
-                                }
-                                Button("Copy Path", systemImage: "doc.on.doc") {
-                                    copyToPasteboard(surface.path)
+                                if let path = surface.path {
+                                    Button("Reveal in Finder", systemImage: "folder") {
+                                        NSWorkspace.shared.activateFileViewerSelecting([
+                                            URL(fileURLWithPath: path)
+                                        ])
+                                    }
+                                    Button("Copy Path", systemImage: "doc.on.doc") {
+                                        copyToPasteboard(path)
+                                    }
                                 }
                             }
                         }
@@ -2694,9 +2711,9 @@ struct LibraryItemDetailSheet: View {
         case .resource:
             "This permanently removes the encrypted value and version history."
         case .surface(let surface) where surface.kind == .unixSocket:
-            "Floria removes the local socket at \(surface.path). Reusable SSH identities are not deleted."
+            "Floria removes this project's SSH route and identity selection. Reusable SSH identities are not deleted."
         case .surface(let surface):
-            "Floria will restore the current generated content at \(surface.path), then remove this file from Managed."
+            "Floria will restore the current generated content at \(surface.path ?? surface.name), then remove this file from Managed."
         }
     }
 
@@ -3642,7 +3659,6 @@ private struct AddSshAgentSurfaceSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var resourceID = ""
     @State private var selectedEntries: Set<String> = []
-    @State private var socketName = "agent.sock"
     @State private var securityLevel = WorkspaceSecurityLevel.confirmation
     @State private var hostPatterns = ""
     @State private var hostname = ""
@@ -3656,15 +3672,11 @@ private struct AddSshAgentSurfaceSheet: View {
         store.sshIdentityProviders.first { $0.id == resourceID }
     }
 
-    private var reusableSurface: WorkspaceSurface? {
-        store.reusableEmptySshAgentSurface(socketName: socketName)
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Add SSH Agent Socket").font(.title2.bold())
-                Text("Expose a project-specific set of identities through one filtered socket.")
+                Text("Add SSH Agent").font(.title2.bold())
+                Text("Choose which identities this project can use. Floria manages the agent endpoint.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -3685,23 +3697,6 @@ private struct AddSshAgentSurfaceSheet: View {
                     }
                     .labelsHidden()
                     .frame(maxWidth: .infinity)
-                }
-
-                VStack(alignment: .leading, spacing: 7) {
-                    Text("Project socket name").font(.callout.weight(.medium))
-                    TextField("agent.sock", text: $socketName)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.body.monospaced())
-                }
-
-                if let reusableSurface {
-                    Label("Attach to existing empty socket", systemImage: "arrow.trianglehead.merge")
-                        .font(.callout.weight(.medium))
-                    Text(
-                        "\(reusableSurface.name) already owns this project path. Floria will keep the socket and attach the selected identity."
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
                 }
 
                 if let resource {
@@ -3750,22 +3745,18 @@ private struct AddSshAgentSurfaceSheet: View {
                 Spacer()
                 Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
-                Button(reusableSurface == nil ? "Create Socket" : "Attach Identity", action: create)
+                Button("Add SSH Agent", action: create)
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(
-                        isSaving || resourceID.isEmpty || selectedEntries.isEmpty
-                            || socketName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(isSaving || resourceID.isEmpty || selectedEntries.isEmpty)
             }
         }
         .padding(24)
         .frame(width: 580)
         .onAppear {
             if resourceID.isEmpty { selectResource(store.sshIdentityProviders.first?.id ?? "") }
-            adoptReusableSurfaceSettings()
         }
         .onChange(of: resourceID) { _, value in selectResource(value) }
-        .onChange(of: socketName) { _, _ in adoptReusableSurfaceSettings() }
         .alert(
             "Could not create SSH agent socket",
             isPresented: Binding(
@@ -3782,16 +3773,6 @@ private struct AddSshAgentSurfaceSheet: View {
         resourceID = id
         selectedEntries = Set(
             store.sshIdentityProviders.first(where: { $0.id == id })?.entries.map(\.address) ?? [])
-    }
-
-    private func adoptReusableSurfaceSettings() {
-        guard let surface = reusableSurface else { return }
-        securityLevel = surface.securityLevel
-        hostPatterns = surface.sshRoute?.hostPatterns.joined(separator: " ") ?? ""
-        hostname = surface.sshRoute?.hostname ?? ""
-        user = surface.sshRoute?.user ?? ""
-        port = surface.sshRoute?.port.map(String.init) ?? ""
-        forwardAgent = surface.sshRoute?.forwardAgent ?? false
     }
 
     private func entrySelection(_ address: String) -> Binding<Bool> {
@@ -3828,7 +3809,7 @@ private struct AddSshAgentSurfaceSheet: View {
                     port: portValue, forwardAgent: forwardAgent)
                 try await store.createSshAgentSurface(
                     resourceID: resourceID, selectedEntries: selectedEntries,
-                    socketName: socketName, securityLevel: securityLevel, route: route)
+                    securityLevel: securityLevel, route: route)
                 dismiss()
             } catch {
                 errorMessage = error.localizedDescription

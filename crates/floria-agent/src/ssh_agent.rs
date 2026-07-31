@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{symlink, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -143,12 +143,6 @@ impl SshAgentRuntime {
         let mut first_error = None;
         for spec in desired.iter().cloned() {
             if running.get(&spec.id).is_some_and(|server| server.spec == spec) {
-                if let Err(error) = ensure_project_link(&spec.project_path, &spec.socket_path) {
-                    tracing::warn!(surface = %spec.id, path = %spec.project_path.display(), %error, "SSH agent project link needs attention");
-                    if first_error.is_none() {
-                        first_error = Some(error);
-                    }
-                }
                 continue;
             }
             if let Some(mut previous) = running.remove(&spec.id) {
@@ -202,7 +196,6 @@ struct SurfaceSpec {
     id: String,
     name: String,
     socket_path: PathBuf,
-    project_path: PathBuf,
     providers: Vec<ProviderSpec>,
     identities: Vec<SelectedIdentity>,
     route: Option<SshRouteSpec>,
@@ -285,7 +278,7 @@ fn compile_surface_specs(
                 .ok_or_else(|| invalid(format!("missing resource {:?}", binding.resource_id)))?;
             let provider = ssh_provider(resource, &snapshot.endpoints)?;
             if let ProviderSpec::ExternalAgent { endpoint, .. } = &provider {
-                if endpoint == &socket_path || endpoint == &surface.path {
+                if endpoint == &socket_path {
                     return Err(invalid(format!(
                         "SSH agent resource {:?} points back to surface {:?}",
                         resource.id, surface.id
@@ -321,7 +314,6 @@ fn compile_surface_specs(
             id: surface.id.clone(),
             name: surface.name.clone(),
             socket_path,
-            project_path: surface.path.clone(),
             providers,
             identities,
             route,
@@ -455,10 +447,6 @@ impl RunningSurface {
         fs::set_permissions(&spec.socket_path, fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;
         let socket_inode = fs::symlink_metadata(&spec.socket_path)?.ino();
-        if let Err(error) = ensure_project_link(&spec.project_path, &spec.socket_path) {
-            tracing::warn!(surface = %spec.id, path = %spec.project_path.display(), %error, "SSH agent project link needs attention");
-        }
-
         let stop = Arc::new(AtomicBool::new(false));
         let loop_stop = Arc::clone(&stop);
         let loop_spec = spec.clone();
@@ -492,7 +480,6 @@ impl RunningSurface {
         if let Some(thread) = self.accept_thread.take() {
             let _ = thread.join();
         }
-        remove_exact_project_link(&self.spec.project_path, &self.spec.socket_path);
         remove_exact_socket(&self.spec.socket_path, self.socket_inode);
     }
 }
@@ -1307,39 +1294,6 @@ fn remove_stale_socket(path: &Path) -> io::Result<()> {
     }
 }
 
-fn ensure_project_link(path: &Path, target: &Path) -> io::Result<()> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            let actual = fs::read_link(path)?;
-            if actual == target {
-                Ok(())
-            } else {
-                Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!("{} points to {}", path.display(), actual.display()),
-                ))
-            }
-        }
-        Ok(_) => Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("{} is occupied by a non-symlink", path.display()),
-        )),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => symlink(target, path),
-        Err(error) => Err(error),
-    }
-}
-
-fn remove_exact_project_link(path: &Path, target: &Path) {
-    let exact = fs::symlink_metadata(path)
-        .ok()
-        .filter(|metadata| metadata.file_type().is_symlink())
-        .and_then(|_| fs::read_link(path).ok())
-        .is_some_and(|actual| actual == target);
-    if exact {
-        let _ = fs::remove_file(path);
-    }
-}
-
 fn remove_exact_socket(path: &Path, inode: u64) {
     let exact = fs::symlink_metadata(path)
         .ok()
@@ -1603,7 +1557,7 @@ mod tests {
                 environment_id: "fixture-development".to_string(),
                 name: "AWS fleet".to_string(),
                 kind: SurfaceKind::UnixSocket,
-                path: project.join("agent.sock"),
+                path: None,
                 input: SurfaceInput::SshAgent {
                     binding_ids: vec!["fixture-binding".to_string()],
                     route: Some(SshRouteSpec {
@@ -1793,6 +1747,7 @@ mod tests {
         )
         .unwrap();
         runtime.replace(&snapshot(&project, &upstream.path)).unwrap();
+        let socket_path = runtime.socket_path("fixture-agent");
 
         let config = fs::read_to_string(dir.path().join("ssh/config")).unwrap();
         assert!(config.contains("Host fixture-*.internal fixture-alias"));
@@ -1811,17 +1766,10 @@ mod tests {
             0o600
         );
 
-        assert_eq!(
-            fs::read_link(project.join("agent.sock")).unwrap(),
-            runtime.socket_path("fixture-agent")
-        );
-        fs::remove_file(project.join("agent.sock")).unwrap();
+        assert!(!project.join("agent.sock").exists());
         runtime.replace(&snapshot(&project, &upstream.path)).unwrap();
-        assert_eq!(
-            fs::read_link(project.join("agent.sock")).unwrap(),
-            runtime.socket_path("fixture-agent")
-        );
-        let mut client = UnixStream::connect(project.join("agent.sock")).unwrap();
+        assert!(!project.join("agent.sock").exists());
+        let mut client = UnixStream::connect(&socket_path).unwrap();
         client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
 
         write_frame(&mut client, &[SSH_AGENTC_REQUEST_IDENTITIES]).unwrap();
@@ -1862,6 +1810,7 @@ mod tests {
 
         drop(client);
         drop(runtime);
+        assert!(!socket_path.exists());
         assert!(!project.join("agent.sock").exists());
     }
 
@@ -1898,6 +1847,8 @@ mod tests {
         runtime
             .replace(&managed_snapshot(&project, &imported.identity))
             .unwrap();
+        let socket_path = runtime.socket_path("fixture-agent");
+        assert!(!project.join("agent.sock").exists());
 
         #[cfg(target_os = "macos")]
         {
@@ -1910,7 +1861,7 @@ mod tests {
             let output = std::process::Command::new("/usr/bin/ssh-add")
                 .arg("-T")
                 .arg(&public_key_path)
-                .env("SSH_AUTH_SOCK", project.join("agent.sock"))
+                .env("SSH_AUTH_SOCK", &socket_path)
                 .output()
                 .unwrap();
             assert!(
@@ -1920,7 +1871,7 @@ mod tests {
             );
         }
 
-        let mut client = UnixStream::connect(project.join("agent.sock")).unwrap();
+        let mut client = UnixStream::connect(&socket_path).unwrap();
         client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         write_frame(&mut client, &[SSH_AGENTC_REQUEST_IDENTITIES]).unwrap();
         let answer = read_frame(&mut client).unwrap();
@@ -2004,6 +1955,8 @@ mod tests {
         runtime
             .replace(&managed_snapshot(&project, &imported.identity))
             .unwrap();
+        let socket_path = runtime.socket_path("fixture-agent");
+        assert!(!project.join("agent.sock").exists());
         let public_key_path = dir.path().join("fixture-rsa-key.pub");
         let canonical = PrivateKey::from_openssh(imported.as_bytes()).unwrap();
         fs::write(
@@ -2015,7 +1968,7 @@ mod tests {
         let output = std::process::Command::new("/usr/bin/ssh-add")
             .arg("-T")
             .arg(&public_key_path)
-            .env("SSH_AUTH_SOCK", project.join("agent.sock"))
+            .env("SSH_AUTH_SOCK", &socket_path)
             .output()
             .unwrap();
         assert!(
@@ -2112,7 +2065,7 @@ mod tests {
             .arg("-o")
             .arg(format!(
                 "IdentityAgent={}",
-                project.join("agent.sock").display()
+                runtime.socket_path("fixture-agent").display()
             ))
             .args(["-o", "PreferredAuthentications=publickey"])
             .args(["-o", "StrictHostKeyChecking=no"])

@@ -96,10 +96,12 @@ pub(super) fn migrate(conn: &mut Connection) -> CatalogResult<()> {
             enforcement TEXT NOT NULL,
             position INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CHECK ((kind = 'unix_socket' AND relative_path = '') OR
+                   (kind != 'unix_socket' AND relative_path != ''))
         );
         CREATE INDEX surfaces_environment_idx ON surfaces(environment_id, position);
-        PRAGMA user_version = 12;",
+        PRAGMA user_version = 13;",
     )?;
     tx.commit()?;
     Ok(())

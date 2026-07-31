@@ -124,7 +124,7 @@ mod tests {
             environment_id: "fixture-development".to_string(),
             name: ".env".to_string(),
             kind,
-            path: PathBuf::from(format!("/fixture/project/{id}")),
+            path: Some(PathBuf::from(format!("/fixture/project/{id}"))),
             input: SurfaceInput::Bindings { binding_ids: Vec::new() },
             enforcement: floria_core::authz::Enforcement::Prompt,
             position: 0,

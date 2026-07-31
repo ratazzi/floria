@@ -50,7 +50,6 @@ fn dispatch_uncoordinated(
         diagnostics,
         checkout_monitor,
         audit_log,
-        ssh_runtime_dir,
         discovery_jobs,
     } = services;
     match command {
@@ -195,7 +194,7 @@ fn dispatch_uncoordinated(
                 .map_err(DispatchError::RecoveryKey)
         }
         ControlCommand::Snapshot => {
-            workspace_snapshot(catalog, store, mount_path, ssh_runtime_dir)
+            workspace_snapshot(catalog, store, mount_path)
         }
         ControlCommand::Discover { paths } => {
             let store = store.ok_or(DispatchError::StoreUnavailable)?;
@@ -280,7 +279,7 @@ fn dispatch_uncoordinated(
             Ok(ControlResult::Empty)
         }
         ControlCommand::ManagedLinkRepair { path } => {
-            repair_managed_path_link(catalog, store, mount_path, ssh_runtime_dir, &path)
+            repair_managed_path_link(catalog, store, mount_path, &path)
         }
         ControlCommand::SshAgentDiscover { endpoint } => {
             if !endpoint.is_absolute() {

@@ -833,7 +833,7 @@
     }
 
     #[test]
-    fn repairs_a_managed_ssh_agent_socket_link_by_path() {
+    fn ssh_agent_surface_is_not_a_project_managed_link() {
         let dir = tempfile::tempdir().unwrap();
         let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
         let project = dir.path().join("project");
@@ -854,55 +854,26 @@
                 position: 0,
             })
             .unwrap();
-        let link = project.join("agent.sock");
         catalog
             .upsert_surface(&Surface {
                 id: "fixture-agent".to_string(),
                 environment_id: "fixture-environment".to_string(),
-                name: "agent.sock".to_string(),
+                name: "Fixture agent".to_string(),
                 kind: SurfaceKind::UnixSocket,
-                path: link.clone(),
+                path: None,
                 input: SurfaceInput::Bindings { binding_ids: Vec::new() },
                 enforcement: Enforcement::Prompt,
                 position: 0,
             })
             .unwrap();
-        symlink("../foreign/agent.sock", &link).unwrap();
-        let runtime_dir = dir.path().join("runtime/sockets");
-        let services = || DispatchServices {
-            ssh_runtime_dir: Some(&runtime_dir),
-            ..DispatchServices::default()
-        };
 
         let ControlResult::Snapshot(snapshot) =
-            dispatch(&catalog, services(), ControlCommand::Snapshot).unwrap()
+            dispatch(&catalog, DispatchServices::default(), ControlCommand::Snapshot).unwrap()
         else {
             panic!("expected workspace snapshot")
         };
-        assert_eq!(
-            snapshot.managed_links,
-            vec![ManagedLink { path: link.clone(), status: ManagedLinkStatus::Replaced }]
-        );
-
-        assert_eq!(
-            dispatch(
-                &catalog,
-                services(),
-                ControlCommand::ManagedLinkRepair { path: link.clone() },
-            )
-            .unwrap(),
-            ControlResult::Empty
-        );
-        assert_eq!(
-            std::fs::read_link(&link).unwrap(),
-            floria_ssh::agent_runtime_socket_path(&runtime_dir, "fixture-agent")
-        );
-        let ControlResult::Snapshot(snapshot) =
-            dispatch(&catalog, services(), ControlCommand::Snapshot).unwrap()
-        else {
-            panic!("expected workspace snapshot")
-        };
-        assert_eq!(snapshot.managed_links[0].status, ManagedLinkStatus::Linked);
+        assert!(snapshot.managed_links.is_empty());
+        assert!(!project.join("agent.sock").exists());
     }
 
     #[test]
@@ -1084,7 +1055,7 @@
                 environment_id: "fixture-environment".to_string(),
                 name: ".env".to_string(),
                 kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
-                path: display_path.clone(),
+                path: Some(display_path.clone()),
                 input: SurfaceInput::Bindings { binding_ids: Vec::new() },
                 enforcement: Enforcement::Prompt,
                 position: 0,
@@ -2199,7 +2170,7 @@
         let mut secondary_surface = snapshot.surfaces[0].clone();
         secondary_surface.id = "fixture-secondary-surface".to_string();
         secondary_surface.name = ".env.secondary".to_string();
-        secondary_surface.path = project_path.join(".env.secondary");
+        secondary_surface.path = Some(project_path.join(".env.secondary"));
         secondary_surface.input = SurfaceInput::Bindings { binding_ids: Vec::new() };
         secondary_surface.position = 1;
         catalog.upsert_surface(&secondary_surface).unwrap();
@@ -2831,8 +2802,8 @@
             ControlResult::Pong {
                 protocol_version: crate::protocol::CONTROL_PROTOCOL_VERSION,
                 daemon_version: env!("CARGO_PKG_VERSION").to_string(),
-                schema_version: 12,
-                minimum_schema_version: 12,
+                schema_version: 13,
+                minimum_schema_version: 13,
                 store_format_version: 2,
                 minimum_store_format_version: 1,
             }
@@ -2916,7 +2887,7 @@
                     environment_id: "fixture-development".to_string(),
                     name: ".env".to_string(),
                     kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
-                    path: PathBuf::from("/fixture/project/.env"),
+                    path: Some(PathBuf::from("/fixture/project/.env")),
                     input: SurfaceInput::Bindings { binding_ids: Vec::new() },
                     enforcement: Enforcement::Prompt,
                     position: 0,
@@ -2959,7 +2930,7 @@
                     environment_id: "fixture-development".to_string(),
                     name: ".env".to_string(),
                     kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
-                    path: PathBuf::from("/outside/.env"),
+                    path: Some(PathBuf::from("/outside/.env")),
                     input: SurfaceInput::Bindings { binding_ids: Vec::new() },
                     enforcement: Enforcement::Prompt,
                     position: 0,
@@ -3783,7 +3754,7 @@
         let ControlResult::ManagedFileConfigured { surface } = configured else {
             panic!("expected configured managed file");
         };
-        assert_eq!(surface.path, source);
+        assert_eq!(surface.path, Some(source.clone()));
         assert_eq!(
             surface.kind,
             SurfaceKind::File(floria_catalog::FileBacking::Composed(

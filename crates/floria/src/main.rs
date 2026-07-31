@@ -969,7 +969,6 @@ fn cmd_mount(config: &Path) -> Result<()> {
             health,
             diagnostics,
             audit_log: cfg.audit_log.clone(),
-            ssh_runtime_dir,
             peer_verifier: control_peer_verifier,
         },
     )
@@ -1238,16 +1237,17 @@ fn cleanup_removed_file_links(
         if still_present {
             continue;
         }
+        let path = surface.path.as_deref().expect("file surface has a project path");
         match remove_file_surface_link(surface, mount_path) {
             Ok(SurfaceLinkRemoval::Removed) => tracing::info!(
                 surface = %surface.id,
-                path = %surface.path.display(),
+                path = %path.display(),
                 "removed project surface link"
             ),
             Ok(SurfaceLinkRemoval::Missing | SurfaceLinkRemoval::Preserved) => {}
             Err(error) => tracing::warn!(
                 surface = %surface.id,
-                path = %surface.path.display(),
+                path = %path.display(),
                 %error,
                 "removed surface link needs attention"
             ),
@@ -1257,20 +1257,21 @@ fn cleanup_removed_file_links(
 
 fn reconcile_file_links(surfaces: &[Surface], mount_path: &Path) {
     for surface in surfaces {
+        let path = surface.path.as_deref().expect("file surface has a project path");
         match ensure_file_surface_link(surface, mount_path) {
             Ok(SurfaceLinkState::Created) => tracing::info!(
                 surface = %surface.id,
-                path = %surface.path.display(),
+                path = %path.display(),
                 "created project surface link"
             ),
             Ok(SurfaceLinkState::Ready) => tracing::debug!(
                 surface = %surface.id,
-                path = %surface.path.display(),
+                path = %path.display(),
                 "project surface link is ready"
             ),
             Err(error) => tracing::warn!(
                 surface = %surface.id,
-                path = %surface.path.display(),
+                path = %path.display(),
                 %error,
                 "project surface link needs attention"
             ),
@@ -1401,7 +1402,8 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
             println!("updated {} to version {}", file.id, file.current_version);
         }
         ControlResult::ManagedFileConfigured { surface } => {
-            println!("configured {} as {}", surface.path.display(), surface.id);
+            let path = surface.path.expect("configured file surface has a project path");
+            println!("configured {} as {}", path.display(), surface.id);
         }
         ControlResult::FileRestored { path, storage_deleted } => {
             println!("restored {} (history deleted: {storage_deleted})", path.display());
@@ -2098,7 +2100,7 @@ mod tests {
                 environment_id: "fixture-environment".to_string(),
                 name: ".env".to_string(),
                 kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
-                path: PathBuf::from("/fixture/.env"),
+                path: Some(PathBuf::from("/fixture/.env")),
                 input: SurfaceInput::Bindings {
                     binding_ids: vec!["audit-binding".to_string(), "bio-binding".to_string()],
                 },

@@ -271,7 +271,20 @@ pub(super) fn validate_surface(surface: &Surface) -> CatalogResult<()> {
     require_path_component(&surface.id, "surface id")?;
     require_id(&surface.environment_id, "surface environment id")?;
     require_name(&surface.name, "surface name")?;
-    require_normalized_absolute_path(&surface.path, "surface path")?;
+    match (surface.kind.is_file(), surface.path.as_deref()) {
+        (true, Some(path)) => require_normalized_absolute_path(path, "surface path")?,
+        (true, None) => {
+            return Err(CatalogError::Validation(
+                "file surface requires a project path".to_string(),
+            ))
+        }
+        (false, None) => {}
+        (false, Some(_)) => {
+            return Err(CatalogError::Validation(
+                "capability surface cannot have a project path".to_string(),
+            ))
+        }
+    }
     match &surface.input {
         SurfaceInput::Bindings { binding_ids } => {
             for binding_id in binding_ids {

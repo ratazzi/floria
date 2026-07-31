@@ -364,7 +364,7 @@ enum WorkspaceSurfaceKind: String, CaseIterable, Sendable {
         case .iniFile: "credentials.ini"
         case .linesFile: ".secrets"
         case .envFileDirect: ".env.local"
-        case .unixSocket: "agent.sock"
+        case .unixSocket: "SSH Agent"
         }
     }
 
@@ -400,21 +400,23 @@ struct WorkspaceSurface: Identifiable, Hashable, Sendable {
     let id: String
     let name: String
     let kind: WorkspaceSurfaceKind
-    let path: String
-    let managedLink: WorkspaceManagedLink
+    let path: String?
+    let managedLink: WorkspaceManagedLink?
     let input: WorkspaceSurfaceInput
     let securityLevel: WorkspaceSecurityLevel
 
     init(
-        id: String, name: String, kind: WorkspaceSurfaceKind, path: String,
-        linkStatus: ManagedLinkStatus, input: WorkspaceSurfaceInput,
+        id: String, name: String, kind: WorkspaceSurfaceKind, path: String?,
+        linkStatus: ManagedLinkStatus?, input: WorkspaceSurfaceInput,
         securityLevel: WorkspaceSecurityLevel = .confirmation
     ) {
         self.id = id
         self.name = name
         self.kind = kind
         self.path = path
-        managedLink = WorkspaceManagedLink(path: path, status: linkStatus)
+        managedLink = path.map {
+            WorkspaceManagedLink(path: $0, status: linkStatus ?? .missing)
+        }
         self.input = input
         self.securityLevel = securityLevel
     }
@@ -762,28 +764,6 @@ final class WorkspaceStore {
         resources.filter {
             ($0.kind == .sshIdentity && $0.shape == .sshIdentity)
                 || ($0.kind == .sshAgent && $0.shape == .socket)
-        }
-    }
-
-    func reusableEmptySshAgentSurface(socketName: String) -> WorkspaceSurface? {
-        guard let project = selectedProject, let environment = selectedEnvironment else {
-            return nil
-        }
-        let name = socketName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty, name != ".", name != "..",
-            (name as NSString).lastPathComponent == name
-        else {
-            return nil
-        }
-        let path = (project.path as NSString).appendingPathComponent(name)
-        return environment.surfaces.first { surface in
-            guard surface.kind == .unixSocket, surface.path == path,
-                surface.bindingIDs.isEmpty
-            else {
-                return false
-            }
-            guard case .sshAgent = surface.input else { return false }
-            return true
         }
     }
 
@@ -1703,7 +1683,7 @@ final class WorkspaceStore {
 
     @discardableResult
     func createSshAgentSurface(
-        resourceID: WorkspaceResource.ID, selectedEntries: Set<String>, socketName: String,
+        resourceID: WorkspaceResource.ID, selectedEntries: Set<String>,
         securityLevel: WorkspaceSecurityLevel, route: WorkspaceSshRoute?
     ) async throws -> WorkspaceSurface.ID {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
@@ -1717,14 +1697,8 @@ final class WorkspaceStore {
         guard !addresses.isEmpty else {
             throw WorkspaceStoreError.invalid("Select at least one SSH identity")
         }
-        let reusableSurface = reusableEmptySshAgentSurface(socketName: socketName)
-        let output = try reusableSurface.map { (name: $0.name, path: $0.path) }
-            ?? newSurfaceOutput(fileName: socketName, in: project)
         let bindingID = Self.newID("binding")
-        let surfaceID = reusableSurface?.id ?? Self.newID("ssh-agent")
-        let surfacePosition = reusableSurface.flatMap { surface in
-            environment.surfaces.firstIndex(where: { $0.id == surface.id })
-        } ?? environment.surfaces.count
+        let surfaceID = Self.newID("ssh-agent")
         let selection: CatalogEntrySelection = addresses.count == resource.entries.count
             ? .all : .entries(addresses)
         try await controlClient.upsertBinding(
@@ -1735,11 +1709,11 @@ final class WorkspaceStore {
         do {
             try await controlClient.upsertSurface(
                 CatalogSurface(
-                    id: surfaceID, environmentID: environment.id, name: output.name,
-                    kind: WorkspaceSurfaceKind.unixSocket.catalogValue, path: output.path,
+                    id: surfaceID, environmentID: environment.id, name: resource.name,
+                    kind: WorkspaceSurfaceKind.unixSocket.catalogValue, path: nil,
                     input: .sshAgent([bindingID], route: route?.catalogValue),
                     enforcement: securityLevel.rawValue,
-                    position: Int64(surfacePosition)))
+                    position: Int64(environment.surfaces.count)))
         } catch {
             try? await controlClient.removeBinding(bindingID)
             throw error
@@ -1912,8 +1886,17 @@ final class WorkspaceStore {
         else {
             throw WorkspaceStoreError.invalid("Select an output first")
         }
-        let output = try newSurfaceOutput(
-            fileName: fileName, in: project, excludingSurfaceID: id)
+        let outputName: String
+        let outputPath: String?
+        if kind == .unixSocket {
+            outputName = surface.name
+            outputPath = nil
+        } else {
+            let output = try newSurfaceOutput(
+                fileName: fileName, in: project, excludingSurfaceID: id)
+            outputName = output.name
+            outputPath = output.path
+        }
 
         let input: CatalogSurfaceInput
         switch surface.input {
@@ -1948,8 +1931,8 @@ final class WorkspaceStore {
 
         try await controlClient.upsertSurface(
             CatalogSurface(
-                id: id, environmentID: environment.id, name: output.name,
-                kind: kind.catalogValue, path: output.path, input: input,
+                id: id, environmentID: environment.id, name: outputName,
+                kind: kind.catalogValue, path: outputPath, input: input,
                 enforcement: surface.securityLevel.rawValue,
                 position: Int64(position)))
         apply(try await controlClient.snapshot())
@@ -2061,7 +2044,7 @@ final class WorkspaceStore {
         projects[projectIndex].environments[environmentIndex].surfaces[surfaceIndex] =
             WorkspaceSurface(
                 id: surface.id, name: surface.name, kind: surface.kind, path: surface.path,
-                linkStatus: surface.managedLink.status,
+                linkStatus: surface.managedLink?.status,
                 input: .bindings(surface.bindingIDs + [binding.id]))
     }
 
@@ -2124,7 +2107,8 @@ final class WorkspaceStore {
                         .sorted { $0.position < $1.position }
                         .compactMap {
                             WorkspaceSurface(
-                                $0, linkStatus: managedLinkStatuses[$0.path] ?? .missing)
+                                $0,
+                                linkStatus: $0.path.flatMap { managedLinkStatuses[$0] })
                         }
                     return WorkspaceEnvironment(
                         id: environment.id, name: environment.name,
@@ -2247,7 +2231,7 @@ private extension WorkspaceProtectedFile {
 }
 
 private extension WorkspaceSurface {
-    init?(_ surface: CatalogSurface, linkStatus: ManagedLinkStatus) {
+    init?(_ surface: CatalogSurface, linkStatus: ManagedLinkStatus?) {
         guard let kind = WorkspaceSurfaceKind(catalogValue: surface.kind) else { return nil }
         let input: WorkspaceSurfaceInput
         switch surface.input.type {

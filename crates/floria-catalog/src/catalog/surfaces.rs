@@ -130,7 +130,10 @@ impl Catalog {
             [&surface.environment_id],
             |row| row.get::<_, String>(0),
         )?);
-        let relative_path = surface_relative_path(&surface.path, &project_path)?;
+        let relative_path = match surface.path.as_deref() {
+            Some(path) => surface_relative_path(path, &project_path)?,
+            None => Path::new(""),
+        };
         tx.execute(
             "INSERT INTO surfaces
                 (id, environment_id, name, kind, relative_path, input_json, enforcement, position)
@@ -203,13 +206,16 @@ impl Catalog {
             .iter()
             .find(|resource| resource.id == resource_id)
             .ok_or_else(|| CatalogError::NotFound(format!("resource {resource_id}")))?;
+        let surface_path = surface.path.as_deref().ok_or_else(|| {
+            CatalogError::Validation(format!("surface {surface_id:?} has no file path"))
+        })?;
         let is_discovered_file_resource = resource.origin.kind == OriginKind::Discovered
             && resource.origin.sources.len() == 1
-            && resource.origin.sources[0].path == surface.path;
+            && resource.origin.sources[0].path == surface_path;
         if !is_discovered_file_resource {
             return Err(CatalogError::Validation(format!(
                 "resource {resource_id:?} was not created from {}",
-                surface.path.display()
+                surface_path.display()
             )));
         }
 

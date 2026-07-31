@@ -329,7 +329,7 @@ impl Shared {
                 };
                 return Ok(OpenTarget {
                     virtual_path: format!("{SURFACES_DIR}/{}", surface.id),
-                    display: Some(surface.path.display().to_string()),
+                    display: surface.path.as_ref().map(|path| path.display().to_string()),
                     direct_io: true,
                     kind,
                 });
@@ -1816,7 +1816,7 @@ mod tests {
                 environment_id: "fixture-environment".to_string(),
                 name: name.to_string(),
                 kind,
-                path: PathBuf::from(format!("/fixture/project/{name}")),
+                path: Some(PathBuf::from(format!("/fixture/project/{name}"))),
                 input,
                 enforcement: Enforcement::Prompt,
                 position,
@@ -2436,7 +2436,7 @@ mod tests {
             environment_id: "fixture-development".to_string(),
             name: ".env".to_string(),
             kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
-            path: tmp.path().join("project/.env"),
+            path: Some(tmp.path().join("project/.env")),
             input: SurfaceInput::Bindings { binding_ids: Vec::new() },
             enforcement: floria_core::authz::Enforcement::Prompt,
             position: 0,
@@ -2466,7 +2466,7 @@ mod tests {
             environment_id: "fixture-development".to_string(),
             name: ".env.local".to_string(),
             kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
-            path: tmp.path().join("project/.env.local"),
+            path: Some(tmp.path().join("project/.env.local")),
             input: SurfaceInput::Bindings { binding_ids: Vec::new() },
             enforcement: floria_core::authz::Enforcement::Prompt,
             position: 0,

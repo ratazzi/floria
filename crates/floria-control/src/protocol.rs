@@ -727,8 +727,8 @@ mod tests {
         let result = ControlResult::Pong {
             protocol_version: CONTROL_PROTOCOL_VERSION,
             daemon_version: "0.1.0".to_string(),
-            schema_version: 12,
-            minimum_schema_version: 12,
+            schema_version: 13,
+            minimum_schema_version: 13,
             store_format_version: 2,
             minimum_store_format_version: 1,
         };
@@ -737,8 +737,8 @@ mod tests {
         assert_eq!(value["type"], "pong");
         assert_eq!(value["value"]["protocol_version"], CONTROL_PROTOCOL_VERSION);
         assert_eq!(value["value"]["daemon_version"], "0.1.0");
-        assert_eq!(value["value"]["schema_version"], 12);
-        assert_eq!(value["value"]["minimum_schema_version"], 12);
+        assert_eq!(value["value"]["schema_version"], 13);
+        assert_eq!(value["value"]["minimum_schema_version"], 13);
         assert_eq!(value["value"]["store_format_version"], 2);
         assert_eq!(value["value"]["minimum_store_format_version"], 1);
     }

@@ -485,7 +485,9 @@ pub struct Surface {
     pub environment_id: String,
     pub name: String,
     pub kind: SurfaceKind,
-    pub path: PathBuf,
+    /// Project-local materialization path for file surfaces. Capability surfaces such as an SSH
+    /// agent have no catalog path; their machine-local endpoint is derived at runtime.
+    pub path: Option<PathBuf>,
     pub input: SurfaceInput,
     pub enforcement: Enforcement,
     #[serde(default)]
@@ -662,7 +664,7 @@ mod tests {
                 environment_id: "fixture-environment".to_string(),
                 name: ".env".to_string(),
                 kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
-                path: PathBuf::from("/fixture/.env"),
+                path: Some(PathBuf::from("/fixture/.env")),
                 input: SurfaceInput::Bindings {
                     binding_ids: vec!["configured-binding".to_string()],
                 },

@@ -344,13 +344,13 @@ struct CatalogSurface: Codable, Sendable {
     let environmentID: String
     let name: String
     let kind: String
-    let path: String
+    let path: String?
     let input: CatalogSurfaceInput
     let enforcement: String
     let position: Int64
 
     init(
-        id: String, environmentID: String, name: String, kind: String, path: String,
+        id: String, environmentID: String, name: String, kind: String, path: String?,
         input: CatalogSurfaceInput, enforcement: String = WorkspaceSecurityLevel.confirmation.rawValue,
         position: Int64
     ) {

@@ -800,7 +800,10 @@ fn apply_project_outputs_discovery(
             source_surface = Some(surface);
         } else {
             create_discovered_surface(catalog, mount_path, &surface)?;
-            mutation.track_surface(surface.id.clone(), surface.path.clone());
+            mutation.track_surface(
+                surface.id.clone(),
+                surface.path.clone().expect("discovered file surface has a path"),
+            );
         }
     }
     if let Some(surface) = source_surface {
@@ -1049,7 +1052,7 @@ fn discovered_surface(
             .unwrap_or("environment")
             .to_string(),
         kind,
-        path: output_path.to_path_buf(),
+        path: Some(output_path.to_path_buf()),
         input: SurfaceInput::Bindings { binding_ids },
         enforcement: SecurityDefaults::composed_surface(
             resources.iter().map(|resource| resource.enforcement),
@@ -1120,17 +1123,20 @@ fn create_discovered_surface(
     mount_path: &Path,
     surface: &Surface,
 ) -> Result<(), DispatchError> {
-    match std::fs::symlink_metadata(&surface.path) {
+    let path = surface.path.as_deref().ok_or_else(|| {
+        DispatchError::Validation(format!("file surface {:?} has no path", surface.id))
+    })?;
+    match std::fs::symlink_metadata(path) {
         Ok(_) => {
             return Err(DispatchError::Validation(format!(
                 "project output already exists: {}",
-                surface.path.display()
+                path.display()
             )));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(source) => {
             return Err(DispatchError::Io {
-                path: surface.path.clone(),
+                path: path.to_path_buf(),
                 source,
             });
         }
@@ -1138,7 +1144,7 @@ fn create_discovered_surface(
     catalog.upsert_surface(surface)?;
     if let Err(error) = ensure_file_surface_link(surface, mount_path) {
         let _ = catalog.remove_surface(&surface.id);
-        let _ = std::fs::remove_file(&surface.path);
+        let _ = std::fs::remove_file(path);
         return Err(DispatchError::Validation(error.to_string()));
     }
     Ok(())
@@ -1377,32 +1383,34 @@ pub(super) fn replace_discovered_file_with_surface(
     mount_path: &Path,
     surface: &Surface,
 ) -> Result<(), DispatchError> {
-    let file_name = surface
-        .path
+    let path = surface.path.as_deref().ok_or_else(|| {
+        DispatchError::Validation(format!("file surface {:?} has no path", surface.id))
+    })?;
+    let file_name = path
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("environment");
-    let backup = surface.path.with_file_name(format!(
+    let backup = path.with_file_name(format!(
         ".{file_name}.floria-import-{}",
         SecretId::generate()
     ));
-    std::fs::rename(&surface.path, &backup).map_err(|source| DispatchError::Io {
-        path: surface.path.clone(),
+    std::fs::rename(path, &backup).map_err(|source| DispatchError::Io {
+        path: path.to_path_buf(),
         source,
     })?;
     if let Err(error) = catalog.upsert_surface(surface) {
-        let _ = std::fs::rename(&backup, &surface.path);
+        let _ = std::fs::rename(&backup, path);
         return Err(DispatchError::Catalog(error));
     }
     if let Err(error) = ensure_file_surface_link(surface, mount_path) {
         let _ = catalog.remove_surface(&surface.id);
-        let _ = std::fs::rename(&backup, &surface.path);
+        let _ = std::fs::rename(&backup, path);
         return Err(DispatchError::Validation(error.to_string()));
     }
     if let Err(source) = std::fs::remove_file(&backup) {
-        let _ = std::fs::remove_file(&surface.path);
+        let _ = std::fs::remove_file(path);
         let _ = catalog.remove_surface(&surface.id);
-        let _ = std::fs::rename(&backup, &surface.path);
+        let _ = std::fs::rename(&backup, path);
         return Err(DispatchError::Io { path: backup, source });
     }
     Ok(())
@@ -1461,7 +1469,10 @@ pub(super) fn existing_discovery_projects(
                     .map(|surface| {
                         Ok(ExistingSurface {
                             id: surface.id.clone(),
-                            path: surface.path.clone(),
+                            path: surface
+                                .path
+                                .clone()
+                                .expect("composed file surface has a path"),
                             keys: resolve_catalog_surface(&snapshot, &surface.id)?
                                 .into_iter()
                                 .map(|export| export.key)
@@ -1495,7 +1506,8 @@ pub(super) fn discovery_review_plan(
     let mut managed_items = Vec::new();
 
     for surface in snapshot.surfaces.iter().filter(|surface| surface.kind.is_file()) {
-        if !discovery_path_is_in_scope(&surface.path, &discovery.paths) {
+        let path = surface.path.as_deref().expect("validated file surface has a path");
+        if !discovery_path_is_in_scope(path, &discovery.paths) {
             continue;
         }
         let Some(environment) = snapshot
@@ -1517,16 +1529,16 @@ pub(super) fn discovery_review_plan(
         });
         managed_items.push(DiscoveryManagedItem {
             id: surface.id.clone(),
-            path: surface.path.clone(),
+            path: path.to_path_buf(),
             relative_path: discovery_relative_path(
-                &surface.path,
+                path,
                 project_path.as_deref(),
                 &discovery.paths,
             ),
             project_path,
             environment: Some(environment.name.clone()),
             kind: DiscoveryManagedItemKind::Surface,
-            status: discovery_managed_path_status(&surface.path, expected_target.as_deref()),
+            status: discovery_managed_path_status(path, expected_target.as_deref()),
         });
     }
 

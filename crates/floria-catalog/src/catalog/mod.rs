@@ -15,7 +15,7 @@ use crate::domain::{
 };
 use crate::error::{CatalogError, CatalogResult};
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 
 #[derive(Debug, Clone)]
 pub struct Catalog {
@@ -430,7 +430,7 @@ mod tests {
                 environment_id: "development".to_string(),
                 name: ".env".to_string(),
                 kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
-                path: PathBuf::from("/workspace/floria/.env"),
+                path: Some(PathBuf::from("/workspace/floria/.env")),
                 input: SurfaceInput::Bindings {
                     binding_ids: vec!["fixture-ini-binding".to_string()],
                 },
@@ -446,7 +446,7 @@ mod tests {
             environment_id: "development".to_string(),
             name: "credentials.ini".to_string(),
             kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Ini)),
-            path: PathBuf::from("/workspace/floria/credentials.ini"),
+            path: Some(PathBuf::from("/workspace/floria/credentials.ini")),
             input: SurfaceInput::Bindings {
                 binding_ids: vec!["fixture-ini-binding".to_string()],
             },
@@ -501,7 +501,7 @@ mod tests {
                 environment_id: "development".to_string(),
                 name: ".env".to_string(),
                 kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
-                path: PathBuf::from("/workspace/floria/.env"),
+                path: Some(PathBuf::from("/workspace/floria/.env")),
                 input: SurfaceInput::Bindings {
                     binding_ids: vec!["common-cloudflare".to_string()],
                 },
@@ -574,7 +574,7 @@ mod tests {
             environment_id: "development".to_string(),
             name: ".config/dev.env".to_string(),
             kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
-            path: PathBuf::from("/workspace/floria/.config/dev.env"),
+            path: Some(PathBuf::from("/workspace/floria/.config/dev.env")),
             input: SurfaceInput::Bindings { binding_ids: Vec::new() },
             enforcement: Enforcement::Prompt,
             position: 0,
@@ -635,7 +635,7 @@ mod tests {
                     environment_id: environment_id.to_string(),
                     name: ".env".to_string(),
                     kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
-                    path: PathBuf::from(path),
+                    path: Some(PathBuf::from(path)),
                     input: SurfaceInput::Bindings {
                         binding_ids: vec!["fixture-common".to_string()],
                     },
@@ -663,13 +663,27 @@ mod tests {
     #[test]
     fn surface_path_must_stay_inside_its_project() {
         let (_dir, catalog) = catalog();
+        let missing = catalog
+            .upsert_surface(&Surface {
+                id: "fixture-missing-path".to_string(),
+                environment_id: "development".to_string(),
+                name: ".env".to_string(),
+                kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
+                path: None,
+                input: SurfaceInput::Bindings { binding_ids: vec![] },
+                enforcement: Enforcement::Prompt,
+                position: 0,
+            })
+            .unwrap_err();
+        assert!(matches!(missing, CatalogError::Validation(message) if message.contains("file surface requires a project path")));
+
         let error = catalog
             .upsert_surface(&Surface {
                 id: "fixture-dotenv".to_string(),
                 environment_id: "development".to_string(),
                 name: ".env".to_string(),
                 kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
-                path: PathBuf::from("/workspace/other/.env"),
+                path: Some(PathBuf::from("/workspace/other/.env")),
                 input: SurfaceInput::Bindings { binding_ids: vec![] },
                 enforcement: Enforcement::Prompt,
                 position: 0,
@@ -687,7 +701,7 @@ mod tests {
                 environment_id: "development".to_string(),
                 name: ".env".to_string(),
                 kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
-                path: PathBuf::from("/workspace/floria/.env"),
+                path: Some(PathBuf::from("/workspace/floria/.env")),
                 input: SurfaceInput::Bindings { binding_ids: vec![] },
                 enforcement: Enforcement::Prompt,
                 position: 0,
@@ -707,7 +721,7 @@ mod tests {
                 environment_id: "development".to_string(),
                 name: ".env.local".to_string(),
                 kind: SurfaceKind::File(FileBacking::EnvFileDirect),
-                path: PathBuf::from("/workspace/floria/.env.local"),
+                path: Some(PathBuf::from("/workspace/floria/.env.local")),
                 input: SurfaceInput::Resource { resource_id: resource.id.clone() },
                 enforcement: Enforcement::Prompt,
                 position: 1,
@@ -735,7 +749,7 @@ mod tests {
             environment_id: "development".to_string(),
             name: ".env.local".to_string(),
             kind: SurfaceKind::File(FileBacking::EnvFileDirect),
-            path: PathBuf::from("/workspace/floria/.env.local"),
+            path: Some(PathBuf::from("/workspace/floria/.env.local")),
             input: SurfaceInput::Bindings { binding_ids: vec![] },
             enforcement: Enforcement::Prompt,
             position: 1,
@@ -776,7 +790,7 @@ mod tests {
             environment_id: "development".to_string(),
             name: ".env".to_string(),
             kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
-            path: PathBuf::from("/workspace/floria/.env"),
+            path: Some(PathBuf::from("/workspace/floria/.env")),
             input: SurfaceInput::Bindings {
                 binding_ids: vec!["first-binding".to_string()],
             },
@@ -834,7 +848,7 @@ mod tests {
                     environment_id: "development".to_string(),
                     name: name.to_string(),
                     kind,
-                    path: PathBuf::from("/workspace/floria").join(name),
+                    path: Some(PathBuf::from("/workspace/floria").join(name)),
                     input: SurfaceInput::Bindings {
                         binding_ids: vec![binding_id.to_string()],
                     },
@@ -860,7 +874,7 @@ mod tests {
             environment_id: "development".to_string(),
             name: ".env".to_string(),
             kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
-            path: PathBuf::from("/workspace/floria/.env"),
+            path: Some(PathBuf::from("/workspace/floria/.env")),
             input: SurfaceInput::Bindings {
                 binding_ids: vec!["missing-binding".to_string()],
             },
@@ -912,7 +926,7 @@ mod tests {
                 environment_id: "development".to_string(),
                 name: ".env".to_string(),
                 kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
-                path,
+                path: Some(path),
                 input: SurfaceInput::Bindings {
                     binding_ids: vec!["managed-binding".to_string()],
                 },
@@ -966,7 +980,7 @@ mod tests {
                     environment_id: "development".to_string(),
                     name: name.to_string(),
                     kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
-                    path: PathBuf::from("/workspace/floria").join(name),
+                    path: Some(PathBuf::from("/workspace/floria").join(name)),
                     input: SurfaceInput::Bindings {
                         binding_ids: vec!["managed-binding".to_string()],
                     },
@@ -1185,7 +1199,7 @@ mod tests {
             environment_id: "development".to_string(),
             name: "AWS fleet".to_string(),
             kind: SurfaceKind::UnixSocket,
-            path: PathBuf::from("/workspace/floria/.floria/agent.sock"),
+            path: None,
             input: SurfaceInput::SshAgent {
                 binding_ids: vec![selected.id.clone(), managed.id],
                 route: Some(SshRouteSpec {
@@ -1200,11 +1214,29 @@ mod tests {
             position: 0,
         };
         catalog.upsert_surface(&surface).unwrap();
+        assert_eq!(
+            catalog
+                .snapshot()
+                .unwrap()
+                .surfaces
+                .iter()
+                .find(|candidate| candidate.id == surface.id)
+                .unwrap()
+                .path,
+            None
+        );
+
+        let project_socket = Surface {
+            path: Some(PathBuf::from("/fixture/project/agent.sock")),
+            ..surface.clone()
+        };
+        let error = catalog.upsert_surface(&project_socket).unwrap_err();
+        assert!(matches!(error, CatalogError::Validation(message) if message.contains("capability surface cannot have a project path")));
 
         let conflicting_route = Surface {
             id: "fixture-agent-surface-two".to_string(),
             name: "Duplicate route".to_string(),
-            path: PathBuf::from("/workspace/floria/.floria/agent-two.sock"),
+            path: None,
             ..surface.clone()
         };
         let error = catalog.upsert_surface(&conflicting_route).unwrap_err();

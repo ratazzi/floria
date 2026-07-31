@@ -19,7 +19,7 @@ use floria_discover::{
     ExistingSurface, GitCheckoutDiscovery, GitCheckoutMonitor, KeyClass, MonitoredGitCheckout,
 };
 use floria_platform::SocketPeerVerifier;
-use floria_ssh::{agent_runtime_socket_path, ManagedKeyError};
+use floria_ssh::ManagedKeyError;
 use floria_store::{NewSecret, SecretId, SecretOrigin, SecretRecord, SecretStore, StoreError};
 use floria_surface::{
     checkout_link_issues, decode_source, ensure_file_surface_link, file_surface_instances,
@@ -131,7 +131,6 @@ pub struct ControlRuntimeServices {
     pub health: Arc<dyn RuntimeHealthReporter>,
     pub diagnostics: Arc<dyn RuntimeDiagnosticsExporter>,
     pub audit_log: PathBuf,
-    pub ssh_runtime_dir: PathBuf,
     pub peer_verifier: Arc<dyn SocketPeerVerifier>,
 }
 
@@ -150,7 +149,6 @@ struct ControlDependencies {
     health: Option<Arc<dyn RuntimeHealthReporter>>,
     diagnostics: Option<Arc<dyn RuntimeDiagnosticsExporter>>,
     audit_log: Option<PathBuf>,
-    ssh_runtime_dir: Option<PathBuf>,
     discovery_jobs: Option<Arc<DiscoveryJobManager>>,
 }
 
@@ -247,7 +245,6 @@ impl ControlServer {
                 health: Some(services.health),
                 diagnostics: Some(services.diagnostics),
                 audit_log: Some(services.audit_log),
-                ssh_runtime_dir: Some(services.ssh_runtime_dir),
                 discovery_jobs: None,
             },
             services.peer_verifier,
@@ -366,7 +363,6 @@ fn handle_connection(
             diagnostics: dependencies.diagnostics.as_deref(),
             checkout_monitor: dependencies.checkout_monitor.as_deref(),
             audit_log: dependencies.audit_log.as_deref(),
-            ssh_runtime_dir: dependencies.ssh_runtime_dir.as_deref(),
             discovery_jobs: dependencies.discovery_jobs.as_deref(),
         };
         let outcome = match dispatch_observed(
@@ -463,7 +459,6 @@ struct DispatchServices<'a> {
     diagnostics: Option<&'a dyn RuntimeDiagnosticsExporter>,
     checkout_monitor: Option<&'a GitCheckoutMonitor>,
     audit_log: Option<&'a Path>,
-    ssh_runtime_dir: Option<&'a Path>,
     discovery_jobs: Option<&'a DiscoveryJobManager>,
 }
 

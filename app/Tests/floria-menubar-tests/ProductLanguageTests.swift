@@ -273,12 +273,12 @@ final class ProductLanguageTests: XCTestCase {
         let workspace = try source("WorkspaceView.swift")
 
         XCTAssertTrue(model.contains("struct WorkspaceManagedLink"))
-        XCTAssertTrue(model.contains("let managedLink: WorkspaceManagedLink"))
+        XCTAssertTrue(model.contains("let managedLink: WorkspaceManagedLink?"))
         XCTAssertFalse(model.contains("enum SshAgentRuntimeSocket"))
         XCTAssertFalse(model.contains("enum WorkspaceSurfaceStatus"))
         XCTAssertFalse(workspace.contains("expectedLinkTarget"))
         XCTAssertFalse(workspace.contains("destinationOfSymbolicLink"))
-        XCTAssertTrue(dashboard.contains("item.managedLink.needsAttention"))
+        XCTAssertTrue(dashboard.contains("item.managedLink?.needsAttention"))
     }
 
     func testLibraryWindowDoesNotAddATitleBarAboveItsOwnNavigation() throws {

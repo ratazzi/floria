@@ -725,14 +725,16 @@ struct DashboardView: View {
         let projects = selectedProject.map { [$0] } ?? state.workspace.projects
         for project in projects {
             let stopped = project.environments.flatMap(\.surfaces).filter {
-                $0.managedLink.needsAttention
+                $0.managedLink?.needsAttention == true
             }
             if let surface = stopped.first {
                 result.append(
                     DashboardIssue(
                         id: "surface:\(surface.id)",
                         title: "\(project.name): \(surface.name) is unavailable",
-                        detail: (surface.path as NSString).abbreviatingWithTildeInPath,
+                        detail: surface.path.map {
+                            ($0 as NSString).abbreviatingWithTildeInPath
+                        } ?? "Project SSH agent",
                         actionTitle: "Manage", action: .openWorkspace))
             }
         }
@@ -788,8 +790,10 @@ struct DashboardView: View {
 
     private func projectManagedItemCount(_ project: WorkspaceProject) -> Int {
         let surfaces = project.environments.flatMap(\.surfaces)
-        let surfacePaths = Set(surfaces.map {
-            ($0.path as NSString).standardizingPath
+        let surfacePaths = Set(surfaces.compactMap { surface in
+            surface.path.map {
+                ($0 as NSString).standardizingPath
+            }
         })
         let prefix = project.path.hasSuffix("/") ? project.path : project.path + "/"
         let protectedCount = state.workspace.protectedFiles.count { file in
@@ -802,7 +806,7 @@ struct DashboardView: View {
     private func projectIsHealthy(_ project: WorkspaceProject) -> Bool {
         let prefix = project.path.hasSuffix("/") ? project.path : project.path + "/"
         return project.environments.flatMap(\.surfaces).allSatisfy {
-            $0.managedLink.isReady
+            $0.managedLink?.isReady ?? true
         }
             && state.workspace.protectedFiles
                 .filter { $0.path.hasPrefix(prefix) }
@@ -1361,8 +1365,8 @@ private struct CompactProjectDetailView: View {
     }
 
     private var managedItems: [CompactManagedItem] {
-        let surfacePaths = Set(surfaces.map {
-            ($0.path as NSString).standardizingPath
+        let surfacePaths = Set(surfaces.compactMap { surface in
+            surface.path.map { ($0 as NSString).standardizingPath }
         })
         let items =
             surfaces.map(CompactManagedItem.surface)
@@ -1372,14 +1376,14 @@ private struct CompactProjectDetailView: View {
                 }
                 .map(CompactManagedItem.file)
         return items.sorted {
-            $0.path.localizedStandardCompare($1.path) == .orderedAscending
+            $0.sortName.localizedStandardCompare($1.sortName) == .orderedAscending
         }
     }
 
     private var allProjectManagedItems: [CompactManagedItem] {
         let allSurfaces = project.environments.flatMap(\.surfaces)
-        let surfacePaths = Set(allSurfaces.map {
-            ($0.path as NSString).standardizingPath
+        let surfacePaths = Set(allSurfaces.compactMap { surface in
+            surface.path.map { ($0 as NSString).standardizingPath }
         })
         return (
             allSurfaces.map(CompactManagedItem.surface)
@@ -1389,7 +1393,7 @@ private struct CompactProjectDetailView: View {
                     }
                     .map(CompactManagedItem.file)
         ).sorted {
-            $0.path.localizedStandardCompare($1.path) == .orderedAscending
+            $0.sortName.localizedStandardCompare($1.sortName) == .orderedAscending
         }
     }
 
@@ -1402,7 +1406,7 @@ private struct CompactProjectDetailView: View {
     }
 
     private var firstManagedLinkIssue: CompactManagedItem? {
-        allProjectManagedItems.first { $0.managedLink.needsAttention }
+        allProjectManagedItems.first { $0.managedLink?.needsAttention == true }
     }
 
     private func reviewManagedItemButton(_ item: CompactManagedItem) -> some View {
@@ -1414,7 +1418,7 @@ private struct CompactProjectDetailView: View {
                 .foregroundStyle(Color.orange)
         }
         .buttonStyle(.borderless)
-        .help("Review \(URL(fileURLWithPath: item.path).lastPathComponent)")
+        .help("Review \(item.title)")
         .accessibilityHint("Open managed item details")
     }
 
@@ -1454,19 +1458,29 @@ private enum CompactManagedItem: Identifiable {
         }
     }
 
-    var path: String {
+    var path: String? {
         switch self {
         case .surface(let surface): surface.path
         case .file(let file): file.path
         }
     }
 
-    var managedLink: WorkspaceManagedLink {
+    var managedLink: WorkspaceManagedLink? {
         switch self {
         case .surface(let surface): surface.managedLink
         case .file(let file): file.managedLink
         }
     }
+
+    var title: String {
+        switch self {
+        case .surface(let surface):
+            surface.path.map { URL(fileURLWithPath: $0).lastPathComponent } ?? surface.name
+        case .file(let file): URL(fileURLWithPath: file.path).lastPathComponent
+        }
+    }
+
+    var sortName: String { path ?? title }
 
     var surface: WorkspaceSurface? {
         guard case .surface(let surface) = self else { return nil }
@@ -1513,6 +1527,7 @@ private enum CompactManagedItem: Identifiable {
             }
             return (
                 [surface.name, surface.path, surface.kind.managedTitle, surface.securityLevel.title]
+                    .compactMap { $0 }
                 + resources.flatMap { [$0.name, $0.kind.title, $0.exportSummary] }
             ).joined(separator: " ")
         case .file(let file):
@@ -2073,7 +2088,7 @@ private struct CompactManagedItemRow: View {
     @State private var isRepairing = false
 
     private var needsAttention: Bool {
-        item.managedLink.needsAttention
+        item.managedLink?.needsAttention == true
             || (!bindings.isEmpty && bindings.allSatisfy { !$0.isEnabled })
     }
 
@@ -2090,12 +2105,14 @@ private struct CompactManagedItemRow: View {
                             in: RoundedRectangle(cornerRadius: 7))
 
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(URL(fileURLWithPath: item.path).lastPathComponent)
+                        Text(item.title)
                             .font(.callout.weight(.semibold))
                             .lineLimit(1)
                         CompactManagedItemSubtitle(
                             kind: item.kindTitle,
-                            path: compactManagedPath(item.path, projectPath: projectPath),
+                            path: item.path.map {
+                                compactManagedPath($0, projectPath: projectPath)
+                            },
                             needsAttention: needsAttention)
                     }
 
@@ -2115,20 +2132,22 @@ private struct CompactManagedItemRow: View {
                 Button("Details…", systemImage: "info.circle") {
                     showDetails()
                 }
-                if item.managedLink.needsAttention {
+                if item.managedLink?.needsAttention == true {
                     Button("Repair Link", systemImage: "wrench.and.screwdriver") {
                         repairManagedLink()
                     }
                     .disabled(isRepairing)
                 }
-                Divider()
-                Button("Reveal in Finder", systemImage: "folder") {
-                    NSWorkspace.shared.activateFileViewerSelecting([
-                        URL(fileURLWithPath: item.path)
-                    ])
-                }
-                Button("Copy Path", systemImage: "doc.on.doc") {
-                    copyManagedPath(item.path)
+                if let path = item.path {
+                    Divider()
+                    Button("Reveal in Finder", systemImage: "folder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([
+                            URL(fileURLWithPath: path)
+                        ])
+                    }
+                    Button("Copy Path", systemImage: "doc.on.doc") {
+                        copyManagedPath(path)
+                    }
                 }
             } label: {
                 Image(systemName: "ellipsis")
@@ -2137,7 +2156,7 @@ private struct CompactManagedItemRow: View {
             }
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
-            .accessibilityLabel("\(URL(fileURLWithPath: item.path).lastPathComponent) actions")
+            .accessibilityLabel("\(item.title) actions")
         }
         .padding(.horizontal, 14)
         .frame(minHeight: 54)
@@ -2165,11 +2184,12 @@ private struct CompactManagedItemRow: View {
     }
 
     private func repairManagedLink() {
+        guard let path = item.path else { return }
         Task {
             isRepairing = true
             defer { isRepairing = false }
             do {
-                try await state.workspace.repairManagedLink(at: item.path)
+                try await state.workspace.repairManagedLink(at: path)
             } catch {
                 repairError = error.localizedDescription
             }
@@ -2179,7 +2199,7 @@ private struct CompactManagedItemRow: View {
 
 private struct CompactManagedItemSubtitle: View {
     let kind: String
-    let path: String
+    let path: String?
     let needsAttention: Bool
 
     var body: some View {
@@ -2192,10 +2212,12 @@ private struct CompactManagedItemSubtitle: View {
             }
             Text(kind)
                 .fixedSize()
-            Text("·")
-            Text(path)
-                .lineLimit(1)
-                .truncationMode(.middle)
+            if let path {
+                Text("·")
+                Text(path)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
         }
         .font(.caption)
         .foregroundStyle(needsAttention ? Color.orange : Color.secondary)
@@ -2207,7 +2229,12 @@ private struct CompactManagedKindPresentation {
     let systemImage: String
 
     init(surface: WorkspaceSurface) {
-        let recognized = WorkspaceProtectedFileKind.infer(from: surface.path)
+        guard let path = surface.path else {
+            title = surface.kind.managedTitle
+            systemImage = surface.kind.systemImage
+            return
+        }
+        let recognized = WorkspaceProtectedFileKind.infer(from: path)
         switch recognized {
         case .dotenv, .direnv, .pgpass, .awsCredentials:
             title = recognized.title

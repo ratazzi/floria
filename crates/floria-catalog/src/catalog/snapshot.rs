@@ -149,12 +149,13 @@ pub(super) fn snapshot_from(conn: &Connection) -> CatalogResult<CatalogSnapshot>
             let enforcement: String = row.get(7)?;
             let primary_path = PathBuf::from(row.get::<_, String>(4)?);
             let relative_path = PathBuf::from(row.get::<_, String>(5)?);
+            let kind = SurfaceKind::parse(&kind).ok_or_else(|| invalid_value(3, kind))?;
             Ok(Surface {
                 id: row.get(0)?,
                 environment_id: row.get(1)?,
                 name: row.get(2)?,
-                kind: SurfaceKind::parse(&kind).ok_or_else(|| invalid_value(3, kind))?,
-                path: primary_path.join(relative_path),
+                kind,
+                path: kind.is_file().then(|| primary_path.join(relative_path)),
                 input: decode_json(6, &row.get::<_, String>(6)?)?,
                 enforcement: Enforcement::parse(&enforcement)
                     .ok_or_else(|| invalid_value(7, enforcement))?,

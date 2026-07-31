@@ -269,11 +269,13 @@ final class WorkspaceModelTests: XCTestCase {
             hostPatterns: ["ec2-*", "bastion"], hostname: nil, user: "ubuntu",
             port: nil, forwardAgent: true)
         let routed = WorkspaceSurface(
-            id: "routed", name: "agent.sock", kind: .unixSocket,
-            path: "/tmp/fixture/agent.sock", linkStatus: .linked,
+            id: "routed", name: "Fixture identities", kind: .unixSocket,
+            path: nil, linkStatus: nil,
             input: .sshAgent([binding.id], route))
         XCTAssertEqual(routed.bindingIDs, [binding.id])
         XCTAssertEqual(routed.sshRoute?.hostPatterns, ["ec2-*", "bastion"])
+        XCTAssertNil(routed.path)
+        XCTAssertNil(routed.managedLink)
 
         let managed = WorkspaceResource(
             id: "fixture-managed", name: "Fixture managed identity", kind: .sshIdentity,
@@ -292,13 +294,13 @@ final class WorkspaceModelTests: XCTestCase {
         XCTAssertEqual(managed.exportSummary, "1 identity")
     }
 
-    func testEmptySshAgentSocketCanBeReusedForANewIdentityBinding() throws {
+    func testSshAgentSurfaceKeepsProjectSelectionWithoutAProjectSocketPath() {
         let route = WorkspaceSshRoute(
             hostPatterns: ["ec2-*.example.invalid"], hostname: nil,
             user: "fixture-user", port: nil, forwardAgent: false)
-        let emptySocket = WorkspaceSurface(
-            id: "fixture-agent", name: "agent.sock", kind: .unixSocket,
-            path: "/tmp/fixture-project/agent.sock", linkStatus: .linked,
+        let agent = WorkspaceSurface(
+            id: "fixture-agent", name: "Fixture identities", kind: .unixSocket,
+            path: nil, linkStatus: nil,
             input: .sshAgent([], route), securityLevel: .touchID)
         let store = WorkspaceStore(
             projects: [
@@ -308,17 +310,15 @@ final class WorkspaceModelTests: XCTestCase {
                     environments: [
                         WorkspaceEnvironment(
                             id: "fixture-environment", name: "Development", bindings: [],
-                            surfaces: [emptySocket])
+                            surfaces: [agent])
                     ])
             ], resources: [])
 
-        let reusable = try XCTUnwrap(
-            store.reusableEmptySshAgentSurface(socketName: "agent.sock"))
-
-        XCTAssertEqual(reusable.id, emptySocket.id)
-        XCTAssertEqual(reusable.sshRoute, route)
-        XCTAssertEqual(reusable.securityLevel, .touchID)
-        XCTAssertNil(store.reusableEmptySshAgentSurface(socketName: "other.sock"))
+        let stored = store.projects[0].environments[0].surfaces[0]
+        XCTAssertNil(stored.path)
+        XCTAssertNil(stored.managedLink)
+        XCTAssertEqual(stored.sshRoute, route)
+        XCTAssertEqual(stored.securityLevel, WorkspaceSecurityLevel.touchID)
     }
 
     func testProtectedFileKindsAreInferredWithoutParsingContent() {

@@ -350,7 +350,7 @@ mod tests {
                 environment_id: "fixture-development".to_string(),
                 name: "credentials.lines".to_string(),
                 kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Lines)),
-                path: std::path::PathBuf::from("/fixture/credentials.lines"),
+                path: Some(std::path::PathBuf::from("/fixture/credentials.lines")),
                 input: SurfaceInput::Bindings {
                     binding_ids: vec!["fixture-binding".to_string()],
                 },

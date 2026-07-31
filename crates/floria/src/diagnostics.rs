@@ -230,7 +230,9 @@ fn known_paths(
             add_path(&mut paths, path);
         }
         for surface in &snapshot.surfaces {
-            add_path(&mut paths, &surface.path);
+            if let Some(path) = &surface.path {
+                add_path(&mut paths, path);
+            }
         }
         for resource in &snapshot.resources {
             for source in &resource.origin.sources {
