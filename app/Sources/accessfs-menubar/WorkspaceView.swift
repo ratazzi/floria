@@ -510,7 +510,9 @@ struct AdvancedWorkspaceView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(12)
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(
+            Color(nsColor: .windowBackgroundColor)
+                .overlay(Color.black.opacity(0.025)))
     }
 
     private func sidebarSectionTitle(_ title: String) -> some View {
