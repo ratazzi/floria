@@ -3377,9 +3377,25 @@ private struct AddBindingSheet: View {
         }
     }
 
+    // Only resources the selected output can actually compose (an SSH identity
+    // has no place in an env file); entry-level selection still gates Add.
+    private func isListable(_ resource: WorkspaceResource) -> Bool {
+        guard let surface = outputs.first(where: { $0.id == outputSurfaceID }) else {
+            return false
+        }
+        let scope: WorkspaceBindingScope =
+            target == .common ? .common : .environment(store.selectedEnvironmentID)
+        return store.bindingIsCompatible(
+            WorkspaceBinding(
+                id: "prospective-binding", resourceID: resource.id, selection: .all,
+                keyOverride: nil, isEnabled: true, scope: scope),
+            with: surface.kind)
+    }
+
     private var filtered: [WorkspaceResource] {
-        guard !search.isEmpty else { return store.availableResources }
-        return store.availableResources.filter {
+        let candidates = store.availableResources.filter(isListable)
+        guard !search.isEmpty else { return candidates }
+        return candidates.filter {
             $0.name.localizedCaseInsensitiveContains(search)
                 || $0.kind.title.localizedCaseInsensitiveContains(search)
                 || $0.exportSummary.localizedCaseInsensitiveContains(search)
