@@ -654,15 +654,45 @@ fn cmd_reveal(target: &str, version: Option<u32>, to: Option<PathBuf>, config: &
 
     match to {
         Some(dest) => {
-            std::fs::write(&dest, &plaintext[..])
-                .with_context(|| format!("writing {}", dest.display()))?;
-            std::fs::set_permissions(
-                &dest,
-                std::os::unix::fs::PermissionsExt::from_mode(record.mode),
-            )?;
+            write_revealed_file(&dest, &plaintext[..], record.mode)?;
             eprintln!("wrote {} bytes to {}", plaintext.len(), dest.display());
         }
         None => std::io::stdout().write_all(&plaintext[..])?,
+    }
+    Ok(())
+}
+
+fn write_revealed_file(destination: &Path, plaintext: &[u8], mode: u32) -> Result<()> {
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(destination)
+        .with_context(|| {
+            format!(
+                "creating new reveal destination {} (it must not already exist)",
+                destination.display()
+            )
+        })?;
+
+    let result = (|| -> Result<()> {
+        output
+            .write_all(plaintext)
+            .with_context(|| format!("writing {}", destination.display()))?;
+        output
+            .sync_all()
+            .with_context(|| format!("syncing {}", destination.display()))?;
+        std::fs::set_permissions(
+            destination,
+            std::os::unix::fs::PermissionsExt::from_mode(mode),
+        )
+        .with_context(|| format!("setting permissions on {}", destination.display()))
+    })();
+    drop(output);
+
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(destination);
+        return Err(error);
     }
     Ok(())
 }
@@ -1847,6 +1877,24 @@ mod tests {
 
         let expected = std::fs::canonicalize(dir.path()).unwrap().join(".env");
         assert_eq!(reveal_lookup_path(&source).unwrap(), expected);
+    }
+
+    #[test]
+    fn reveal_destination_is_private_exact_and_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("revealed");
+        let plaintext = b"fixture-content\n";
+
+        write_revealed_file(&destination, plaintext, 0o640).unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), plaintext);
+        assert_eq!(
+            std::fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+
+        let error = write_revealed_file(&destination, b"replacement", 0o600).unwrap_err();
+        assert!(error.to_string().contains("must not already exist"));
+        assert_eq!(std::fs::read(&destination).unwrap(), plaintext);
     }
 
     #[test]
