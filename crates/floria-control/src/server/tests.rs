@@ -84,6 +84,23 @@
         }
     }
 
+    struct FixtureDiagnosticsExporter;
+
+    impl RuntimeDiagnosticsExporter for FixtureDiagnosticsExporter {
+        fn export(
+            &self,
+            destination: &Path,
+            include_paths: bool,
+        ) -> Result<DiagnosticsReport, String> {
+            Ok(DiagnosticsReport {
+                path: destination.to_path_buf(),
+                paths_included: include_paths,
+                files: 4,
+                bytes: 512,
+            })
+        }
+    }
+
     const FIXTURE_SECRET_ID: &str = "00000000-0000-0000-0000-000000000101";
 
     struct FixtureSecretMetadata {
@@ -227,6 +244,51 @@
                 checks,
             }) if checks.len() == 1 && checks[0].id == "catalog"
         ));
+    }
+
+    #[test]
+    fn diagnostics_export_uses_the_runtime_service_and_requires_an_absolute_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite")).unwrap();
+        let diagnostics = FixtureDiagnosticsExporter;
+        let destination = directory.path().join("Floria Diagnostics");
+
+        let result = dispatch(
+            &catalog,
+            DispatchServices {
+                diagnostics: Some(&diagnostics),
+                ..DispatchServices::default()
+            },
+            ControlCommand::DiagnosticsExport {
+                destination: destination.clone(),
+                include_paths: false,
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            result,
+            ControlResult::Diagnostics(DiagnosticsReport {
+                path,
+                paths_included: false,
+                files: 4,
+                bytes: 512,
+            }) if path == destination
+        ));
+
+        let relative = dispatch(
+            &catalog,
+            DispatchServices {
+                diagnostics: Some(&diagnostics),
+                ..DispatchServices::default()
+            },
+            ControlCommand::DiagnosticsExport {
+                destination: PathBuf::from("diagnostics"),
+                include_paths: false,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(relative, DispatchError::Validation(_)));
     }
 
     fn project_outputs_import(

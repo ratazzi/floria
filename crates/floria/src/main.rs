@@ -14,8 +14,9 @@ use floria_agent::{ManagedObject, ManagedPolicyItem};
 use floria_control::{
     ActiveGrant as ControlActiveGrant, BackupReport as ControlBackupReport, BackupService,
     CatalogObserver, ControlClient, ControlCommand, ControlResult, ControlRuntimeServices,
-    ControlServer, ManagedSshConfig, ProtectedFile, RuntimeHealthReporter,
-    RuntimePolicyController, SshConfigManager, SshIdentity, SshIdentityDiscovery,
+    ControlServer, ManagedSshConfig, ProtectedFile, RuntimeDiagnosticsExporter,
+    RuntimeHealthReporter, RuntimePolicyController, SshConfigManager, SshIdentity,
+    SshIdentityDiscovery,
 };
 use floria_core::audit::AuditLog;
 use floria_core::authz::{Authorizer, PolicyMode, PolicyModeStatus};
@@ -35,8 +36,10 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
+mod diagnostics;
 mod health;
 
+use diagnostics::RuntimeDiagnostics;
 use health::RuntimeHealth;
 
 /// Floria: a userspace filesystem that exposes dynamic content as plain local files (macOS/macFUSE).
@@ -129,6 +132,11 @@ enum Cmd {
         #[command(subcommand)]
         command: BackupCmd,
     },
+    /// Export a bounded support bundle without secret plaintext or encrypted data.
+    Diagnostics {
+        #[command(subcommand)]
+        command: DiagnosticsCmd,
+    },
     /// Manage the store's decryption key.
     Keys {
         #[command(subcommand)]
@@ -165,6 +173,20 @@ enum BackupCmd {
     Activate {
         /// Standalone data directory created by `backup restore`.
         restored: PathBuf,
+        #[arg(short, long, default_value = "floria.toml")]
+        config: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum DiagnosticsCmd {
+    /// Export redacted health, inventory, and daemon warning/error summaries.
+    Export {
+        /// New directory to create. Existing paths are never overwritten.
+        destination: PathBuf,
+        /// Include local file-system paths. Paths are omitted by default.
+        #[arg(long)]
+        include_paths: bool,
         #[arg(short, long, default_value = "floria.toml")]
         config: PathBuf,
     },
@@ -275,6 +297,11 @@ fn main() -> Result<()> {
             }
             BackupCmd::Activate { restored, config } => {
                 cmd_backup_activate(&restored, &config)
+            }
+        },
+        Cmd::Diagnostics { command } => match command {
+            DiagnosticsCmd::Export { destination, include_paths, config } => {
+                cmd_diagnostics_export(&destination, include_paths, &config)
             }
         },
         Cmd::Keys { command } => match command {
@@ -441,6 +468,34 @@ fn print_backup_report(action: &str, report: &floria_backup::BackupReport) {
         report.versions,
         report.files,
     );
+}
+
+fn cmd_diagnostics_export(
+    destination: &Path,
+    include_paths: bool,
+    config: &Path,
+) -> Result<()> {
+    let cfg = load(config)?;
+    let mut client = connect_control(&cfg)?;
+    let result = client.request(ControlCommand::DiagnosticsExport {
+        destination: destination.to_path_buf(),
+        include_paths,
+    })?;
+    let ControlResult::Diagnostics(report) = result else {
+        anyhow::bail!("daemon returned an unexpected diagnostics response");
+    };
+    println!(
+        "exported {} diagnostics files ({} bytes) to {}{}",
+        report.files,
+        report.bytes,
+        report.path.display(),
+        if report.paths_included {
+            " with local paths included"
+        } else {
+            ""
+        }
+    );
+    Ok(())
 }
 
 fn cmd_keys_import(remove_file: bool, config: &Path) -> Result<()> {
@@ -815,6 +870,12 @@ fn cmd_mount(config: &Path) -> Result<()> {
         cfg.mount_path.clone(),
         cfg.store_root.clone(),
     ));
+    let diagnostics: Arc<dyn RuntimeDiagnosticsExporter> = Arc::new(RuntimeDiagnostics::new(
+        catalog.clone(),
+        Arc::clone(&health),
+        support_dir.clone(),
+        cfg.mount_path.clone(),
+    ));
     let records = store.list()?;
     release_protected_links_for_file_surfaces(
         &snapshot,
@@ -885,6 +946,7 @@ fn cmd_mount(config: &Path) -> Result<()> {
             ssh_config,
             backup,
             health,
+            diagnostics,
             audit_log: cfg.audit_log.clone(),
             ssh_runtime_dir,
             peer_verifier: control_peer_verifier,
@@ -1259,6 +1321,9 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
             println!("{}", serde_json::to_string_pretty(&events)?);
         }
         ControlResult::Backup(report) => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        ControlResult::Diagnostics(report) => {
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         ControlResult::Snapshot(snapshot) => {
@@ -1822,6 +1887,47 @@ mod tests {
             }
             _ => panic!("expected backup activate"),
         }
+    }
+
+    #[test]
+    fn diagnostics_export_is_redacted_by_default_and_requires_an_explicit_path_opt_in() {
+        let redacted = Cli::try_parse_from([
+            "floria",
+            "diagnostics",
+            "export",
+            "/tmp/Floria Diagnostics",
+        ])
+        .unwrap();
+        match redacted.command {
+            Cmd::Diagnostics {
+                command:
+                    DiagnosticsCmd::Export {
+                        destination,
+                        include_paths,
+                        config,
+                    },
+            } => {
+                assert_eq!(destination, PathBuf::from("/tmp/Floria Diagnostics"));
+                assert!(!include_paths);
+                assert_eq!(config, PathBuf::from("floria.toml"));
+            }
+            _ => panic!("expected diagnostics export"),
+        }
+
+        let with_paths = Cli::try_parse_from([
+            "floria",
+            "diagnostics",
+            "export",
+            "/tmp/diagnostics",
+            "--include-paths",
+        ])
+        .unwrap();
+        assert!(matches!(
+            with_paths.command,
+            Cmd::Diagnostics {
+                command: DiagnosticsCmd::Export { include_paths: true, .. },
+            }
+        ));
     }
 
     #[test]

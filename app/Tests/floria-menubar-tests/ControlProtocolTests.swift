@@ -15,7 +15,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertNil(request["params"])
 
         let response = Data(
-            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":2,"daemon_version":"0.1.0","schema_version":12,"minimum_schema_version":12,"store_format_version":2,"minimum_store_format_version":1}}}"#.utf8)
+            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":3,"daemon_version":"0.1.0","schema_version":12,"minimum_schema_version":12,"store_format_version":2,"minimum_store_format_version":1}}}"#.utf8)
         let decoded = try JSONDecoder().decode(
             ControlResponseEnvelope<ControlServerInfo>.self, from: response)
         let info = try XCTUnwrap(decoded.result?.value)
@@ -47,6 +47,30 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(report.status, .warning)
         XCTAssertEqual(report.issues.map(\.id), ["disk"])
         XCTAssertFalse(String(decoding: response, as: UTF8.self).contains("/Users/"))
+    }
+
+    func testDiagnosticsExportDefaultsCanKeepPathsOutOfTheBundle() throws {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let data = try ControlCommand.diagnosticsExport(
+            destination: "/tmp/Floria Diagnostics",
+            includePaths: false
+        ).requestData(requestID: 62, encoder: encoder)
+        let request = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let params = try XCTUnwrap(request["params"] as? [String: Any])
+
+        XCTAssertEqual(request["method"] as? String, "diagnostics_export")
+        XCTAssertEqual(params["destination"] as? String, "/tmp/Floria Diagnostics")
+        XCTAssertEqual(params["include_paths"] as? Bool, false)
+
+        let response = Data(
+            #"{"request_id":62,"status":"ok","result":{"type":"diagnostics","value":{"path":"/tmp/Floria Diagnostics","paths_included":false,"files":4,"bytes":512}}}"#.utf8)
+        let decoded = try JSONDecoder().decode(
+            ControlResponseEnvelope<DiagnosticsReport>.self, from: response)
+        let report = try XCTUnwrap(decoded.result?.value)
+        XCTAssertFalse(report.pathsIncluded)
+        XCTAssertEqual(report.files, 4)
     }
 
     func testControlProtocolCompatibilityRejectsOldOrNewDaemons() throws {

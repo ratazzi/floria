@@ -1,9 +1,17 @@
 import AppKit
 import SwiftUI
 
+private struct DiagnosticsNotice: Identifiable {
+    let id = UUID()
+    let title: String
+    let message: String
+}
+
 struct SystemHealthView: View {
     @Environment(\.dismiss) private var dismiss
     @Bindable var state: AppState
+    @State private var diagnosticsNotice: DiagnosticsNotice?
+    @State private var diagnosticsExportInProgress = false
 
     private var issues: [SystemHealthCheck] {
         state.systemHealth?.issues ?? []
@@ -55,6 +63,10 @@ struct SystemHealthView: View {
 
             Divider()
             HStack {
+                Button("Export Diagnostics…", systemImage: "stethoscope") {
+                    exportDiagnostics()
+                }
+                .disabled(diagnosticsExportInProgress || !state.connected)
                 if !issues.isEmpty || state.systemHealthError != nil {
                     Button("Copy Doctor Command", systemImage: "terminal") {
                         NSPasteboard.general.clearContents()
@@ -74,6 +86,12 @@ struct SystemHealthView: View {
         .frame(width: 570, height: 440)
         .task {
             await state.reloadSystemHealth()
+        }
+        .alert(item: $diagnosticsNotice) { notice in
+            Alert(
+                title: Text(notice.title),
+                message: Text(notice.message),
+                dismissButton: .default(Text("OK")))
         }
     }
 
@@ -125,6 +143,29 @@ struct SystemHealthView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
+        }
+    }
+
+    private func exportDiagnostics() {
+        guard !diagnosticsExportInProgress,
+              let selection = chooseDiagnosticsExportDestination()
+        else { return }
+        diagnosticsExportInProgress = true
+        Task {
+            defer { diagnosticsExportInProgress = false }
+            do {
+                let report = try await state.workspace.exportDiagnostics(
+                    at: selection.path,
+                    includePaths: selection.includePaths)
+                revealDiagnostics(report)
+                diagnosticsNotice = DiagnosticsNotice(
+                    title: "Diagnostics Exported",
+                    message: "\(report.files) support files were saved without secret data.")
+            } catch {
+                diagnosticsNotice = DiagnosticsNotice(
+                    title: "Diagnostics Failed",
+                    message: error.localizedDescription)
+            }
         }
     }
 }

@@ -272,6 +272,11 @@ struct DashboardView: View {
                     chooseBackupToVerify()
                 }
                 .disabled(backupOperationInProgress || !state.connected)
+                Divider()
+                Button("Export Diagnostics…", systemImage: "stethoscope") {
+                    chooseDiagnosticsDestination()
+                }
+                .disabled(backupOperationInProgress || !state.connected)
             } label: {
                 Image(systemName: "ellipsis")
                     .frame(width: 28, height: 28)
@@ -318,6 +323,21 @@ struct DashboardView: View {
                 title: "Backup Verified",
                 message:
                     "\(report.secrets) secrets and \(report.versions) versions are recoverable.\n\(report.path)"
+            )
+        }
+    }
+
+    private func chooseDiagnosticsDestination() {
+        guard let selection = chooseDiagnosticsExportDestination() else { return }
+        runBackupOperation {
+            let report = try await state.workspace.exportDiagnostics(
+                at: selection.path,
+                includePaths: selection.includePaths)
+            revealDiagnostics(report)
+            return BackupNotice(
+                title: "Diagnostics Exported",
+                message:
+                    "\(report.files) support files were saved without secret data.\n\(report.path)"
             )
         }
     }

@@ -14,6 +14,7 @@ pub(super) fn dispatch(
         ssh_config,
         backup,
         health,
+        diagnostics,
         checkout_monitor,
         audit_log,
         ssh_runtime_dir,
@@ -35,6 +36,22 @@ pub(super) fn dispatch(
                     "runtime health is unavailable on this control server".to_string(),
                 )
             }),
+        ControlCommand::DiagnosticsExport { destination, include_paths } => {
+            if !destination.is_absolute() {
+                return Err(DispatchError::Validation(
+                    "diagnostics destination must be absolute".to_string(),
+                ));
+            }
+            diagnostics
+                .ok_or_else(|| {
+                    DispatchError::Validation(
+                        "diagnostics export is unavailable on this control server".to_string(),
+                    )
+                })?
+                .export(&destination, include_paths)
+                .map(ControlResult::Diagnostics)
+                .map_err(DispatchError::Diagnostics)
+        }
         ControlCommand::PolicyModeGet => policy
             .map(|controller| ControlResult::PolicyMode(controller.policy_mode()))
             .ok_or_else(|| {

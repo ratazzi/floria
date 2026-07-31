@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 const MAX_MSG: usize = 8 << 20;
-pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRequest {
@@ -66,6 +66,7 @@ pub enum ControlCommand {
     AccessHistory { limit: usize },
     BackupCreate { destination: PathBuf },
     BackupVerify { backup: PathBuf },
+    DiagnosticsExport { destination: PathBuf, include_paths: bool },
     Snapshot,
     Discover { paths: Vec<PathBuf> },
     DiscoverStart { paths: Vec<PathBuf> },
@@ -206,6 +207,7 @@ pub enum ControlResult {
     ActiveGrants(Vec<ActiveGrant>),
     AccessHistory(Vec<AccessHistoryEvent>),
     Backup(BackupReport),
+    Diagnostics(DiagnosticsReport),
     Snapshot(WorkspaceSnapshot),
     Discovery(DiscoveryReviewPlan),
     DiscoveryJob(DiscoveryJobStatus),
@@ -280,6 +282,14 @@ pub struct BackupReport {
     pub versions: usize,
     pub plaintext_bytes: u64,
     pub files: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiagnosticsReport {
+    pub path: PathBuf,
+    pub paths_included: bool,
+    pub files: usize,
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -750,6 +760,32 @@ mod tests {
         assert_eq!(value["value"]["status"], "warning");
         assert_eq!(value["value"]["checks"][1]["id"], "disk");
         assert_eq!(value["value"]["checks"][1]["guidance"], "Free disk space");
+    }
+
+    #[test]
+    fn diagnostics_export_has_a_stable_redaction_contract() {
+        let request = ControlRequest {
+            request_id: 9,
+            command: ControlCommand::DiagnosticsExport {
+                destination: PathBuf::from("/tmp/Floria Diagnostics"),
+                include_paths: false,
+            },
+        };
+        let value = serde_json::to_value(request).unwrap();
+        assert_eq!(value["method"], "diagnostics_export");
+        assert_eq!(value["params"]["destination"], "/tmp/Floria Diagnostics");
+        assert_eq!(value["params"]["include_paths"], false);
+
+        let result = ControlResult::Diagnostics(DiagnosticsReport {
+            path: PathBuf::from("/tmp/Floria Diagnostics"),
+            paths_included: false,
+            files: 4,
+            bytes: 1024,
+        });
+        let value = serde_json::to_value(result).unwrap();
+        assert_eq!(value["type"], "diagnostics");
+        assert_eq!(value["value"]["paths_included"], false);
+        assert_eq!(value["value"]["files"], 4);
     }
 
     #[test]

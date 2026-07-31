@@ -928,6 +928,16 @@ final class WorkspaceStore {
             at: (path as NSString).standardizingPath)
     }
 
+    func exportDiagnostics(
+        at path: String,
+        includePaths: Bool
+    ) async throws -> DiagnosticsReport {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        return try await controlClient.exportDiagnostics(
+            destination: (path as NSString).standardizingPath,
+            includePaths: includePaths)
+    }
+
     func applyDiscovery(
         at paths: [String], imports: [DiscoveryImport],
         separateEntries: [DiscoverySeparateEntry],

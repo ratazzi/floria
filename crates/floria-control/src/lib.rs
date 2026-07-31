@@ -12,13 +12,14 @@ pub use client::ControlClient;
 pub use protocol::{
     AccessHistoryEvent, AccessHistoryIdentity, AccessHistoryProcess, AccessHistorySsh, ActiveGrant,
     BackupReport, ControlCommand, ControlErrorBody, ControlOutcome, ControlRequest, ControlResponse,
-    ControlResult, DiscoveryJobPhase, DiscoveryJobProgress, DiscoveryJobState, DiscoveryJobStatus,
-    HealthCheck, HealthReport, HealthStatus, ProjectCheckoutCandidate, ProjectCheckoutDiscovery,
-    ProjectCheckoutInventory, ProtectedFile, ProtectedFileVersion, SecretValue, SshConfigState,
-    SshConfigStatus, SshIdentity, CONTROL_PROTOCOL_VERSION,
+    ControlResult, DiagnosticsReport, DiscoveryJobPhase, DiscoveryJobProgress, DiscoveryJobState,
+    DiscoveryJobStatus, HealthCheck, HealthReport, HealthStatus, ProjectCheckoutCandidate,
+    ProjectCheckoutDiscovery, ProjectCheckoutInventory, ProtectedFile, ProtectedFileVersion,
+    SecretValue, SshConfigState, SshConfigStatus, SshIdentity, CONTROL_PROTOCOL_VERSION,
 };
 pub use server::{
-    BackupService, CatalogObserver, ControlRuntimeServices, ControlServer, RuntimeHealthReporter,
-    RuntimePolicyController, SshConfigManager, SshIdentityDiscovery,
+    BackupService, CatalogObserver, ControlRuntimeServices, ControlServer,
+    RuntimeDiagnosticsExporter, RuntimeHealthReporter, RuntimePolicyController, SshConfigManager,
+    SshIdentityDiscovery,
 };
 pub use ssh_config::ManagedSshConfig;

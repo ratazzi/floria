@@ -1,6 +1,6 @@
 import Foundation
 
-let supportedControlProtocolVersion: UInt32 = 2
+let supportedControlProtocolVersion: UInt32 = 3
 
 struct ControlServerInfo: Decodable, Equatable, Sendable {
     let protocolVersion: UInt32?
@@ -945,6 +945,18 @@ struct BackupReport: Codable, Equatable, Sendable {
     }
 }
 
+struct DiagnosticsReport: Codable, Equatable, Sendable {
+    let path: String
+    let pathsIncluded: Bool
+    let files: Int
+    let bytes: UInt64
+
+    enum CodingKeys: String, CodingKey {
+        case path, files, bytes
+        case pathsIncluded = "paths_included"
+    }
+}
+
 enum ControlCommand: Sendable {
     case ping
     case health
@@ -956,6 +968,7 @@ enum ControlCommand: Sendable {
     case accessHistory(limit: Int)
     case backupCreate(destination: String)
     case backupVerify(backup: String)
+    case diagnosticsExport(destination: String, includePaths: Bool)
     case snapshot
     case discover(paths: [String])
     case discoverStart(paths: [String])
@@ -1028,6 +1041,7 @@ enum ControlCommand: Sendable {
         case .accessHistory: "access_history"
         case .backupCreate: "backup_create"
         case .backupVerify: "backup_verify"
+        case .diagnosticsExport: "diagnostics_export"
         case .snapshot: "snapshot"
         case .discover: "discover"
         case .discoverStart: "discover_start"
@@ -1105,6 +1119,12 @@ enum ControlCommand: Sendable {
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: BackupVerifyParams(backup: backup)))
+        case .diagnosticsExport(let destination, let includePaths):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: DiagnosticsExportParams(
+                        destination: destination, includePaths: includePaths)))
         case .discover(let paths):
             return try encoder.encode(
                 ControlRequest(
@@ -1299,6 +1319,10 @@ private struct GrantIDParams: Encodable { let id: String }
 private struct AccessHistoryParams: Encodable { let limit: Int }
 private struct BackupCreateParams: Encodable { let destination: String }
 private struct BackupVerifyParams: Encodable { let backup: String }
+private struct DiagnosticsExportParams: Encodable {
+    let destination: String
+    let includePaths: Bool
+}
 private struct DiscoverParams: Encodable { let paths: [String] }
 private struct DiscoveryJobIDParams: Encodable { let id: String }
 private struct DiscoverApplyParams: Encodable {

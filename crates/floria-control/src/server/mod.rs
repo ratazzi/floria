@@ -38,7 +38,7 @@ use crate::protocol::{
     DiscoveryApplyResult, DiscoveryImport, DiscoveryImportDestination, DiscoveryJobPhase,
     DiscoveryJobProgress, DiscoveryJobState, DiscoveryJobStatus, DiscoveryManagedItem,
     DiscoveryManagedItemKind, DiscoveryReferenceResolution, DiscoveryReferenceSource,
-    DiscoveryReviewPlan, DiscoverySourceDisposition, HealthReport, ManagedLink,
+    DiagnosticsReport, DiscoveryReviewPlan, DiscoverySourceDisposition, HealthReport, ManagedLink,
     ManagedLinkStatus, ProjectCheckoutCandidate, ProjectCheckoutDiscovery,
     ProjectCheckoutInventory, ProtectedFile, ProtectedFileVersion, SecretValue, SshConfigStatus,
     SshIdentity, WorkspaceSnapshot,
@@ -95,6 +95,17 @@ pub trait RuntimeHealthReporter: Send + Sync + 'static {
     fn report(&self) -> HealthReport;
 }
 
+/// Export a shareable support bundle without exposing catalog, store, or plaintext internals.
+///
+/// Production owns collection, redaction, size limits, permissions, and atomic publication.
+pub trait RuntimeDiagnosticsExporter: Send + Sync + 'static {
+    fn export(
+        &self,
+        destination: &Path,
+        include_paths: bool,
+    ) -> Result<DiagnosticsReport, String>;
+}
+
 pub struct ControlRuntimeServices {
     pub observer: Arc<dyn CatalogObserver>,
     pub checkout_monitor: Arc<GitCheckoutMonitor>,
@@ -103,6 +114,7 @@ pub struct ControlRuntimeServices {
     pub ssh_config: Arc<dyn SshConfigManager>,
     pub backup: Arc<dyn BackupService>,
     pub health: Arc<dyn RuntimeHealthReporter>,
+    pub diagnostics: Arc<dyn RuntimeDiagnosticsExporter>,
     pub audit_log: PathBuf,
     pub ssh_runtime_dir: PathBuf,
     pub peer_verifier: Arc<dyn SocketPeerVerifier>,
@@ -119,6 +131,7 @@ struct ControlDependencies {
     ssh_config: Option<Arc<dyn SshConfigManager>>,
     backup: Option<Arc<dyn BackupService>>,
     health: Option<Arc<dyn RuntimeHealthReporter>>,
+    diagnostics: Option<Arc<dyn RuntimeDiagnosticsExporter>>,
     audit_log: Option<PathBuf>,
     ssh_runtime_dir: Option<PathBuf>,
     discovery_jobs: Option<Arc<DiscoveryJobManager>>,
@@ -213,6 +226,7 @@ impl ControlServer {
                 ssh_config: Some(services.ssh_config),
                 backup: Some(services.backup),
                 health: Some(services.health),
+                diagnostics: Some(services.diagnostics),
                 audit_log: Some(services.audit_log),
                 ssh_runtime_dir: Some(services.ssh_runtime_dir),
                 discovery_jobs: None,
@@ -324,6 +338,7 @@ fn handle_connection(
             ssh_config: dependencies.ssh_config.as_deref(),
             backup: dependencies.backup.as_deref(),
             health: dependencies.health.as_deref(),
+            diagnostics: dependencies.diagnostics.as_deref(),
             checkout_monitor: dependencies.checkout_monitor.as_deref(),
             audit_log: dependencies.audit_log.as_deref(),
             ssh_runtime_dir: dependencies.ssh_runtime_dir.as_deref(),
@@ -356,6 +371,7 @@ fn is_read_only(command: &ControlCommand) -> bool {
         command,
         ControlCommand::Ping
             | ControlCommand::Health
+            | ControlCommand::DiagnosticsExport { .. }
             | ControlCommand::PolicyModeGet
             | ControlCommand::GrantList
             | ControlCommand::AccessHistory { .. }
@@ -395,6 +411,7 @@ enum DispatchError {
     Policy(io::Error),
     SshConfig(io::Error),
     Backup(String),
+    Diagnostics(String),
     Validation(String),
     StoreUnavailable,
 }
@@ -414,6 +431,7 @@ struct DispatchServices<'a> {
     ssh_config: Option<&'a dyn SshConfigManager>,
     backup: Option<&'a dyn BackupService>,
     health: Option<&'a dyn RuntimeHealthReporter>,
+    diagnostics: Option<&'a dyn RuntimeDiagnosticsExporter>,
     checkout_monitor: Option<&'a GitCheckoutMonitor>,
     audit_log: Option<&'a Path>,
     ssh_runtime_dir: Option<&'a Path>,
@@ -455,6 +473,10 @@ impl DispatchError {
             },
             DispatchError::Backup(message) => ControlErrorBody {
                 code: "backup".to_string(),
+                message: message.clone(),
+            },
+            DispatchError::Diagnostics(message) => ControlErrorBody {
+                code: "diagnostics".to_string(),
                 message: message.clone(),
             },
             DispatchError::StoreUnavailable => ControlErrorBody {

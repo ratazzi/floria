@@ -107,6 +107,20 @@ final class ControlClient: @unchecked Sendable {
         return report
     }
 
+    func exportDiagnostics(
+        destination: String,
+        includePaths: Bool
+    ) async throws -> DiagnosticsReport {
+        guard let report: DiagnosticsReport = try await request(
+            .diagnosticsExport(destination: destination, includePaths: includePaths),
+            expecting: "diagnostics",
+            as: DiagnosticsReport.self)
+        else {
+            throw ControlClientError.missingResult("diagnostics")
+        }
+        return report
+    }
+
     func snapshot() async throws -> CatalogSnapshot {
         guard let snapshot: CatalogSnapshot = try await request(
             .snapshot, expecting: "snapshot", as: CatalogSnapshot.self)
