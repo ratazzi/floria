@@ -143,10 +143,14 @@ impl SocketPeerVerifier for SameUserPeerVerifier {
                 actual: credentials.uid,
             });
         }
-        let identity = match credentials.pid {
-            Some(pid) => crate::enrich(pid, credentials.uid, credentials.gid),
-            None => ProcessIdentity::bare(-1, credentials.uid, credentials.gid),
-        };
+        // This verifier is a protocol-test adapter, not a production trust boundary.
+        // Keep it deterministic and cheap: parallel socket tests must not serialize on
+        // Security.framework process enrichment that their assertions never inspect.
+        let identity = ProcessIdentity::bare(
+            credentials.pid.unwrap_or(-1),
+            credentials.uid,
+            credentials.gid,
+        );
         Ok(VerifiedPeer { identity })
     }
 }
