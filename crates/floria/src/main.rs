@@ -1452,6 +1452,18 @@ fn cmd_unmount(path: Option<PathBuf>, config: &Path) -> Result<()> {
         Some(p) => p,
         None => load(config)?.mount_path,
     };
+    let Some(mount) = exact_mount(&target)? else {
+        println!("already unmounted {}", target.display());
+        return Ok(());
+    };
+    if !mount.is_floria() {
+        anyhow::bail!(
+            "refusing to unmount {} because it is owned by {:?} ({:?}), not Floria",
+            target.display(),
+            mount.source,
+            mount.fs_type
+        );
+    }
     unmount_target(&target)?;
     println!("unmounted {}", target.display());
     Ok(())
@@ -1981,6 +1993,23 @@ mod tests {
         let root = exact_mount(Path::new("/")).unwrap().unwrap();
         assert!(!root.source.is_empty());
         assert!(!root.fs_type.is_empty());
+    }
+
+    #[test]
+    fn unmount_is_idempotent_and_refuses_foreign_filesystems() {
+        let dir = tempfile::tempdir().unwrap();
+        cmd_unmount(
+            Some(dir.path().to_path_buf()),
+            Path::new("/fixture/config-is-not-read.toml"),
+        )
+        .unwrap();
+
+        let error = cmd_unmount(
+            Some(PathBuf::from("/")),
+            Path::new("/fixture/config-is-not-read.toml"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("not Floria"));
     }
 
     #[test]
