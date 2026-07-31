@@ -1,8 +1,9 @@
 //! floria-store: confidential secret storage, decoupled from encryption backend.
 //!
 //! Secrets live as portable age-encrypted blobs ([`AgeDirStore`]); the key that protects them
-//! comes from a swappable [`KeyProvider`] (SSH ed25519 for dev; a dedicated age key or Keychain
-//! later). The FS read path and the `protect` CLI both drive the same [`SecretStore`] trait.
+//! comes from a swappable [`KeyProvider`] (an SSH key for development or a dedicated ed25519 key
+//! in the login Keychain for installed apps). The FS read path and the `protect` CLI both drive
+//! the same [`SecretStore`] trait.
 
 mod error;
 mod keys;

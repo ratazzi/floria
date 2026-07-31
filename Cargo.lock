@@ -958,6 +958,7 @@ dependencies = [
  "floria-core",
  "libc",
  "security-framework",
+ "security-framework-sys",
  "serde",
  "ssh-key",
  "tempfile",

@@ -277,6 +277,22 @@ fn open_store(cfg: &ResolvedConfig) -> Result<AgeDirStore> {
     Ok(store)
 }
 
+fn initialize_store_key_if_needed(cfg: &ResolvedConfig) -> Result<()> {
+    let uses_keychain = match cfg.store_key_source {
+        StoreKeySource::Keychain => true,
+        StoreKeySource::Auto => !cfg.store_ssh_key.exists(),
+        StoreKeySource::Ssh => false,
+    };
+    if uses_keychain {
+        let created = KeychainKeyProvider::initialize_if_missing(&cfg.store_root)
+            .context("initializing the dedicated Floria store key")?;
+        if created {
+            tracing::info!("created dedicated Floria store key in the login Keychain");
+        }
+    }
+    Ok(())
+}
+
 fn cmd_backup_create(destination: &Path, config: &Path) -> Result<()> {
     let cfg = load(config)?;
     let catalog_path = support_dir(&cfg)?.join("catalog.sqlite");
@@ -552,6 +568,7 @@ fn cmd_mount(config: &Path) -> Result<()> {
         .with_context(|| format!("creating mount point {}", cfg.mount_path.display()))?;
     let support_dir = support_dir(&cfg)?.to_path_buf();
     let _instance = DaemonInstance::acquire(&support_dir)?;
+    initialize_store_key_if_needed(&cfg)?;
     recover_stale_mount(&cfg.mount_path)?;
     let daemon_executable =
         std::env::current_exe().context("resolving daemon executable for peer policy")?;

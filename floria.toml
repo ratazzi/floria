@@ -5,6 +5,11 @@ path = "~/.floria"
 volname = "Floria"
 # audit_log defaults to <name>.audit.jsonl next to the mount point, i.e. ~/.floria.audit.jsonl
 
+# New installations generate a dedicated Floria ed25519 key in the login Keychain. Existing
+# development configs may keep using `auto` or `ssh` with an explicit key path.
+[store]
+key_source = "keychain"
+
 # [[file]] entries declare virtual files under the mount point. A `content` string is a
 # constant file (bytes known at mount time, exact size). A `read = [cmd, args...]` command
 # instead runs on open and its stdout becomes the content -- `size` is a declared upper bound,

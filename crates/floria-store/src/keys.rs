@@ -1,12 +1,12 @@
 //! Key material for the store, abstracted behind [`KeyProvider`] so the encryption backend is
-//! swappable. Dev uses an existing SSH ed25519 key ([`SshKeyProvider`]); a dedicated age key or a
-//! Keychain-wrapped key can slot in later without touching the store.
+//! swappable. Development can use an existing SSH ed25519 key ([`SshKeyProvider`]); installed
+//! apps generate a dedicated ed25519 key in the login Keychain.
 //!
 //! Asymmetry worth noting: encryption needs only the public recipient (cheap, no unlock), so
 //! `protect` never touches the private key or a passphrase. Only decryption ([`identity`]) does.
 
 use std::io::BufReader;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use age::secrecy::Secret;
@@ -82,9 +82,9 @@ impl KeyProvider for SshKeyProvider {
 }
 
 /// Keychain item coordinates for the store's decryption key. One fixed generic-password item in
-/// the user's login keychain holds the *decrypted* OpenSSH ed25519 private key, written by
-/// `floria keys import`. Reading it needs no passphrase or KDF; macOS gates access per binary
-/// signature instead.
+/// the user's login keychain holds the *decrypted* OpenSSH ed25519 private key, generated on first
+/// installed-app mount or written by `floria keys import`. Reading it needs no passphrase or KDF;
+/// macOS gates access per binary signature instead.
 pub const KEYCHAIN_SERVICE: &str = "dev.floria.hola.ac.store";
 pub const KEYCHAIN_ACCOUNT: &str = "store-ssh-key";
 
@@ -107,10 +107,49 @@ impl KeychainKeyProvider {
             })
     }
 
-    /// Whether the Keychain item exists (without exporting its data where possible).
-    pub fn item_exists() -> bool {
-        security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-            .is_ok()
+    /// Create a dedicated Floria ed25519 key when the Keychain item is genuinely absent.
+    ///
+    /// Existing encrypted data makes generation fail closed: a replacement key could never
+    /// decrypt it. Keychain access errors are also propagated and never mistaken for absence.
+    pub fn initialize_if_missing(store_root: &Path) -> StoreResult<bool> {
+        match security_framework::passwords::get_generic_password(
+            KEYCHAIN_SERVICE,
+            KEYCHAIN_ACCOUNT,
+        ) {
+            Ok(private_key) => {
+                let private_key = Zeroizing::new(private_key);
+                parse_identity(&private_key, "keychain")?;
+                Ok(false)
+            }
+            Err(error)
+                if error.code() == security_framework_sys::base::errSecItemNotFound =>
+            {
+                if store_root_has_data(store_root)? {
+                    return Err(StoreError::Key(format!(
+                        "Keychain item {KEYCHAIN_SERVICE}/{KEYCHAIN_ACCOUNT} is missing but \
+                         encrypted store data already exists at {}; refusing to generate a \
+                         replacement key (restore the original key first)",
+                        store_root.display()
+                    )));
+                }
+                let key = ssh_key::PrivateKey::random(
+                    &mut ssh_key::rand_core::OsRng,
+                    ssh_key::Algorithm::Ed25519,
+                )
+                .map_err(|error| {
+                    StoreError::Key(format!("generate dedicated store key: {error}"))
+                })?;
+                let private_key =
+                    key.to_openssh(ssh_key::LineEnding::LF).map_err(|error| {
+                        StoreError::Key(format!("encode dedicated store key: {error}"))
+                    })?;
+                Self::import(private_key.as_bytes())?;
+                Ok(true)
+            }
+            Err(error) => Err(StoreError::Key(format!(
+                "inspect Keychain item {KEYCHAIN_SERVICE}/{KEYCHAIN_ACCOUNT}: {error}"
+            ))),
+        }
     }
 
     /// Store `private_key` (a *decrypted* OpenSSH private key) in the Keychain, replacing any
@@ -128,6 +167,21 @@ impl KeychainKeyProvider {
             ))
         })
     }
+}
+
+fn store_root_has_data(root: &Path) -> StoreResult<bool> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(StoreError::io(root, error)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| StoreError::io(root, error))?;
+        if entry.file_name() != ".lock" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 impl KeyProvider for KeychainKeyProvider {
@@ -181,5 +235,30 @@ impl age::Callbacks for PassCallbacks {
 
     fn request_passphrase(&self, _description: &str) -> Option<Secret<String>> {
         Some(Secret::new(self.0.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_or_lock_only_store_is_safe_for_first_key_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing");
+        assert!(!store_root_has_data(&missing).unwrap());
+
+        let root = directory.path().join("store");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join(".lock"), b"").unwrap();
+        assert!(!store_root_has_data(&root).unwrap());
+    }
+
+    #[test]
+    fn any_store_payload_prevents_replacement_key_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("encrypted-entry"), b"ciphertext").unwrap();
+
+        assert!(store_root_has_data(directory.path()).unwrap());
     }
 }

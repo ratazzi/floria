@@ -39,6 +39,7 @@ signature = "2"
 rsa = "0.9.10"
 ssh-key = { version = "0.6.7", features = ["ed25519", "encryption", "getrandom", "p256", "p384", "p521", "rsa"] }
 security-framework = "3"
+security-framework-sys = "2"
 
 floria-core = { path = "crates/floria-core" }
 floria-platform = { path = "crates/floria-platform" }

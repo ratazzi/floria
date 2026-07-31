@@ -8,6 +8,7 @@ license.workspace = true
 floria-core = { workspace = true }
 age = { workspace = true }
 security-framework = { workspace = true }
+security-framework-sys = { workspace = true }
 serde = { workspace = true }
 ssh-key = { workspace = true }
 toml = { workspace = true }
