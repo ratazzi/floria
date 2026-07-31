@@ -13,6 +13,10 @@ SERVICE_LABEL="floria.hola.ac.daemon"
 SERVICE_TARGET="gui/$(id -u)/${SERVICE_LABEL}"
 LAUNCH_AGENT_PLIST="${HOME}/Library/LaunchAgents/${SERVICE_LABEL}.plist"
 WAIT_SECONDS="${FLORIA_SMOKE_WAIT_SECONDS:-20}"
+READ_FAILURE_SECONDS="${FLORIA_SMOKE_READ_FAILURE_SECONDS:-3}"
+CRASH_FIXTURE_DIRECTORY=""
+CRASH_FIXTURE_PATH=""
+CRASH_READER_PID=0
 
 for required_path in "${APP_PATH}" "${DAEMON_PATH}" "${INFO_PLIST}" "${CONFIG_PATH}"; do
     if [[ ! -e "${required_path}" ]]; then
@@ -103,6 +107,23 @@ wait_for_process_exit() {
     done
 
     echo "Timed out waiting for ${description} (pid ${pid}) to exit" >&2
+    return 1
+}
+
+wait_for_path() {
+    local path="$1"
+    local description="$2"
+    local wait_seconds="${3:-${WAIT_SECONDS}}"
+    local deadline=$((SECONDS + wait_seconds))
+
+    while ((SECONDS < deadline)); do
+        if [[ -e "${path}" ]]; then
+            return 0
+        fi
+        sleep 0.01
+    done
+
+    echo "Timed out waiting for ${description}" >&2
     return 1
 }
 
@@ -242,18 +263,46 @@ stop_daemon() {
 
 restore_environment() {
     local test_status=$?
+    local cleanup_failed=0
+    local fixture_cleanup_failed=0
     trap - EXIT INT TERM
+
+    if ((CRASH_READER_PID > 0)) && kill -0 "${CRASH_READER_PID}" 2>/dev/null; then
+        kill "${CRASH_READER_PID}" >/dev/null 2>&1 || true
+        wait "${CRASH_READER_PID}" >/dev/null 2>&1 || true
+    fi
 
     if [[ "$(job_state || true)" != "running" ]]; then
         request_app_start >/dev/null 2>&1 || true
         wait_for_job_state running "the Floria daemon to recover during cleanup" || true
     fi
-    wait_for_doctor "the Floria installation to recover during cleanup" || true
+    if ! wait_for_doctor "the Floria installation to recover during cleanup"; then
+        cleanup_failed=1
+    fi
+
+    if [[ -n "${CRASH_FIXTURE_PATH}" && -L "${CRASH_FIXTURE_PATH}" ]]; then
+        if ! "${DAEMON_PATH}" unprotect "${CRASH_FIXTURE_PATH}" \
+            --config "${CONFIG_PATH}" >/dev/null 2>&1; then
+            echo "Could not stop protecting crash-test fixture ${CRASH_FIXTURE_PATH}" >&2
+            cleanup_failed=1
+            fixture_cleanup_failed=1
+        fi
+    fi
+    if [[ -n "${CRASH_FIXTURE_DIRECTORY}" &&
+        "${fixture_cleanup_failed}" == "0" &&
+        "${CRASH_FIXTURE_DIRECTORY}" == /private/tmp/floria-daemon-crash.* ]]; then
+        rm -rf "${CRASH_FIXTURE_DIRECTORY}"
+    elif ((fixture_cleanup_failed != 0)); then
+        echo "Preserved crash-test fixture for recovery: ${CRASH_FIXTURE_DIRECTORY}" >&2
+    fi
 
     if ((initial_app_running == 0)); then
         killall "${APP_NAME}" >/dev/null 2>&1 || true
     fi
 
+    if ((test_status == 0 && cleanup_failed != 0)); then
+        test_status=1
+    fi
     exit "${test_status}"
 }
 trap restore_environment EXIT INT TERM
@@ -323,6 +372,92 @@ if [[ "$(job_pid)" != "${new_daemon_pid}" ||
 fi
 assert_daemon_owns_socket "${new_daemon_pid}" "${AGENT_SOCKET}"
 assert_daemon_owns_socket "${new_daemon_pid}" "${CONTROL_SOCKET}"
+
+echo "==> Verifying an open read fails promptly after a daemon crash"
+CRASH_FIXTURE_DIRECTORY="$(mktemp -d /private/tmp/floria-daemon-crash.XXXXXX)"
+CRASH_FIXTURE_PATH="${CRASH_FIXTURE_DIRECTORY}/managed-fixture"
+printf 'floria-daemon-crash-fixture\n' >"${CRASH_FIXTURE_PATH}"
+"${DAEMON_PATH}" protect "${CRASH_FIXTURE_PATH}" --config "${CONFIG_PATH}" >/dev/null
+
+reader_ready="${CRASH_FIXTURE_DIRECTORY}/reader-ready"
+reader_continue="${CRASH_FIXTURE_DIRECTORY}/reader-continue"
+reader_result="${CRASH_FIXTURE_DIRECTORY}/reader-result"
+/bin/zsh -c '
+    zmodload zsh/system || exit 91
+    fixture_path="$1"
+    ready_path="$2"
+    continue_path="$3"
+    result_path="$4"
+
+    exec 3<"${fixture_path}" || exit 92
+    first_byte=""
+    sysread -i 3 -s 1 first_byte
+    first_status=$?
+    print -r -- "${first_status}" >"${ready_path}"
+
+    while [[ ! -e "${continue_path}" ]]; do
+        sleep 0.01
+    done
+
+    second_byte=""
+    sysread -i 3 -s 1 second_byte
+    second_status=$?
+    {
+        print -r -- "second_status=${second_status}"
+        print -r -- "second_length=${#second_byte}"
+    } >"${result_path}"
+' -- "${CRASH_FIXTURE_PATH}" "${reader_ready}" "${reader_continue}" "${reader_result}" &
+CRASH_READER_PID=$!
+
+wait_for_path "${reader_ready}" "the crash-test reader to open its Managed file"
+first_status="$(<"${reader_ready}")"
+if [[ "${first_status}" != "0" ]]; then
+    echo "The crash-test reader could not read its first byte (status ${first_status})" >&2
+    exit 1
+fi
+
+crash_runs_before="$(job_runs)"
+crashed_daemon_pid="$(job_pid)"
+if [[ "${crashed_daemon_pid}" == "0" ]]; then
+    echo "Could not capture the daemon generation before SIGKILL" >&2
+    exit 1
+fi
+/bin/kill -9 "${crashed_daemon_pid}"
+wait_for_process_exit "${crashed_daemon_pid}" "the SIGKILLed Floria daemon"
+touch "${reader_continue}"
+
+if ! wait_for_path \
+    "${reader_result}" \
+    "the old file descriptor to fail after daemon SIGKILL" \
+    "${READ_FAILURE_SECONDS}"; then
+    echo "The old file descriptor remained blocked after daemon SIGKILL" >&2
+    exit 1
+fi
+wait "${CRASH_READER_PID}"
+CRASH_READER_PID=0
+
+second_status="$(awk -F= '$1 == "second_status" { print $2 }' "${reader_result}")"
+second_length="$(awk -F= '$1 == "second_length" { print $2 }' "${reader_result}")"
+if [[ ! "${second_status}" =~ ^[0-9]+$ || "${second_status}" == "0" ]]; then
+    echo "The old file descriptor unexpectedly completed its second read" >&2
+    cat "${reader_result}" >&2
+    exit 1
+fi
+if [[ "${second_length}" != "0" ]]; then
+    echo "The old file descriptor returned plaintext after daemon SIGKILL" >&2
+    cat "${reader_result}" >&2
+    exit 1
+fi
+
+wait_for_job_restart "${crash_runs_before}" "launchd to replace the SIGKILLed daemon"
+recovered_daemon_pid="$(job_pid)"
+if [[ "${recovered_daemon_pid}" == "0" ||
+    "${recovered_daemon_pid}" == "${crashed_daemon_pid}" ]]; then
+    echo "SIGKILL recovery did not replace daemon pid ${crashed_daemon_pid}" >&2
+    exit 1
+fi
+wait_for_doctor "the installation to recover after daemon SIGKILL"
+echo "Old fd failed with status ${second_status}; daemon ${crashed_daemon_pid} recovered as ${recovered_daemon_pid}"
 
 echo "==> Verifying recovered installation health"
 wait_for_doctor "the recovered Floria installation to become healthy"
