@@ -104,5 +104,6 @@ struct FloriaMenuBarApp: App {
                 .frame(minWidth: 1080, minHeight: 680)
         }
         .defaultSize(width: 1180, height: 760)
+        .windowStyle(.hiddenTitleBar)
     }
 }

@@ -164,6 +164,17 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertFalse(dashboard.contains(".frame(width: 126, alignment: .leading)"))
     }
 
+    func testLibraryWindowDoesNotAddATitleBarAboveItsOwnNavigation() throws {
+        let app = try source("App.swift")
+        let scenes = app.components(
+            separatedBy: #"Window("Floria Library", id: "workspace")"#)
+        XCTAssertEqual(scenes.count, 2)
+        let libraryScene = try XCTUnwrap(scenes.last)
+
+        XCTAssertTrue(libraryScene.contains(".defaultSize(width: 1180, height: 760)"))
+        XCTAssertTrue(libraryScene.contains(".windowStyle(.hiddenTitleBar)"))
+    }
+
     private func source(_ name: String) throws -> String {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
