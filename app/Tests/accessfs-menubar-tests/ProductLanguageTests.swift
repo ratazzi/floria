@@ -211,6 +211,21 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertTrue(workspace.contains(#""Offline""#))
     }
 
+    func testRecentProjectsSummarizeManagedItemCounts() throws {
+        let dashboard = try source("CompactDashboardView.swift")
+        let detailParts = dashboard.components(
+            separatedBy: "private func projectDetail(_ project: WorkspaceProject) -> String {")
+        XCTAssertEqual(detailParts.count, 2)
+        let detail = try XCTUnwrap(
+            detailParts.last?.components(
+                separatedBy: "private func projectIsHealthy").first)
+
+        XCTAssertTrue(detail.contains("projectManagedItemCount(project)"))
+        XCTAssertTrue(detail.contains(#"item\(count == 1 ? "" : "s")"#))
+        XCTAssertFalse(detail.contains("surfaces.prefix"))
+        XCTAssertFalse(detail.contains(#""SSH agent""#))
+    }
+
     private func source(_ name: String) throws -> String {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

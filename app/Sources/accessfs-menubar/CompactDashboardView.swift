@@ -592,22 +592,27 @@ struct DashboardView: View {
 
     private func projectDetail(_ project: WorkspaceProject) -> String {
         let environments = project.environments
-        guard let first = environments.first else { return "No environments" }
-        var parts = [
+        let environmentSummary =
             environments.count == 1
-                ? first.name
+                ? environments[0].name
+                : environments.isEmpty
+                    ? "No environments"
                 : "\(environments.count) environments"
-        ]
-        let surfaces = environments.flatMap(\.surfaces)
-        parts.append(contentsOf: surfaces.prefix(2).map { surface in
-            if surface.kind == .unixSocket { return "SSH agent" }
-            let filename = URL(fileURLWithPath: surface.path).lastPathComponent
-            return filename.isEmpty ? surface.name : filename
+        let count = projectManagedItemCount(project)
+        return "\(environmentSummary)  ·  \(count) item\(count == 1 ? "" : "s")"
+    }
+
+    private func projectManagedItemCount(_ project: WorkspaceProject) -> Int {
+        let surfaces = project.environments.flatMap(\.surfaces)
+        let surfacePaths = Set(surfaces.map {
+            ($0.path as NSString).standardizingPath
         })
-        if surfaces.count > 2 {
-            parts.append("\(surfaces.count - 2) more")
+        let prefix = project.path.hasSuffix("/") ? project.path : project.path + "/"
+        let protectedCount = state.workspace.protectedFiles.count { file in
+            file.path.hasPrefix(prefix)
+                && !surfacePaths.contains((file.path as NSString).standardizingPath)
         }
-        return parts.joined(separator: "  ·  ")
+        return surfaces.count + protectedCount
     }
 
     private func projectIsHealthy(_ project: WorkspaceProject) -> Bool {
