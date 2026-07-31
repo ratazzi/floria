@@ -23,8 +23,7 @@ use floria_core::config::{Config, ResolvedConfig, StoreKeySource};
 use floria_discover::{GitCheckoutMonitor, MonitoredGitProject};
 use floria_platform::{CodeSignedPeerVerifier, SocketPeerVerifier};
 use floria_store::{
-    AgeDirStore, KeychainKeyProvider, NewSecret, SecretId, SecretRecord, SecretStore,
-    SshKeyProvider,
+    AgeDirStore, KeychainKeyProvider, SecretId, SecretRecord, SecretStore, SshKeyProvider,
 };
 use floria_surface::{
     ensure_file_surface_link, file_surface_instances, protected_checkout_links,
@@ -63,19 +62,10 @@ enum Cmd {
         #[arg(short, long, default_value = "floria.toml")]
         config: PathBuf,
     },
-    /// Encrypt a file into the secret store (age-encrypted, keyed by the store's ssh key).
+    /// Protect a regular file in place through the running Floria daemon.
     Protect {
         /// File to protect.
         path: PathBuf,
-        /// Replace the original with a symlink into the mount (`secrets/<id>`); readable once mounted.
-        #[arg(long)]
-        link: bool,
-        /// Delete the plaintext original after a successful encrypt (implied by --link).
-        #[arg(long)]
-        remove: bool,
-        /// If already protected, re-encrypt the current content in place (same id).
-        #[arg(long)]
-        force: bool,
         #[arg(short, long, default_value = "floria.toml")]
         config: PathBuf,
     },
@@ -255,9 +245,7 @@ fn main() -> Result<()> {
         Cmd::Mount { config } => cmd_mount(&config),
         Cmd::Unmount { path, config } => cmd_unmount(path, &config),
         Cmd::Doctor { config } => cmd_doctor(&config),
-        Cmd::Protect { path, link, remove, force, config } => {
-            cmd_protect(&path, link, remove, force, &config)
-        }
+        Cmd::Protect { path, config } => cmd_protect(&path, &config),
         Cmd::Reveal { target, version, to, config } => cmd_reveal(&target, version, to, &config),
         Cmd::History { target, config } => cmd_history(&target, &config),
         Cmd::Rollback { target, version, config } => cmd_rollback(&target, version, &config),
@@ -560,78 +548,31 @@ fn recovery_passphrase(confirm: bool) -> Result<zeroize::Zeroizing<String>> {
     Ok(passphrase)
 }
 
-fn cmd_protect(path: &Path, link: bool, remove: bool, force: bool, config: &Path) -> Result<()> {
+fn cmd_protect(path: &Path, config: &Path) -> Result<()> {
     let cfg = load(config)?;
-    let store = open_store(&cfg)?;
-
-    // Refuse a symlink (very likely one we already created into the mount); don't recurse into it.
-    let lmeta = std::fs::symlink_metadata(path)
-        .with_context(|| format!("stat {}", path.display()))?;
-    if lmeta.file_type().is_symlink() {
-        anyhow::bail!("{} is a symlink (already linked?); refusing to protect it", path.display());
-    }
-    if !lmeta.is_file() {
-        anyhow::bail!("{} is not a regular file", path.display());
-    }
-    let abs = std::fs::canonicalize(path)
-        .with_context(|| format!("resolving {}", path.display()))?;
-    let plaintext = zeroize::Zeroizing::new(std::fs::read(&abs)?);
-    let mode = (lmeta.mode() & 0o7777) as u32;
-
-    // Import step: reuse the existing entry when already protected, so --link/--remove stay usable.
-    let id = match store.get_by_path(&abs)? {
-        Some(rec) if force => {
-            validate_catalog_secret_bytes(&cfg, &rec.id, &plaintext)?;
-            let v = store.append_version(&rec.id, &plaintext)?;
-            println!("updated {} → {} (saved version {v})", abs.display(), rec.id);
-            rec.id
-        }
-        Some(rec) => {
-            if rec.size != plaintext.len() as u64 {
-                anyhow::bail!(
-                    "{} changed since it was protected (id {}); re-run with --force to save a new version",
-                    abs.display(),
-                    rec.id
-                );
-            }
-            println!("already protected {} → {} (v{})", abs.display(), rec.id, rec.current_version);
-            rec.id
-        }
-        None => {
-            let id = store.put(NewSecret::file(abs.clone(), mode), &plaintext)?;
-            println!("protected {} → {id}", abs.display());
-            println!("  stored at {}/{id}", cfg.store_root.display());
-            id
-        }
-    };
-
-    // Surface step: independent of whether we just imported or reused an existing entry.
-    if link {
-        let target = cfg
-            .mount_path
-            .join(floria_core::config::SECRETS_DIR)
-            .join(id.to_string());
-        replace_with_symlink(&abs, &target)?;
-        println!("  linked {} → {} (readable once mounted)", abs.display(), target.display());
-    } else if remove {
-        std::fs::remove_file(&abs)?;
-        println!("  removed plaintext original (restore: floria reveal {id} --to {})", abs.display());
+    let socket = support_dir(&cfg)?.join("control.sock");
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
     } else {
-        println!("  original left in place; add --link or --remove to surface it");
+        std::env::current_dir()
+            .context("resolving the current directory")?
+            .join(path)
+    };
+    let mut client = ControlClient::connect(&socket)
+        .with_context(|| format!("connecting to control socket {}", socket.display()))?;
+    match client.request(ControlCommand::FileProtect { path: absolute })? {
+        ControlResult::FileProtected { file, created } => {
+            let action = if created { "protected" } else { "already protected" };
+            println!(
+                "{action} {} as {} (version {})",
+                file.source_path.display(),
+                file.id,
+                file.current_version
+            );
+            Ok(())
+        }
+        result => anyhow::bail!("daemon returned an unexpected protect result: {result:?}"),
     }
-    Ok(())
-}
-
-/// Atomically replace the file at `at` with a symlink to `target` (symlink a temp sibling, rename over).
-fn replace_with_symlink(at: &Path, target: &Path) -> Result<()> {
-    let parent = at.parent().unwrap_or_else(|| Path::new("."));
-    let name = at.file_name().unwrap_or_default().to_string_lossy();
-    let tmp = parent.join(format!(".{name}.floria-tmp"));
-    let _ = std::fs::remove_file(&tmp);
-    std::os::unix::fs::symlink(target, &tmp)
-        .with_context(|| format!("creating symlink {}", tmp.display()))?;
-    std::fs::rename(&tmp, at).with_context(|| format!("replacing {}", at.display()))?;
-    Ok(())
 }
 
 fn cmd_reveal(target: &str, version: Option<u32>, to: Option<PathBuf>, config: &Path) -> Result<()> {
@@ -1697,6 +1638,22 @@ mod tests {
             bundled_gui_executable(Path::new("/workspace/floria/target/release/floria")),
             None
         );
+    }
+
+    #[test]
+    fn protect_has_one_managed_lifecycle_without_legacy_storage_switches() {
+        let protect = Cli::try_parse_from(["floria", "protect", "/tmp/.env"]).unwrap();
+        match protect.command {
+            Cmd::Protect { path, config } => {
+                assert_eq!(path, PathBuf::from("/tmp/.env"));
+                assert_eq!(config, PathBuf::from("floria.toml"));
+            }
+            _ => panic!("expected protect"),
+        }
+
+        for flag in ["--link", "--remove", "--force"] {
+            assert!(Cli::try_parse_from(["floria", "protect", "/tmp/.env", flag]).is_err());
+        }
     }
 
     #[test]
