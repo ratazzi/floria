@@ -92,6 +92,15 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertFalse(workspace.contains(#""Remove Output""#))
     }
 
+    func testManagedItemRowsExposeDetailsWithoutOpeningTheMoreMenu() throws {
+        let workspace = try source("WorkspaceView.swift")
+        let dashboard = try source("CompactDashboardView.swift")
+
+        XCTAssertEqual(dashboard.components(separatedBy: "Button(action: showDetails)").count - 1, 2)
+        XCTAssertTrue(workspace.contains(#".accessibilityHint("Open details")"#))
+        XCTAssertTrue(dashboard.contains(#".accessibilityHint("Open details")"#))
+    }
+
     private func source(_ name: String) throws -> String {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

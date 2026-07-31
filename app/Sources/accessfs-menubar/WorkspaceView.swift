@@ -2075,25 +2075,35 @@ private struct LibraryCatalogView: View {
 
             List(items) { item in
                 HStack(spacing: 12) {
-                    Image(systemName: item.systemImage)
-                        .font(.title3)
-                        .foregroundStyle(.blue)
-                        .frame(width: 36, height: 36)
-                        .background(Color.blue.opacity(0.1))
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                    Button {
+                        selectedItem = item
+                    } label: {
+                        HStack(spacing: 12) {
+                            Image(systemName: item.systemImage)
+                                .font(.title3)
+                                .foregroundStyle(.blue)
+                                .frame(width: 36, height: 36)
+                                .background(Color.blue.opacity(0.1))
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
 
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(item.title)
-                            .font(.body.weight(.medium))
-                            .lineLimit(1)
-                        Text(item.detail)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(item.title)
+                                    .font(.body.weight(.medium))
+                                    .lineLimit(1)
+                                Text(item.detail)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+
+                            Spacer(minLength: 12)
+                        }
+                        .contentShape(Rectangle())
                     }
-
-                    Spacer()
+                    .buttonStyle(.plain)
+                    .frame(maxWidth: .infinity)
+                    .accessibilityHint("Open details")
 
                     Text(item.typeTitle)
                         .font(.caption)

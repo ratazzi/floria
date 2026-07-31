@@ -1596,24 +1596,34 @@ private struct CompactSurfaceRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: presentation.systemImage)
-                .font(.system(size: 15, weight: .medium))
-                .foregroundStyle(Color.blue.opacity(0.76))
-                .frame(width: 32, height: 32)
-                .background(Color.blue.opacity(0.07), in: RoundedRectangle(cornerRadius: 7))
+            Button(action: showDetails) {
+                HStack(spacing: 12) {
+                    Image(systemName: presentation.systemImage)
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundStyle(Color.blue.opacity(0.76))
+                        .frame(width: 32, height: 32)
+                        .background(
+                            Color.blue.opacity(0.07),
+                            in: RoundedRectangle(cornerRadius: 7))
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text(URL(fileURLWithPath: surface.path).lastPathComponent)
-                    .font(.callout.weight(.semibold))
-                    .lineLimit(1)
-                Text(compactManagedPath(surface.path, projectPath: projectPath))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(URL(fileURLWithPath: surface.path).lastPathComponent)
+                            .font(.callout.weight(.semibold))
+                            .lineLimit(1)
+                        Text(compactManagedPath(surface.path, projectPath: projectPath))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+
+                    Spacer(minLength: 12)
+                }
+                .contentShape(Rectangle())
             }
-
-            Spacer()
+            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity)
+            .accessibilityHint("Open details")
 
             Text(needsAttention ? "Needs attention" : presentation.title)
                 .font(.caption.weight(needsAttention ? .medium : .regular))
@@ -1666,24 +1676,34 @@ private struct CompactProtectedFileRow: View {
 
     var body: some View {
         HStack(spacing: 12) {
-            Image(systemName: file.kind.systemImage)
-                .font(.system(size: 15, weight: .medium))
-                .foregroundStyle(Color.blue.opacity(0.76))
-                .frame(width: 32, height: 32)
-                .background(Color.blue.opacity(0.07), in: RoundedRectangle(cornerRadius: 7))
+            Button(action: showDetails) {
+                HStack(spacing: 12) {
+                    Image(systemName: file.kind.systemImage)
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundStyle(Color.blue.opacity(0.76))
+                        .frame(width: 32, height: 32)
+                        .background(
+                            Color.blue.opacity(0.07),
+                            in: RoundedRectangle(cornerRadius: 7))
 
-            VStack(alignment: .leading, spacing: 2) {
-                Text(URL(fileURLWithPath: file.path).lastPathComponent)
-                    .font(.callout.weight(.semibold))
-                    .lineLimit(1)
-                Text(compactManagedPath(file.path, projectPath: projectPath))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(URL(fileURLWithPath: file.path).lastPathComponent)
+                            .font(.callout.weight(.semibold))
+                            .lineLimit(1)
+                        Text(compactManagedPath(file.path, projectPath: projectPath))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+
+                    Spacer(minLength: 12)
+                }
+                .contentShape(Rectangle())
             }
-
-            Spacer()
+            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity)
+            .accessibilityHint("Open details")
 
             Text(file.linked ? file.kind.title : "Needs attention")
                 .font(.caption.weight(file.linked ? .regular : .medium))
