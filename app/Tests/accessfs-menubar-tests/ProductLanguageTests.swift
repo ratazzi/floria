@@ -153,6 +153,15 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertFalse(dashboard.contains(#""Ask every time""#))
     }
 
+    func testWorktreeAttentionNavigatesAndRevealsSpecificFiles() throws {
+        let dashboard = try source("CompactDashboardView.swift")
+
+        XCTAssertTrue(dashboard.contains("reviewWorktreeIssuesButton"))
+        XCTAssertTrue(dashboard.contains("expandedIssuePaths"))
+        XCTAssertTrue(dashboard.contains("worktreeIssueDetails("))
+        XCTAssertTrue(dashboard.contains("revealWorktreeIssue("))
+    }
+
     func testManagedRowsKeepTypeWithTheFileDescription() throws {
         let dashboard = try source("CompactDashboardView.swift")
 

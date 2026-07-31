@@ -231,6 +231,8 @@ pub struct ProjectCheckoutCandidate {
     pub path: PathBuf,
     pub git_primary: bool,
     pub managed_checkout_id: Option<String>,
+    #[serde(default)]
+    pub link_issues: Vec<PathBuf>,
 }
 
 /// Metadata-only view of one non-expired authorization grant. Matching continues to use the
@@ -805,6 +807,7 @@ mod tests {
                     path: PathBuf::from("/workspace/fixture-worktree"),
                     git_primary: false,
                     managed_checkout_id: None,
+                    link_issues: Vec::new(),
                 }],
             },
         ))
@@ -813,6 +816,10 @@ mod tests {
         assert_eq!(
             result["value"]["checkouts"][0]["path"],
             "/workspace/fixture-worktree"
+        );
+        assert_eq!(
+            result["value"]["checkouts"][0]["link_issues"],
+            serde_json::json!([])
         );
 
         let inventory = serde_json::to_value(ControlResult::ProjectCheckoutInventory(

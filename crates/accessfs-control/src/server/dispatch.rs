@@ -151,10 +151,10 @@ pub(super) fn dispatch(
             )
         }
         ControlCommand::ProjectCheckoutInventory => {
-            project_checkout_inventory(catalog, checkout_monitor)
+            project_checkout_inventory(catalog, checkout_monitor, store, mount_path)
         }
         ControlCommand::ProjectCheckoutDiscover { project_id } => {
-            discover_project_checkouts(catalog, &project_id)
+            discover_project_checkouts(catalog, &project_id, store, mount_path)
         }
         ControlCommand::ProjectCheckoutUpsert { checkout } => {
             catalog.upsert_checkout(&checkout)?;

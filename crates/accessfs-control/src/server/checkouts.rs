@@ -3,8 +3,11 @@ use super::*;
 pub(super) fn discover_project_checkouts(
     catalog: &Catalog,
     project_id: &str,
+    store: Option<&dyn SecretStore>,
+    mount_path: Option<&Path>,
 ) -> Result<ControlResult, DispatchError> {
     let snapshot = catalog.snapshot()?;
+    let records = store.map(SecretStore::list).transpose()?;
     let project = snapshot
         .projects
         .iter()
@@ -13,39 +16,53 @@ pub(super) fn discover_project_checkouts(
     let discovered = discover_git_checkouts(&project.path)
         .map_err(|error| DispatchError::Validation(error.to_string()))?;
     Ok(ControlResult::ProjectCheckoutDiscovery(
-        checkout_discovery(&snapshot, project_id, discovered),
+        checkout_discovery(
+            &snapshot,
+            project_id,
+            discovered,
+            records.as_deref(),
+            mount_path,
+        )?,
     ))
 }
 pub(super) fn project_checkout_inventory(
     catalog: &Catalog,
     monitor: Option<&GitCheckoutMonitor>,
+    store: Option<&dyn SecretStore>,
+    mount_path: Option<&Path>,
 ) -> Result<ControlResult, DispatchError> {
     let snapshot = catalog.snapshot()?;
+    let records = store.map(SecretStore::list).transpose()?;
     let (revision, projects) = if let Some(monitor) = monitor {
         let inventory = monitor.inventory();
-        let projects = snapshot
-            .projects
-            .iter()
-            .filter_map(|project| match inventory.projects.get(&project.id) {
-                Some(MonitoredGitCheckout::Ready(discovered)) => Some(checkout_discovery(
+        let mut projects = Vec::new();
+        for project in &snapshot.projects {
+            if let Some(MonitoredGitCheckout::Ready(discovered)) =
+                inventory.projects.get(&project.id)
+            {
+                projects.push(checkout_discovery(
                     &snapshot,
                     &project.id,
                     discovered.clone(),
-                )),
-                Some(MonitoredGitCheckout::Unavailable(_)) | None => None,
-            })
-            .collect();
+                    records.as_deref(),
+                    mount_path,
+                )?);
+            }
+        }
         (inventory.revision, projects)
     } else {
-        let projects = snapshot
-            .projects
-            .iter()
-            .filter_map(|project| {
-                discover_git_checkouts(&project.path)
-                    .ok()
-                    .map(|discovered| checkout_discovery(&snapshot, &project.id, discovered))
-            })
-            .collect();
+        let mut projects = Vec::new();
+        for project in &snapshot.projects {
+            if let Ok(discovered) = discover_git_checkouts(&project.path) {
+                projects.push(checkout_discovery(
+                    &snapshot,
+                    &project.id,
+                    discovered,
+                    records.as_deref(),
+                    mount_path,
+                )?);
+            }
+        }
         (0, projects)
     };
     Ok(ControlResult::ProjectCheckoutInventory(
@@ -57,25 +74,39 @@ pub(super) fn checkout_discovery(
     snapshot: &CatalogSnapshot,
     project_id: &str,
     discovered: GitCheckoutDiscovery,
-) -> ProjectCheckoutDiscovery {
+    records: Option<&[SecretRecord]>,
+    mount_path: Option<&Path>,
+) -> Result<ProjectCheckoutDiscovery, DispatchError> {
     let checkouts = discovered
         .checkouts
         .into_iter()
-        .map(|candidate| ProjectCheckoutCandidate {
-            managed_checkout_id: snapshot
+        .map(|candidate| {
+            let managed = snapshot
                 .checkouts
                 .iter()
                 .find(|checkout| {
                     checkout.project_id == project_id && checkout.path == candidate.path
-                })
-                .map(|checkout| checkout.id.clone()),
-            path: candidate.path,
-            git_primary: candidate.git_primary,
+                });
+            let link_issues = match (managed, records, mount_path) {
+                (Some(checkout), Some(records), Some(mount_path))
+                    if checkout.kind == ProjectCheckoutKind::Worktree =>
+                {
+                    checkout_link_issues(snapshot, records, mount_path, checkout)
+                        .map_err(|error| DispatchError::Validation(error.to_string()))?
+                }
+                _ => Vec::new(),
+            };
+            Ok(ProjectCheckoutCandidate {
+                managed_checkout_id: managed.map(|checkout| checkout.id.clone()),
+                path: candidate.path,
+                git_primary: candidate.git_primary,
+                link_issues,
+            })
         })
-        .collect();
-    ProjectCheckoutDiscovery {
+        .collect::<Result<Vec<_>, DispatchError>>()?;
+    Ok(ProjectCheckoutDiscovery {
         project_id: project_id.to_string(),
         common_dir: discovered.common_dir,
         checkouts,
-    }
+    })
 }

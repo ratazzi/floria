@@ -420,6 +420,88 @@
     }
 
     #[test]
+    fn managed_checkout_discovery_reports_a_foreign_protected_file_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("main");
+        let worktree = dir.path().join("feature");
+        let worktree_git = primary.join(".git/worktrees/feature");
+        std::fs::create_dir_all(&worktree_git).unwrap();
+        std::fs::create_dir(&worktree).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            format!("gitdir: {}\n", worktree_git.display()),
+        )
+        .unwrap();
+        std::fs::write(worktree_git.join("commondir"), "../..\n").unwrap();
+        std::fs::write(
+            worktree_git.join("gitdir"),
+            format!("{}\n", worktree.join(".git").display()),
+        )
+        .unwrap();
+        let primary = std::fs::canonicalize(primary).unwrap();
+        let worktree = std::fs::canonicalize(worktree).unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        catalog
+            .upsert_project(&Project {
+                id: "fixture-project".to_string(),
+                name: "Fixture".to_string(),
+                path: primary.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+        catalog
+            .upsert_environment(&Environment {
+                id: "fixture-development".to_string(),
+                project_id: "fixture-project".to_string(),
+                name: "Development".to_string(),
+                position: 0,
+            })
+            .unwrap();
+        catalog
+            .upsert_checkout(&ProjectCheckout {
+                id: "fixture-worktree".to_string(),
+                project_id: "fixture-project".to_string(),
+                path: worktree.clone(),
+                environment_id: Some("fixture-development".to_string()),
+                kind: ProjectCheckoutKind::Worktree,
+                ..Default::default()
+            })
+            .unwrap();
+        let store = FixtureStore::new();
+        store
+            .put(
+                NewSecret::file(primary.join(".envrc"), 0o600),
+                b"export FIXTURE_VALUE='fixture'\n",
+            )
+            .unwrap();
+        symlink("../main/.envrc", worktree.join(".envrc")).unwrap();
+        let mount = dir.path().join("mount");
+
+        let result = dispatch(
+            &catalog,
+            DispatchServices {
+                store: Some(&store),
+                mount_path: Some(&mount),
+                ..DispatchServices::default()
+            },
+            ControlCommand::ProjectCheckoutDiscover {
+                project_id: "fixture-project".to_string(),
+            },
+        )
+        .unwrap();
+        let ControlResult::ProjectCheckoutDiscovery(discovery) = result else {
+            panic!("unexpected checkout discovery result")
+        };
+        let candidate = discovery
+            .checkouts
+            .iter()
+            .find(|candidate| candidate.path == worktree)
+            .unwrap();
+        assert_eq!(candidate.managed_checkout_id.as_deref(), Some("fixture-worktree"));
+        assert_eq!(candidate.link_issues, vec![worktree.join(".envrc")]);
+    }
+
+    #[test]
     fn policy_mode_roundtrips_through_the_control_seam() {
         let dir = tempfile::tempdir().unwrap();
         let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();

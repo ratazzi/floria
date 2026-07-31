@@ -377,13 +377,38 @@ struct ProjectCheckoutCandidate: Codable, Hashable, Identifiable, Sendable {
     let path: String
     let gitPrimary: Bool
     let managedCheckoutID: String?
+    let linkIssues: [String]
 
     var id: String { path }
+    var needsAttention: Bool { !linkIssues.isEmpty }
 
     enum CodingKeys: String, CodingKey {
         case path
         case gitPrimary = "git_primary"
         case managedCheckoutID = "managed_checkout_id"
+        case linkIssues = "link_issues"
+    }
+
+    init(
+        path: String,
+        gitPrimary: Bool,
+        managedCheckoutID: String?,
+        linkIssues: [String] = []
+    ) {
+        self.path = path
+        self.gitPrimary = gitPrimary
+        self.managedCheckoutID = managedCheckoutID
+        self.linkIssues = linkIssues
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        path = try container.decode(String.self, forKey: .path)
+        gitPrimary = try container.decode(Bool.self, forKey: .gitPrimary)
+        managedCheckoutID = try container.decodeIfPresent(
+            String.self, forKey: .managedCheckoutID)
+        linkIssues = try container.decodeIfPresent(
+            [String].self, forKey: .linkIssues) ?? []
     }
 }
 

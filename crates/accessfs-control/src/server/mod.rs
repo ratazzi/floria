@@ -8,8 +8,8 @@ use std::sync::Arc;
 use accessfs_catalog::{
     resolve_catalog_surface, Binding, BindingScope, Catalog, CatalogError, CatalogSnapshot,
     EntrySelection, EntrySpec, Environment, FileBacking, ItemMetadata, OriginKind, OriginSource,
-    Project, Resource, ResourceCodec, ResourceKind, ResourceOrigin, ResourceSource, Surface,
-    SurfaceFormat, SurfaceInput, SurfaceKind, ValueShape,
+    Project, ProjectCheckoutKind, Resource, ResourceCodec, ResourceKind, ResourceOrigin,
+    ResourceSource, Surface, SurfaceFormat, SurfaceInput, SurfaceKind, ValueShape,
 };
 use accessfs_core::audit::{read_recent_access, AuditAccessRecord};
 use accessfs_core::authz::{Enforcement, PolicyMode, PolicyModeStatus};
@@ -22,7 +22,7 @@ use accessfs_platform::SocketPeerVerifier;
 use accessfs_ssh::ManagedKeyError;
 use accessfs_store::{NewSecret, SecretId, SecretOrigin, SecretRecord, SecretStore, StoreError};
 use accessfs_surface::{
-    decode_source, ensure_file_surface_link, file_surface_instances,
+    checkout_link_issues, decode_source, ensure_file_surface_link, file_surface_instances,
     replace_regular_file_with_symlink_if_matches, replace_symlink_with_file_if_target,
     restore_protected_checkout_links, validate_secret_bytes, SurfaceResolver,
 };

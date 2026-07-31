@@ -617,6 +617,9 @@ struct DashboardView: View {
 
     private func projectIsHealthy(_ project: WorkspaceProject) -> Bool {
         project.environments.flatMap(\.surfaces).allSatisfy(\.status.isHealthy)
+            && !(state.workspace.checkoutDiscoveries[project.id]?.checkouts.contains {
+                $0.needsAttention
+            } ?? false)
     }
 
     private func open(_ project: WorkspaceProject) {
@@ -923,7 +926,9 @@ private struct CompactProjectDetailView: View {
                 HStack(spacing: 10) {
                     projectSwitcher
                     environmentMenu
-                    if !projectIsHealthy {
+                    if projectHasWorktreeIssues {
+                        reviewWorktreeIssuesButton
+                    } else if !projectIsHealthy {
                         Label("Needs attention", systemImage: "exclamationmark.circle.fill")
                             .font(.callout.weight(.medium))
                             .foregroundStyle(Color.orange)
@@ -1180,6 +1185,26 @@ private struct CompactProjectDetailView: View {
 
     private var projectIsHealthy: Bool {
         project.environments.flatMap(\.surfaces).allSatisfy(\.status.isHealthy)
+            && !projectHasWorktreeIssues
+    }
+
+    private var projectHasWorktreeIssues: Bool {
+        state.workspace.checkoutDiscoveries[project.id]?.checkouts.contains {
+            $0.needsAttention
+        } ?? false
+    }
+
+    private var reviewWorktreeIssuesButton: some View {
+        Button {
+            showingWorktrees = true
+        } label: {
+            Label("Needs attention", systemImage: "exclamationmark.circle.fill")
+                .font(.callout.weight(.medium))
+                .foregroundStyle(Color.orange)
+        }
+        .buttonStyle(.borderless)
+        .help("Review worktree files that Floria could not link")
+        .accessibilityHint("Open Project Worktrees")
     }
 
     private var unmanagedWorktreeCount: Int {
@@ -1237,6 +1262,7 @@ private struct ProjectCheckoutsSheet: View {
     @State private var isDiscovering = false
     @State private var busyPath: String?
     @State private var errorMessage: String?
+    @State private var expandedIssuePaths: Set<String> = []
 
     private var project: WorkspaceProject? {
         store.projects.first { $0.id == projectID }
@@ -1447,70 +1473,174 @@ private struct ProjectCheckoutsSheet: View {
                 }
             })
 
-        return HStack(spacing: 14) {
-            Image(systemName: candidate.gitPrimary ? "folder" : "arrow.triangle.branch")
-                .font(.system(size: 19))
-                .foregroundStyle(candidate.gitPrimary ? Color.accentColor : Color.blue.opacity(0.78))
-                .frame(width: 34, height: 34)
+        return VStack(spacing: 0) {
+            HStack(spacing: 14) {
+                Image(systemName: candidate.gitPrimary ? "folder" : "arrow.triangle.branch")
+                    .font(.system(size: 19))
+                    .foregroundStyle(
+                        candidate.gitPrimary ? Color.accentColor : Color.blue.opacity(0.78))
+                    .frame(width: 34, height: 34)
 
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 7) {
-                    Text(displayName(for: candidate.path))
-                        .font(.callout.weight(.semibold))
+                VStack(alignment: .leading, spacing: 3) {
+                    HStack(spacing: 7) {
+                        Text(displayName(for: candidate.path))
+                            .font(.callout.weight(.semibold))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        if candidate.gitPrimary {
+                            checkoutBadge("Primary", color: .secondary)
+                        }
+                    }
+                    Text((candidate.path as NSString).abbreviatingWithTildeInPath)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    if candidate.gitPrimary {
-                        checkoutBadge("Primary", color: .secondary)
+                    if candidate.needsAttention {
+                        Button {
+                            toggleWorktreeIssueDetails(for: candidate.path)
+                        } label: {
+                            HStack(spacing: 5) {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                Text(
+                                    "\(candidate.linkIssues.count) file\(candidate.linkIssues.count == 1 ? "" : "s") need\(candidate.linkIssues.count == 1 ? "s" : "") attention"
+                                )
+                                Image(
+                                    systemName: expandedIssuePaths.contains(candidate.path)
+                                        ? "chevron.down" : "chevron.right"
+                                )
+                                .font(.caption2.weight(.semibold))
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                        .font(.caption)
+                        .foregroundStyle(Color.orange)
+                        .accessibilityHint("Show affected files")
                     }
                 }
-                Text((candidate.path as NSString).abbreviatingWithTildeInPath)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .layoutPriority(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .layoutPriority(1)
 
-            if candidate.gitPrimary {
-                Text(primaryEnvironmentTitle)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .frame(width: 160, alignment: .leading)
-            } else {
-                Picker("Environment", selection: selection) {
-                    Text("No Environment").tag("")
-                    ForEach(project?.environments ?? []) { environment in
-                        Text(environment.name).tag(environment.id)
-                    }
-                }
-                .labelsHidden()
-                .frame(width: 160)
-                .disabled(busyPath != nil)
-            }
-
-            Button {
-                NSWorkspace.shared.open(URL(fileURLWithPath: candidate.path))
-            } label: {
-                Image(systemName: "folder")
-            }
-            .buttonStyle(.borderless)
-            .help("Open in Finder")
-            .frame(width: 24)
-
-            Group {
-                if busyPath == candidate.path {
-                    ProgressView()
-                        .controlSize(.small)
+                if candidate.gitPrimary {
+                    Text(primaryEnvironmentTitle)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .frame(width: 160, alignment: .leading)
                 } else {
-                    Color.clear
+                    Picker("Environment", selection: selection) {
+                        Text("No Environment").tag("")
+                        ForEach(project?.environments ?? []) { environment in
+                            Text(environment.name).tag(environment.id)
+                        }
+                    }
+                    .labelsHidden()
+                    .frame(width: 160)
+                    .disabled(busyPath != nil)
+                }
+
+                Button {
+                    NSWorkspace.shared.open(URL(fileURLWithPath: candidate.path))
+                } label: {
+                    Image(systemName: "folder")
+                }
+                .buttonStyle(.borderless)
+                .help("Open in Finder")
+                .frame(width: 24)
+
+                Group {
+                    if busyPath == candidate.path {
+                        ProgressView()
+                            .controlSize(.small)
+                    } else {
+                        Color.clear
+                    }
+                }
+                .frame(width: 16, height: 16)
+            }
+            .padding(.horizontal, 16)
+            .frame(minHeight: 62)
+
+            if candidate.needsAttention && expandedIssuePaths.contains(candidate.path) {
+                worktreeIssueDetails(candidate)
+            }
+        }
+    }
+
+    private func worktreeIssueDetails(
+        _ candidate: ProjectCheckoutCandidate
+    ) -> some View {
+        VStack(spacing: 0) {
+            ForEach(Array(candidate.linkIssues.enumerated()), id: \.element) { index, path in
+                Button {
+                    revealWorktreeIssue(path)
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.circle")
+                            .foregroundStyle(Color.orange)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(worktreeIssuePath(path, relativeTo: candidate.path))
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Text("Doesn’t point to Floria")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Label("Show in Finder", systemImage: "folder")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(.horizontal, 12)
+                    .frame(minHeight: 44)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Show \(path) in Finder")
+                if index != candidate.linkIssues.count - 1 {
+                    Divider()
                 }
             }
-            .frame(width: 16, height: 16)
         }
-        .padding(.horizontal, 16)
-        .frame(minHeight: 62)
+        .background(Color.orange.opacity(0.055))
+        .padding(.leading, 64)
+        .padding(.trailing, 16)
+        .padding(.bottom, 10)
+    }
+
+    private func toggleWorktreeIssueDetails(for path: String) {
+        if expandedIssuePaths.contains(path) {
+            expandedIssuePaths.remove(path)
+        } else {
+            expandedIssuePaths.insert(path)
+        }
+    }
+
+    private func worktreeIssuePath(_ path: String, relativeTo checkoutPath: String) -> String {
+        let prefix = checkoutPath.hasSuffix("/") ? checkoutPath : checkoutPath + "/"
+        if path.hasPrefix(prefix) {
+            return String(path.dropFirst(prefix.count))
+        }
+        return (path as NSString).abbreviatingWithTildeInPath
+    }
+
+    private func revealWorktreeIssue(_ path: String) {
+        let url = URL(fileURLWithPath: path)
+        if FileManager.default.fileExists(atPath: path) {
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+            return
+        }
+
+        var parent = url.deletingLastPathComponent()
+        while parent.path != "/"
+            && !FileManager.default.fileExists(atPath: parent.path)
+        {
+            parent.deleteLastPathComponent()
+        }
+        NSWorkspace.shared.open(parent)
     }
 
     private var footer: some View {

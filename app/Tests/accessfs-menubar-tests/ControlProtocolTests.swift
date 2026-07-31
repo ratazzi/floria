@@ -698,13 +698,18 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(encodedCheckout["kind"] as? String, "worktree")
 
         let response = Data(
-            #"{"request_id":31,"status":"ok","result":{"type":"project_checkout_discovery","value":{"project_id":"fixture-project","common_dir":"/tmp/fixture/.git","checkouts":[{"path":"/tmp/fixture","git_primary":true,"managed_checkout_id":"fixture-project"},{"path":"/tmp/fixture-worktree","git_primary":false,"managed_checkout_id":null}]}}}"#.utf8)
+            #"{"request_id":31,"status":"ok","result":{"type":"project_checkout_discovery","value":{"project_id":"fixture-project","common_dir":"/tmp/fixture/.git","checkouts":[{"path":"/tmp/fixture","git_primary":true,"managed_checkout_id":"fixture-project","link_issues":[]},{"path":"/tmp/fixture-worktree","git_primary":false,"managed_checkout_id":"fixture-worktree","link_issues":["/tmp/fixture-worktree/.envrc"]}]}}}"#.utf8)
         let decoded = try JSONDecoder().decode(
             ControlResponseEnvelope<ProjectCheckoutDiscovery>.self, from: response)
         let result = try XCTUnwrap(decoded.result?.value)
         XCTAssertEqual(result.projectID, "fixture-project")
         XCTAssertTrue(result.checkouts.first?.gitPrimary == true)
-        XCTAssertNil(result.checkouts.last?.managedCheckoutID)
+        XCTAssertEqual(result.checkouts.first?.linkIssues, [])
+        XCTAssertEqual(result.checkouts.last?.managedCheckoutID, "fixture-worktree")
+        XCTAssertEqual(
+            result.checkouts.last?.linkIssues,
+            ["/tmp/fixture-worktree/.envrc"])
+        XCTAssertTrue(result.checkouts.last?.needsAttention == true)
 
         let inventoryResponse = Data(
             #"{"request_id":30,"status":"ok","result":{"type":"project_checkout_inventory","value":{"revision":4,"projects":[{"project_id":"fixture-project","common_dir":"/tmp/fixture/.git","checkouts":[]}]}}}"#.utf8)

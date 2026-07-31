@@ -1,11 +1,13 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::CString;
 use std::io::{self, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
-use accessfs_catalog::{CatalogSnapshot, ProjectCheckoutKind, Surface, SurfaceKind};
+use accessfs_catalog::{
+    CatalogSnapshot, ProjectCheckout, ProjectCheckoutKind, Surface, SurfaceKind,
+};
 use accessfs_core::config::{SECRETS_DIR, SURFACES_DIR};
 use accessfs_store::{SecretRecord, SecretStore};
 
@@ -246,6 +248,52 @@ pub fn protected_checkout_links(
         .map(|surface| surface.path)
         .collect::<HashSet<_>>();
     protected_checkout_links_excluding(snapshot, records, mount_path, &configured_paths)
+}
+
+/// Inspect every project-facing file that a managed worktree should expose.
+/// This is read-only: foreign links, divergent files, and missing paths are
+/// reported to callers instead of being replaced.
+pub fn checkout_link_issues(
+    snapshot: &CatalogSnapshot,
+    records: &[SecretRecord],
+    mount_path: &Path,
+    checkout: &ProjectCheckout,
+) -> SurfaceResult<Vec<PathBuf>> {
+    if checkout.kind != ProjectCheckoutKind::Worktree {
+        return Ok(Vec::new());
+    }
+
+    let mut issues = BTreeSet::new();
+    for surface in file_surface_instances(snapshot)?
+        .into_iter()
+        .filter(|surface| surface.path.starts_with(&checkout.path))
+    {
+        let expected = mount_path.join(SURFACES_DIR).join(&surface.id);
+        if !is_exact_symlink(&surface.path, &expected).map_err(|source| {
+            SurfaceError::LinkIo {
+                operation: "inspecting checkout",
+                path: surface.path.clone(),
+                source,
+            }
+        })? {
+            issues.insert(surface.path);
+        }
+    }
+    for link in protected_checkout_links(snapshot, records, mount_path)
+        .into_iter()
+        .filter(|link| link.path.starts_with(&checkout.path))
+    {
+        if !is_exact_symlink(&link.path, &link.target).map_err(|source| {
+            SurfaceError::LinkIo {
+                operation: "inspecting checkout",
+                path: link.path.clone(),
+                source,
+            }
+        })? {
+            issues.insert(link.path);
+        }
+    }
+    Ok(issues.into_iter().collect())
 }
 
 fn protected_checkout_links_excluding(
@@ -813,6 +861,60 @@ mod tests {
                 ("fixture-dotenv", Path::new("/workspace/floria-feature/.env")),
                 ("fixture-staging", Path::new("/workspace/floria/.env.staging")),
             ]
+        );
+    }
+
+    #[test]
+    fn checkout_health_requires_the_exact_surface_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("project");
+        let worktree = dir.path().join("worktree");
+        std::fs::create_dir(&primary).unwrap();
+        std::fs::create_dir(&worktree).unwrap();
+        let checkout = ProjectCheckout {
+            id: "fixture-feature".to_string(),
+            project_id: "fixture-project".to_string(),
+            path: worktree.clone(),
+            environment_id: Some("fixture-development".to_string()),
+            kind: ProjectCheckoutKind::Worktree,
+            git_common_dir: None,
+        };
+        let snapshot = CatalogSnapshot {
+            projects: vec![Project {
+                id: "fixture-project".to_string(),
+                name: "Fixture".to_string(),
+                path: primary.clone(),
+                ..Default::default()
+            }],
+            checkouts: vec![checkout.clone()],
+            environments: vec![Environment {
+                id: "fixture-development".to_string(),
+                project_id: "fixture-project".to_string(),
+                name: "Development".to_string(),
+                position: 0,
+            }],
+            surfaces: vec![fixture_surface(primary.join(".env"))],
+            ..CatalogSnapshot::default()
+        };
+        let mount = dir.path().join("mount");
+        let worktree_path = worktree.join(".env");
+        symlink("../project/.env", &worktree_path).unwrap();
+
+        assert_eq!(
+            checkout_link_issues(&snapshot, &[], &mount, &checkout).unwrap(),
+            vec![worktree_path.clone()]
+        );
+
+        std::fs::remove_file(&worktree_path).unwrap();
+        symlink(
+            mount.join(SURFACES_DIR).join("fixture-dotenv"),
+            &worktree_path,
+        )
+        .unwrap();
+        assert!(
+            checkout_link_issues(&snapshot, &[], &mount, &checkout)
+                .unwrap()
+                .is_empty()
         );
     }
 
