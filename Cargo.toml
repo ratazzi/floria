@@ -28,6 +28,7 @@ wait-timeout = "0.2"
 ctrlc = { version = "3", features = ["termination"] }
 threadpool = "1"
 sha2 = "0.10"
+hmac = "0.12"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["clock"], default-features = false }
 age = { version = "0.10", features = ["ssh"] }
@@ -52,3 +53,4 @@ floria-discover = { path = "crates/floria-discover" }
 floria-surface = { path = "crates/floria-surface" }
 floria-ssh = { path = "crates/floria-ssh" }
 floria-backup = { path = "crates/floria-backup" }
+floria-integrity = { path = "crates/floria-integrity" }

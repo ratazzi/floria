@@ -781,6 +781,7 @@ dependencies = [
  "floria-core",
  "floria-discover",
  "floria-fs",
+ "floria-integrity",
  "floria-platform",
  "floria-store",
  "floria-surface",
@@ -802,6 +803,7 @@ dependencies = [
  "dashmap 6.2.1",
  "floria-catalog",
  "floria-core",
+ "floria-integrity",
  "floria-platform",
  "floria-ssh",
  "libc",
@@ -814,6 +816,7 @@ dependencies = [
  "tempfile",
  "threadpool",
  "tracing",
+ "uuid",
  "zeroize",
 ]
 
@@ -825,6 +828,7 @@ dependencies = [
  "chrono",
  "floria-catalog",
  "floria-core",
+ "floria-integrity",
  "floria-store",
  "libc",
  "serde",
@@ -839,11 +843,14 @@ name = "floria-catalog"
 version = "0.1.0"
 dependencies = [
  "floria-core",
+ "floria-integrity",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -924,6 +931,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "floria-integrity"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "hmac",
+ "libc",
+ "security-framework",
+ "security-framework-sys",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.18",
+ "zeroize",
+]
+
+[[package]]
 name = "floria-platform"
 version = "0.1.0"
 dependencies = [
@@ -954,12 +978,15 @@ name = "floria-store"
 version = "0.1.0"
 dependencies = [
  "age",
+ "base64 0.22.1",
  "chrono",
  "floria-core",
+ "floria-integrity",
  "libc",
  "security-framework",
  "security-framework-sys",
  "serde",
+ "sha2",
  "ssh-key",
  "tempfile",
  "thiserror 2.0.18",

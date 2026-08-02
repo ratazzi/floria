@@ -19,6 +19,7 @@ floria-discover = { workspace = true }
 floria-platform = { workspace = true }
 floria-surface = { workspace = true }
 floria-backup = { workspace = true }
+floria-integrity = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
 ssh-key = { workspace = true }
