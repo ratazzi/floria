@@ -30,7 +30,7 @@ use floria_core::source::{ContentSource, SourceCtx};
 use floria_core::writebuf::{WriteBufTable, WriteErr};
 use floria_store::{SecretId, SecretRecord, SecretStore};
 use floria_surface::{
-    commit_secret_version, renderer_for, ManagedMutationCoordinator, RegisteredSurface,
+    commit_secret_version, renderer_for, ManagedMutationCoordinator, ResolvedAccessPlan,
     SurfaceBacking, SurfaceError, SurfaceRegistry, SurfaceResolver,
 };
 use dashmap::DashMap;
@@ -147,7 +147,7 @@ impl SurfaceNs {
         self.inos.ino_for(id)
     }
 
-    fn surface_for_ino(&self, ino: u64) -> Option<RegisteredSurface> {
+    fn surface_for_ino(&self, ino: u64) -> Option<ResolvedAccessPlan> {
         self.id_for_ino(ino).and_then(|id| self.registry.get(&id))
     }
 
@@ -165,6 +165,9 @@ struct Shared {
     /// Per-open write buffers for store-backed secrets (fh >= WRITE_FH_BASE); committed as a
     /// new store version on flush/release.
     writes: WriteBufTable,
+    /// The exact backing graph approved when each write fd was opened. Inode lookup is live and
+    /// must never be used to rediscover a write target after authorization.
+    write_targets: DashMap<u64, WriteOpenTarget>,
     audit: Arc<AuditLog>,
     /// Authorization decision boundary. Supplied by the agent (or AllowAll in monitor mode).
     authorizer: Arc<dyn Authorizer>,
@@ -243,6 +246,7 @@ impl Floria {
             tree,
             reads: ReadSessionTable::new(),
             writes: WriteBufTable::new(),
+            write_targets: DashMap::new(),
             audit,
             authorizer,
             secrets,
@@ -290,7 +294,7 @@ impl Shared {
         ))
     }
 
-    fn surface_attr(&self, ino: u64, registered: &RegisteredSurface) -> Option<fuser::FileAttr> {
+    fn surface_attr(&self, ino: u64, registered: &ResolvedAccessPlan) -> Option<fuser::FileAttr> {
         let (size, mode) = match &registered.backing {
             // Composed surfaces are always read-only; only their byte-layout upper bound belongs
             // to the renderer.
@@ -318,18 +322,22 @@ impl Shared {
     fn resolve_open_target(&self, ino: u64) -> Result<OpenTarget, Errno> {
         if let Some(ns) = &self.surfaces {
             if let Some(registered) = ns.surface_for_ino(ino) {
-                let surface = registered.surface;
-                let kind = match registered.backing {
+                let kind = match &registered.backing {
                     SurfaceBacking::Composed { .. } => {
-                        OpenKind::ComposedSurface(surface.id.clone())
+                        OpenKind::ComposedSurface(registered.clone())
                     }
                     SurfaceBacking::EnvFileDirect { .. } => {
-                        OpenKind::DirectEnvFileSurface(surface.id.clone())
+                        OpenKind::DirectEnvFileSurface(registered.clone())
                     }
                 };
                 return Ok(OpenTarget {
-                    virtual_path: format!("{SURFACES_DIR}/{}", surface.id),
-                    display: surface.path.as_ref().map(|path| path.display().to_string()),
+                    virtual_path: format!("{SURFACES_DIR}/{}", registered.surface.id),
+                    display: registered
+                        .surface
+                        .path
+                        .as_ref()
+                        .map(|path| path.display().to_string()),
+                    object_revision: Some(registered.semantic_revision().to_string()),
                     direct_io: true,
                     kind,
                 });
@@ -349,6 +357,7 @@ impl Shared {
                 return Ok(OpenTarget {
                     virtual_path: format!("{SECRETS_DIR}/{id}"),
                     display: self.secret_display(&id),
+                    object_revision: None,
                     direct_io: true,
                     kind: OpenKind::Secret(id),
                 });
@@ -361,6 +370,7 @@ impl Shared {
         Ok(OpenTarget {
             virtual_path: file.virtual_path.clone(),
             display: None,
+            object_revision: None,
             direct_io: file.direct_io,
             kind: OpenKind::Static(Arc::clone(&file.source)),
         })
@@ -419,9 +429,17 @@ impl Shared {
             return Ok(false);
         };
         let result = (|| {
-            let ino = self.writes.ino_of(fh).ok_or_else(|| CommitFailure::io("write fh vanished"))?;
-            if let Some(ns) = &self.secrets {
-                if let Some(id) = ns.id_for_ino(ino) {
+            let target = self
+                .write_targets
+                .get(&fh)
+                .map(|target| target.clone())
+                .ok_or_else(|| CommitFailure::io("write authorization plan vanished"))?;
+            match target {
+                WriteOpenTarget::Secret(id) => {
+                    let ns = self
+                        .secrets
+                        .as_ref()
+                        .ok_or_else(|| CommitFailure::io("secret namespace is unavailable"))?;
                     let sid: SecretId = id
                         .parse()
                         .map_err(|_| CommitFailure::io(format!("invalid secret id {id}")))?;
@@ -433,29 +451,35 @@ impl Shared {
                         &bytes,
                     )
                     .map_err(CommitFailure::surface)?;
-                    return Ok((format!("{SECRETS_DIR}/{id}"), version));
+                    Ok((format!("{SECRETS_DIR}/{id}"), version))
+                }
+                WriteOpenTarget::DirectEnvFile(plan) => {
+                    let ns = self
+                        .surfaces
+                        .as_ref()
+                        .ok_or_else(|| CommitFailure::io("surface resolver is unavailable"))?;
+                    let committed = ns
+                        .resolver
+                        .commit_direct_env_file_plan(&plan, &bytes)
+                        .map_err(CommitFailure::surface)?;
+                    Ok((
+                        format!("{SURFACES_DIR}/{}", plan.surface.id),
+                        committed.version,
+                    ))
                 }
             }
-            if let Some(ns) = &self.surfaces {
-                if let Some(registered) = ns.surface_for_ino(ino) {
-                    if matches!(registered.backing, SurfaceBacking::EnvFileDirect { .. }) {
-                        let surface_id = registered.surface.id;
-                        let committed = ns
-                            .resolver
-                            .commit_direct_env_file(&surface_id, &bytes)
-                            .map_err(CommitFailure::surface)?;
-                        return Ok((format!("{SURFACES_DIR}/{surface_id}"), committed.version));
-                    }
-                }
-            }
-            Err(CommitFailure::io("write inode has no writable backing"))
         })();
         match result {
             Ok((path, version)) => {
                 let content_version = content_version_of(&bytes);
                 tracing::info!(path = %path, fh, version, size = bytes.len(), "write commit");
                 self.audit
-                    .log_write_commit(&path, fh, version, &content_version, bytes.len() as u64);
+                    .log_write_commit(&path, fh, version, &content_version, bytes.len() as u64)
+                    .map_err(|error| {
+                        CommitFailure::io(format!(
+                            "content committed but audit checkpoint failed: {error}"
+                        ))
+                    })?;
                 Ok(true)
             }
             Err(error) => {
@@ -471,9 +495,14 @@ impl Shared {
         operation: Operation,
         identity: &ProcessIdentity,
     ) -> Result<Decision, Errno> {
+        self.audit.ensure_healthy().map_err(|error| {
+            tracing::error!(%error, "refusing access while audit logging is degraded");
+            errno(libc::EIO)
+        })?;
         let decision = self.authorizer.authorize(&AuthRequest {
             path: &target.virtual_path,
             display: target.display.as_deref(),
+            object_revision: target.object_revision.as_deref(),
             operation,
             context: None,
             identity,
@@ -489,7 +518,7 @@ impl Shared {
             reason = %decision.reason,
             "deny"
         );
-        self.audit.log_denied(
+        let _ = self.audit.log_denied(
             &target.virtual_path,
             operation.as_str(),
             identity,
@@ -535,12 +564,12 @@ impl Shared {
                     }
                 }
             }
-            OpenKind::ComposedSurface(surface_id) => {
+            OpenKind::ComposedSurface(plan) => {
                 let Some(surfaces) = &self.surfaces else {
                     tracing::warn!(path = %target.virtual_path, "surface resolver is unavailable");
                     return Err(errno(libc::EIO));
                 };
-                match surfaces.resolver.render_surface(surface_id) {
+                match surfaces.resolver.render_access_plan(plan) {
                     Ok(snapshot) => {
                         tracing::debug!(
                             path = %target.virtual_path,
@@ -559,14 +588,14 @@ impl Shared {
                     }
                 }
             }
-            OpenKind::DirectEnvFileSurface(surface_id) => {
+            OpenKind::DirectEnvFileSurface(plan) => {
                 let Some(surfaces) = &self.surfaces else {
                     tracing::warn!(path = %target.virtual_path, "surface resolver is unavailable");
                     return Err(errno(libc::EIO));
                 };
-                match surfaces.resolver.read_direct_env_file(surface_id) {
+                match surfaces.resolver.read_direct_env_file_plan(plan) {
                     Ok(snapshot) => GeneratedRead {
-                        dependencies: Some(snapshot.audit_dependencies(surface_id)),
+                        dependencies: Some(snapshot.audit_dependencies(&plan.surface.id)),
                         bytes: snapshot.bytes,
                     },
                     Err(error) => {
@@ -594,8 +623,8 @@ impl Shared {
         let wants_write = flags & libc::O_ACCMODE != libc::O_RDONLY;
         let write_target = match (&target.kind, wants_write) {
             (OpenKind::Secret(id), true) => Some(WriteOpenTarget::Secret(id.clone())),
-            (OpenKind::DirectEnvFileSurface(surface_id), true) => {
-                Some(WriteOpenTarget::DirectEnvFile(surface_id.clone()))
+            (OpenKind::DirectEnvFileSurface(plan), true) => {
+                Some(WriteOpenTarget::DirectEnvFile(Box::new(plan.clone())))
             }
             (_, true) => {
                 reply.error(errno(libc::EROFS));
@@ -623,16 +652,16 @@ impl Shared {
             let initial = if flags & libc::O_TRUNC != 0 {
                 Vec::new()
             } else {
-                let result = match write_target {
-                    WriteOpenTarget::Secret(ref id) => self.decrypt_secret(id),
-                    WriteOpenTarget::DirectEnvFile(ref surface_id) => self
+                let result = match &write_target {
+                    WriteOpenTarget::Secret(id) => self.decrypt_secret(id),
+                    WriteOpenTarget::DirectEnvFile(plan) => self
                         .surfaces
                         .as_ref()
                         .ok_or_else(|| "surface resolver is unavailable".to_string())
                         .and_then(|surfaces| {
                             surfaces
                                 .resolver
-                                .read_direct_env_file(surface_id)
+                                .read_direct_env_file_plan(plan)
                                 .map(|snapshot| snapshot.bytes)
                                 .map_err(|error| error.to_string())
                         }),
@@ -648,6 +677,7 @@ impl Shared {
             };
             let size = initial.len() as u64;
             let fh = self.writes.insert(ino, Arc::clone(&identity), initial);
+            self.write_targets.insert(fh, write_target);
             if flags & libc::O_TRUNC != 0 {
                 // Opening with O_TRUNC is itself a mutation even when the caller writes no
                 // bytes afterwards; mark the empty buffer dirty so close cannot silently keep
@@ -665,7 +695,7 @@ impl Shared {
             );
             // The written content isn't known yet; the commit is audited separately
             // as a write_commit event carrying the new version's hash.
-            self.audit.log_open(
+            if let Err(error) = self.audit.log_open(
                 &target.virtual_path,
                 operation.as_str(),
                 &identity,
@@ -676,7 +706,13 @@ impl Shared {
                 fh,
                 size,
                 None,
-            );
+            ) {
+                self.write_targets.remove(&fh);
+                self.writes.remove(fh);
+                tracing::error!(%error, "refusing write open because it could not be audited");
+                reply.error(errno(libc::EIO));
+                return;
+            }
             reply.opened(FileHandle(fh), fuser::FopenFlags::FOPEN_DIRECT_IO);
             return;
         }
@@ -703,7 +739,7 @@ impl Shared {
             size = opened.size,
             "open"
         );
-        self.audit.log_open(
+        if let Err(error) = self.audit.log_open(
             &target.virtual_path,
             operation.as_str(),
             &identity,
@@ -714,7 +750,12 @@ impl Shared {
             opened.fh,
             opened.size,
             generated.dependencies.as_deref(),
-        );
+        ) {
+            self.reads.remove(opened.fh);
+            tracing::error!(%error, "refusing read open because it could not be audited");
+            reply.error(errno(libc::EIO));
+            return;
+        }
 
         // Dynamic (script/secret) files use direct-io: the kernel won't truncate to attr size
         // or cache across opens, so the fd returns the snapshot's real bytes and EOF.
@@ -764,7 +805,11 @@ impl Shared {
             fh,
             size,
             generated.dependencies.as_deref(),
-        );
+        )
+        .map_err(|error| {
+            tracing::error!(%error, "refusing read session because it could not be audited");
+            errno(libc::EIO)
+        })?;
         Ok(generated.bytes)
     }
 
@@ -786,7 +831,8 @@ impl Shared {
             .unwrap_or_default();
         let reason = "macFUSE reused a write session owned by another process";
         tracing::warn!(path = %path, pid, chain = %identity.chain_display(), reason, "deny cross-process write");
-        self.audit
+        let _ = self
+            .audit
             .log_denied(&path, Operation::Write.as_str(), &identity, None, reason, None);
     }
 
@@ -836,6 +882,7 @@ impl Shared {
 struct OpenTarget {
     virtual_path: String,
     display: Option<String>,
+    object_revision: Option<String>,
     direct_io: bool,
     kind: OpenKind,
 }
@@ -858,13 +905,25 @@ struct PendingRead {
 enum OpenKind {
     Static(Arc<dyn ContentSource>),
     Secret(String),
-    ComposedSurface(String),
-    DirectEnvFileSurface(String),
+    ComposedSurface(ResolvedAccessPlan),
+    DirectEnvFileSurface(ResolvedAccessPlan),
 }
 
+#[derive(Clone)]
 enum WriteOpenTarget {
     Secret(String),
-    DirectEnvFile(String),
+    DirectEnvFile(Box<ResolvedAccessPlan>),
+}
+
+impl WriteOpenTarget {
+    fn virtual_path(&self) -> String {
+        match self {
+            WriteOpenTarget::Secret(id) => format!("{SECRETS_DIR}/{id}"),
+            WriteOpenTarget::DirectEnvFile(plan) => {
+                format!("{SURFACES_DIR}/{}", plan.surface.id)
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1444,14 +1503,18 @@ impl fuser::Filesystem for Floria {
             let shared = Arc::clone(&self.inner);
             self.pool.execute(move || {
                 let commit_err = shared.commit_write(fh.0).err();
+                let write_target = shared.write_targets.remove(&fh.0).map(|(_, target)| target);
                 if let Some(closed) = shared.writes.remove(fh.0) {
-                    let path = shared.dynamic_path(closed.ino).unwrap_or_default();
+                    let path = write_target
+                        .as_ref()
+                        .map(WriteOpenTarget::virtual_path)
+                        .unwrap_or_else(|| shared.dynamic_path(closed.ino).unwrap_or_default());
                     if closed.dirty_bytes.is_some() {
                         // Commit failed even at release; the fd is gone, the content is lost.
                         tracing::error!(path = %path, fh = fh.0, "uncommitted write dropped at close");
                     }
                     tracing::debug!(path = %path, fh = fh.0, bytes = closed.size, "close (write)");
-                    shared.audit.log_close(
+                    let _ = shared.audit.log_close(
                         &path,
                         fh.0,
                         closed.duration.as_millis(),
@@ -1476,7 +1539,7 @@ impl fuser::Filesystem for Floria {
                 .or_else(|| self.inner.dynamic_path(info.ino))
                 .unwrap_or_default();
             tracing::debug!(path = %path, fh = fh.0, bytes = info.bytes_served, "close");
-            self.inner.audit.log_close(
+            let _ = self.inner.audit.log_close(
                 &path,
                 fh.0,
                 info.duration.as_millis(),
@@ -2061,6 +2124,7 @@ mod tests {
             tree,
             reads: ReadSessionTable::new(),
             writes: WriteBufTable::new(),
+            write_targets: DashMap::new(),
             audit: Arc::new(AuditLog::open(&tmp.join("audit.jsonl")).unwrap()),
             authorizer: Arc::new(AllowAll),
             secrets: Some(secrets),
@@ -2069,6 +2133,25 @@ mod tests {
             mount_uid: 501,
             mount_gid: 20,
         })
+    }
+
+    fn surface_registry_snapshot(surface: Surface) -> CatalogSnapshot {
+        CatalogSnapshot {
+            projects: vec![Project {
+                id: "fixture-project".to_string(),
+                name: "Fixture Project".to_string(),
+                path: PathBuf::from("/fixture/project"),
+                default_environment_id: Some("fixture-development".to_string()),
+            }],
+            environments: vec![Environment {
+                id: "fixture-development".to_string(),
+                project_id: "fixture-project".to_string(),
+                name: "Development".to_string(),
+                position: 0,
+            }],
+            surfaces: vec![surface],
+            ..CatalogSnapshot::default()
+        }
     }
 
     #[test]
@@ -2270,10 +2353,8 @@ mod tests {
             .resolve_open_target(surfaces.ino_for("fixture-dotenv"))
             .unwrap();
         catalog.remove_surface("fixture-dotenv").unwrap();
-        assert_eq!(
-            shared.generate_read(&stale_target, &identity).err().unwrap().code(),
-            libc::EIO
-        );
+        let generated = shared.generate_read(&stale_target, &identity).unwrap();
+        assert_eq!(generated.bytes, b"TOKEN=literal-value\n");
     }
 
     #[test]
@@ -2325,8 +2406,8 @@ mod tests {
         let shared = shared_fixture(
             &[],
             Arc::clone(&store) as Arc<dyn SecretStore>,
-            Some(catalog),
-            Some(registry),
+            Some(catalog.clone()),
+            Some(Arc::clone(&registry)),
             tmp.path(),
         );
         let identity = Arc::new(ProcessIdentity::bare(4242, 501, 20));
@@ -2335,6 +2416,9 @@ mod tests {
         let raw_fh = shared
             .writes
             .insert(raw_ino, Arc::clone(&identity), Vec::new());
+        shared
+            .write_targets
+            .insert(raw_fh, WriteOpenTarget::Secret(RAW_SECRET_ID.to_string()));
         shared
             .writes
             .write_at(raw_fh, 0, b"first line\nsecond line")
@@ -2355,6 +2439,28 @@ mod tests {
         let direct_fh = shared
             .writes
             .insert(direct_ino, Arc::clone(&identity), Vec::new());
+        let direct_plan = shared
+            .surfaces
+            .as_ref()
+            .unwrap()
+            .surface_for_ino(direct_ino)
+            .unwrap();
+        shared.write_targets.insert(
+            direct_fh,
+            WriteOpenTarget::DirectEnvFile(Box::new(direct_plan.clone())),
+        );
+        let mut rebound_resource = catalog
+            .snapshot()
+            .unwrap()
+            .resources
+            .into_iter()
+            .find(|resource| resource.id == "fixture-direct")
+            .unwrap();
+        rebound_resource.source = ResourceSource::SecretRef {
+            secret_id: RAW_SECRET_ID.to_string(),
+        };
+        catalog.upsert_resource(&rebound_resource).unwrap();
+        registry.replace(&catalog.snapshot().unwrap());
         shared
             .writes
             .write_at(direct_fh, 0, b"# changed\nKEY=new-value\n")
@@ -2365,8 +2471,13 @@ mod tests {
             store.current_bytes(DIRECT_SECRET_ID),
             b"# changed\nKEY=new-value\n"
         );
+        assert_eq!(store.current_bytes(RAW_SECRET_ID), b"protected-value");
 
         let invalid_fh = shared.writes.insert(direct_ino, identity, Vec::new());
+        shared.write_targets.insert(
+            invalid_fh,
+            WriteOpenTarget::DirectEnvFile(Box::new(direct_plan)),
+        );
         shared
             .writes
             .write_at(invalid_fh, 0, b"OTHER=new-value\n")
@@ -2441,10 +2552,9 @@ mod tests {
             enforcement: floria_core::authz::Enforcement::Prompt,
             position: 0,
         };
-        let registry = Arc::new(SurfaceRegistry::from_snapshot(&CatalogSnapshot {
-            surfaces: vec![surface.clone()],
-            ..CatalogSnapshot::default()
-        }));
+        let registry = Arc::new(SurfaceRegistry::from_snapshot(&surface_registry_snapshot(
+            surface.clone(),
+        )));
         let catalog = Catalog::open(tmp.path().join("catalog.sqlite")).unwrap();
         let surface_ns = SurfaceNs::new(
             Arc::clone(&registry),
@@ -2471,10 +2581,7 @@ mod tests {
             enforcement: floria_core::authz::Enforcement::Prompt,
             position: 0,
         };
-        registry.replace(&CatalogSnapshot {
-            surfaces: vec![replacement.clone()],
-            ..CatalogSnapshot::default()
-        });
+        registry.replace(&surface_registry_snapshot(replacement.clone()));
         assert!(surface_ns.surface_for_ino(first_surface_ino).is_none());
         let replacement_ino = surface_ns.ino_for(&replacement.id);
         assert_ne!(replacement_ino, first_surface_ino);
@@ -2554,6 +2661,7 @@ mod tests {
             tree,
             reads: ReadSessionTable::new(),
             writes: WriteBufTable::new(),
+            write_targets: DashMap::new(),
             audit: Arc::new(AuditLog::open(&tmp.join("audit.jsonl")).unwrap()),
             authorizer: Arc::new(AllowAll),
             secrets: Some(secrets),
@@ -2584,6 +2692,9 @@ mod tests {
         let fh = shared
             .writes
             .insert(ino, Arc::new(ProcessIdentity::bare(1, 501, 20)), Vec::new());
+        shared
+            .write_targets
+            .insert(fh, WriteOpenTarget::Secret(id.to_string()));
         shared.writes.write_at(fh, 0, b"old").unwrap();
 
         // A commits "old" and parks inside the store append.

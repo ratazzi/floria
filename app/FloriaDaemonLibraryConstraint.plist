@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- macFUSE's Developer ID Team. Apple/platform libraries remain allowed by the OS. -->
+    <key>team-identifier</key>
+    <string>3T5GSNBU6W</string>
+</dict>
+</plist>

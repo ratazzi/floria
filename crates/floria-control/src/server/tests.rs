@@ -3,7 +3,7 @@
     use floria_core::audit::AuditLog;
     use floria_core::identity::{ProcSummary, ProcessIdentity};
     use floria_platform::{
-        PeerVerificationError, SameUserPeerVerifier, SocketPeerVerifier, VerifiedPeer,
+        PeerAccess, PeerVerificationError, SameUserPeerVerifier, SocketPeerVerifier, VerifiedPeer,
     };
     use crate::client::ControlClient;
     use floria_catalog::{
@@ -32,6 +32,21 @@
                 pid: std::process::id() as i32,
                 executable: "fixture client".to_string(),
                 trusted: "fixture trusted app".to_string(),
+            })
+        }
+    }
+
+    struct ReadOnlyPeers;
+
+    impl SocketPeerVerifier for ReadOnlyPeers {
+        fn verify(&self, _stream: &UnixStream) -> Result<VerifiedPeer, PeerVerificationError> {
+            Ok(VerifiedPeer {
+                identity: ProcessIdentity::bare(
+                    std::process::id() as i32,
+                    unsafe { libc::geteuid() },
+                    unsafe { libc::getegid() },
+                ),
+                access: PeerAccess::ReadOnly,
             })
         }
     }
@@ -1092,11 +1107,12 @@
             7,
             32,
             None,
-        );
+        )
+        .unwrap();
 
         let result = dispatch(
             &catalog,
-            DispatchServices { audit_log: Some(&audit_path), ..DispatchServices::default() },
+            DispatchServices { audit_log: Some(&audit), ..DispatchServices::default() },
             ControlCommand::AccessHistory { limit: 500 },
         )
         .unwrap();
@@ -2804,7 +2820,7 @@
                 daemon_version: env!("CARGO_PKG_VERSION").to_string(),
                 schema_version: 13,
                 minimum_schema_version: 13,
-                store_format_version: 2,
+                store_format_version: 3,
                 minimum_store_format_version: 1,
             }
         );
@@ -2848,6 +2864,34 @@
         let mut client = ControlClient::connect(&socket).unwrap();
 
         assert!(client.request(ControlCommand::Ping).is_err());
+    }
+
+    #[test]
+    fn read_only_peer_can_query_but_cannot_mutate_control_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let socket = dir.path().join("control.sock");
+        let _server =
+            ControlServer::start(&socket, catalog.clone(), Arc::new(ReadOnlyPeers)).unwrap();
+        let mut client = ControlClient::connect(&socket).unwrap();
+
+        assert!(matches!(
+            client.request(ControlCommand::Ping).unwrap(),
+            ControlResult::Pong { .. }
+        ));
+        let error = client
+            .request(ControlCommand::ProjectUpsert {
+                project: Project {
+                    id: "blocked-project".to_string(),
+                    name: "Blocked".to_string(),
+                    path: PathBuf::from("/blocked"),
+                    ..Default::default()
+                },
+            })
+            .unwrap_err();
+
+        assert!(error.to_string().contains("permission_denied"));
+        assert!(catalog.snapshot().unwrap().projects.is_empty());
     }
 
     #[test]

@@ -3,11 +3,11 @@ use super::*;
 pub(super) fn access_history(
     catalog: &Catalog,
     store: Option<&dyn SecretStore>,
-    audit_log: &Path,
+    audit_log: &AuditLog,
     limit: usize,
 ) -> Result<ControlResult, DispatchError> {
-    let records = read_recent_access(audit_log, limit).map_err(|source| DispatchError::Io {
-        path: audit_log.to_path_buf(),
+    let records = audit_log.read_recent_verified(limit).map_err(|source| DispatchError::Io {
+        path: audit_log.path().to_path_buf(),
         source,
     })?;
     let snapshot = catalog.snapshot()?;

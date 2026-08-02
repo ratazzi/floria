@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use floria_catalog::{
-    CatalogSnapshot, FileBacking, ResourceSource, Surface, SurfaceFormat, SurfaceInput, SurfaceKind,
+    catalog_surface_semantic_revision, CatalogSnapshot, FileBacking, ResourceSource, Surface,
+    SurfaceFormat, SurfaceInput, SurfaceKind,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -11,16 +12,32 @@ pub enum SurfaceBacking {
     EnvFileDirect { resource_id: String, secret_id: String },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RegisteredSurface {
+/// Immutable catalog meaning authorized for one file open.
+///
+/// The registry may be replaced while a prompt is visible. Holding this plan makes the eventual
+/// read or write continue to use the exact authenticated graph whose revision was approved.
+#[derive(Debug, Clone)]
+pub struct ResolvedAccessPlan {
     pub surface: Surface,
     pub backing: SurfaceBacking,
+    semantic_revision: String,
+    snapshot: Arc<CatalogSnapshot>,
+}
+
+impl ResolvedAccessPlan {
+    pub fn semantic_revision(&self) -> &str {
+        &self.semantic_revision
+    }
+
+    pub fn catalog_snapshot(&self) -> &CatalogSnapshot {
+        &self.snapshot
+    }
 }
 
 /// In-memory metadata used by fast FUSE callbacks. Control-plane mutations replace this view,
 /// so lookup/readdir/getattr never need to query SQLite or resolve secret values.
 pub struct SurfaceRegistry {
-    surfaces: RwLock<BTreeMap<String, RegisteredSurface>>,
+    surfaces: RwLock<BTreeMap<String, ResolvedAccessPlan>>,
 }
 
 impl SurfaceRegistry {
@@ -33,7 +50,7 @@ impl SurfaceRegistry {
             file_surfaces(snapshot);
     }
 
-    pub fn get(&self, id: &str) -> Option<RegisteredSurface> {
+    pub fn get(&self, id: &str) -> Option<ResolvedAccessPlan> {
         self.surfaces
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -41,7 +58,7 @@ impl SurfaceRegistry {
             .cloned()
     }
 
-    pub fn list(&self) -> Vec<RegisteredSurface> {
+    pub fn list(&self) -> Vec<ResolvedAccessPlan> {
         self.surfaces
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -58,7 +75,8 @@ impl SurfaceRegistry {
     }
 }
 
-fn file_surfaces(snapshot: &CatalogSnapshot) -> BTreeMap<String, RegisteredSurface> {
+fn file_surfaces(snapshot: &CatalogSnapshot) -> BTreeMap<String, ResolvedAccessPlan> {
+    let snapshot = Arc::new(snapshot.clone());
     snapshot
         .surfaces
         .iter()
@@ -102,10 +120,24 @@ fn file_surfaces(snapshot: &CatalogSnapshot) -> BTreeMap<String, RegisteredSurfa
                 }
                 SurfaceKind::UnixSocket => return None,
             };
-            Some((
-                surface.id.clone(),
-                RegisteredSurface { surface: surface.clone(), backing },
-            ))
+            let semantic_revision = match catalog_surface_semantic_revision(&snapshot, &surface.id)
+            {
+                Ok(revision) => revision,
+                Err(error) => {
+                    tracing::warn!(
+                        surface_id = %surface.id,
+                        %error,
+                        "surface dropped from registry: access plan could not be resolved"
+                    );
+                    return None;
+                }
+            };
+            Some((surface.id.clone(), ResolvedAccessPlan {
+                surface: surface.clone(),
+                backing,
+                semantic_revision,
+                snapshot: Arc::clone(&snapshot),
+            }))
         })
         .collect()
 }
@@ -114,7 +146,8 @@ fn file_surfaces(snapshot: &CatalogSnapshot) -> BTreeMap<String, RegisteredSurfa
 mod tests {
     use super::*;
     use floria_catalog::{
-        EntrySpec, Resource, ResourceCodec, ResourceKind, SurfaceInput, ValueShape,
+        EntrySpec, Environment, Project, Resource, ResourceCodec, ResourceKind, SurfaceInput,
+        ValueShape,
     };
     use std::path::PathBuf;
 
@@ -131,6 +164,26 @@ mod tests {
         }
     }
 
+    fn snapshot(surfaces: Vec<Surface>, resources: Vec<Resource>) -> CatalogSnapshot {
+        CatalogSnapshot {
+            projects: vec![Project {
+                id: "fixture-project".to_string(),
+                name: "Fixture Project".to_string(),
+                path: PathBuf::from("/fixture/project"),
+                default_environment_id: Some("fixture-development".to_string()),
+            }],
+            environments: vec![Environment {
+                id: "fixture-development".to_string(),
+                project_id: "fixture-project".to_string(),
+                name: "Development".to_string(),
+                position: 0,
+            }],
+            resources,
+            surfaces,
+            ..CatalogSnapshot::default()
+        }
+    }
+
     #[test]
     fn replacement_is_sorted_and_only_keeps_file_surfaces() {
         let direct = Surface {
@@ -139,7 +192,7 @@ mod tests {
             },
             ..surface("fixture-direct", SurfaceKind::File(FileBacking::EnvFileDirect))
         };
-        let env_resource = Resource {
+        let mut env_resource = Resource {
             id: "fixture-env-resource".to_string(),
             name: "Fixture Env File".to_string(),
             kind: ResourceKind::EnvFile,
@@ -157,19 +210,18 @@ mod tests {
             metadata: Default::default(),
             origin: Default::default(),
         };
-        let registry = SurfaceRegistry::from_snapshot(&CatalogSnapshot {
-            surfaces: vec![
+        let registry = SurfaceRegistry::from_snapshot(&snapshot(
+            vec![
                 surface("fixture-b", SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv))),
                 surface("fixture-socket", SurfaceKind::UnixSocket),
                 surface("fixture-a", SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv))),
                 surface("fixture-direnv", SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Direnv))),
                 surface("fixture-ini", SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Ini))),
                 surface("fixture-lines", SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Lines))),
-                direct,
+                direct.clone(),
             ],
-            resources: vec![env_resource],
-            ..CatalogSnapshot::default()
-        });
+            vec![env_resource.clone()],
+        ));
         assert_eq!(
             registry
                 .list()
@@ -198,10 +250,30 @@ mod tests {
             SurfaceBacking::EnvFileDirect { .. }
         ));
 
-        registry.replace(&CatalogSnapshot {
-            surfaces: vec![surface("fixture-c", SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)))],
-            ..CatalogSnapshot::default()
-        });
+        let first_revision = registry
+            .get("fixture-direct")
+            .unwrap()
+            .semantic_revision()
+            .to_string();
+        env_resource.source = ResourceSource::SecretRef {
+            secret_id: "fixture-rebound-secret".to_string(),
+        };
+        registry.replace(&snapshot(vec![direct], vec![env_resource]));
+        assert_ne!(
+            registry
+                .get("fixture-direct")
+                .unwrap()
+                .semantic_revision(),
+            first_revision
+        );
+
+        registry.replace(&snapshot(
+            vec![surface(
+                "fixture-c",
+                SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
+            )],
+            Vec::new(),
+        ));
         assert!(registry.get("fixture-a").is_none());
         assert_eq!(registry.get("fixture-c").unwrap().surface.id, "fixture-c");
     }

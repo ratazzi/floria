@@ -17,6 +17,7 @@ use crate::render::{
     renderer_for, ResolvedBindingEntry, ResolvedDocument, ResolvedEntryMeta,
     ResolvedEnvironmentEntry,
 };
+use crate::ResolvedAccessPlan;
 use crate::source::compile_source;
 
 type DecodedResources = HashMap<String, Vec<DecodedEntry>>;
@@ -123,6 +124,22 @@ impl SurfaceResolver {
     /// referenced secret head is frozen before the first secret is decrypted.
     pub fn render_surface(&self, surface_id: &str) -> SurfaceResult<SurfaceSnapshot> {
         let snapshot = self.catalog.snapshot()?;
+        self.render_from_snapshot(&snapshot, surface_id)
+    }
+
+    /// Execute the immutable catalog graph captured before authorization.
+    pub fn render_access_plan(
+        &self,
+        plan: &ResolvedAccessPlan,
+    ) -> SurfaceResult<SurfaceSnapshot> {
+        self.render_from_snapshot(plan.catalog_snapshot(), &plan.surface.id)
+    }
+
+    fn render_from_snapshot(
+        &self,
+        snapshot: &CatalogSnapshot,
+        surface_id: &str,
+    ) -> SurfaceResult<SurfaceSnapshot> {
         let surface = snapshot
             .surfaces
             .iter()
@@ -137,11 +154,11 @@ impl SurfaceResolver {
         let spec = format.spec();
         let (document, versions) = match spec.input {
             FormatInputModel::EnvironmentProjection => {
-                self.resolve_environment_document(&snapshot, surface_id)?
+                self.resolve_environment_document(snapshot, surface_id)?
             }
             FormatInputModel::StructuredEntries { .. }
             | FormatInputModel::KeylessScalars { .. } => {
-                self.resolve_binding_document(&snapshot, surface, spec)?
+                self.resolve_binding_document(snapshot, surface, spec)?
             }
         };
         let rendered = renderer_for(format).render(document)?;
@@ -283,7 +300,22 @@ impl SurfaceResolver {
     /// dotenv surface, the original bytes are preserved so comments and quoting survive edits.
     pub fn read_direct_env_file(&self, surface_id: &str) -> SurfaceResult<DirectEnvFileSnapshot> {
         let snapshot = self.catalog.snapshot()?;
-        let target = direct_env_file_target(&snapshot, surface_id)?;
+        self.read_direct_env_file_from_snapshot(&snapshot, surface_id)
+    }
+
+    pub fn read_direct_env_file_plan(
+        &self,
+        plan: &ResolvedAccessPlan,
+    ) -> SurfaceResult<DirectEnvFileSnapshot> {
+        self.read_direct_env_file_from_snapshot(plan.catalog_snapshot(), &plan.surface.id)
+    }
+
+    fn read_direct_env_file_from_snapshot(
+        &self,
+        snapshot: &CatalogSnapshot,
+        surface_id: &str,
+    ) -> SurfaceResult<DirectEnvFileSnapshot> {
+        let target = direct_env_file_target(snapshot, surface_id)?;
         let id: SecretId = target.secret_id.parse()?;
         let record = self
             .store
@@ -310,6 +342,29 @@ impl SurfaceResolver {
     ) -> SurfaceResult<DirectEnvFileCommit> {
         let snapshot = self.catalog.snapshot()?;
         let target = direct_env_file_target(&snapshot, surface_id)?;
+        let id: SecretId = target.secret_id.parse()?;
+        let version = crate::codec::commit_secret_version(
+            Some(&self.catalog),
+            self.store.as_ref(),
+            self.mutations.as_ref(),
+            &id,
+            bytes,
+        )?;
+        Ok(DirectEnvFileCommit {
+            resource_id: target.resource.id,
+            secret_id: target.secret_id,
+            version,
+        })
+    }
+
+    /// Commit through the same surface/resource binding that was authorized at open time.
+    pub fn commit_direct_env_file_plan(
+        &self,
+        plan: &ResolvedAccessPlan,
+        bytes: &[u8],
+    ) -> SurfaceResult<DirectEnvFileCommit> {
+        let target = direct_env_file_target(plan.catalog_snapshot(), &plan.surface.id)?;
+        validate_direct_env_file(&target.resource, bytes)?;
         let id: SecretId = target.secret_id.parse()?;
         let version = crate::codec::commit_secret_version(
             Some(&self.catalog),

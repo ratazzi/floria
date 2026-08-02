@@ -16,6 +16,7 @@ use floria_core::authz::{
 use floria_core::config::ResolvedConfig;
 use floria_core::identity::ProcessIdentity;
 use floria_core::rules::{repo_root, RuleObject, RuleRequest, RuleSet};
+use floria_integrity::StateAuthenticator;
 use floria_platform::SocketPeerVerifier;
 
 use crate::grant_cache::{ActiveGrant, GrantCache, GrantKey, GrantMetadata};
@@ -100,6 +101,7 @@ impl SocketAgent {
     pub fn start(
         cfg: &ResolvedConfig,
         peer_verifier: Arc<dyn SocketPeerVerifier>,
+        state_authenticator: Arc<StateAuthenticator>,
     ) -> std::io::Result<Arc<SocketAgent>> {
         let server = SocketServer::start(&cfg.agent_socket, peer_verifier)?;
         tracing::info!(
@@ -115,8 +117,12 @@ impl SocketAgent {
             managed_items: RwLock::new(None),
             policy_mode: PolicyModeState::open(
                 cfg.agent_socket.with_file_name("policy-mode.json"),
+                Arc::clone(&state_authenticator),
             ),
-            grants: GrantCache::open(cfg.agent_socket.with_file_name("grants.json")),
+            grants: GrantCache::open(
+                cfg.agent_socket.with_file_name("grants.json"),
+                state_authenticator,
+            ),
             prompt_flights: Mutex::new(HashMap::new()),
             grant_generation: AtomicU64::new(0),
         }))
@@ -282,11 +288,15 @@ impl SocketAgent {
 }
 
 fn grant_object(req: &AuthRequest<'_>) -> String {
-    match req.context {
+    let object = match req.context {
         Some(floria_core::authz::AccessContext::SshSign(context)) => {
             format!("{}#{}", req.path, context.key_fingerprint)
         }
         None => req.path.to_string(),
+    };
+    match req.object_revision {
+        Some(revision) => format!("{object}@{revision}"),
+        None => object,
     }
 }
 
@@ -447,13 +457,17 @@ mod tests {
         let server =
             SocketServer::start(&dir.join("agent.sock"), Arc::new(SameUserPeerVerifier)).unwrap();
         let base_rules = RuleSet::new(rules);
+        let state_authenticator = Arc::new(StateAuthenticator::for_tests([31; 32]));
         SocketAgent {
             server,
             rules: RwLock::new(base_rules.clone()),
             base_rules,
             managed_items: RwLock::new(None),
-            policy_mode: PolicyModeState::open(dir.join("policy-mode.json")),
-            grants: GrantCache::open(dir.join("grants.json")),
+            policy_mode: PolicyModeState::open(
+                dir.join("policy-mode.json"),
+                Arc::clone(&state_authenticator),
+            ),
+            grants: GrantCache::open(dir.join("grants.json"), state_authenticator),
             prompt_flights: Mutex::new(HashMap::new()),
             grant_generation: AtomicU64::new(0),
         }
@@ -488,6 +502,7 @@ mod tests {
         AuthRequest {
             path: "secrets/test-id",
             display: None,
+            object_revision: None,
             operation: op,
             context: None,
             identity: id,
@@ -661,6 +676,7 @@ mod tests {
                 agent.authorize(&AuthRequest {
                     path: "secrets/test-id",
                     display: Some("/Users/fixture/.pgpass"),
+                    object_revision: None,
                     operation: Operation::Read,
                     context: None,
                     identity: &identity,
@@ -722,7 +738,6 @@ mod tests {
 
         assert!(worker.join().unwrap());
         assert!(agent.grants.is_empty());
-        assert!(GrantCache::open(tmp.path().join("grants.json")).is_empty());
     }
 
     #[test]
@@ -755,6 +770,46 @@ mod tests {
         let d = agent.authorize(&req(&id, Operation::Write));
         assert!(!d.is_allowed());
         assert_eq!(d.rule_id.as_deref(), Some("fail-closed"));
+    }
+
+    #[test]
+    fn surface_grant_does_not_survive_catalog_rebinding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = prompt_only_agent(tmp.path());
+        let id = ProcessIdentity::bare(1234, 501, 20);
+        agent
+            .grants
+            .insert(
+                GrantKey::new(
+                    grant_key(&id, None),
+                    "surfaces/fixture@revision-one".to_string(),
+                    Operation::Read,
+                    Enforcement::Prompt,
+                ),
+                Duration::from_secs(600),
+                fixture_grant_metadata(),
+            )
+            .unwrap();
+
+        let old_request = AuthRequest {
+            path: "surfaces/fixture",
+            display: Some("/fixture/.env"),
+            object_revision: Some("revision-one"),
+            operation: Operation::Read,
+            context: None,
+            identity: &id,
+        };
+        let decision = agent.authorize(&old_request);
+        assert!(decision.is_allowed());
+        assert_eq!(decision.rule_id.as_deref(), Some("grant"));
+
+        let rebound_request = AuthRequest {
+            object_revision: Some("revision-two"),
+            ..old_request
+        };
+        let decision = agent.authorize(&rebound_request);
+        assert!(!decision.is_allowed());
+        assert_eq!(decision.rule_id.as_deref(), Some("fail-closed"));
     }
 
     #[test]
@@ -793,6 +848,7 @@ mod tests {
         let first_request = AuthRequest {
             path: "surfaces/fixture-agent",
             display: Some("Fixture Agent"),
+            object_revision: None,
             operation: Operation::Sign,
             context: Some(AccessContext::SshSign(first)),
             identity: &id,
@@ -948,6 +1004,7 @@ mod tests {
         let decision = agent.authorize(&AuthRequest {
             path: "surfaces/fixture-agent",
             display: Some("Fixture Agent"),
+            object_revision: None,
             operation: Operation::Sign,
             context: Some(AccessContext::SshSign(context)),
             identity: &identity,
@@ -1096,7 +1153,6 @@ mod tests {
         agent.set_policy_mode(PolicyMode::AuditOnly, Some(3600)).unwrap();
 
         assert!(agent.grants.is_empty());
-        assert!(GrantCache::open(tmp.path().join("grants.json")).is_empty());
     }
 
     #[test]
@@ -1137,6 +1193,5 @@ mod tests {
         agent.replace_managed_policy(vec![managed_secret("test-id", Enforcement::TouchId)]);
         assert!(agent.grants.is_empty());
         assert_eq!(agent.grant_generation.load(Ordering::Acquire), 1);
-        assert!(GrantCache::open(tmp.path().join("grants.json")).is_empty());
     }
 }

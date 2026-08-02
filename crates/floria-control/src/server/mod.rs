@@ -11,14 +11,14 @@ use floria_catalog::{
     Project, ProjectCheckoutKind, Resource, ResourceCodec, ResourceKind, ResourceOrigin,
     ResourceSource, Surface, SurfaceFormat, SurfaceInput, SurfaceKind, ValueShape,
 };
-use floria_core::audit::{read_recent_access, AuditAccessRecord};
+use floria_core::audit::{AuditAccessRecord, AuditLog};
 use floria_core::authz::{Enforcement, PolicyMode, PolicyModeStatus};
 use floria_discover::{
     classify_key, discover_git_checkouts, discover_many, DiscoveredContent, DiscoveredFileAction,
     DiscoveredFileKind, DiscoveryPlan, ExistingEnvironment, ExistingProject, ExistingSecret,
     ExistingSurface, GitCheckoutDiscovery, GitCheckoutMonitor, KeyClass, MonitoredGitCheckout,
 };
-use floria_platform::SocketPeerVerifier;
+use floria_platform::{PeerAccess, SocketPeerVerifier};
 use floria_ssh::ManagedKeyError;
 use floria_store::{NewSecret, SecretId, SecretOrigin, SecretRecord, SecretStore, StoreError};
 use floria_surface::{
@@ -130,7 +130,7 @@ pub struct ControlRuntimeServices {
     pub recovery_key: Arc<dyn RecoveryKeyExporter>,
     pub health: Arc<dyn RuntimeHealthReporter>,
     pub diagnostics: Arc<dyn RuntimeDiagnosticsExporter>,
-    pub audit_log: PathBuf,
+    pub audit_log: Arc<AuditLog>,
     pub peer_verifier: Arc<dyn SocketPeerVerifier>,
 }
 
@@ -148,7 +148,7 @@ struct ControlDependencies {
     recovery_key: Option<Arc<dyn RecoveryKeyExporter>>,
     health: Option<Arc<dyn RuntimeHealthReporter>>,
     diagnostics: Option<Arc<dyn RuntimeDiagnosticsExporter>>,
-    audit_log: Option<PathBuf>,
+    audit_log: Option<Arc<AuditLog>>,
     discovery_jobs: Option<Arc<DiscoveryJobManager>>,
 }
 
@@ -320,14 +320,16 @@ fn accept_loop(
             executable = ?peer.identity.exe_path,
             bundle_id = ?peer.identity.bundle_id,
             team_id = ?peer.identity.team_id,
+            access = ?peer.access,
             "trusted control client connected"
         );
+        let access = peer.access;
         let catalog = Arc::clone(&catalog);
         let dependencies = dependencies.clone();
         if let Err(error) = std::thread::Builder::new()
             .name("floria-control-conn".to_string())
             .spawn(move || {
-                handle_connection(stream, catalog, dependencies)
+                handle_connection(stream, catalog, dependencies, access)
             })
         {
             tracing::warn!(%error, "spawning control connection failed");
@@ -339,6 +341,7 @@ fn handle_connection(
     mut stream: UnixStream,
     catalog: Arc<Catalog>,
     dependencies: ControlDependencies,
+    peer_access: PeerAccess,
 ) {
     loop {
         let request: ControlRequest = match read_msg(&mut stream) {
@@ -349,30 +352,44 @@ fn handle_connection(
                 break;
             }
         };
-        let services = DispatchServices {
-            store: dependencies.store.as_deref(),
-            store_arc: dependencies.store.as_ref(),
-            mount_path: dependencies.mount_path.as_deref(),
-            mutations: dependencies.mutations.as_deref(),
-            policy: dependencies.policy.as_deref(),
-            ssh_discovery: dependencies.ssh_discovery.as_deref(),
-            ssh_config: dependencies.ssh_config.as_deref(),
-            backup: dependencies.backup.as_deref(),
-            recovery_key: dependencies.recovery_key.as_deref(),
-            health: dependencies.health.as_deref(),
-            diagnostics: dependencies.diagnostics.as_deref(),
-            checkout_monitor: dependencies.checkout_monitor.as_deref(),
-            audit_log: dependencies.audit_log.as_deref(),
-            discovery_jobs: dependencies.discovery_jobs.as_deref(),
-        };
-        let outcome = match dispatch_observed(
-            &catalog,
-            services,
-            request.command,
-            dependencies.observer.as_deref(),
-        ) {
-            Ok(result) => ControlOutcome::Ok { result },
-            Err(error) => ControlOutcome::Error { error: error.body() },
+        let outcome = if !command_allowed_for_peer(peer_access, &request.command) {
+            tracing::warn!(
+                access = ?peer_access,
+                "read-only control peer attempted a privileged command"
+            );
+            ControlOutcome::Error {
+                error: ControlErrorBody {
+                    code: "permission_denied".to_string(),
+                    message: "this Floria client is not authorized to change or export protected state"
+                        .to_string(),
+                },
+            }
+        } else {
+            let services = DispatchServices {
+                store: dependencies.store.as_deref(),
+                store_arc: dependencies.store.as_ref(),
+                mount_path: dependencies.mount_path.as_deref(),
+                mutations: dependencies.mutations.as_deref(),
+                policy: dependencies.policy.as_deref(),
+                ssh_discovery: dependencies.ssh_discovery.as_deref(),
+                ssh_config: dependencies.ssh_config.as_deref(),
+                backup: dependencies.backup.as_deref(),
+                recovery_key: dependencies.recovery_key.as_deref(),
+                health: dependencies.health.as_deref(),
+                diagnostics: dependencies.diagnostics.as_deref(),
+                checkout_monitor: dependencies.checkout_monitor.as_deref(),
+                audit_log: dependencies.audit_log.as_deref(),
+                discovery_jobs: dependencies.discovery_jobs.as_deref(),
+            };
+            match dispatch_observed(
+                &catalog,
+                services,
+                request.command,
+                dependencies.observer.as_deref(),
+            ) {
+                Ok(result) => ControlOutcome::Ok { result },
+                Err(error) => ControlOutcome::Error { error: error.body() },
+            }
         };
         if let Err(error) = write_msg(
             &mut stream,
@@ -382,6 +399,31 @@ fn handle_connection(
             break;
         }
     }
+}
+
+/// Commands exposed to the bundled command-line helper without interactive GUI intent.
+///
+/// This is deliberately narrower than [`is_read_only`]. Some operationally read-only commands
+/// export cryptographic material or render secret plaintext, so mutation classification is not a
+/// security authorization policy.
+fn command_allowed_for_peer(access: PeerAccess, command: &ControlCommand) -> bool {
+    access == PeerAccess::Full
+        || matches!(
+            command,
+            ControlCommand::Ping
+                | ControlCommand::Health
+                | ControlCommand::PolicyModeGet
+                | ControlCommand::GrantList
+                | ControlCommand::AccessHistory { .. }
+                | ControlCommand::Snapshot
+                | ControlCommand::ProjectCheckoutInventory
+                | ControlCommand::ProjectCheckoutDiscover { .. }
+                | ControlCommand::SshConfigStatus
+                | ControlCommand::ProtectedFiles
+                | ControlCommand::ProtectedFileLookup { .. }
+                | ControlCommand::ProtectedFileHistory { .. }
+                | ControlCommand::ResourceUsage { .. }
+        )
 }
 
 /// Commands known not to mutate catalog, store, generated files, or runtime policy state.
@@ -458,7 +500,7 @@ struct DispatchServices<'a> {
     health: Option<&'a dyn RuntimeHealthReporter>,
     diagnostics: Option<&'a dyn RuntimeDiagnosticsExporter>,
     checkout_monitor: Option<&'a GitCheckoutMonitor>,
-    audit_log: Option<&'a Path>,
+    audit_log: Option<&'a AuditLog>,
     discovery_jobs: Option<&'a DiscoveryJobManager>,
 }
 

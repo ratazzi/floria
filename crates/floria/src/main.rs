@@ -18,11 +18,11 @@ use floria_control::{
     RecoveryKeyExporter, RuntimeHealthReporter, RuntimePolicyController, SshConfigManager,
     SshIdentity, SshIdentityDiscovery,
 };
-use floria_core::audit::AuditLog;
+use floria_core::audit::{AuditAuthority, AuditCheckpoint, AuditLog};
 use floria_core::authz::{Authorizer, PolicyMode, PolicyModeStatus};
 use floria_core::config::{Config, ResolvedConfig, StoreKeySource};
 use floria_discover::{GitCheckoutMonitor, MonitoredGitProject};
-use floria_platform::{CodeSignedPeerVerifier, SocketPeerVerifier};
+use floria_platform::{CodeSignedPeerVerifier, PeerAccess, SocketPeerVerifier};
 use floria_store::{
     AgeDirStore, KeychainKeyProvider, SecretId, SecretRecord, SecretStore, SshKeyProvider,
 };
@@ -278,7 +278,9 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    match Cli::parse().command {
+    let command = Cli::parse().command;
+    enforce_packaged_command_boundary(&command)?;
+    match command {
         Cmd::Mount { config } => cmd_mount(&config),
         Cmd::Unmount { path, config } => cmd_unmount(path, &config),
         Cmd::Doctor { config } => cmd_doctor(&config),
@@ -382,9 +384,18 @@ fn cmd_backup_create(destination: &Path, config: &Path) -> Result<()> {
             catalog_path.display()
         );
     }
-    let catalog = Catalog::open(&catalog_path)
+    let state_authenticator = Arc::new(
+        floria_integrity::StateAuthenticator::keychain()
+            .context("opening the Keychain security-state authority")?,
+    );
+    let catalog = Catalog::open_authenticated(
+        &catalog_path,
+        Arc::clone(&state_authenticator),
+    )
         .with_context(|| format!("opening catalog at {}", catalog_path.display()))?;
-    let store = open_store(&cfg)?;
+    let store = open_store(&cfg)?
+        .authenticate(Arc::clone(&state_authenticator))
+        .context("authenticating encrypted-store security state")?;
     let report = floria_backup::create(&catalog, &store, destination)
         .with_context(|| format!("creating backup at {}", destination.display()))?;
     print_backup_report("created and verified", &report);
@@ -431,7 +442,13 @@ fn cmd_backup_activate(restored: &Path, config: &Path) -> Result<()> {
     }
 
     let catalog_path = support.join("catalog.sqlite");
-    let store = open_store(&cfg)?;
+    let state_authenticator = Arc::new(
+        floria_integrity::StateAuthenticator::keychain()
+            .context("opening the Keychain security-state authority")?,
+    );
+    let store = open_store(&cfg)?
+        .authenticate(Arc::clone(&state_authenticator))
+        .context("authenticating active data before restore")?;
     let backups = support.join("backups");
     std::fs::create_dir_all(&backups)
         .with_context(|| format!("creating backup directory {}", backups.display()))?;
@@ -450,6 +467,7 @@ fn cmd_backup_activate(restored: &Path, config: &Path) -> Result<()> {
         &catalog_path,
         &store,
         &safety_backup,
+        state_authenticator,
     )
     .with_context(|| format!("activating restored data from {}", restored.display()))?;
     print_backup_report("activated and verified", &report.active);
@@ -819,7 +837,68 @@ fn reveal_lookup_path(path: &Path) -> Result<PathBuf> {
 }
 
 fn load(config: &Path) -> Result<ResolvedConfig> {
+    if option_env!("FLORIA_SIGNING_TEAM_ID").is_some() {
+        let expected = packaged_runtime_config_path()?;
+        if config != expected {
+            anyhow::bail!(
+                "packaged Floria only accepts its managed config at {}; got {}",
+                expected.display(),
+                config.display()
+            );
+        }
+        let bundled = packaged_config_path()?;
+        let resolved = Config::load(&bundled)
+            .with_context(|| format!("loading signed bundled config {}", bundled.display()))?;
+        if resolved.store_key_source != StoreKeySource::Keychain || !resolved.files.is_empty() {
+            anyhow::bail!(
+                "signed bundled config must use the Keychain store key and cannot declare command-backed files"
+            );
+        }
+        return Ok(resolved);
+    }
     Config::load(config).with_context(|| format!("loading config {}", config.display()))
+}
+
+/// A signed helper can be launched by any same-user process. Code signing authenticates the
+/// executable, not human intent, so packaged builds expose only daemon lifecycle and metadata
+/// commands directly. Sensitive operations must cross the GUI-authenticated control boundary.
+fn enforce_packaged_command_boundary(command: &Cmd) -> Result<()> {
+    if option_env!("FLORIA_SIGNING_TEAM_ID").is_none() {
+        return Ok(());
+    }
+    if matches!(
+        command,
+        Cmd::Mount { .. }
+            | Cmd::Unmount { .. }
+            | Cmd::Doctor { .. }
+            | Cmd::History { .. }
+            | Cmd::List { .. }
+            | Cmd::Control { .. }
+    ) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "this operation is disabled in the packaged Floria helper; use the Floria app so sensitive actions cross the authenticated control boundary"
+        )
+    }
+}
+
+fn packaged_runtime_config_path() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").context("HOME is required for packaged Floria")?;
+    Ok(PathBuf::from(home).join("Library/Application Support/floria/floria.toml"))
+}
+
+fn packaged_config_path() -> Result<PathBuf> {
+    let executable = std::env::current_exe().context("resolving packaged Floria executable")?;
+    let resources = executable
+        .parent()
+        .filter(|path| path.file_name().is_some_and(|name| name == "Resources"))
+        .context("packaged Floria helper is not inside an app Resources directory")?;
+    let config = resources.join("floria.toml");
+    if !config.is_file() {
+        anyhow::bail!("signed bundled config is missing at {}", config.display());
+    }
+    Ok(config)
 }
 
 fn cmd_mount(config: &Path) -> Result<()> {
@@ -832,9 +911,17 @@ fn cmd_mount(config: &Path) -> Result<()> {
     recover_stale_mount(&cfg.mount_path)?;
     let catalog_path = support_dir.join("catalog.sqlite");
     let (store, key_provider) = open_store_with_provider(&cfg)?;
+    let state_authenticator = Arc::new(
+        floria_integrity::StateAuthenticator::keychain()
+            .context("opening the Keychain security-state authority")?,
+    );
     if catalog_path.exists() {
         if let Some(report) =
-            floria_backup::recover_interrupted_activation(&catalog_path, &store)
+            floria_backup::recover_interrupted_activation(
+                &catalog_path,
+                &store,
+                Arc::clone(&state_authenticator),
+            )
                 .context("recovering an interrupted data restore")?
         {
             tracing::warn!(
@@ -843,24 +930,15 @@ fn cmd_mount(config: &Path) -> Result<()> {
             );
         }
     }
-    let daemon_executable =
-        std::env::current_exe().context("resolving daemon executable for peer policy")?;
-    let gui_executable = trusted_gui_executable(&daemon_executable)?;
-    let agent_peer_verifier: Arc<dyn SocketPeerVerifier> = Arc::new(
-        CodeSignedPeerVerifier::from_executables([&gui_executable])
-            .context("building agent socket peer policy")?,
-    );
-    let control_peer_verifier: Arc<dyn SocketPeerVerifier> = Arc::new(
-        CodeSignedPeerVerifier::from_executables([&gui_executable, &daemon_executable])
-            .context("building control socket peer policy")?,
-    );
-    tracing::info!(
-        gui = %gui_executable.display(),
-        daemon = %daemon_executable.display(),
-        "loaded local socket code-signing policy"
-    );
+    let (agent_peer_verifier, control_peer_verifier) = local_peer_verifiers()?;
+    let store = store
+        .authenticate(Arc::clone(&state_authenticator))
+        .context("authenticating encrypted-store security state")?;
     let control_path = support_dir.join("control.sock");
-    let catalog = Catalog::open(&catalog_path)
+    let catalog = Catalog::open_authenticated(
+        &catalog_path,
+        Arc::clone(&state_authenticator),
+    )
         .with_context(|| format!("opening catalog at {}", catalog_path.display()))?;
     let snapshot = catalog.snapshot().context("loading initial surface registry")?;
     let checkout_monitor = Arc::new(
@@ -910,10 +988,21 @@ fn cmd_mount(config: &Path) -> Result<()> {
         store.as_ref(),
     )
     .context("materializing protected files in project worktrees")?;
-    let agent = floria_agent::SocketAgent::start(&cfg, agent_peer_verifier)
+    let agent = floria_agent::SocketAgent::start(
+        &cfg,
+        agent_peer_verifier,
+        Arc::clone(&state_authenticator),
+    )
         .context("starting agent socket")?;
     agent.replace_managed_policy(managed_policy_items(&snapshot, &records));
-    let audit = Arc::new(AuditLog::open(&cfg.audit_log).context("opening shared audit log")?);
+    let audit_authority = Arc::new(AuthenticatedAuditAuthority::new(
+        state_authenticator,
+        cfg.audit_log.with_extension("integrity.json"),
+    ));
+    let audit = Arc::new(
+        AuditLog::open_authenticated(&cfg.audit_log, audit_authority)
+            .context("opening authenticated audit log")?,
+    );
     let ssh_authorizer: Arc<dyn Authorizer> = agent.clone();
     let managed_keys: Arc<dyn floria_agent::ManagedKeyReader> =
         Arc::new(StoreManagedKeyReader { store: Arc::clone(&store) });
@@ -968,7 +1057,7 @@ fn cmd_mount(config: &Path) -> Result<()> {
             recovery_key,
             health,
             diagnostics,
-            audit_log: cfg.audit_log.clone(),
+            audit_log: Arc::clone(&audit),
             peer_verifier: control_peer_verifier,
         },
     )
@@ -991,6 +1080,85 @@ struct AgentPolicyController {
 }
 
 struct AgentSshIdentityDiscovery;
+
+const AUDIT_CHECKPOINT_DOMAIN: &str = "audit-log-checkpoint";
+const AUDIT_EVENT_DOMAIN: &str = "audit-log-event";
+
+struct AuthenticatedAuditAuthority {
+    authenticator: Arc<floria_integrity::StateAuthenticator>,
+    checkpoint_path: PathBuf,
+    generation: Mutex<Option<u64>>,
+}
+
+impl AuthenticatedAuditAuthority {
+    fn new(
+        authenticator: Arc<floria_integrity::StateAuthenticator>,
+        checkpoint_path: PathBuf,
+    ) -> Self {
+        Self {
+            authenticator,
+            checkpoint_path,
+            generation: Mutex::new(None),
+        }
+    }
+}
+
+impl AuditAuthority for AuthenticatedAuditAuthority {
+    fn load_checkpoint(&self) -> std::io::Result<Option<AuditCheckpoint>> {
+        let loaded = self
+            .authenticator
+            .load::<AuditCheckpoint>(&self.checkpoint_path, AUDIT_CHECKPOINT_DOMAIN)
+            .map_err(std::io::Error::other)?;
+        *self
+            .generation
+            .lock()
+            .map_err(|_| std::io::Error::other("audit checkpoint lock poisoned"))? =
+            Some(loaded.generation);
+        if loaded.value.is_none() && loaded.generation != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "audit checkpoint file is missing at authenticated generation {}",
+                    loaded.generation
+                ),
+            ));
+        }
+        Ok(loaded.value)
+    }
+
+    fn authenticate(&self, payload: &[u8]) -> std::io::Result<String> {
+        Ok(self
+            .authenticator
+            .authenticate_detached(AUDIT_EVENT_DOMAIN, payload))
+    }
+
+    fn verify(&self, payload: &[u8], tag: &str) -> std::io::Result<()> {
+        self.authenticator
+            .verify_detached(AUDIT_EVENT_DOMAIN, payload, tag)
+            .map_err(std::io::Error::other)
+    }
+
+    fn persist_checkpoint(&self, checkpoint: &AuditCheckpoint) -> std::io::Result<()> {
+        let mut generation = self
+            .generation
+            .lock()
+            .map_err(|_| std::io::Error::other("audit checkpoint lock poisoned"))?;
+        let current = generation.ok_or_else(|| {
+            std::io::Error::other("audit checkpoint was not loaded before persistence")
+        })?;
+        *generation = Some(
+            self.authenticator
+                .persist(
+                    &self.checkpoint_path,
+                    AUDIT_CHECKPOINT_DOMAIN,
+                    current,
+                    checkpoint,
+                )
+                .map_err(std::io::Error::other)?,
+        );
+        Ok(())
+    }
+}
 
 struct DaemonBackupService {
     store: Arc<AgeDirStore>,
@@ -1471,6 +1639,89 @@ fn trusted_gui_executable(daemon_executable: &Path) -> Result<PathBuf> {
     anyhow::bail!(
         "could not locate the trusted Floria GUI executable; install Floria.app or set \
          FLORIA_TRUSTED_GUI_EXECUTABLE for an unbundled development run"
+    )
+}
+
+const GUI_CODE_IDENTIFIER: &str = "floria.hola.ac";
+const DAEMON_CODE_IDENTIFIER: &str = "floria.hola.ac.daemon";
+
+fn local_peer_verifiers(
+) -> Result<(Arc<dyn SocketPeerVerifier>, Arc<dyn SocketPeerVerifier>)> {
+    if let Some(team_id) = option_env!("FLORIA_SIGNING_TEAM_ID") {
+        validate_team_id(team_id)?;
+        let gui_requirement = product_code_requirement(GUI_CODE_IDENTIFIER, team_id);
+        let daemon_requirement = product_code_requirement(DAEMON_CODE_IDENTIFIER, team_id);
+        let agent: Arc<dyn SocketPeerVerifier> = Arc::new(
+            CodeSignedPeerVerifier::from_requirements([(
+                GUI_CODE_IDENTIFIER,
+                gui_requirement.clone(),
+                PeerAccess::Full,
+            )])
+            .context("building agent socket peer policy")?,
+        );
+        let control: Arc<dyn SocketPeerVerifier> = Arc::new(
+            CodeSignedPeerVerifier::from_requirements([
+                (GUI_CODE_IDENTIFIER, gui_requirement, PeerAccess::Full),
+                (
+                    DAEMON_CODE_IDENTIFIER,
+                    daemon_requirement,
+                    PeerAccess::ReadOnly,
+                ),
+            ])
+            .context("building control socket peer policy")?,
+        );
+        tracing::info!(team_id, "loaded embedded production socket code-signing policy");
+        return Ok((agent, control));
+    }
+
+    if option_env!("FLORIA_INSECURE_DEVELOPMENT_BUILD") != Some("1") {
+        anyhow::bail!(
+            "this build has no embedded Floria signing Team ID; refusing to derive socket trust \
+             from mutable executable paths. Build a signed release with FLORIA_SIGNING_TEAM_ID, \
+             or use scripts/build-app for an explicitly insecure local development build"
+        );
+    }
+
+    let daemon_executable =
+        std::env::current_exe().context("resolving daemon executable for development peer policy")?;
+    let gui_executable = trusted_gui_executable(&daemon_executable)?;
+    let agent: Arc<dyn SocketPeerVerifier> = Arc::new(
+        CodeSignedPeerVerifier::from_executables_for_development([(
+            &gui_executable,
+            PeerAccess::Full,
+        )])
+            .context("building development agent socket peer policy")?,
+    );
+    let control: Arc<dyn SocketPeerVerifier> = Arc::new(
+        CodeSignedPeerVerifier::from_executables_for_development([
+            (&gui_executable, PeerAccess::Full),
+            (&daemon_executable, PeerAccess::Full),
+        ])
+        .context("building development control socket peer policy")?,
+    );
+    tracing::warn!(
+        gui = %gui_executable.display(),
+        daemon = %daemon_executable.display(),
+        "INSECURE DEVELOPMENT BUILD: socket trust is derived from mutable executable paths"
+    );
+    Ok((agent, control))
+}
+
+fn validate_team_id(team_id: &str) -> Result<()> {
+    if team_id.len() == 10
+        && team_id
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+    {
+        Ok(())
+    } else {
+        anyhow::bail!("FLORIA_SIGNING_TEAM_ID must be a 10-character uppercase Apple Team ID")
+    }
+}
+
+fn product_code_requirement(identifier: &str, team_id: &str) -> String {
+    format!(
+        "anchor apple generic and identifier \"{identifier}\" and certificate leaf[subject.OU] = \"{team_id}\""
     )
 }
 
@@ -2144,5 +2395,17 @@ mod tests {
             },
             enforcement: Enforcement::Prompt,
         }));
+    }
+
+    #[test]
+    fn product_peer_requirement_pins_identifier_and_team() {
+        let requirement = product_code_requirement("floria.hola.ac", "A1B2C3D4E5");
+
+        assert_eq!(
+            requirement,
+            "anchor apple generic and identifier \"floria.hola.ac\" and certificate leaf[subject.OU] = \"A1B2C3D4E5\""
+        );
+        assert!(validate_team_id("A1B2C3D4E5").is_ok());
+        assert!(validate_team_id("attacker").is_err());
     }
 }

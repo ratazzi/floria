@@ -1,9 +1,12 @@
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::authz::PolicyEvaluation;
 use crate::error::Result;
@@ -11,7 +14,58 @@ use crate::identity::ProcessIdentity;
 
 /// Append-only JSONL audit log. Flushed line by line so no already-written event is lost even if the process is killed.
 pub struct AuditLog {
-    writer: Mutex<BufWriter<std::fs::File>>,
+    writer: Mutex<AuditWriter>,
+    authority: Option<std::sync::Arc<dyn AuditAuthority>>,
+    path: PathBuf,
+}
+
+const AUDIT_FORMAT: u32 = 1;
+const GENESIS_HASH: &str = "genesis";
+
+/// Authenticated tail of one append-only audit chain.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditCheckpoint {
+    pub sequence: u64,
+    pub head: String,
+    pub file_size: u64,
+}
+
+/// The platform-owned authority for event HMACs and the anti-rollback tail checkpoint.
+///
+/// Core owns chain semantics; the application adapter owns Keychain access and checkpoint
+/// persistence. This keeps the authorization/filesystem spine independent of macOS storage APIs.
+pub trait AuditAuthority: Send + Sync {
+    fn load_checkpoint(&self) -> std::io::Result<Option<AuditCheckpoint>>;
+    fn authenticate(&self, payload: &[u8]) -> std::io::Result<String>;
+    fn verify(&self, payload: &[u8], tag: &str) -> std::io::Result<()>;
+    fn persist_checkpoint(&self, checkpoint: &AuditCheckpoint) -> std::io::Result<()>;
+}
+
+struct AuditWriter {
+    output: BufWriter<File>,
+    sequence: u64,
+    head: String,
+    file_size: u64,
+    stamp: FileStamp,
+    degraded: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    device: u64,
+    inode: u64,
+    size: u64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct AuditEnvelope {
+    format: u32,
+    sequence: u64,
+    previous: String,
+    event: serde_json::Value,
+    tag: String,
 }
 
 /// Metadata-only provenance for one rendered surface export. Secret ids and immutable version
@@ -71,24 +125,216 @@ pub struct OwnedSshSessionAudit {
 
 impl AuditLog {
     pub fn open(path: &Path) -> Result<Self> {
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        Self::open_with_authority(path, None)
+    }
+
+    pub fn open_authenticated(
+        path: &Path,
+        authority: std::sync::Arc<dyn AuditAuthority>,
+    ) -> Result<Self> {
+        Self::open_with_authority(path, Some(authority))
+    }
+
+    fn open_with_authority(
+        path: &Path,
+        authority: Option<std::sync::Arc<dyn AuditAuthority>>,
+    ) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let checkpoint = match &authority {
+            Some(authority) => authority.load_checkpoint()?,
+            None => None,
+        };
+        if authority.is_some()
+            && checkpoint.is_none()
+            && path.exists()
+            && path.metadata()?.len() != 0
+        {
+            let quarantine = unverified_audit_path(path);
+            std::fs::rename(path, &quarantine)?;
+            tracing::warn!(
+                audit = %path.display(),
+                quarantine = %quarantine.display(),
+                "moved legacy audit log aside before starting an authenticated chain"
+            );
+        }
+
+        let tail = if path.exists() {
+            verify_audit_chain(path, authority.as_deref())?
+        } else {
+            AuditCheckpoint {
+                sequence: 0,
+                head: GENESIS_HASH.to_string(),
+                file_size: 0,
+            }
+        };
+        if let Some(expected) = &checkpoint {
+            if expected != &tail {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "audit log tail does not match its authenticated checkpoint: expected sequence {}, found {}",
+                        expected.sequence, tail.sequence
+                    ),
+                )
+                .into());
+            }
+        } else if let Some(authority) = &authority {
+            authority.persist_checkpoint(&tail)?;
+        }
+
+        let file = open_private_append(path)?;
+        let stamp = file_stamp(&file.metadata()?);
         Ok(AuditLog {
-            writer: Mutex::new(BufWriter::new(file)),
+            writer: Mutex::new(AuditWriter {
+                output: BufWriter::new(file),
+                sequence: tail.sequence,
+                head: tail.head,
+                file_size: tail.file_size,
+                stamp,
+                degraded: None,
+            }),
+            authority,
+            path: path.to_path_buf(),
         })
     }
 
-    fn write(&self, value: &impl Serialize) {
-        let line = match serde_json::to_string(value) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!("audit serialize failed: {e}");
-                return;
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn ensure_healthy(&self) -> std::io::Result<()> {
+        let writer = self
+            .writer
+            .lock()
+            .map_err(|_| std::io::Error::other("audit writer lock poisoned"))?;
+        validate_writer_file(&self.path, &writer)?;
+        match &writer.degraded {
+            Some(reason) => Err(std::io::Error::other(format!(
+                "audit log is degraded: {reason}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// Read access history only after verifying the exact bytes against the live chain and
+    /// authenticated tail. Keeping this on `AuditLog` prevents control-plane readers from
+    /// accidentally treating the JSONL encoding as trusted state by itself.
+    pub fn read_recent_verified(
+        &self,
+        limit: usize,
+    ) -> std::io::Result<Vec<AuditAccessRecord>> {
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| std::io::Error::other("audit writer lock poisoned"))?;
+        if let Some(reason) = &writer.degraded {
+            return Err(std::io::Error::other(format!(
+                "audit log is degraded: {reason}"
+            )));
+        }
+
+        let verified = (|| {
+            writer.output.flush()?;
+            validate_writer_file(&self.path, &writer)?;
+            let expected = AuditCheckpoint {
+                sequence: writer.sequence,
+                head: writer.head.clone(),
+                file_size: writer.file_size,
+            };
+            if let Some(authority) = &self.authority {
+                if authority.load_checkpoint()?.as_ref() != Some(&expected) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "audit writer tail does not match its authenticated checkpoint",
+                    ));
+                }
             }
+
+            let mut input = writer.output.get_ref().try_clone()?;
+            input.seek(SeekFrom::Start(0))?;
+            let (tail, records) = read_verified_access_chain(
+                &mut input,
+                self.authority.as_deref(),
+                limit,
+            )?;
+            if tail != expected {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "audit history does not match the live writer tail",
+                ));
+            }
+            validate_writer_file(&self.path, &writer)?;
+            Ok(records)
+        })();
+
+        if let Err(error) = &verified {
+            writer.degraded = Some(error.to_string());
+        }
+        verified
+    }
+
+    fn write(&self, value: &impl Serialize) -> std::io::Result<()> {
+        let event = serde_json::to_value(value).map_err(std::io::Error::other)?;
+        let mut writer = self
+            .writer
+            .lock()
+            .map_err(|_| std::io::Error::other("audit writer lock poisoned"))?;
+        if let Some(reason) = &writer.degraded {
+            return Err(std::io::Error::other(format!(
+                "audit log is degraded: {reason}"
+            )));
+        }
+        if let Err(error) = validate_writer_file(&self.path, &writer) {
+            writer.degraded = Some(error.to_string());
+            return Err(error);
+        }
+
+        let sequence = writer.sequence.checked_add(1).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "audit sequence overflow")
+        })?;
+        let payload = chain_payload(sequence, &writer.head, &event)?;
+        let tag = match &self.authority {
+            Some(authority) => authority.authenticate(&payload)?,
+            None => sha256_tag(&payload),
         };
-        // An audit write failure must not affect file semantics; just log an error.
-        if let Ok(mut w) = self.writer.lock() {
-            if let Err(e) = writeln!(w, "{line}").and_then(|_| w.flush()) {
-                tracing::error!("audit write failed: {e}");
+        let envelope = AuditEnvelope {
+            format: AUDIT_FORMAT,
+            sequence,
+            previous: writer.head.clone(),
+            event,
+            tag: tag.clone(),
+        };
+        let mut line = serde_json::to_vec(&envelope).map_err(std::io::Error::other)?;
+        line.push(b'\n');
+
+        let attempted = (|| -> std::io::Result<AuditCheckpoint> {
+            writer.output.write_all(&line)?;
+            writer.output.flush()?;
+            let checkpoint = AuditCheckpoint {
+                sequence,
+                head: tag,
+                file_size: writer.file_size.saturating_add(line.len() as u64),
+            };
+            if let Some(authority) = &self.authority {
+                authority.persist_checkpoint(&checkpoint)?;
+            }
+            Ok(checkpoint)
+        })();
+        match attempted {
+            Ok(checkpoint) => {
+                writer.sequence = checkpoint.sequence;
+                writer.head = checkpoint.head;
+                writer.file_size = checkpoint.file_size;
+                writer.stamp = file_stamp(&writer.output.get_ref().metadata()?);
+                Ok(())
+            }
+            Err(error) => {
+                writer.degraded = Some(error.to_string());
+                tracing::error!(%error, "audit write failed; future allowed access will fail closed");
+                Err(error)
             }
         }
     }
@@ -106,7 +352,7 @@ impl AuditLog {
         fh: u64,
         size: u64,
         dependencies: Option<&[AuditDependency]>,
-    ) {
+    ) -> std::io::Result<()> {
         self.write(&OpenEvent {
             ts: now_rfc3339(),
             event: "open",
@@ -125,7 +371,7 @@ impl AuditLog {
             fh,
             size,
             dependencies,
-        });
+        })
     }
 
     /// Authorization denied: no snapshot/fh, only records the identity and the rationale for the decision.
@@ -137,7 +383,7 @@ impl AuditLog {
         rule_id: Option<&str>,
         reason: &str,
         policy: Option<&PolicyEvaluation>,
-    ) {
+    ) -> std::io::Result<()> {
         self.write(&DeniedEvent {
             ts: now_rfc3339(),
             event: "open",
@@ -153,7 +399,7 @@ impl AuditLog {
                 pid: identity.pid,
             },
             identity,
-        });
+        })
     }
 
     /// A committed write: a new immutable version appended to the store. Records only the
@@ -165,7 +411,7 @@ impl AuditLog {
         version: u32,
         content_version: &str,
         size: u64,
-    ) {
+    ) -> std::io::Result<()> {
         self.write(&WriteCommitEvent {
             ts: now_rfc3339(),
             event: "write_commit",
@@ -174,7 +420,7 @@ impl AuditLog {
             version,
             content_version,
             size,
-        });
+        })
     }
 
     /// One SSH agent signature attempt. Only public identity metadata and the authorization/
@@ -193,7 +439,7 @@ impl AuditLog {
         key_fingerprint: &str,
         result: &str,
         ssh_session: Option<SshSessionAudit<'_>>,
-    ) {
+    ) -> std::io::Result<()> {
         self.write(&SshSignEvent {
             ts: now_rfc3339(),
             event: "ssh_sign",
@@ -214,7 +460,7 @@ impl AuditLog {
             key_fingerprint,
             result,
             ssh_session,
-        });
+        })
     }
 
     pub fn log_close(
@@ -224,7 +470,7 @@ impl AuditLog {
         duration_ms: u128,
         bytes_served: u64,
         error: Option<&str>,
-    ) {
+    ) -> std::io::Result<()> {
         self.write(&CloseEvent {
             ts: now_rfc3339(),
             event: "close",
@@ -233,8 +479,178 @@ impl AuditLog {
             duration_ms,
             bytes_served,
             error,
-        });
+        })
     }
+}
+
+fn open_private_append(path: &Path) -> std::io::Result<File> {
+    if path.exists() {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("audit log must be a regular file: {}", path.display()),
+            ));
+        }
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("audit log must be private, found mode {mode:04o}"),
+            ));
+        }
+    }
+    OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+fn file_stamp(metadata: &std::fs::Metadata) -> FileStamp {
+    FileStamp {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.len(),
+        ctime: metadata.ctime(),
+        ctime_nsec: metadata.ctime_nsec(),
+    }
+}
+
+fn validate_writer_file(path: &Path, writer: &AuditWriter) -> std::io::Result<()> {
+    let descriptor = file_stamp(&writer.output.get_ref().metadata()?);
+    let path_metadata = std::fs::symlink_metadata(path)?;
+    if !path_metadata.file_type().is_file() || path_metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "audit log path was replaced with a non-regular file",
+        ));
+    }
+    let at_path = file_stamp(&path_metadata);
+    if descriptor != writer.stamp || at_path != writer.stamp || descriptor.size != writer.file_size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "audit log changed outside the authenticated writer",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_audit_chain(
+    path: &Path,
+    authority: Option<&dyn AuditAuthority>,
+) -> std::io::Result<AuditCheckpoint> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("audit log must be a regular file: {}", path.display()),
+        ));
+    }
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("audit log must be private: {}", path.display()),
+        ));
+    }
+
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    read_verified_access_chain(&mut file, authority, 0).map(|(checkpoint, _)| checkpoint)
+}
+
+fn read_verified_access_chain(
+    file: &mut File,
+    authority: Option<&dyn AuditAuthority>,
+    limit: usize,
+) -> std::io::Result<(AuditCheckpoint, Vec<AuditAccessRecord>)> {
+    let expected_size = file.metadata()?.len();
+    let mut sequence = 0_u64;
+    let mut head = GENESIS_HASH.to_string();
+    let mut file_size = 0_u64;
+    let mut records = VecDeque::with_capacity(limit.min(500));
+    let reader = BufReader::new(file);
+
+    for line in reader.split(b'\n') {
+        let line = line?;
+        if line.is_empty() {
+            continue;
+        }
+        file_size = file_size.saturating_add(line.len() as u64 + 1);
+        let envelope: AuditEnvelope = serde_json::from_slice(&line).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("audit row is malformed: {error}"),
+            )
+        })?;
+        if envelope.format != AUDIT_FORMAT
+            || envelope.sequence != sequence.saturating_add(1)
+            || envelope.previous != head
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("audit chain breaks at sequence {}", envelope.sequence),
+            ));
+        }
+        let payload = chain_payload(envelope.sequence, &envelope.previous, &envelope.event)?;
+        match authority {
+            Some(authority) => authority.verify(&payload, &envelope.tag)?,
+            None if sha256_tag(&payload) == envelope.tag => {}
+            None => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("audit tag is invalid at sequence {}", envelope.sequence),
+                ))
+            }
+        }
+        sequence = envelope.sequence;
+        head = envelope.tag;
+
+        if limit != 0 {
+            if let Ok(record) = serde_json::from_value::<AuditAccessRecord>(envelope.event) {
+                if matches!(record.event.as_str(), "open" | "ssh_sign") {
+                    if records.len() == limit {
+                        records.pop_front();
+                    }
+                    records.push_back(record);
+                }
+            }
+        }
+    }
+    if file_size != expected_size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "audit log ends with a partial row",
+        ));
+    }
+
+    Ok((
+        AuditCheckpoint { sequence, head, file_size },
+        records.into_iter().rev().collect(),
+    ))
+}
+
+fn chain_payload(
+    sequence: u64,
+    previous: &str,
+    event: &serde_json::Value,
+) -> std::io::Result<Vec<u8>> {
+    serde_json::to_vec(&(AUDIT_FORMAT, sequence, previous, event)).map_err(std::io::Error::other)
+}
+
+fn sha256_tag(payload: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(payload))
+}
+
+fn unverified_audit_path(path: &Path) -> PathBuf {
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    path.with_extension(format!("unverified-{suffix}-{}", std::process::id()))
 }
 
 /// Read the newest access/sign events without loading an unbounded audit file into memory.
@@ -279,7 +695,13 @@ pub fn read_recent_access(path: &Path, limit: usize) -> std::io::Result<Vec<Audi
             if line.is_empty() {
                 continue;
             }
-            let Ok(record) = serde_json::from_slice::<AuditAccessRecord>(line) else {
+            let event = serde_json::from_slice::<AuditEnvelope>(line)
+                .map(|envelope| envelope.event)
+                .or_else(|_| serde_json::from_slice::<serde_json::Value>(line));
+            let Ok(event) = event else {
+                continue;
+            };
+            let Ok(record) = serde_json::from_value::<AuditAccessRecord>(event) else {
                 continue;
             };
             if !matches!(record.event.as_str(), "open" | "ssh_sign") {
@@ -391,6 +813,100 @@ struct CloseEvent<'a> {
 mod tests {
     use super::*;
     use crate::authz::{Enforcement, PolicyMode};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[derive(Default)]
+    struct TestAuditAuthority {
+        checkpoint: Mutex<Option<AuditCheckpoint>>,
+        fail_persist: AtomicBool,
+    }
+
+    impl AuditAuthority for TestAuditAuthority {
+        fn load_checkpoint(&self) -> std::io::Result<Option<AuditCheckpoint>> {
+            Ok(self.checkpoint.lock().unwrap().clone())
+        }
+
+        fn authenticate(&self, payload: &[u8]) -> std::io::Result<String> {
+            let mut tagged = b"fixture-audit-key".to_vec();
+            tagged.extend_from_slice(payload);
+            Ok(sha256_tag(&tagged))
+        }
+
+        fn verify(&self, payload: &[u8], tag: &str) -> std::io::Result<()> {
+            if self.authenticate(payload)? == tag {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "fixture audit HMAC mismatch",
+                ))
+            }
+        }
+
+        fn persist_checkpoint(&self, checkpoint: &AuditCheckpoint) -> std::io::Result<()> {
+            if self.fail_persist.load(Ordering::SeqCst) {
+                return Err(std::io::Error::other("fixture checkpoint failure"));
+            }
+            *self.checkpoint.lock().unwrap() = Some(checkpoint.clone());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn authenticated_chain_rejects_rewrite_and_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let authority = std::sync::Arc::new(TestAuditAuthority::default());
+        let audit = AuditLog::open_authenticated(&path, authority.clone()).unwrap();
+        audit
+            .log_denied(
+                "surfaces/fixture",
+                "read",
+                &ProcessIdentity::bare(42, 501, 20),
+                Some("fixture-deny"),
+                "fixture reason",
+                None,
+            )
+            .unwrap();
+        drop(audit);
+        let live = AuditLog::open_authenticated(&path, authority.clone()).unwrap();
+        assert_eq!(live.read_recent_verified(10).unwrap().len(), 1);
+
+        let original = std::fs::read(&path).unwrap();
+        let rewritten = String::from_utf8(original.clone())
+            .unwrap()
+            .replace("fixture reason", "forged! reason");
+        assert_eq!(rewritten.len(), original.len());
+        std::fs::write(&path, rewritten).unwrap();
+        assert!(live.read_recent_verified(10).is_err());
+        assert!(live.ensure_healthy().is_err());
+        drop(live);
+        assert!(AuditLog::open_authenticated(&path, authority.clone()).is_err());
+
+        std::fs::write(&path, &original[..original.len() / 2]).unwrap();
+        assert!(AuditLog::open_authenticated(&path, authority).is_err());
+    }
+
+    #[test]
+    fn checkpoint_failure_degrades_and_blocks_future_audit_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let authority = std::sync::Arc::new(TestAuditAuthority::default());
+        let audit = AuditLog::open_authenticated(&path, authority.clone()).unwrap();
+        authority.fail_persist.store(true, Ordering::SeqCst);
+
+        assert!(audit
+            .log_denied(
+                "surfaces/fixture",
+                "read",
+                &ProcessIdentity::bare(42, 501, 20),
+                Some("fixture-deny"),
+                "fixture reason",
+                None,
+            )
+            .is_err());
+        assert!(audit.ensure_healthy().is_err());
+    }
 
     #[test]
     fn surface_audit_records_version_provenance_without_plaintext() {
@@ -419,7 +935,8 @@ mod tests {
                 secret_id: Some("00000000-0000-0000-0000-000000000001".to_string()),
                 version: Some(3),
             }]),
-        );
+        )
+        .unwrap();
 
         let line = std::fs::read_to_string(path).unwrap();
         assert!(line.contains("fixture-resource"));
@@ -452,7 +969,8 @@ mod tests {
                 ssh_user: Some("fixture-user"),
                 forwarding_hops: 1,
             }),
-        );
+        )
+        .unwrap();
 
         let line = std::fs::read_to_string(path).unwrap();
         assert!(line.contains("\"event\":\"ssh_sign\""));
@@ -480,8 +998,11 @@ mod tests {
             7,
             32,
             None,
-        );
-        audit.log_close("surfaces/fixture-env", 7, 4, 32, None);
+        )
+        .unwrap();
+        audit
+            .log_close("surfaces/fixture-env", 7, 4, 32, None)
+            .unwrap();
         audit.log_denied(
             "secrets/00000000-0000-0000-0000-000000000001",
             "read",
@@ -489,7 +1010,8 @@ mod tests {
             Some("fixture-deny"),
             "denied by fixture",
             None,
-        );
+        )
+        .unwrap();
 
         let newest = read_recent_access(&path, 1).unwrap();
         assert_eq!(newest.len(), 1);
@@ -516,7 +1038,8 @@ mod tests {
             Some("fixture-deny"),
             "denied by fixture",
             None,
-        );
+        )
+        .unwrap();
 
         let records = read_recent_access(&path, 1).unwrap();
         assert_eq!(records.len(), 1);

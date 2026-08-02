@@ -15,6 +15,17 @@ pub trait SocketPeerVerifier: Send + Sync + 'static {
 #[derive(Debug, Clone)]
 pub struct VerifiedPeer {
     pub identity: ProcessIdentity,
+    pub access: PeerAccess,
+}
+
+/// Authority assigned to a verified local-socket peer.
+///
+/// Code signing proves which executable connected, not that a human intended a sensitive action.
+/// Servers must therefore authorize the verified executable's role independently of its identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerAccess {
+    ReadOnly,
+    Full,
 }
 
 #[derive(Debug, Error)]
@@ -43,8 +54,9 @@ pub enum PeerVerificationError {
 
 #[derive(Debug)]
 struct TrustedRequirement {
-    executable: PathBuf,
+    source: String,
     text: String,
+    access: PeerAccess,
 }
 
 /// Verifies same-user peers against designated requirements extracted from trusted executables.
@@ -57,11 +69,50 @@ pub struct CodeSignedPeerVerifier {
 }
 
 impl CodeSignedPeerVerifier {
-    pub fn from_executables(
-        executables: impl IntoIterator<Item = impl AsRef<Path>>,
+    /// Build a peer policy from requirements embedded in trusted, signed code.
+    ///
+    /// Production callers must use this constructor. Loading a requirement from an executable at
+    /// a user-writable path makes that path the trust root: an attacker can replace the executable
+    /// before daemon startup and have the daemon learn the attacker's signature as trusted.
+    pub fn from_requirements(
+        requirements: impl IntoIterator<
+            Item = (impl Into<String>, impl Into<String>, PeerAccess),
+        >,
+    ) -> Result<Self, PeerPolicyError> {
+        let mut trusted = Vec::new();
+        for (source, text, access) in requirements {
+            let source = source.into();
+            let text = text.into();
+            if text.trim().is_empty() {
+                return Err(PeerPolicyError::InvalidExecutable {
+                    path: PathBuf::from(source),
+                    reason: "code-signing requirement is empty".to_string(),
+                });
+            }
+            if !trusted
+                .iter()
+                .any(|requirement: &TrustedRequirement| requirement.text == text)
+            {
+                trusted.push(TrustedRequirement { source, text, access });
+            }
+        }
+        if trusted.is_empty() {
+            return Err(PeerPolicyError::Empty);
+        }
+        // SAFETY: geteuid has no preconditions.
+        let expected_uid = unsafe { libc::geteuid() };
+        Ok(Self { expected_uid, requirements: trusted })
+    }
+
+    /// Development-only adapter that snapshots designated requirements from local executables.
+    ///
+    /// This is deliberately unavailable in production builds. A mutable executable path cannot
+    /// be a production trust root; see [`Self::from_requirements`].
+    pub fn from_executables_for_development(
+        executables: impl IntoIterator<Item = (impl AsRef<Path>, PeerAccess)>,
     ) -> Result<Self, PeerPolicyError> {
         let mut requirements = Vec::new();
-        for executable in executables {
+        for (executable, access) in executables {
             let executable = executable.as_ref();
             let path = std::fs::canonicalize(executable).map_err(|error| {
                 PeerPolicyError::InvalidExecutable {
@@ -76,7 +127,11 @@ impl CodeSignedPeerVerifier {
                 .iter()
                 .any(|requirement: &TrustedRequirement| requirement.text == text)
             {
-                requirements.push(TrustedRequirement { executable: path, text });
+                requirements.push(TrustedRequirement {
+                    source: path.display().to_string(),
+                    text,
+                    access,
+                });
             }
         }
         if requirements.is_empty() {
@@ -102,7 +157,7 @@ impl SocketPeerVerifier for CodeSignedPeerVerifier {
 
         for requirement in &self.requirements {
             match crate::codesign::satisfies_requirement(pid, &requirement.text) {
-                Ok(true) => return Ok(VerifiedPeer { identity }),
+                Ok(true) => return Ok(VerifiedPeer { identity, access: requirement.access }),
                 Ok(false) => {}
                 Err(reason) => {
                     return Err(PeerVerificationError::CodeInspection { pid, reason });
@@ -119,7 +174,7 @@ impl SocketPeerVerifier for CodeSignedPeerVerifier {
         let trusted = self
             .requirements
             .iter()
-            .map(|requirement| requirement.executable.display().to_string())
+            .map(|requirement| requirement.source.clone())
             .collect::<Vec<_>>()
             .join(", ");
         Err(PeerVerificationError::UntrustedCode { pid, executable, trusted })
@@ -151,7 +206,7 @@ impl SocketPeerVerifier for SameUserPeerVerifier {
             credentials.uid,
             credentials.gid,
         );
-        Ok(VerifiedPeer { identity })
+        Ok(VerifiedPeer { identity, access: PeerAccess::Full })
     }
 }
 
@@ -195,7 +250,14 @@ mod tests {
     #[test]
     fn trusted_current_executable_accepts_current_process() {
         let executable = std::env::current_exe().unwrap();
-        let verifier = CodeSignedPeerVerifier::from_executables([executable]).unwrap();
+        let requirement = crate::codesign::designated_requirement(&executable).unwrap();
+        let verifier =
+            CodeSignedPeerVerifier::from_requirements([(
+                "test executable",
+                requirement,
+                PeerAccess::Full,
+            )])
+            .unwrap();
         let (peer, accepted) = UnixStream::pair().unwrap();
 
         let verified = verifier.verify(&accepted).unwrap();
@@ -206,7 +268,13 @@ mod tests {
 
     #[test]
     fn unrelated_designated_requirement_rejects_current_process() {
-        let verifier = CodeSignedPeerVerifier::from_executables(["/bin/ls"]).unwrap();
+        let requirement = crate::codesign::designated_requirement(Path::new("/bin/ls")).unwrap();
+        let verifier = CodeSignedPeerVerifier::from_requirements([(
+            "/bin/ls",
+            requirement,
+            PeerAccess::ReadOnly,
+        )])
+        .unwrap();
         let (_peer, accepted) = UnixStream::pair().unwrap();
 
         let error = verifier.verify(&accepted).unwrap_err();

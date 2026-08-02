@@ -39,7 +39,7 @@ pub use render::{
     renderer_for, RenderedSurface, Renderer, ResolvedBindingEntry, ResolvedDocument,
     ResolvedEntryMeta, ResolvedEnvironmentEntry,
 };
-pub use registry::{RegisteredSurface, SurfaceBacking, SurfaceRegistry};
+pub use registry::{ResolvedAccessPlan, SurfaceBacking, SurfaceRegistry};
 pub use resolver::{
     DirectEnvFileCommit, DirectEnvFileSnapshot, FrozenResourceVersion, SurfaceResolver,
     SurfaceSnapshot,

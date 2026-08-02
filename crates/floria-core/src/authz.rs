@@ -17,6 +17,9 @@ pub struct AuthRequest<'a> {
     /// original source path instead of its opaque `secrets/<uuid>`. Display only: rules,
     /// grants, and audit all keep keying on the stable `path`.
     pub display: Option<&'a str>,
+    /// Stable digest of the resolved object graph. Grant caches include it so a path cannot be
+    /// rebound to different backing state while retaining an earlier approval.
+    pub object_revision: Option<&'a str>,
     pub operation: Operation,
     /// Operation-specific public metadata for prompts, grant scoping, and audit. Rules continue
     /// to key on stable path + operation; callers must never place payloads or bytes-to-sign here.
@@ -230,6 +233,7 @@ mod tests {
         let d = AllowAll.authorize(&AuthRequest {
             path: "env/demo/dev.env",
             display: None,
+            object_revision: None,
             operation: Operation::Read,
             context: None,
             identity: &id,

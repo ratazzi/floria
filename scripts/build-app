@@ -4,6 +4,7 @@ set -euo pipefail
 VERSION="$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')"
 BUILD_NUMBER="${BUILD_NUMBER:-$(date +%Y%m%d%H%M)}"
 SIGN_IDENTITY="${SIGN_IDENTITY:--}"
+FLORIA_SIGNING_TEAM_ID="${FLORIA_SIGNING_TEAM_ID:-}"
 PRODUCT_NAME="floria-menubar"
 APP_NAME="Floria"
 APP_BUNDLE="app/.build/${APP_NAME}.app"
@@ -15,7 +16,14 @@ fi
 
 echo "==> Building ${APP_NAME}.app v${VERSION} (build ${BUILD_NUMBER})"
 echo "==> Building Rust daemon"
-cargo build --release -p floria
+if [[ "${SIGN_IDENTITY}" == "-" ]]; then
+    FLORIA_INSECURE_DEVELOPMENT_BUILD=1 cargo build --release -p floria
+elif [[ "${FLORIA_SIGNING_TEAM_ID}" =~ ^[A-Z0-9]{10}$ ]]; then
+    FLORIA_SIGNING_TEAM_ID="${FLORIA_SIGNING_TEAM_ID}" cargo build --release -p floria
+else
+    echo "A signed build requires FLORIA_SIGNING_TEAM_ID (the 10-character Apple Team ID)." >&2
+    exit 1
+fi
 
 echo "==> Building Swift app"
 swift build --package-path app --configuration release --product "${PRODUCT_NAME}"
@@ -35,10 +43,13 @@ plutil -replace CFBundleVersion -string "${BUILD_NUMBER}" "${APP_BUNDLE}/Content
 chmod 0755 "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}"
 chmod 0755 "${APP_BUNDLE}/Contents/Resources/floria"
 codesign "${codesign_args[@]}" \
+    --identifier floria.hola.ac.daemon \
     --entitlements app/FloriaDaemon.entitlements \
+    --library-constraint app/FloriaDaemonLibraryConstraint.plist \
+    --enforce-constraint-validity \
     "${APP_BUNDLE}/Contents/Resources/floria"
-codesign "${codesign_args[@]}" "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}"
-codesign "${codesign_args[@]}" "${APP_BUNDLE}"
+codesign "${codesign_args[@]}" --identifier floria.hola.ac "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}"
+codesign "${codesign_args[@]}" --identifier floria.hola.ac "${APP_BUNDLE}"
 codesign --verify --deep --strict "${APP_BUNDLE}"
 # Hardened Runtime library validation can reject macFUSE's separately signed dylib before main().
 # Execute the packaged daemon so every build catches that exact failure, not only signature syntax.

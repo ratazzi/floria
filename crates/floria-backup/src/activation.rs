@@ -1,10 +1,11 @@
-use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::fs::File;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use floria_catalog::Catalog;
+use floria_integrity::StateAuthenticator;
 use floria_store::AgeDirStore;
 use serde::{Deserialize, Serialize};
 
@@ -16,6 +17,7 @@ use super::{
 
 const ACTIVATION_FORMAT: u32 = 1;
 const ACTIVATION_JOURNAL: &str = ".restore-state.json";
+const RESTORE_STATE_DOMAIN: &str = "backup-restore-transaction";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivationReport {
@@ -29,7 +31,7 @@ struct FileIdentity {
     inode: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ActivationJournal {
     format: u32,
     active_catalog: PathBuf,
@@ -43,6 +45,11 @@ struct ActivationJournal {
     safety_backup: PathBuf,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct RestoreTransactionState {
+    transaction: Option<ActivationJournal>,
+}
+
 /// Replace the inactive catalog and encrypted store with a verified standalone restore.
 ///
 /// The caller must prevent the daemon from starting and ensure the mount is inactive. This
@@ -53,12 +60,17 @@ pub fn activate_restored_data(
     active_catalog: &Path,
     store: &AgeDirStore,
     safety_backup: &Path,
+    authenticator: Arc<StateAuthenticator>,
 ) -> BackupResult<ActivationReport> {
     let expected = verify_restored_data(restored, store)?;
     let active_catalog = canonical_existing_file(active_catalog)?;
     let active_store = canonical_existing_directory(store.root())?;
     let journal_path = activation_journal_path(&active_catalog)?;
-    if journal_path.exists() {
+    if load_restore_state(&journal_path, &authenticator)?
+        .0
+        .transaction
+        .is_some()
+    {
         return Err(BackupError::Manifest(format!(
             "an interrupted restore must be recovered first: {}",
             journal_path.display()
@@ -67,7 +79,7 @@ pub fn activate_restored_data(
 
     let store_lock = store.lock_for_maintenance()?;
     let safety = {
-        let catalog = Catalog::open(&active_catalog)?;
+        let catalog = Catalog::open_authenticated(&active_catalog, Arc::clone(&authenticator))?;
         create_with_locked_store(&catalog, store, &store_lock, safety_backup)?
     };
 
@@ -99,21 +111,21 @@ pub fn activate_restored_data(
         restored_store: file_identity(staged.store_path())?,
         safety_backup: safety.path.clone(),
     };
-    write_journal(&journal_path, &journal)?;
+    persist_restore_state(&journal_path, &authenticator, Some(journal.clone()))?;
     staged.keep_for_recovery();
 
-    match finish_activation(&journal, store) {
+    match finish_activation(&journal, store, Arc::clone(&authenticator)) {
         Ok(active) => {
-            finalize_activation(&journal_path, &journal)?;
+            finalize_activation(&journal_path, &journal, &authenticator)?;
             Ok(ActivationReport {
                 active,
                 safety_backup: safety,
             })
         }
         Err(activation_error) => {
-            let rollback = rollback_activation(&journal, store);
+            let rollback = rollback_activation(&journal, store, Arc::clone(&authenticator));
             if rollback.is_ok() {
-                remove_journal(&journal_path)?;
+                persist_restore_state(&journal_path, &authenticator, None)?;
             }
             match rollback {
                 Ok(()) => Err(BackupError::Manifest(format!(
@@ -139,30 +151,30 @@ pub fn activate_restored_data(
 pub fn recover_interrupted_activation(
     active_catalog: &Path,
     store: &AgeDirStore,
+    authenticator: Arc<StateAuthenticator>,
 ) -> BackupResult<Option<ActivationReport>> {
     let active_catalog = canonical_existing_file(active_catalog)?;
     let active_store = canonical_existing_directory(store.root())?;
     let journal_path = activation_journal_path(&active_catalog)?;
-    if !journal_path.exists() {
+    let Some(journal) = load_restore_state(&journal_path, &authenticator)?.0.transaction else {
         return Ok(None);
-    }
-    let journal = read_journal(&journal_path)?;
+    };
     validate_journal_paths(&journal, &active_catalog, &active_store)?;
     let _store_lock = store.lock_for_maintenance()?;
 
-    match finish_activation(&journal, store) {
+    match finish_activation(&journal, store, Arc::clone(&authenticator)) {
         Ok(active) => {
             let safety_backup = verify(&journal.safety_backup, store)?;
-            finalize_activation(&journal_path, &journal)?;
+            finalize_activation(&journal_path, &journal, &authenticator)?;
             Ok(Some(ActivationReport {
                 active,
                 safety_backup,
             }))
         }
         Err(activation_error) => {
-            let rollback = rollback_activation(&journal, store);
+            let rollback = rollback_activation(&journal, store, Arc::clone(&authenticator));
             if rollback.is_ok() {
-                remove_journal(&journal_path)?;
+                persist_restore_state(&journal_path, &authenticator, None)?;
             }
             match rollback {
                 Ok(()) => Err(BackupError::Manifest(format!(
@@ -182,6 +194,7 @@ pub fn recover_interrupted_activation(
 fn finish_activation(
     journal: &ActivationJournal,
     store: &AgeDirStore,
+    authenticator: Arc<StateAuthenticator>,
 ) -> BackupResult<BackupReport> {
     ensure_restored_at_active_path(
         &journal.active_catalog,
@@ -195,20 +208,28 @@ fn finish_activation(
         journal.old_store,
         journal.restored_store,
     )?;
-    verify_components(&journal.active_catalog, &journal.active_store, store)
+    let report = verify_components(&journal.active_catalog, &journal.active_store, store)?;
+    Catalog::authenticate_restored_state(
+        &journal.active_catalog,
+        Arc::clone(&authenticator),
+    )?;
+    store.authenticate_restored_state(authenticator)?;
+    Ok(report)
 }
 
 fn finalize_activation(
     journal_path: &Path,
     journal: &ActivationJournal,
+    authenticator: &StateAuthenticator,
 ) -> BackupResult<()> {
     remove_old_staged_data(journal)?;
-    remove_journal(journal_path)
+    persist_restore_state(journal_path, authenticator, None)
 }
 
 fn rollback_activation(
     journal: &ActivationJournal,
     store: &AgeDirStore,
+    authenticator: Arc<StateAuthenticator>,
 ) -> BackupResult<()> {
     ensure_old_at_active_path(
         &journal.active_catalog,
@@ -223,6 +244,11 @@ fn rollback_activation(
         journal.restored_store,
     )?;
     verify_components(&journal.active_catalog, &journal.active_store, store)?;
+    Catalog::authenticate_restored_state(
+        &journal.active_catalog,
+        Arc::clone(&authenticator),
+    )?;
+    store.authenticate_restored_state(authenticator)?;
     remove_restored_staged_data(journal)
 }
 
@@ -380,45 +406,45 @@ fn activation_journal_path(active_catalog: &Path) -> BackupResult<PathBuf> {
     Ok(parent.join(ACTIVATION_JOURNAL))
 }
 
-fn write_journal(path: &Path, journal: &ActivationJournal) -> BackupResult<()> {
-    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
-    let bytes = serde_json::to_vec_pretty(journal)?;
-    let mut output = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&temporary)
-        .map_err(|source| BackupError::io(&temporary, source))?;
-    output
-        .write_all(&bytes)
-        .map_err(|source| BackupError::io(&temporary, source))?;
-    output
-        .sync_all()
-        .map_err(|source| BackupError::io(&temporary, source))?;
-    std::fs::rename(&temporary, path).map_err(|source| BackupError::io(path, source))?;
-    sync_parent(path)
+fn load_restore_state(
+    path: &Path,
+    authenticator: &StateAuthenticator,
+) -> BackupResult<(RestoreTransactionState, u64)> {
+    let loaded = authenticator.load::<RestoreTransactionState>(path, RESTORE_STATE_DOMAIN)?;
+    let state = match loaded.value {
+        Some(state) => state,
+        None if loaded.generation == 0 => RestoreTransactionState::default(),
+        None => {
+            return Err(BackupError::Manifest(format!(
+                "restore transaction state is missing at authenticated generation {}",
+                loaded.generation
+            )))
+        }
+    };
+    if let Some(journal) = &state.transaction {
+        if journal.format != ACTIVATION_FORMAT {
+            return Err(BackupError::Manifest(format!(
+                "restore journal format {} is unsupported",
+                journal.format
+            )));
+        }
+    }
+    Ok((state, loaded.generation))
 }
 
-fn read_journal(path: &Path) -> BackupResult<ActivationJournal> {
-    let metadata =
-        std::fs::symlink_metadata(path).map_err(|source| BackupError::io(path, source))?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
-        return Err(BackupError::Manifest(format!(
-            "restore journal must be a private regular file: {}",
-            path.display()
-        )));
-    }
-    let journal: ActivationJournal = serde_json::from_slice(
-        &std::fs::read(path).map_err(|source| BackupError::io(path, source))?,
+fn persist_restore_state(
+    path: &Path,
+    authenticator: &StateAuthenticator,
+    transaction: Option<ActivationJournal>,
+) -> BackupResult<()> {
+    let (_, generation) = load_restore_state(path, authenticator)?;
+    authenticator.persist(
+        path,
+        RESTORE_STATE_DOMAIN,
+        generation,
+        &RestoreTransactionState { transaction },
     )?;
-    if journal.format != ACTIVATION_FORMAT {
-        return Err(BackupError::Manifest(format!(
-            "restore journal format {} is unsupported",
-            journal.format
-        )));
-    }
-    Ok(journal)
+    Ok(())
 }
 
 fn validate_journal_paths(
@@ -475,10 +501,6 @@ fn remove_directory_if_present(path: &Path) -> BackupResult<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(BackupError::io(path, error)),
     }
-}
-
-fn remove_journal(path: &Path) -> BackupResult<()> {
-    remove_file_if_present(path)
 }
 
 fn sync_parent(path: &Path) -> BackupResult<()> {
@@ -627,6 +649,7 @@ mod tests {
 
     struct ActivationFixture {
         _directory: tempfile::TempDir,
+        authenticator: Arc<StateAuthenticator>,
         active_catalog: PathBuf,
         active_store: AgeDirStore,
         restored: PathBuf,
@@ -637,13 +660,16 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let keys: Arc<dyn KeyProvider> =
             Arc::new(TestKeys(age::x25519::Identity::generate()));
+        let authenticator = Arc::new(StateAuthenticator::for_tests([44; 32]));
         let active_catalog = directory.path().join("support/catalog.sqlite");
         std::fs::create_dir_all(active_catalog.parent().unwrap()).unwrap();
-        Catalog::open(&active_catalog)
+        Catalog::open_authenticated(&active_catalog, Arc::clone(&authenticator))
             .unwrap()
             .upsert_project(&project("old-project", directory.path()))
             .unwrap();
-        let active_store = open_store(&directory.path().join("active-store"), &keys);
+        let active_store = open_store(&directory.path().join("active-store"), &keys)
+            .authenticate(Arc::clone(&authenticator))
+            .unwrap();
         active_store
             .put(NewSecret::managed("Old"), b"old-fixture-value")
             .unwrap();
@@ -665,6 +691,7 @@ mod tests {
         let safety_backup = directory.path().join("safety-backup");
         ActivationFixture {
             _directory: directory,
+            authenticator,
             active_catalog,
             active_store,
             restored,
@@ -681,11 +708,24 @@ mod tests {
             &fixture.active_catalog,
             &fixture.active_store,
             &fixture.safety_backup,
+            Arc::clone(&fixture.authenticator),
         )
         .unwrap();
 
         let active = Catalog::inspect_backup(&fixture.active_catalog).unwrap();
         assert_eq!(active.projects[0].id, "restored-project");
+        assert_eq!(
+            Catalog::open_authenticated(
+                &fixture.active_catalog,
+                Arc::clone(&fixture.authenticator),
+            )
+            .unwrap()
+            .snapshot()
+            .unwrap()
+            .projects[0]
+            .id,
+            "restored-project"
+        );
         assert_eq!(
             fixture.active_store.list().unwrap()[0].display_name(),
             "Restored"
@@ -697,9 +737,13 @@ mod tests {
                 .projects,
             1
         );
-        assert!(!activation_journal_path(&fixture.active_catalog)
+        let journal_path = activation_journal_path(&fixture.active_catalog).unwrap();
+        assert!(journal_path.exists());
+        assert!(load_restore_state(&journal_path, &fixture.authenticator)
             .unwrap()
-            .exists());
+            .0
+            .transaction
+            .is_none());
     }
 
     #[test]
@@ -707,7 +751,11 @@ mod tests {
         let fixture = fixture();
         let expected = verify_restored_data(&fixture.restored, &fixture.active_store).unwrap();
         let safety = {
-            let catalog = Catalog::open(&fixture.active_catalog).unwrap();
+            let catalog = Catalog::open_authenticated(
+                &fixture.active_catalog,
+                Arc::clone(&fixture.authenticator),
+            )
+            .unwrap();
             create(
                 &catalog,
                 &fixture.active_store,
@@ -746,13 +794,19 @@ mod tests {
             restored_store: file_identity(&staged_store).unwrap(),
             safety_backup: safety.path,
         };
-        write_journal(&journal_path, &journal).unwrap();
+        persist_restore_state(
+            &journal_path,
+            &fixture.authenticator,
+            Some(journal),
+        )
+        .unwrap();
         rename_swap(&active_catalog, &staged_catalog).unwrap();
         drop(store_lock);
 
         let report = recover_interrupted_activation(
             &fixture.active_catalog,
             &fixture.active_store,
+            Arc::clone(&fixture.authenticator),
         )
         .unwrap()
         .unwrap();
@@ -769,8 +823,38 @@ mod tests {
             fixture.active_store.list().unwrap()[0].display_name(),
             "Restored"
         );
-        assert!(!journal_path.exists());
+        assert!(load_restore_state(&journal_path, &fixture.authenticator)
+            .unwrap()
+            .0
+            .transaction
+            .is_none());
         assert!(!staged_catalog.exists());
         assert!(!staged_store.exists());
+    }
+
+    #[test]
+    fn recovery_rejects_a_tampered_authorization_journal() {
+        let fixture = fixture();
+        let journal_path = activation_journal_path(&fixture.active_catalog).unwrap();
+        persist_restore_state(&journal_path, &fixture.authenticator, None).unwrap();
+        let mut bytes = std::fs::read(&journal_path).unwrap();
+        let index = bytes.len() / 2;
+        bytes[index] ^= 1;
+        std::fs::write(&journal_path, bytes).unwrap();
+
+        let error = recover_interrupted_activation(
+            &fixture.active_catalog,
+            &fixture.active_store,
+            Arc::clone(&fixture.authenticator),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("authenticated state"));
+        assert_eq!(
+            Catalog::inspect_backup(&fixture.active_catalog)
+                .unwrap()
+                .projects[0]
+                .id,
+            "old-project"
+        );
     }
 }

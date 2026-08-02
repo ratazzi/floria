@@ -17,8 +17,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use floria_catalog::{
-    Binding, CatalogSnapshot, EntrySelection, Resource, ResourceKind, ResourceSource, SshRouteSpec,
-    SurfaceInput, SurfaceKind, ValueShape,
+    catalog_surface_semantic_revision, Binding, CatalogSnapshot, EntrySelection, Resource,
+    ResourceKind, ResourceSource, SshRouteSpec, SurfaceInput, SurfaceKind, ValueShape,
 };
 use floria_core::audit::{AuditLog, SshSessionAudit};
 use floria_core::authz::{
@@ -195,6 +195,7 @@ impl Drop for SshAgentRuntime {
 struct SurfaceSpec {
     id: String,
     name: String,
+    semantic_revision: String,
     socket_path: PathBuf,
     providers: Vec<ProviderSpec>,
     identities: Vec<SelectedIdentity>,
@@ -313,6 +314,8 @@ fn compile_surface_specs(
         specs.push(SurfaceSpec {
             id: surface.id.clone(),
             name: surface.name.clone(),
+            semantic_revision: catalog_surface_semantic_revision(snapshot, &surface.id)
+                .map_err(|error| invalid(error.to_string()))?,
             socket_path,
             providers,
             identities,
@@ -776,6 +779,10 @@ fn handle_sign(
     request: &[u8],
     state: &mut ConnectionState,
 ) -> Vec<u8> {
+    if let Err(error) = audit.ensure_healthy() {
+        tracing::error!(surface = %spec.id, %error, "refusing SSH signature while audit logging is degraded");
+        return vec![SSH_AGENT_FAILURE];
+    }
     let parsed = match parse_sign_request(request) {
         Ok(parsed) => parsed,
         Err(_) => return vec![SSH_AGENT_FAILURE],
@@ -787,7 +794,7 @@ fn handle_sign(
     }
     let Some(selected) = state.available.get(parsed.key) else {
         let (_, fingerprint) = identity_names(parsed.key);
-        audit.log_ssh_sign(
+        let _ = audit.log_ssh_sign(
             &format!("surfaces/{}", spec.id),
             identity,
             "denied",
@@ -837,12 +844,13 @@ fn handle_sign(
     let decision = authorizer.authorize(&AuthRequest {
         path: &path,
         display: Some(&spec.name),
+        object_revision: Some(&spec.semantic_revision),
         operation: Operation::Sign,
         context: Some(context),
         identity,
     });
     if !decision.is_allowed() {
-        audit.log_ssh_sign(
+        let _ = audit.log_ssh_sign(
             &path,
             identity,
             decision.decision_str(),
@@ -869,7 +877,7 @@ fn handle_sign(
             (vec![SSH_AGENT_FAILURE], "upstream_error")
         }
     };
-    audit.log_ssh_sign(
+    if let Err(error) = audit.log_ssh_sign(
         &path,
         identity,
         decision.decision_str(),
@@ -881,7 +889,10 @@ fn handle_sign(
         &selected.fingerprint,
         result,
         Some(ssh_session_audit),
-    );
+    ) {
+        tracing::error!(surface = %spec.id, %error, "withholding SSH signature because audit logging failed");
+        return vec![SSH_AGENT_FAILURE];
+    }
     response
 }
 

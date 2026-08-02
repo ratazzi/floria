@@ -52,6 +52,8 @@ pub enum BackupError {
     Catalog(#[from] floria_catalog::CatalogError),
     #[error("encrypted store backup failed: {0}")]
     Store(#[from] floria_store::StoreError),
+    #[error("restore authorization state failed: {0}")]
+    Integrity(#[from] floria_integrity::IntegrityError),
     #[error("backup manifest is invalid: {0}")]
     Manifest(String),
     #[error("backup manifest encoding failed: {0}")]

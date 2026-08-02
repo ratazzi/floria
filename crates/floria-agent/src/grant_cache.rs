@@ -1,17 +1,20 @@
 use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::fs;
+use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use floria_core::authz::{Enforcement, Operation};
+use floria_integrity::StateAuthenticator;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 const SCHEMA_VERSION: u32 = 2;
+const INTEGRITY_DOMAIN: &str = "authorization-grants";
+const MAXIMUM_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct GrantKey {
@@ -59,21 +62,163 @@ struct GrantRecord {
 
 pub(crate) struct GrantCache {
     path: PathBuf,
+    authenticator: Arc<StateAuthenticator>,
+    persistence: Mutex<GrantPersistence>,
     entries: Mutex<HashMap<GrantKey, GrantRecord>>,
 }
 
+#[derive(Default)]
+struct GrantPersistence {
+    generation: Option<u64>,
+    degraded_reason: Option<String>,
+}
+
 impl GrantCache {
-    pub(crate) fn open(path: impl Into<PathBuf>) -> Self {
+    pub(crate) fn open(
+        path: impl Into<PathBuf>,
+        authenticator: Arc<StateAuthenticator>,
+    ) -> Self {
         let path = path.into();
-        let entries = load(&path).unwrap_or_else(|error| {
+        let loaded = authenticator.load::<GrantDocument>(&path, INTEGRITY_DOMAIN);
+        let (entries, generation, rejected) = match loaded {
+            Ok(loaded) => {
+                match loaded.value {
+                    Some(document) => match load_document(document) {
+                        Ok(entries) => (entries, Some(loaded.generation), None),
+                        Err(error) => (
+                            HashMap::new(),
+                            Some(loaded.generation),
+                            Some(format!("authenticated grant document is invalid: {error}")),
+                        ),
+                    },
+                    None if loaded.generation == 0 => {
+                        (HashMap::new(), Some(0), None)
+                    }
+                    None => (
+                        HashMap::new(),
+                        Some(loaded.generation),
+                        Some(format!(
+                            "grant state file is missing at authenticated generation {}",
+                            loaded.generation
+                        )),
+                    ),
+                }
+            }
+            Err(error) => {
+                let (generation, reason) = match authenticator.checkpoint_generation(INTEGRITY_DOMAIN)
+                {
+                    Ok(generation) => (Some(generation), error.to_string()),
+                    Err(checkpoint_error) => (
+                        None,
+                        format!(
+                            "{error}; Keychain checkpoint is unavailable: {checkpoint_error}"
+                        ),
+                    ),
+                };
+                (HashMap::new(), generation, Some(reason))
+            }
+        };
+        let cache = GrantCache {
+            path,
+            authenticator,
+            persistence: Mutex::new(GrantPersistence {
+                generation,
+                degraded_reason: rejected.clone(),
+            }),
+            entries: Mutex::new(entries),
+        };
+        if let Some(reason) = rejected {
+            cache.reject_persisted_state(&reason);
+        }
+        cache
+    }
+
+    fn persist_authenticated(&self, entries: &HashMap<GrantKey, GrantRecord>) -> io::Result<()> {
+        let document = persisted_document(entries);
+        let mut persistence = self
+            .persistence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut generation = match persistence.generation {
+            Some(generation) => generation,
+            None => self
+                .authenticator
+                .checkpoint_generation(INTEGRITY_DOMAIN)
+                .map_err(integrity_io)?,
+        };
+
+        let mut first_error = None;
+        for _ in 0..2 {
+            match self.authenticator.persist(
+                &self.path,
+                INTEGRITY_DOMAIN,
+                generation,
+                &document,
+            ) {
+                Ok(next) => {
+                    persistence.generation = Some(next);
+                    persistence.degraded_reason = None;
+                    return Ok(());
+                }
+                Err(error) => {
+                    if first_error.is_none() {
+                        first_error = Some(error.to_string());
+                    }
+                    match self.authenticator.checkpoint_generation(INTEGRITY_DOMAIN) {
+                        Ok(current) => generation = current,
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+
+        persistence.generation = Some(generation);
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            first_error.unwrap_or_else(|| "grant persistence failed".to_string()),
+        ))
+    }
+
+    fn persist_best_effort(
+        &self,
+        entries: &HashMap<GrantKey, GrantRecord>,
+        operation: &str,
+    ) {
+        if let Err(error) = self.persist_authenticated(entries) {
+            self.persistence
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .degraded_reason = Some(error.to_string());
             tracing::warn!(
-                path = %path.display(),
+                path = %self.path.display(),
                 %error,
-                "loading authorization grants failed; starting with no grants"
+                operation,
+                "authorization grants are memory-only until authenticated persistence recovers"
             );
-            HashMap::new()
-        });
-        GrantCache { path, entries: Mutex::new(entries) }
+        }
+    }
+
+    fn reject_persisted_state(&self, reason: &str) {
+        tracing::error!(
+            path = %self.path.display(),
+            reason,
+            "authorization grant state was rejected; clearing grants"
+        );
+        match quarantine_rejected_state(&self.path) {
+            Ok(Some(quarantine)) => tracing::warn!(
+                path = %self.path.display(),
+                quarantine = %quarantine.display(),
+                "rejected authorization grant state was quarantined"
+            ),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(
+                path = %self.path.display(),
+                %error,
+                "quarantining rejected authorization grant state failed"
+            ),
+        }
+        let entries = self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.persist_best_effort(&entries, "reset rejected grant state");
     }
 
     pub(crate) fn is_valid(&self, key: &GrantKey) -> bool {
@@ -82,13 +227,7 @@ impl GrantCache {
             Some(expiry) if expiry.monotonic > Instant::now() => true,
             Some(_) => {
                 entries.remove(key);
-                if let Err(error) = persist(&self.path, &entries) {
-                    tracing::warn!(
-                        path = %self.path.display(),
-                        %error,
-                        "persisting expired authorization grant removal failed"
-                    );
-                }
+                self.persist_best_effort(&entries, "remove expired grant");
                 false
             }
             None => false,
@@ -101,6 +240,12 @@ impl GrantCache {
         ttl: Duration,
         metadata: GrantMetadata,
     ) -> io::Result<()> {
+        if ttl > MAXIMUM_TTL {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "grant TTL exceeds the 24-hour daemon limit",
+            ));
+        }
         let expires_at = now_unix()
             .checked_add(
                 ttl.as_secs()
@@ -115,7 +260,8 @@ impl GrantCache {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "grant TTL is too large"))?;
         let mut entries = self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         entries.insert(key, GrantRecord { monotonic, unix: expires_at, metadata });
-        persist(&self.path, &entries)
+        self.persist_best_effort(&entries, "insert grant");
+        Ok(())
     }
 
     pub(crate) fn active(&self) -> io::Result<Vec<ActiveGrant>> {
@@ -124,7 +270,7 @@ impl GrantCache {
         let before = entries.len();
         entries.retain(|_, grant| grant.monotonic > now);
         if entries.len() != before {
-            persist(&self.path, &entries)?;
+            self.persist_best_effort(&entries, "remove expired grants");
         }
         let mut active = entries
             .iter()
@@ -143,7 +289,7 @@ impl GrantCache {
         entries.retain(|key, _| grant_id(key) != id);
         let removed = entries.len() != before;
         if removed {
-            persist(&self.path, &entries)?;
+            self.persist_best_effort(&entries, "revoke grant");
         }
         Ok(removed)
     }
@@ -151,7 +297,8 @@ impl GrantCache {
     pub(crate) fn clear(&self) -> io::Result<()> {
         let mut entries = self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         entries.clear();
-        persist(&self.path, &entries)
+        self.persist_best_effort(&entries, "clear grants");
+        Ok(())
     }
 
     #[cfg(test)]
@@ -160,6 +307,15 @@ impl GrantCache {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_memory_only(&self) -> bool {
+        self.persistence
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .degraded_reason
+            .is_some()
     }
 
     #[cfg(test)]
@@ -202,27 +358,7 @@ struct PersistedGrant {
     target: String,
 }
 
-fn load(path: &Path) -> io::Result<HashMap<GrantKey, GrantRecord>> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
-        Err(error) => return Err(error),
-    };
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "grant store must be a regular file",
-        ));
-    }
-    if metadata.permissions().mode() & 0o077 != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "grant store must not be accessible by group or other users",
-        ));
-    }
-
-    let document: GrantDocument = serde_json::from_slice(&fs::read(path)?)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+fn load_document(document: GrantDocument) -> io::Result<HashMap<GrantKey, GrantRecord>> {
     if document.version != SCHEMA_VERSION {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -240,6 +376,12 @@ fn load(path: &Path) -> io::Result<HashMap<GrantKey, GrantRecord>> {
         let remaining = u64::try_from(persisted.expires_at - now_unix)
             .map(Duration::from_secs)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid grant expiry"))?;
+        if remaining > MAXIMUM_TTL {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "persisted grant expiry exceeds the 24-hour daemon limit",
+            ));
+        }
         let monotonic = now_monotonic
             .checked_add(remaining)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "grant expiry is too large"))?;
@@ -266,10 +408,7 @@ fn load(path: &Path) -> io::Result<HashMap<GrantKey, GrantRecord>> {
     Ok(entries)
 }
 
-fn persist(path: &Path, entries: &HashMap<GrantKey, GrantRecord>) -> io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+fn persisted_document(entries: &HashMap<GrantKey, GrantRecord>) -> GrantDocument {
     let mut grants = entries
         .iter()
         .map(|(key, expiry)| PersistedGrant {
@@ -298,19 +437,11 @@ fn persist(path: &Path, entries: &HashMap<GrantKey, GrantRecord>) -> io::Result<
                 right.enforcement.as_str(),
             ))
     });
-    let body = serde_json::to_vec(&GrantDocument { version: SCHEMA_VERSION, grants })?;
-    let temporary = path.with_extension("json.tmp");
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&temporary)?;
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    file.write_all(&body)?;
-    file.sync_all()?;
-    fs::rename(temporary, path)
+    GrantDocument { version: SCHEMA_VERSION, grants }
+}
+
+fn integrity_io(error: floria_integrity::IntegrityError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, error)
 }
 
 fn active_grant(key: &GrantKey, record: &GrantRecord) -> ActiveGrant {
@@ -360,9 +491,37 @@ fn now_unix() -> i64 {
         .unwrap_or(i64::MAX)
 }
 
+fn quarantine_rejected_state(path: &Path) -> io::Result<Option<PathBuf>> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "grant path has no parent"))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("grants.json");
+    let quarantine = parent.join(format!("{name}.rejected-{}", uuid::Uuid::new_v4()));
+    fs::rename(path, &quarantine)?;
+    if fs::symlink_metadata(&quarantine)?.file_type().is_file() {
+        fs::set_permissions(&quarantine, fs::Permissions::from_mode(0o600))?;
+    }
+    fs::File::open(parent)?.sync_all()?;
+    Ok(Some(quarantine))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn authenticator() -> Arc<StateAuthenticator> {
+        Arc::new(StateAuthenticator::for_tests([17; 32]))
+    }
 
     fn metadata() -> GrantMetadata {
         GrantMetadata {
@@ -386,13 +545,14 @@ mod tests {
     fn grant_survives_reopen_and_file_is_private() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("grants.json");
-        let cache = GrantCache::open(&path);
+        let auth = authenticator();
+        let cache = GrantCache::open(&path, Arc::clone(&auth));
         cache
             .insert(key(Operation::Read), Duration::from_secs(600), metadata())
             .unwrap();
 
-        assert!(GrantCache::open(&path).is_valid(&key(Operation::Read)));
-        let active = GrantCache::open(&path).active().unwrap();
+        assert!(GrantCache::open(&path, Arc::clone(&auth)).is_valid(&key(Operation::Read)));
+        let active = GrantCache::open(&path, auth).active().unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].metadata, metadata());
         assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
@@ -416,19 +576,26 @@ mod tests {
                 target: "~/.fixture".to_string(),
             }],
         };
-        fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let auth = authenticator();
+        auth.persist(&path, INTEGRITY_DOMAIN, 0, &document).unwrap();
 
-        assert!(GrantCache::open(path).is_empty());
+        assert!(GrantCache::open(path, auth).is_empty());
     }
 
     #[test]
-    fn corrupt_or_overexposed_store_fails_closed() {
+    fn corrupt_or_overexposed_store_is_quarantined_and_reset() {
         let dir = tempfile::tempdir().unwrap();
         let corrupt_path = dir.path().join("corrupt.json");
         fs::write(&corrupt_path, b"not-json").unwrap();
         fs::set_permissions(&corrupt_path, fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(GrantCache::open(corrupt_path).is_empty());
+        let corrupt_auth = authenticator();
+        assert!(GrantCache::open(&corrupt_path, Arc::clone(&corrupt_auth)).is_empty());
+        let reset = corrupt_auth
+            .load::<GrantDocument>(&corrupt_path, INTEGRITY_DOMAIN)
+            .unwrap()
+            .value
+            .unwrap();
+        assert!(reset.grants.is_empty());
 
         let open_path = dir.path().join("open.json");
         fs::write(
@@ -438,26 +605,91 @@ mod tests {
         )
         .unwrap();
         fs::set_permissions(&open_path, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(GrantCache::open(open_path).is_empty());
+        let open_auth = authenticator();
+        assert!(GrantCache::open(&open_path, Arc::clone(&open_auth)).is_empty());
+        assert!(open_auth
+            .load::<GrantDocument>(&open_path, INTEGRITY_DOMAIN)
+            .unwrap()
+            .value
+            .unwrap()
+            .grants
+            .is_empty());
+
+        let rejected = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".rejected-"))
+            .count();
+        assert_eq!(rejected, 2);
+    }
+
+    #[test]
+    fn missing_authenticated_store_is_immediately_replaced_with_empty_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grants.json");
+        let auth = authenticator();
+        let cache = GrantCache::open(&path, Arc::clone(&auth));
+        cache
+            .insert(key(Operation::Read), Duration::from_secs(600), metadata())
+            .unwrap();
+        fs::remove_file(&path).unwrap();
+
+        let reopened = GrantCache::open(&path, Arc::clone(&auth));
+        assert!(reopened.is_empty());
+        assert!(!reopened.is_memory_only());
+        let reset = auth
+            .load::<GrantDocument>(&path, INTEGRITY_DOMAIN)
+            .unwrap()
+            .value
+            .unwrap();
+        assert!(reset.grants.is_empty());
+    }
+
+    #[test]
+    fn persistence_failure_keeps_grants_in_memory_and_recovers_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked_parent = dir.path().join("blocked");
+        fs::write(&blocked_parent, b"not a directory").unwrap();
+        let path = blocked_parent.join("grants.json");
+        let auth = authenticator();
+        let cache = GrantCache::open(&path, Arc::clone(&auth));
+
+        cache
+            .insert(key(Operation::Read), Duration::from_secs(600), metadata())
+            .unwrap();
+        assert!(cache.is_valid(&key(Operation::Read)));
+        assert!(cache.is_memory_only());
+
+        fs::remove_file(&blocked_parent).unwrap();
+        fs::create_dir(&blocked_parent).unwrap();
+        cache
+            .insert(key(Operation::Sign), Duration::from_secs(600), metadata())
+            .unwrap();
+        assert!(!cache.is_memory_only());
+
+        let reopened = GrantCache::open(path, auth);
+        assert!(reopened.is_valid(&key(Operation::Read)));
+        assert!(reopened.is_valid(&key(Operation::Sign)));
     }
 
     #[test]
     fn clear_is_persistent() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("grants.json");
-        let cache = GrantCache::open(&path);
+        let auth = authenticator();
+        let cache = GrantCache::open(&path, Arc::clone(&auth));
         cache
             .insert(key(Operation::Sign), Duration::from_secs(600), metadata())
             .unwrap();
         cache.clear().unwrap();
 
-        assert!(GrantCache::open(path).is_empty());
+        assert!(GrantCache::open(path, auth).is_empty());
     }
 
     #[test]
     fn unrepresentable_ttl_is_rejected_without_caching() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = GrantCache::open(dir.path().join("grants.json"));
+        let cache = GrantCache::open(dir.path().join("grants.json"), authenticator());
 
         assert!(cache.insert(key(Operation::Read), Duration::MAX, metadata()).is_err());
         assert!(cache.is_empty());
@@ -467,7 +699,8 @@ mod tests {
     fn active_grants_have_stable_ids_and_can_be_revoked() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("grants.json");
-        let cache = GrantCache::open(&path);
+        let auth = authenticator();
+        let cache = GrantCache::open(&path, Arc::clone(&auth));
         cache
             .insert(key(Operation::Read), Duration::from_secs(600), metadata())
             .unwrap();
@@ -477,6 +710,6 @@ mod tests {
         assert_eq!(active[0].id, grant_id(&key(Operation::Read)));
         assert!(cache.revoke(&active[0].id).unwrap());
         assert!(cache.active().unwrap().is_empty());
-        assert!(GrantCache::open(path).active().unwrap().is_empty());
+        assert!(GrantCache::open(path, auth).active().unwrap().is_empty());
     }
 }

@@ -16,8 +16,8 @@ mod peer;
 
 #[cfg(target_os = "macos")]
 pub use peer::{
-    CodeSignedPeerVerifier, PeerPolicyError, PeerVerificationError, SameUserPeerVerifier,
-    SocketPeerVerifier, VerifiedPeer,
+    CodeSignedPeerVerifier, PeerAccess, PeerPolicyError, PeerVerificationError,
+    SameUserPeerVerifier, SocketPeerVerifier, VerifiedPeer,
 };
 
 /// Enrich the process identity. `uid/gid/pid` come from the FUSE request; the rest relies on platform forensics.
