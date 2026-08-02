@@ -1,4 +1,5 @@
 use super::*;
+use sha2::{Digest, Sha256};
 
 pub(super) fn snapshot_from(conn: &Connection) -> CatalogResult<CatalogSnapshot> {
     let projects = {
@@ -175,6 +176,74 @@ pub(super) fn snapshot_from(conn: &Connection) -> CatalogResult<CatalogSnapshot>
         bindings,
         surfaces,
     })
+}
+
+/// Stable digest of every catalog object that can change what one surface reads or signs with.
+///
+/// Store head versions are deliberately excluded: rotating the value behind the same resource
+/// does not change the authorization object. Rebinding the surface, changing its format/policy,
+/// changing a selected resource, or redirecting a machine-local endpoint does.
+pub fn catalog_surface_semantic_revision(
+    snapshot: &CatalogSnapshot,
+    surface_id: &str,
+) -> CatalogResult<String> {
+    let surface = snapshot
+        .surfaces
+        .iter()
+        .find(|surface| surface.id == surface_id)
+        .ok_or_else(|| CatalogError::NotFound(format!("surface {surface_id}")))?;
+    let environment = snapshot
+        .environments
+        .iter()
+        .find(|environment| environment.id == surface.environment_id)
+        .ok_or_else(|| {
+            CatalogError::NotFound(format!("environment {}", surface.environment_id))
+        })?;
+    let project = snapshot
+        .projects
+        .iter()
+        .find(|project| project.id == environment.project_id)
+        .ok_or_else(|| CatalogError::NotFound(format!("project {}", environment.project_id)))?;
+
+    let binding_ids = surface.input.binding_ids().unwrap_or(&[]);
+    let mut bindings = Vec::with_capacity(binding_ids.len());
+    let mut resource_ids = std::collections::BTreeSet::new();
+    for binding_id in binding_ids {
+        let binding = snapshot
+            .bindings
+            .iter()
+            .find(|binding| binding.id == *binding_id)
+            .ok_or_else(|| CatalogError::NotFound(format!("binding {binding_id}")))?;
+        resource_ids.insert(binding.resource_id.as_str());
+        bindings.push(binding);
+    }
+    if let SurfaceInput::Resource { resource_id } = &surface.input {
+        resource_ids.insert(resource_id);
+    }
+
+    let mut resources = Vec::with_capacity(resource_ids.len());
+    let mut endpoints = Vec::new();
+    for resource_id in resource_ids {
+        let resource = snapshot
+            .resources
+            .iter()
+            .find(|resource| resource.id == resource_id)
+            .ok_or_else(|| CatalogError::NotFound(format!("resource {resource_id}")))?;
+        resources.push(resource);
+        if let Some(endpoint) = snapshot.endpoints.get(resource_id) {
+            endpoints.push((resource_id, endpoint));
+        }
+    }
+
+    let canonical = serde_json::to_vec(&(
+        surface,
+        environment,
+        project,
+        bindings,
+        resources,
+        endpoints,
+    ))?;
+    Ok(format!("{:x}", Sha256::digest(canonical)))
 }
 
 pub fn resolve_catalog_snapshot(

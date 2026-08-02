@@ -9,21 +9,28 @@
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
+use base64::Engine;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use floria_core::authz::Enforcement;
 use floria_core::metadata::ItemMetadata;
+use floria_integrity::StateAuthenticator;
 
 use crate::error::{StoreError, StoreResult};
 use crate::keys::KeyProvider;
 
-/// Current on-disk layout. Format 2 adds managed (non-file) origins; format 1 file entries remain
-/// readable and are updated in place without rewriting their origin metadata.
-pub const STORE_FORMAT_VERSION: u32 = 2;
+/// Current on-disk layout. Format 3 binds every encrypted payload to its secret id and version;
+/// opening an older store rewrites legacy ciphertext before returning it to callers.
+pub const STORE_FORMAT_VERSION: u32 = 3;
 pub const MIN_SUPPORTED_STORE_FORMAT_VERSION: u32 = 1;
+
+const PAYLOAD_MAGIC: &[u8; 8] = b"FLORIA\0\x03";
+const INTEGRITY_DOMAIN: &str = "encrypted-store-security-state";
 
 /// Stable secret identifier (a v4 UUID string). Immutable for the life of an entry.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -188,7 +195,7 @@ pub trait SecretStore: Send + Sync {
 }
 
 /// On-disk `<id>/meta.toml`: entry-level metadata plus the head pointer.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct MetaFile {
     /// See [`STORE_FORMAT_VERSION`]. `default` so a pre-format entry reads as 0 and fails the check.
     #[serde(default)]
@@ -214,7 +221,7 @@ fn default_secret_enforcement() -> Enforcement {
 }
 
 /// On-disk `<id>/v/NNNN.toml`: immutable per-version metadata.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct VersionMetaFile {
     version: u32,
     size: u64,
@@ -227,6 +234,31 @@ struct VersionMetaFile {
 pub struct AgeDirStore {
     root: PathBuf,
     keys: Arc<dyn KeyProvider>,
+    integrity: Option<StoreIntegrity>,
+}
+
+#[derive(Clone)]
+struct StoreIntegrity {
+    authenticator: Arc<StateAuthenticator>,
+    sidecar: PathBuf,
+    generation: Arc<Mutex<u64>>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoreSecuritySnapshot {
+    entries: Vec<StoreSecurityEntry>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoreSecurityEntry {
+    meta: MetaFile,
+    versions: Vec<StoreSecurityVersion>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoreSecurityVersion {
+    meta: VersionMetaFile,
+    ciphertext_sha256: String,
 }
 
 /// Holds the store's cross-process mutation lock for a maintenance operation.
@@ -256,7 +288,166 @@ impl AgeDirStore {
                 .create(&root)
                 .map_err(|e| StoreError::io(&root, e))?;
         }
-        Ok(AgeDirStore { root, keys })
+        let store = AgeDirStore { root, keys, integrity: None };
+        store.migrate_context_binding()?;
+        Ok(store)
+    }
+
+    pub fn open_authenticated(
+        root: PathBuf,
+        keys: Arc<dyn KeyProvider>,
+        authenticator: Arc<StateAuthenticator>,
+    ) -> StoreResult<Self> {
+        Self::open(root, keys)?.authenticate(authenticator)
+    }
+
+    pub fn authenticate(mut self, authenticator: Arc<StateAuthenticator>) -> StoreResult<Self> {
+        let sidecar = self.root.join(".integrity.json");
+        let loaded = authenticator.load::<StoreSecuritySnapshot>(&sidecar, INTEGRITY_DOMAIN)?;
+        let current = self.security_snapshot()?;
+        let generation = match loaded.value {
+            Some(authenticated) if authenticated == current => loaded.generation,
+            Some(_) => {
+                return Err(StoreError::Corrupt {
+                    id: "store".to_string(),
+                    reason: "store contents do not match the authenticated security-state snapshot"
+                        .to_string(),
+                })
+            }
+            None
+                if loaded.generation == 0
+                    && (current.entries.is_empty()
+                        || option_env!("FLORIA_INSECURE_DEVELOPMENT_BUILD") == Some("1")) =>
+            {
+                tracing::warn!(store = %self.root.display(), "sealing existing encrypted store as authenticated security state");
+                authenticator.persist(&sidecar, INTEGRITY_DOMAIN, 0, &current)?
+            }
+            None if loaded.generation == 0 => {
+                return Err(StoreError::Corrupt {
+                    id: "store".to_string(),
+                    reason: "refusing to trust a non-empty encrypted store without an authenticated checkpoint"
+                        .to_string(),
+                })
+            }
+            None => {
+                return Err(StoreError::Corrupt {
+                    id: "store".to_string(),
+                    reason: format!(
+                        "authenticated store sidecar {} is missing at Keychain generation {}",
+                        sidecar.display(),
+                        loaded.generation
+                    ),
+                })
+            }
+        };
+        self.integrity = Some(StoreIntegrity {
+            authenticator,
+            sidecar,
+            generation: Arc::new(Mutex::new(generation)),
+        });
+        Ok(self)
+    }
+
+    /// Adopt the currently mounted root after an explicit, verified restore activation.
+    ///
+    /// Normal startup never calls this: it compares the live store with the existing checkpoint
+    /// and rejects rollback. The restore transaction calls it only after decrypting every staged
+    /// version and atomically switching both catalog and store paths.
+    pub fn authenticate_restored_state(
+        &self,
+        authenticator: Arc<StateAuthenticator>,
+    ) -> StoreResult<()> {
+        let restored = AgeDirStore {
+            root: self.root.clone(),
+            keys: Arc::clone(&self.keys),
+            integrity: None,
+        };
+        restored.verify_all()?;
+        let snapshot = restored.security_snapshot()?;
+        let sidecar = self.root.join(".integrity.json");
+        let generation = authenticator.checkpoint_generation(INTEGRITY_DOMAIN)?;
+        let next = authenticator.persist(
+            &sidecar,
+            INTEGRITY_DOMAIN,
+            generation,
+            &snapshot,
+        )?;
+        if let Some(integrity) = &self.integrity {
+            *integrity
+                .generation
+                .lock()
+                .expect("store integrity generation poisoned") = next;
+        }
+        Ok(())
+    }
+
+    fn security_snapshot(&self) -> StoreResult<StoreSecuritySnapshot> {
+        let mut ids = std::fs::read_dir(&self.root)
+            .map_err(|error| StoreError::io(&self.root, error))?
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.path().is_dir())
+            .filter_map(|entry| entry.file_name().to_string_lossy().parse::<SecretId>().ok())
+            .collect::<Vec<_>>();
+        ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        let mut entries = Vec::with_capacity(ids.len());
+        for id in ids {
+            let meta = self.read_meta(&id)?;
+            let mut versions = Vec::new();
+            for version in self.history_unverified(&id)? {
+                let ciphertext = self.read_version_ciphertext(&id, version.version)?;
+                versions.push(StoreSecurityVersion {
+                    meta: VersionMetaFile {
+                        version: version.version,
+                        size: version.size,
+                        created: version.created,
+                        note: version.note,
+                    },
+                    ciphertext_sha256: base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .encode(Sha256::digest(ciphertext)),
+                });
+            }
+            entries.push(StoreSecurityEntry { meta, versions });
+        }
+        Ok(StoreSecuritySnapshot { entries })
+    }
+
+    fn verify_security_state(&self) -> StoreResult<()> {
+        let Some(integrity) = &self.integrity else { return Ok(()) };
+        let loaded = integrity
+            .authenticator
+            .load::<StoreSecuritySnapshot>(&integrity.sidecar, INTEGRITY_DOMAIN)?;
+        let authenticated = loaded.value.ok_or_else(|| StoreError::Corrupt {
+            id: "store".to_string(),
+            reason: "authenticated store snapshot is missing".to_string(),
+        })?;
+        if authenticated != self.security_snapshot()? {
+            return Err(StoreError::Corrupt {
+                id: "store".to_string(),
+                reason: "store contents changed outside the authenticated daemon transaction boundary"
+                    .to_string(),
+            });
+        }
+        *integrity
+            .generation
+            .lock()
+            .expect("store integrity generation poisoned") = loaded.generation;
+        Ok(())
+    }
+
+    fn seal_security_state(&self) -> StoreResult<()> {
+        let Some(integrity) = &self.integrity else { return Ok(()) };
+        let snapshot = self.security_snapshot()?;
+        let mut generation = integrity
+            .generation
+            .lock()
+            .expect("store integrity generation poisoned");
+        *generation = integrity.authenticator.persist(
+            &integrity.sidecar,
+            INTEGRITY_DOMAIN,
+            *generation,
+            &snapshot,
+        )?;
+        Ok(())
     }
 
     pub fn root(&self) -> &Path {
@@ -269,6 +460,7 @@ impl AgeDirStore {
     /// plaintext or key material is written there.
     pub fn backup_to(&self, destination: &Path) -> StoreResult<()> {
         let _lock = self.lock_exclusive()?;
+        self.verify_security_state()?;
         copy_store_directory(&self.root, destination)
     }
 
@@ -326,13 +518,16 @@ impl AgeDirStore {
         AgeDirStore {
             root: root.to_path_buf(),
             keys: Arc::clone(&self.keys),
+            integrity: None,
         }
         .verify_all()
     }
 
     pub fn lock_for_maintenance(&self) -> StoreResult<StoreMaintenanceGuard> {
+        let lock = self.lock_exclusive()?;
+        self.verify_security_state()?;
         Ok(StoreMaintenanceGuard {
-            _lock: self.lock_exclusive()?,
+            _lock: lock,
             root: self.root.clone(),
         })
     }
@@ -382,6 +577,12 @@ impl AgeDirStore {
             id: id.to_string(),
             reason: format!("meta.toml: {e}"),
         })?;
+        if meta.id != id.as_str() {
+            return Err(StoreError::Corrupt {
+                id: id.to_string(),
+                reason: format!("meta.toml id {:?} does not match its directory", meta.id),
+            });
+        }
         if !(MIN_SUPPORTED_STORE_FORMAT_VERSION..=STORE_FORMAT_VERSION).contains(&meta.format) {
             return Err(StoreError::Corrupt {
                 id: id.to_string(),
@@ -425,6 +626,30 @@ impl AgeDirStore {
         })
     }
 
+    fn history_unverified(&self, id: &SecretId) -> StoreResult<Vec<VersionRecord>> {
+        self.read_meta(id)?;
+        let vdir = self.versions_dir(id);
+        let rd = std::fs::read_dir(&vdir).map_err(|e| StoreError::io(&vdir, e))?;
+        let mut out = Vec::new();
+        for entry in rd {
+            let entry = entry.map_err(|e| StoreError::io(&vdir, e))?;
+            let name = entry.file_name();
+            if let Some(stem) = name.to_string_lossy().strip_suffix(".toml") {
+                if let Ok(v) = stem.parse::<u32>() {
+                    let vm = self.read_version_meta(id, v)?;
+                    out.push(VersionRecord {
+                        version: vm.version,
+                        size: vm.size,
+                        created: vm.created,
+                        note: vm.note,
+                    });
+                }
+            }
+        }
+        out.sort_by_key(|record| record.version);
+        Ok(out)
+    }
+
     /// Highest existing version number for an entry (0 if none), used to pick the next on append.
     fn max_version(&self, id: &SecretId) -> StoreResult<u32> {
         let vdir = self.versions_dir(id);
@@ -454,7 +679,8 @@ impl AgeDirStore {
         plaintext: &[u8],
         note: Option<String>,
     ) -> StoreResult<()> {
-        let ciphertext = self.encrypt(plaintext)?;
+        let bound = encode_bound_payload(id, version, plaintext)?;
+        let ciphertext = self.encrypt(&bound)?;
         write_private(&self.version_blob(id, version), &ciphertext)?;
         let vmeta = VersionMetaFile {
             version,
@@ -509,11 +735,6 @@ impl AgeDirStore {
         Ok(out)
     }
 
-    fn decrypt(&self, ciphertext: &[u8]) -> StoreResult<Zeroizing<Vec<u8>>> {
-        let identity = self.keys.identity()?;
-        self.decrypt_with_identity(ciphertext, identity.as_ref())
-    }
-
     fn read_version_ciphertext(&self, id: &SecretId, version: u32) -> StoreResult<Vec<u8>> {
         let path = self.version_blob(id, version);
         std::fs::read(&path).map_err(|e| {
@@ -524,6 +745,130 @@ impl AgeDirStore {
             }
         })
     }
+
+    fn decrypt_version_with_identity(
+        &self,
+        id: &SecretId,
+        version: u32,
+        identity: &dyn age::Identity,
+    ) -> StoreResult<Zeroizing<Vec<u8>>> {
+        let ciphertext = self.read_version_ciphertext(id, version)?;
+        let decrypted = self.decrypt_with_identity(&ciphertext, identity)?;
+        decode_bound_payload(id, version, decrypted)
+    }
+
+    fn migrate_context_binding(&self) -> StoreResult<()> {
+        let _lock = self.lock_exclusive()?;
+        let entries = match std::fs::read_dir(&self.root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(StoreError::io(&self.root, error)),
+        };
+        let mut identity: Option<Box<dyn age::Identity>> = None;
+        for entry in entries {
+            let entry = entry.map_err(|error| StoreError::io(&self.root, error))?;
+            if !entry.path().is_dir() {
+                continue;
+            }
+            let Ok(id) = entry.file_name().to_string_lossy().parse::<SecretId>() else {
+                continue;
+            };
+            let mut meta = self.read_meta(&id)?;
+            if meta.format >= 3 {
+                continue;
+            }
+            if identity.is_none() {
+                identity = Some(self.keys.identity()?);
+            }
+            let identity = identity.as_ref().expect("initialized above");
+            for version in self.history(&id)? {
+                let ciphertext = self.read_version_ciphertext(&id, version.version)?;
+                let decrypted = self.decrypt_with_identity(&ciphertext, identity.as_ref())?;
+                if payload_is_bound(&id, version.version, &decrypted)? {
+                    continue;
+                }
+                let bound = encode_bound_payload(&id, version.version, &decrypted)?;
+                let ciphertext = self.encrypt(&bound)?;
+                write_private(&self.version_blob(&id, version.version), &ciphertext)?;
+            }
+            meta.format = STORE_FORMAT_VERSION;
+            self.write_meta(&id, &meta)?;
+        }
+        Ok(())
+    }
+}
+
+fn encode_bound_payload(
+    id: &SecretId,
+    version: u32,
+    plaintext: &[u8],
+) -> StoreResult<Zeroizing<Vec<u8>>> {
+    let id_bytes = id.as_str().as_bytes();
+    let id_len = u16::try_from(id_bytes.len())
+        .map_err(|_| StoreError::Invalid("secret id is too long".to_string()))?;
+    let mut bound = Zeroizing::new(Vec::with_capacity(
+        PAYLOAD_MAGIC.len() + 2 + id_bytes.len() + 4 + plaintext.len(),
+    ));
+    bound.extend_from_slice(PAYLOAD_MAGIC);
+    bound.extend_from_slice(&id_len.to_be_bytes());
+    bound.extend_from_slice(id_bytes);
+    bound.extend_from_slice(&version.to_be_bytes());
+    bound.extend_from_slice(plaintext);
+    Ok(bound)
+}
+
+fn payload_is_bound(id: &SecretId, version: u32, payload: &[u8]) -> StoreResult<bool> {
+    if !payload.starts_with(PAYLOAD_MAGIC) {
+        return Ok(false);
+    }
+    decode_bound_payload(id, version, Zeroizing::new(payload.to_vec())).map(|_| true)
+}
+
+fn decode_bound_payload(
+    expected_id: &SecretId,
+    expected_version: u32,
+    payload: Zeroizing<Vec<u8>>,
+) -> StoreResult<Zeroizing<Vec<u8>>> {
+    if !payload.starts_with(PAYLOAD_MAGIC) {
+        return Err(StoreError::Corrupt {
+            id: expected_id.to_string(),
+            reason: format!("v/{expected_version:04}.age has no authenticated context binding"),
+        });
+    }
+    let mut cursor = PAYLOAD_MAGIC.len();
+    let id_len_bytes: [u8; 2] = payload
+        .get(cursor..cursor + 2)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| StoreError::Corrupt {
+            id: expected_id.to_string(),
+            reason: format!("v/{expected_version:04}.age has a truncated context header"),
+        })?;
+    cursor += 2;
+    let id_len = u16::from_be_bytes(id_len_bytes) as usize;
+    let actual_id = payload.get(cursor..cursor + id_len).ok_or_else(|| StoreError::Corrupt {
+        id: expected_id.to_string(),
+        reason: format!("v/{expected_version:04}.age has a truncated secret id"),
+    })?;
+    cursor += id_len;
+    let version_bytes: [u8; 4] = payload
+        .get(cursor..cursor + 4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| StoreError::Corrupt {
+            id: expected_id.to_string(),
+            reason: format!("v/{expected_version:04}.age has a truncated version"),
+        })?;
+    cursor += 4;
+    let actual_version = u32::from_be_bytes(version_bytes);
+    if actual_id != expected_id.as_str().as_bytes() || actual_version != expected_version {
+        return Err(StoreError::Corrupt {
+            id: expected_id.to_string(),
+            reason: format!(
+                "v/{expected_version:04}.age belongs to {}@v{actual_version}",
+                String::from_utf8_lossy(actual_id)
+            ),
+        });
+    }
+    Ok(Zeroizing::new(payload[cursor..].to_vec()))
 }
 
 fn copy_store_directory(source: &Path, destination: &Path) -> StoreResult<()> {
@@ -593,6 +938,7 @@ impl SecretStore for AgeDirStore {
             }
         };
         let _lock = self.lock_exclusive()?;
+        self.verify_security_state()?;
         let id = SecretId::generate();
         let vdir = self.versions_dir(&id);
         std::fs::DirBuilder::new()
@@ -616,15 +962,18 @@ impl SecretStore for AgeDirStore {
                 metadata: ItemMetadata::default(),
             },
         )?;
+        self.seal_security_state()?;
         Ok(id)
     }
 
     fn get(&self, id: &SecretId) -> StoreResult<Zeroizing<Vec<u8>>> {
+        self.verify_security_state()?;
         let head = self.read_meta(id)?.current_version;
         self.get_version(id, head)
     }
 
     fn get_many(&self, ids: &[SecretId]) -> StoreResult<Vec<Zeroizing<Vec<u8>>>> {
+        self.verify_security_state()?;
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -632,64 +981,51 @@ impl SecretStore for AgeDirStore {
         ids.iter()
             .map(|id| {
                 let head = self.read_meta(id)?.current_version;
-                let ciphertext = self.read_version_ciphertext(id, head)?;
-                self.decrypt_with_identity(&ciphertext, identity.as_ref())
+                self.decrypt_version_with_identity(id, head, identity.as_ref())
             })
             .collect()
     }
 
     fn get_version(&self, id: &SecretId, version: u32) -> StoreResult<Zeroizing<Vec<u8>>> {
-        let ciphertext = self.read_version_ciphertext(id, version)?;
-        self.decrypt(&ciphertext)
+        self.verify_security_state()?;
+        self.read_meta(id)?;
+        let identity = self.keys.identity()?;
+        self.decrypt_version_with_identity(id, version, identity.as_ref())
     }
 
     fn append_version(&self, id: &SecretId, plaintext: &[u8]) -> StoreResult<u32> {
         // Order matters: write the immutable version first, then move the head. A crash between
         // the two leaves an orphan version (harmless) rather than a dangling head.
         let _lock = self.lock_exclusive()?;
+        self.verify_security_state()?;
         let mut meta = self.read_meta(id)?;
         let next = self.max_version(id)?.saturating_add(1);
         self.write_version(id, next, plaintext, None)?;
         meta.current_version = next;
         self.write_meta(id, &meta)?;
+        self.seal_security_state()?;
         Ok(next)
     }
 
     fn history(&self, id: &SecretId) -> StoreResult<Vec<VersionRecord>> {
-        self.read_meta(id)?; // ensure the entry exists
-        let vdir = self.versions_dir(id);
-        let rd = std::fs::read_dir(&vdir).map_err(|e| StoreError::io(&vdir, e))?;
-        let mut out = Vec::new();
-        for entry in rd {
-            let entry = entry.map_err(|e| StoreError::io(&vdir, e))?;
-            let name = entry.file_name();
-            if let Some(stem) = name.to_string_lossy().strip_suffix(".toml") {
-                if let Ok(v) = stem.parse::<u32>() {
-                    let vm = self.read_version_meta(id, v)?;
-                    out.push(VersionRecord {
-                        version: vm.version,
-                        size: vm.size,
-                        created: vm.created,
-                        note: vm.note,
-                    });
-                }
-            }
-        }
-        out.sort_by_key(|r| r.version);
-        Ok(out)
+        self.verify_security_state()?;
+        self.history_unverified(id)
     }
 
     fn set_head(&self, id: &SecretId, version: u32) -> StoreResult<()> {
         let _lock = self.lock_exclusive()?;
+        self.verify_security_state()?;
         let mut meta = self.read_meta(id)?;
         if !self.version_blob(id, version).exists() {
             return Err(StoreError::NotFound(format!("{id}@v{version}")));
         }
         meta.current_version = version;
-        self.write_meta(id, &meta)
+        self.write_meta(id, &meta)?;
+        self.seal_security_state()
     }
 
     fn record(&self, id: &SecretId) -> StoreResult<Option<SecretRecord>> {
+        self.verify_security_state()?;
         let meta = match self.read_meta(id) {
             Ok(m) => m,
             Err(StoreError::NotFound(_)) => return Ok(None),
@@ -717,6 +1053,7 @@ impl SecretStore for AgeDirStore {
     }
 
     fn list(&self) -> StoreResult<Vec<SecretRecord>> {
+        self.verify_security_state()?;
         let mut out = Vec::new();
         let entries = match std::fs::read_dir(&self.root) {
             Ok(e) => e,
@@ -743,6 +1080,7 @@ impl SecretStore for AgeDirStore {
     }
 
     fn get_by_path(&self, source_path: &Path) -> StoreResult<Option<SecretRecord>> {
+        self.verify_security_state()?;
         let target = source_path.to_string_lossy();
         Ok(self
             .list()?
@@ -763,15 +1101,18 @@ impl SecretStore for AgeDirStore {
     ) -> StoreResult<()> {
         metadata.validate().map_err(StoreError::Invalid)?;
         let _lock = self.lock_exclusive()?;
+        self.verify_security_state()?;
         let mut meta = self.read_meta(id)?;
         meta.metadata = metadata;
         meta.enforcement = enforcement;
         meta.environment_ids = environment_ids;
-        self.write_meta(id, &meta)
+        self.write_meta(id, &meta)?;
+        self.seal_security_state()
     }
 
     fn delete(&self, id: &SecretId) -> StoreResult<()> {
         let _lock = self.lock_exclusive()?;
+        self.verify_security_state()?;
         let dir = self.entry_dir(id);
         std::fs::remove_dir_all(&dir).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -779,7 +1120,8 @@ impl SecretStore for AgeDirStore {
             } else {
                 StoreError::io(&dir, e)
             }
-        })
+        })?;
+        self.seal_security_state()
     }
 }
 
@@ -792,21 +1134,32 @@ fn now_rfc3339() -> String {
 /// target. A crash mid-write leaves the old content intact (this guards the head pointer in
 /// `meta.toml`). Concurrent writers are serialized by the store lock, so the fixed temp name is safe.
 fn write_private(path: &Path, bytes: &[u8]) -> StoreResult<()> {
+    static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let tmp = {
         let mut os = path.as_os_str().to_owned();
-        os.push(".tmp");
+        os.push(format!(
+            ".tmp.{}.{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
         PathBuf::from(os)
     };
     let mut f = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&tmp)
         .map_err(|e| StoreError::io(&tmp, e))?;
     f.write_all(bytes).map_err(|e| StoreError::io(&tmp, e))?;
     f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
-    std::fs::rename(&tmp, path).map_err(|e| StoreError::io(path, e))
+    std::fs::rename(&tmp, path).map_err(|e| StoreError::io(path, e))?;
+    let parent = path.parent().ok_or_else(|| {
+        StoreError::Invalid(format!("private state path has no parent: {}", path.display()))
+    })?;
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|e| StoreError::io(parent, e))
 }
 
 #[cfg(test)]
@@ -872,6 +1225,73 @@ mod tests {
         // ciphertext on disk must not contain the plaintext
         let blob = std::fs::read(s.version_blob(&id, 1)).unwrap();
         assert!(!blob.windows(secret.len()).any(|w| w == secret));
+    }
+
+    #[test]
+    fn ciphertext_and_metadata_cannot_be_transplanted_between_secret_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path().to_path_buf());
+        let first = s
+            .put(NewSecret::file(PathBuf::from("/x/first"), 0o600), b"first")
+            .unwrap();
+        let second = s
+            .put(NewSecret::file(PathBuf::from("/x/second"), 0o600), b"second")
+            .unwrap();
+
+        std::fs::copy(s.version_blob(&first, 1), s.version_blob(&second, 1)).unwrap();
+        assert!(matches!(s.get(&second), Err(StoreError::Corrupt { .. })));
+
+        let first_meta = std::fs::read(s.entry_dir(&first).join("meta.toml")).unwrap();
+        std::fs::write(s.entry_dir(&second).join("meta.toml"), first_meta).unwrap();
+        assert!(matches!(s.record(&second), Err(StoreError::Corrupt { .. })));
+    }
+
+    #[test]
+    fn authenticated_store_rejects_external_tampering_and_signed_rollback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let keys: Arc<dyn KeyProvider> =
+            Arc::new(X25519Keys(age::x25519::Identity::generate()));
+        let auth = Arc::new(StateAuthenticator::for_tests([31; 32]));
+        let store = AgeDirStore::open(tmp.path().to_path_buf(), Arc::clone(&keys))
+            .unwrap()
+            .authenticate(Arc::clone(&auth))
+            .unwrap();
+        let id = store
+            .put(NewSecret::managed("authenticated fixture"), b"version-one")
+            .unwrap();
+        let old_sidecar = std::fs::read(tmp.path().join(".integrity.json")).unwrap();
+
+        let meta_path = tmp.path().join(id.as_str()).join("meta.toml");
+        let original_meta = std::fs::read(&meta_path).unwrap();
+        std::fs::write(&meta_path, b"externally modified").unwrap();
+        assert!(store.get(&id).is_err());
+
+        std::fs::write(&meta_path, original_meta).unwrap();
+        store.append_version(&id, b"version-two").unwrap();
+        std::fs::write(tmp.path().join(".integrity.json"), old_sidecar).unwrap();
+        assert!(store.get(&id).is_err());
+    }
+
+    #[test]
+    fn authenticated_store_does_not_silently_adopt_existing_secrets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let keys: Arc<dyn KeyProvider> =
+            Arc::new(X25519Keys(age::x25519::Identity::generate()));
+        let store = AgeDirStore::open(tmp.path().to_path_buf(), Arc::clone(&keys)).unwrap();
+        store
+            .put(NewSecret::managed("legacy fixture"), b"legacy-secret")
+            .unwrap();
+        drop(store);
+
+        let error = match AgeDirStore::open(tmp.path().to_path_buf(), keys)
+            .unwrap()
+            .authenticate(Arc::new(StateAuthenticator::for_tests([32; 32])))
+        {
+            Ok(_) => panic!("existing unauthenticated store was adopted"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("refusing to trust"));
     }
 
     #[test]
@@ -1058,7 +1478,7 @@ mod tests {
         // Simulate an entry written by a different (older/newer) layout.
         let meta_path = tmp.path().join(id.as_str()).join("meta.toml");
         let text = std::fs::read_to_string(&meta_path).unwrap();
-        std::fs::write(&meta_path, text.replace("format = 2", "format = 99")).unwrap();
+        std::fs::write(&meta_path, text.replace("format = 3", "format = 99")).unwrap();
 
         match s.get(&id) {
             Err(StoreError::Corrupt { reason, .. }) => assert!(reason.contains("format 99")),
@@ -1075,7 +1495,7 @@ mod tests {
             .unwrap();
         let meta_path = tmp.path().join(id.as_str()).join("meta.toml");
         let text = std::fs::read_to_string(&meta_path).unwrap();
-        std::fs::write(&meta_path, text.replace("format = 2", "format = 1")).unwrap();
+        std::fs::write(&meta_path, text.replace("format = 3", "format = 1")).unwrap();
 
         assert_eq!(s.get(&id).unwrap().as_slice(), b"fixture-v1");
         assert_eq!(s.append_version(&id, b"fixture-v2").unwrap(), 2);

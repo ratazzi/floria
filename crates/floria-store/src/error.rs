@@ -22,6 +22,9 @@ pub enum StoreError {
     #[error("crypto error: {0}")]
     Crypto(String),
 
+    #[error("store security-state verification failed: {0}")]
+    Integrity(#[from] floria_integrity::IntegrityError),
+
     #[error("invalid secret metadata: {0}")]
     Invalid(String),
 

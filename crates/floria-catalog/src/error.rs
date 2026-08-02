@@ -19,6 +19,9 @@ pub enum CatalogError {
     #[error("catalog encoding error: {0}")]
     Encoding(#[from] serde_json::Error),
 
+    #[error("catalog security-state verification failed: {0}")]
+    Integrity(#[from] floria_integrity::IntegrityError),
+
     #[error("invalid catalog value: {0}")]
     Validation(String),
 

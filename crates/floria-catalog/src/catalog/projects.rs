@@ -3,24 +3,23 @@ use super::*;
 impl Catalog {
     pub fn upsert_project(&self, project: &Project) -> CatalogResult<()> {
         validate_project(project)?;
-        let mut conn = self.connection()?;
-        let tx = conn.transaction()?;
-        tx.execute(
-            "INSERT INTO projects (id, name) VALUES (?1, ?2)
-             ON CONFLICT(id) DO UPDATE SET name = excluded.name,
-                 updated_at = CURRENT_TIMESTAMP",
-            params![project.id, project.name],
-        )?;
-        tx.execute(
-            "INSERT INTO project_checkouts
-                (id, project_id, path, environment_id, kind, git_common_dir)
-             VALUES (?1, ?1, ?2, NULL, 'primary', NULL)
-             ON CONFLICT(id) DO UPDATE SET path = excluded.path,
-                 updated_at = CURRENT_TIMESTAMP",
-            params![project.id, path_string(&project.path)],
-        )?;
-        tx.commit()?;
-        Ok(())
+        self.with_authenticated_mutation(|tx| {
+            tx.execute(
+                "INSERT INTO projects (id, name) VALUES (?1, ?2)
+                 ON CONFLICT(id) DO UPDATE SET name = excluded.name,
+                     updated_at = CURRENT_TIMESTAMP",
+                params![project.id, project.name],
+            )?;
+            tx.execute(
+                "INSERT INTO project_checkouts
+                    (id, project_id, path, environment_id, kind, git_common_dir)
+                 VALUES (?1, ?1, ?2, NULL, 'primary', NULL)
+                 ON CONFLICT(id) DO UPDATE SET path = excluded.path,
+                     updated_at = CURRENT_TIMESTAMP",
+                params![project.id, path_string(&project.path)],
+            )?;
+            Ok(())
+        })
     }
 
     /// A dedicated setter (not part of `upsert_project`) so idempotent project
@@ -31,51 +30,49 @@ impl Catalog {
         environment_id: Option<&str>,
     ) -> CatalogResult<()> {
         require_id(project_id, "project id")?;
-        let mut conn = self.connection()?;
-        let tx = conn.transaction()?;
-        require_exists(&tx, "projects", project_id, "project")?;
-        if let Some(environment_id) = environment_id {
-            let owner = tx
-                .query_row(
-                    "SELECT project_id FROM environments WHERE id = ?1",
-                    [environment_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?;
-            match owner {
-                Some(owner) if owner == project_id => {}
-                Some(_) => {
-                    return Err(CatalogError::Validation(format!(
-                        "environment {environment_id:?} does not belong to project {project_id:?}"
-                    )))
-                }
-                None => {
-                    return Err(CatalogError::NotFound(format!(
-                        "environment {environment_id}"
-                    )))
+        self.with_authenticated_mutation(|tx| {
+            require_exists(tx, "projects", project_id, "project")?;
+            if let Some(environment_id) = environment_id {
+                let owner = tx
+                    .query_row(
+                        "SELECT project_id FROM environments WHERE id = ?1",
+                        [environment_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                match owner {
+                    Some(owner) if owner == project_id => {}
+                    Some(_) => {
+                        return Err(CatalogError::Validation(format!(
+                            "environment {environment_id:?} does not belong to project {project_id:?}"
+                        )))
+                    }
+                    None => {
+                        return Err(CatalogError::NotFound(format!(
+                            "environment {environment_id}"
+                        )))
+                    }
                 }
             }
-        }
-        tx.execute(
-            "UPDATE projects SET default_environment_id = ?2,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE id = ?1",
-            params![project_id, environment_id],
-        )?;
-        tx.commit()?;
-        Ok(())
+            tx.execute(
+                "UPDATE projects SET default_environment_id = ?2,
+                     updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?1",
+                params![project_id, environment_id],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn remove_project(&self, id: &str) -> CatalogResult<()> {
         require_id(id, "project id")?;
-        remove_one(&self.connection()?, "projects", id, "project")
+        self.with_authenticated_mutation(|tx| remove_one(tx, "projects", id, "project"))
     }
 
     pub fn upsert_checkout(&self, checkout: &ProjectCheckout) -> CatalogResult<()> {
         validate_checkout(checkout)?;
-        let mut conn = self.connection()?;
-        let tx = conn.transaction()?;
-        require_exists(&tx, "projects", &checkout.project_id, "project")?;
+        self.with_authenticated_mutation(|tx| {
+        require_exists(tx, "projects", &checkout.project_id, "project")?;
         if let Some(environment_id) = &checkout.environment_id {
             let owner = tx
                 .query_row(
@@ -134,14 +131,14 @@ impl Catalog {
                 checkout.git_common_dir.as_deref().map(path_string),
             ],
         )?;
-        tx.commit()?;
         Ok(())
+        })
     }
 
     pub fn remove_checkout(&self, id: &str) -> CatalogResult<()> {
         require_id(id, "checkout id")?;
-        let conn = self.connection()?;
-        let kind = conn
+        self.with_authenticated_mutation(|tx| {
+        let kind = tx
             .query_row(
                 "SELECT kind FROM project_checkouts WHERE id = ?1",
                 [id],
@@ -155,14 +152,14 @@ impl Catalog {
                     .to_string(),
             ));
         }
-        remove_one(&conn, "project_checkouts", id, "checkout")
+        remove_one(tx, "project_checkouts", id, "checkout")
+        })
     }
 
     pub fn upsert_environment(&self, environment: &Environment) -> CatalogResult<()> {
         validate_environment(environment)?;
-        let mut conn = self.connection()?;
-        let tx = conn.transaction()?;
-        require_exists(&tx, "projects", &environment.project_id, "project")?;
+        self.with_authenticated_mutation(|tx| {
+        require_exists(tx, "projects", &environment.project_id, "project")?;
         let existing_owner: Option<String> = tx
             .query_row(
                 "SELECT project_id FROM environments WHERE id = ?1",
@@ -188,14 +185,13 @@ impl Catalog {
                 environment.position
             ],
         )?;
-        validate_snapshot_conflicts(&snapshot_from(&tx)?)?;
-        tx.commit()?;
         Ok(())
+        })
     }
 
     pub fn remove_environment(&self, id: &str) -> CatalogResult<()> {
         require_id(id, "environment id")?;
-        remove_one(&self.connection()?, "environments", id, "environment")
+        self.with_authenticated_mutation(|tx| remove_one(tx, "environments", id, "environment"))
     }
 
 }

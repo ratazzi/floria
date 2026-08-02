@@ -671,6 +671,7 @@ impl From<&CatalogError> for ControlErrorBody {
             CatalogError::Io { .. } => "io",
             CatalogError::Database(_) => "database",
             CatalogError::Encoding(_) => "encoding",
+            CatalogError::Integrity(_) => "integrity",
             CatalogError::Validation(_) => "validation",
             CatalogError::NotFound(_) => "not_found",
             CatalogError::AlreadyExists { .. } => "already_exists",
@@ -689,6 +690,7 @@ impl From<&StoreError> for ControlErrorBody {
             StoreError::NotFound(_) => "secret_not_found",
             StoreError::Key(_) => "key",
             StoreError::Crypto(_) => "crypto",
+            StoreError::Integrity(_) => "store_integrity",
             StoreError::Invalid(_) => "validation",
             StoreError::Corrupt { .. } => "store_corrupt",
         };
@@ -729,7 +731,7 @@ mod tests {
             daemon_version: "0.1.0".to_string(),
             schema_version: 13,
             minimum_schema_version: 13,
-            store_format_version: 2,
+            store_format_version: 3,
             minimum_store_format_version: 1,
         };
         let value = serde_json::to_value(result).unwrap();
@@ -739,7 +741,7 @@ mod tests {
         assert_eq!(value["value"]["daemon_version"], "0.1.0");
         assert_eq!(value["value"]["schema_version"], 13);
         assert_eq!(value["value"]["minimum_schema_version"], 13);
-        assert_eq!(value["value"]["store_format_version"], 2);
+        assert_eq!(value["value"]["store_format_version"], 3);
         assert_eq!(value["value"]["minimum_store_format_version"], 1);
     }
 

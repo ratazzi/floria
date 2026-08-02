@@ -3,10 +3,9 @@ use super::*;
 impl Catalog {
     pub fn upsert_binding(&self, binding: &Binding) -> CatalogResult<()> {
         validate_binding(binding)?;
-        let mut conn = self.connection()?;
-        let tx = conn.transaction()?;
-        require_exists(&tx, "projects", &binding.project_id, "project")?;
-        require_exists(&tx, "resources", &binding.resource_id, "resource")?;
+        self.with_authenticated_mutation(|tx| {
+        require_exists(tx, "projects", &binding.project_id, "project")?;
+        require_exists(tx, "resources", &binding.resource_id, "resource")?;
 
         let environment_id = match &binding.scope {
             BindingScope::Common => None,
@@ -71,16 +70,14 @@ impl Catalog {
                 serde_json::to_string(&binding.selection)?,
             ],
         )?;
-        validate_snapshot_conflicts(&snapshot_from(&tx)?)?;
-        tx.commit()?;
         Ok(())
+        })
     }
 
     pub fn remove_binding(&self, id: &str) -> CatalogResult<()> {
         require_id(id, "binding id")?;
-        let mut conn = self.connection()?;
-        let tx = conn.transaction()?;
-        let snapshot = snapshot_from(&tx)?;
+        self.with_authenticated_mutation(|tx| {
+        let snapshot = snapshot_from(tx)?;
         if !snapshot.bindings.iter().any(|binding| binding.id == id) {
             return Err(CatalogError::NotFound(format!("binding {id}")));
         }
@@ -110,16 +107,14 @@ impl Catalog {
             )?;
         }
         tx.execute("DELETE FROM bindings WHERE id = ?1", [id])?;
-        validate_snapshot_conflicts(&snapshot_from(&tx)?)?;
-        tx.commit()?;
         Ok(())
+        })
     }
 
     pub fn upsert_surface(&self, surface: &Surface) -> CatalogResult<()> {
         validate_surface(surface)?;
-        let mut conn = self.connection()?;
-        let tx = conn.transaction()?;
-        require_exists(&tx, "environments", &surface.environment_id, "environment")?;
+        self.with_authenticated_mutation(|tx| {
+        require_exists(tx, "environments", &surface.environment_id, "environment")?;
         let project_path = PathBuf::from(tx.query_row(
             "SELECT project_checkouts.path
              FROM environments
@@ -155,14 +150,13 @@ impl Catalog {
                 surface.position,
             ],
         )?;
-        validate_snapshot_conflicts(&snapshot_from(&tx)?)?;
-        tx.commit()?;
         Ok(())
+        })
     }
 
     pub fn remove_surface(&self, id: &str) -> CatalogResult<()> {
         require_id(id, "surface id")?;
-        remove_one(&self.connection()?, "surfaces", id, "surface")
+        self.with_authenticated_mutation(|tx| remove_one(tx, "surfaces", id, "surface"))
     }
 
     /// Remove the configured representation of one discovered file in a single transaction.
@@ -178,9 +172,8 @@ impl Catalog {
         require_id(surface_id, "surface id")?;
         require_id(binding_id, "binding id")?;
         require_id(resource_id, "resource id")?;
-        let mut conn = self.connection()?;
-        let tx = conn.transaction()?;
-        let snapshot = snapshot_from(&tx)?;
+        self.with_authenticated_mutation(|tx| {
+        let snapshot = snapshot_from(tx)?;
         let surface = snapshot
             .surfaces
             .iter()
@@ -256,11 +249,10 @@ impl Catalog {
             tx.execute("DELETE FROM resources WHERE id = ?1", [resource_id])?;
         }
 
-        validate_snapshot_conflicts(&snapshot_from(&tx)?)?;
-        tx.commit()?;
         Ok(ManagedFileConfigurationRemoval {
             binding_removed,
             resource_removed,
+        })
         })
     }
 
@@ -272,12 +264,5 @@ impl Catalog {
         environment_id: &str,
     ) -> CatalogResult<ResolvedEnvironment> {
         resolve_catalog_snapshot(&self.snapshot()?, project_id, environment_id)
-    }
-
-    pub(super) fn connection(&self) -> CatalogResult<Connection> {
-        let conn = Connection::open(&self.path)?;
-        conn.busy_timeout(Duration::from_secs(2))?;
-        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-        Ok(conn)
     }
 }

@@ -1,10 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use floria_core::authz::Enforcement;
-use rusqlite::{params, Connection, OptionalExtension};
+use floria_integrity::StateAuthenticator;
+use rusqlite::config::DbConfig;
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
+use serde::{Deserialize, Serialize};
 
 use crate::domain::{
     Binding, BindingScope, CatalogSnapshot, EntrySelection, Environment, FileBacking,
@@ -16,16 +20,71 @@ use crate::domain::{
 use crate::error::{CatalogError, CatalogResult};
 
 const SCHEMA_VERSION: i64 = 13;
+const INTEGRITY_DOMAIN: &str = "catalog-security-state";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+struct CatalogIntegrity {
+    authenticator: Arc<StateAuthenticator>,
+    sidecar: PathBuf,
+    mutation: Arc<Mutex<()>>,
+}
+
+/// The complete security-relevant logical state of the catalog.
+///
+/// SQLite files, WAL pages, and timestamps are storage details. Authorization depends on the
+/// declared schema and the typed domain rows, so those are authenticated together.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CatalogSecuritySnapshot {
+    schema_version: i64,
+    schema: Vec<SchemaObject>,
+    catalog: CatalogSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SchemaObject {
+    kind: String,
+    name: String,
+    table_name: String,
+    sql: String,
+}
+
+/// Compatibility reader for the short-lived development checkpoint that authenticated rows but
+/// not schema. It is accepted only when the live schema exactly matches a freshly-created v13
+/// schema, then immediately upgraded to `CatalogSecuritySnapshot`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AuthenticatedCatalogState {
+    Current(CatalogSecuritySnapshot),
+    Legacy(CatalogSnapshot),
+}
+
+#[derive(Clone)]
 pub struct Catalog {
     path: PathBuf,
+    integrity: Option<CatalogIntegrity>,
 }
 
 impl Catalog {
     /// Open or create a private SQLite metadata catalog.
     pub fn open(path: impl Into<PathBuf>) -> CatalogResult<Self> {
-        let path = path.into();
+        Self::open_with_integrity(path.into(), None)
+    }
+
+    /// Open the live catalog behind an authenticated snapshot and Keychain rollback checkpoint.
+    ///
+    /// The first authenticated open seals a legacy development catalog once. After that point a
+    /// missing, modified, or rolled-back sidecar fails closed before catalog state is consumed.
+    pub fn open_authenticated(
+        path: impl Into<PathBuf>,
+        authenticator: Arc<StateAuthenticator>,
+    ) -> CatalogResult<Self> {
+        Self::open_with_integrity(path.into(), Some(authenticator))
+    }
+
+    fn open_with_integrity(
+        path: PathBuf,
+        authenticator: Option<Arc<StateAuthenticator>>,
+    ) -> CatalogResult<Self> {
         if let Some(parent) = path.parent() {
             if !parent.exists() {
                 std::fs::DirBuilder::new()
@@ -36,7 +95,8 @@ impl Catalog {
             }
         }
 
-        if !path.exists() {
+        let created = !path.exists();
+        if created {
             std::fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -44,11 +104,15 @@ impl Catalog {
                 .open(&path)
                 .map_err(|e| CatalogError::io(&path, e))?;
         } else {
-            let mode = std::fs::metadata(&path)
-                .map_err(|e| CatalogError::io(&path, e))?
-                .permissions()
-                .mode()
-                & 0o777;
+            let metadata = std::fs::symlink_metadata(&path)
+                .map_err(|e| CatalogError::io(&path, e))?;
+            if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+                return Err(CatalogError::Validation(format!(
+                    "{} must be a regular file, not a symlink",
+                    path.display()
+                )));
+            }
+            let mode = metadata.permissions().mode() & 0o777;
             if mode & 0o077 != 0 {
                 return Err(CatalogError::Validation(format!(
                     "{} must not be accessible by group or others (mode {mode:04o})",
@@ -57,10 +121,90 @@ impl Catalog {
             }
         }
 
-        let catalog = Catalog { path };
-        let mut conn = catalog.connection()?;
-        migrate(&mut conn)?;
+        // Resolve parent-directory symlinks once, then use SQLITE_OPEN_NOFOLLOW on every
+        // connection so replacing the catalog leaf with a symlink cannot redirect trusted I/O.
+        let path = std::fs::canonicalize(&path).map_err(|e| CatalogError::io(&path, e))?;
+
+        let catalog = Catalog { path, integrity: None };
+        let catalog = match authenticator {
+            Some(authenticator) if created => {
+                let mut conn = catalog.raw_connection()?;
+                migrate(&mut conn)?;
+                drop(conn);
+                catalog.enable_integrity(authenticator)?
+            }
+            Some(authenticator) => catalog.enable_integrity(authenticator)?,
+            None => {
+                let mut conn = catalog.raw_connection()?;
+                migrate(&mut conn)?;
+                drop(conn);
+                catalog
+            }
+        };
         Ok(catalog)
+    }
+
+    fn enable_integrity(mut self, authenticator: Arc<StateAuthenticator>) -> CatalogResult<Self> {
+        let sidecar = self.path.with_extension("integrity.json");
+        let loaded = authenticator
+            .load::<AuthenticatedCatalogState>(&sidecar, INTEGRITY_DOMAIN)?;
+        let current = security_snapshot_from(&self.raw_connection()?)?;
+        match loaded.value {
+            Some(AuthenticatedCatalogState::Current(authenticated)) => {
+                if authenticated != current {
+                    return Err(CatalogError::Validation(
+                        "catalog contents do not match the authenticated security-state snapshot"
+                            .to_string(),
+                    ));
+                }
+            }
+            Some(AuthenticatedCatalogState::Legacy(authenticated)) => {
+                require_canonical_schema(&current)?;
+                if authenticated != current.catalog {
+                    return Err(CatalogError::Validation(
+                        "catalog contents do not match the authenticated legacy security-state snapshot"
+                            .to_string(),
+                    ));
+                }
+                authenticator.persist(
+                    &sidecar,
+                    INTEGRITY_DOMAIN,
+                    loaded.generation,
+                    &current,
+                )?;
+            }
+            None
+                if loaded.generation == 0
+                    && (current.catalog == CatalogSnapshot::default()
+                        || option_env!("FLORIA_INSECURE_DEVELOPMENT_BUILD") == Some("1")) =>
+            {
+                require_canonical_schema(&current)?;
+                tracing::warn!(
+                    catalog = %self.path.display(),
+                    "sealing existing catalog as authenticated security state"
+                );
+                authenticator.persist(&sidecar, INTEGRITY_DOMAIN, 0, &current)?;
+            }
+            None if loaded.generation == 0 => {
+                return Err(CatalogError::Validation(
+                    "refusing to trust a non-empty catalog without an authenticated checkpoint"
+                        .to_string(),
+                ))
+            }
+            None => {
+                return Err(CatalogError::Validation(format!(
+                    "authenticated catalog sidecar {} is missing at Keychain generation {}",
+                    sidecar.display(),
+                    loaded.generation
+                )))
+            }
+        };
+        self.integrity = Some(CatalogIntegrity {
+            authenticator,
+            sidecar,
+            mutation: Arc::new(Mutex::new(())),
+        });
+        Ok(self)
     }
 
     pub fn path(&self) -> &Path {
@@ -80,11 +224,7 @@ impl Catalog {
     }
 
     pub fn snapshot(&self) -> CatalogResult<CatalogSnapshot> {
-        let mut conn = self.connection()?;
-        let tx = conn.transaction()?;
-        let snapshot = snapshot_from(&tx)?;
-        tx.commit()?;
-        Ok(snapshot)
+        self.with_authenticated_read(|_, snapshot| Ok(snapshot.clone()))
     }
 
     /// Check SQLite integrity and validate the complete live catalog without modifying it.
@@ -92,8 +232,10 @@ impl Catalog {
     /// This is intentionally deeper than [`Catalog::snapshot`]: health checks use it to
     /// distinguish a readable catalog from one whose underlying SQLite pages are damaged.
     pub fn verify_integrity(&self) -> CatalogResult<CatalogSnapshot> {
-        let conn = self.connection()?;
-        inspect_connection(&conn)
+        self.with_authenticated_read(|conn, snapshot| {
+            run_physical_integrity_checks(conn)?;
+            Ok(snapshot.clone())
+        })
     }
 
     /// Create a transactionally consistent SQLite copy without pausing readers or writers.
@@ -115,12 +257,14 @@ impl Catalog {
             .open(destination)
             .map_err(|source| CatalogError::io(destination, source))?;
 
-        let source = self.connection()?;
-        let mut target = Connection::open(destination)?;
-        let backup = rusqlite::backup::Backup::new(&source, &mut target)?;
-        backup.run_to_completion(32, Duration::from_millis(10), None)?;
-        drop(backup);
-        target.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+        self.with_authenticated_read(|source, _| {
+            let mut target = Connection::open(destination)?;
+            let backup = rusqlite::backup::Backup::new(source, &mut target)?;
+            backup.run_to_completion(32, Duration::from_millis(10), None)?;
+            drop(backup);
+            target.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+            Ok(())
+        })?;
         std::fs::set_permissions(destination, std::fs::Permissions::from_mode(0o600))
             .map_err(|source| CatalogError::io(destination, source))
     }
@@ -134,23 +278,213 @@ impl Catalog {
         )?;
         inspect_connection(&conn)
     }
+
+    /// Adopt one already-verified restored catalog as the new authenticated live state.
+    ///
+    /// This is deliberately separate from normal open/migration. Restore activation must be an
+    /// explicit maintenance transaction; ordinary startup can never reinterpret an older valid
+    /// database as a legitimate rollback.
+    pub fn authenticate_restored_state(
+        path: &Path,
+        authenticator: Arc<StateAuthenticator>,
+    ) -> CatalogResult<()> {
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|error| CatalogError::io(path, error))?;
+        if !metadata.file_type().is_file()
+            || metadata.file_type().is_symlink()
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(CatalogError::Validation(format!(
+                "restored catalog must be a private regular file: {}",
+                path.display()
+            )));
+        }
+        let path = std::fs::canonicalize(path).map_err(|error| CatalogError::io(path, error))?;
+        let conn = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        let snapshot = security_snapshot_from(&conn)?;
+        require_canonical_schema(&snapshot)?;
+        run_physical_integrity_checks(&conn)?;
+        let sidecar = path.with_extension("integrity.json");
+        let generation = authenticator.checkpoint_generation(INTEGRITY_DOMAIN)?;
+        authenticator.persist(
+            &sidecar,
+            INTEGRITY_DOMAIN,
+            generation,
+            &snapshot,
+        )?;
+        Ok(())
+    }
+
+    /// Verify and consume catalog state from one SQLite read snapshot.
+    ///
+    /// Callers never receive a bare connection, which prevents a verified state from being used
+    /// after another writer has replaced the rows it referred to.
+    fn with_authenticated_read<T>(
+        &self,
+        operation: impl FnOnce(&Transaction<'_>, &CatalogSnapshot) -> CatalogResult<T>,
+    ) -> CatalogResult<T> {
+        let _mutation = self.integrity.as_ref().map(|integrity| {
+            integrity.mutation.lock().expect("catalog integrity lock poisoned")
+        });
+        let mut conn = self.raw_connection()?;
+        let tx = conn.transaction()?;
+        let current = security_snapshot_from(&tx)?;
+        self.verify_security_snapshot(&current)?;
+        let result = operation(&tx, &current.catalog)?;
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Verify, mutate, validate, and checkpoint catalog state as one serialized transaction.
+    ///
+    /// The authenticated sidecar is advanced while SQLite's immediate writer lock is still held.
+    /// If the final SQLite commit fails, the catalog fails closed against the newer checkpoint.
+    fn with_authenticated_mutation<T>(
+        &self,
+        operation: impl FnOnce(&Transaction<'_>) -> CatalogResult<T>,
+    ) -> CatalogResult<T> {
+        let _mutation = self.integrity.as_ref().map(|integrity| {
+            integrity.mutation.lock().expect("catalog integrity lock poisoned")
+        });
+        let mut conn = self.raw_connection()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current = security_snapshot_from(&tx)?;
+        let generation = self.verify_security_snapshot(&current)?;
+        let result = operation(&tx)?;
+        let next = security_snapshot_from(&tx)?;
+        validate_snapshot_conflicts(&next.catalog)?;
+        if let Some(integrity) = &self.integrity {
+            integrity.authenticator.persist(
+                &integrity.sidecar,
+                INTEGRITY_DOMAIN,
+                generation,
+                &next,
+            )?;
+        }
+        tx.commit()?;
+        Ok(result)
+    }
+
+    fn verify_security_snapshot(&self, current: &CatalogSecuritySnapshot) -> CatalogResult<u64> {
+        let Some(integrity) = &self.integrity else { return Ok(0) };
+        let loaded = integrity
+            .authenticator
+            .load::<CatalogSecuritySnapshot>(&integrity.sidecar, INTEGRITY_DOMAIN)?;
+        let authenticated = loaded.value.ok_or_else(|| {
+            CatalogError::Validation("authenticated catalog snapshot is missing".to_string())
+        })?;
+        if authenticated != *current {
+            return Err(CatalogError::Validation(
+                "catalog schema or contents changed outside the authenticated daemon transaction boundary"
+                    .to_string(),
+            ));
+        }
+        Ok(loaded.generation)
+    }
+
+    fn raw_connection(&self) -> CatalogResult<Connection> {
+        let conn = Connection::open_with_flags(
+            &self.path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
+                | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
+        conn.busy_timeout(Duration::from_secs(2))?;
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)?;
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_TRIGGER, false)?;
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_VIEW, false)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+        Ok(conn)
+    }
 }
 
 fn inspect_connection(conn: &Connection) -> CatalogResult<CatalogSnapshot> {
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version != SCHEMA_VERSION {
-        return Err(CatalogError::UnsupportedSchema {
-            found: version,
-            expected: SCHEMA_VERSION,
-        });
-    }
+    let security = security_snapshot_from(conn)?;
+    require_canonical_schema(&security)?;
+    run_physical_integrity_checks(conn)?;
+    Ok(security.catalog)
+}
+
+fn run_physical_integrity_checks(conn: &Connection) -> CatalogResult<()> {
     let quick_check: String = conn.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
     if quick_check != "ok" {
         return Err(CatalogError::Validation(format!(
             "catalog integrity check failed: {quick_check}"
         )));
     }
-    snapshot_from(conn)
+    let foreign_key_violation: Option<(String, i64, String)> = conn
+        .query_row("PRAGMA foreign_key_check", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .optional()?;
+    if let Some((table, rowid, parent)) = foreign_key_violation {
+        return Err(CatalogError::Validation(format!(
+            "catalog foreign-key check failed for {table} row {rowid} referencing {parent}"
+        )));
+    }
+    Ok(())
+}
+
+fn security_snapshot_from(conn: &Connection) -> CatalogResult<CatalogSecuritySnapshot> {
+    let schema_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if schema_version != SCHEMA_VERSION {
+        return Err(CatalogError::UnsupportedSchema {
+            found: schema_version,
+            expected: SCHEMA_VERSION,
+        });
+    }
+    let schema = schema_objects_from(conn)?;
+    if let Some(object) = schema
+        .iter()
+        .find(|object| matches!(object.kind.as_str(), "trigger" | "view"))
+    {
+        return Err(CatalogError::Validation(format!(
+            "catalog contains unsupported {} {:?}",
+            object.kind, object.name
+        )));
+    }
+    let catalog = snapshot_from(conn)?;
+    validate_snapshot_conflicts(&catalog)?;
+    Ok(CatalogSecuritySnapshot { schema_version, schema, catalog })
+}
+
+fn schema_objects_from(conn: &Connection) -> CatalogResult<Vec<SchemaObject>> {
+    let mut statement = conn.prepare(
+        "SELECT type, name, tbl_name, COALESCE(sql, '')
+         FROM sqlite_schema
+         WHERE name NOT LIKE 'sqlite_%'
+         ORDER BY type, name, tbl_name",
+    )?;
+    let objects = statement
+        .query_map([], |row| {
+            Ok(SchemaObject {
+                kind: row.get(0)?,
+                name: row.get(1)?,
+                table_name: row.get(2)?,
+                sql: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(objects)
+}
+
+fn require_canonical_schema(snapshot: &CatalogSecuritySnapshot) -> CatalogResult<()> {
+    let mut expected = Connection::open_in_memory()?;
+    migrate(&mut expected)?;
+    let expected = schema_objects_from(&expected)?;
+    if snapshot.schema_version != SCHEMA_VERSION || snapshot.schema != expected {
+        return Err(CatalogError::Validation(
+            "catalog schema does not exactly match the supported schema".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 mod projects;
@@ -162,7 +496,9 @@ mod validation;
 
 use schema::migrate;
 use snapshot::{snapshot_from, validate_snapshot_conflicts};
-pub use snapshot::{resolve_catalog_snapshot, resolve_catalog_surface};
+pub use snapshot::{
+    catalog_surface_semantic_revision, resolve_catalog_snapshot, resolve_catalog_surface,
+};
 use validation::*;
 
 #[cfg(test)]
@@ -307,7 +643,7 @@ mod tests {
 
         let reopened = Catalog::open(&path).unwrap();
         let persisted: i64 = reopened
-            .connection()
+            .raw_connection()
             .unwrap()
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
@@ -322,6 +658,164 @@ mod tests {
 
         assert_eq!(snapshot.projects, vec![project()]);
         assert_eq!(snapshot.environments, vec![environment()]);
+    }
+
+    #[test]
+    fn authenticated_catalog_rejects_external_database_tampering_and_sidecar_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.sqlite");
+        let auth = Arc::new(StateAuthenticator::for_tests([41; 32]));
+        let catalog = Catalog::open_authenticated(&path, Arc::clone(&auth)).unwrap();
+        let baseline_sidecar = std::fs::read(path.with_extension("integrity.json")).unwrap();
+        catalog.upsert_project(&project()).unwrap();
+
+        let attacker = Connection::open(&path).unwrap();
+        attacker
+            .execute("UPDATE projects SET name = 'attacker' WHERE id = 'floria'", [])
+            .unwrap();
+        assert!(catalog.snapshot().unwrap_err().to_string().contains("outside"));
+        drop(attacker);
+
+        let trusted = Connection::open(&path).unwrap();
+        trusted.execute("UPDATE projects SET name = 'floria' WHERE id = 'floria'", []).unwrap();
+        drop(trusted);
+        std::fs::write(path.with_extension("integrity.json"), baseline_sidecar).unwrap();
+        assert!(catalog.snapshot().unwrap_err().to_string().contains("rolled back"));
+    }
+
+    #[test]
+    fn authenticated_catalog_rejects_schema_tampering_before_a_legitimate_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.sqlite");
+        let catalog = Catalog::open_authenticated(
+            &path,
+            Arc::new(StateAuthenticator::for_tests([43; 32])),
+        )
+        .unwrap();
+        catalog.upsert_project(&project()).unwrap();
+
+        let attacker = Connection::open(&path).unwrap();
+        attacker
+            .execute_batch(
+                "CREATE TRIGGER inject_environment AFTER UPDATE ON projects BEGIN
+                     INSERT OR IGNORE INTO environments (id, project_id, name, position)
+                     VALUES ('attacker', NEW.id, 'Attacker', 0);
+                 END;",
+            )
+            .unwrap();
+        drop(attacker);
+
+        let mut changed = project();
+        changed.name = "Changed".to_string();
+        let error = catalog.upsert_project(&changed).unwrap_err();
+        assert!(error.to_string().contains("unsupported trigger"));
+
+        let inspect = Connection::open(&path).unwrap();
+        let project_name: String = inspect
+            .query_row("SELECT name FROM projects WHERE id = 'floria'", [], |row| row.get(0))
+            .unwrap();
+        let injected: i64 = inspect
+            .query_row(
+                "SELECT COUNT(*) FROM environments WHERE id = 'attacker'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(project_name, "floria");
+        assert_eq!(injected, 0);
+    }
+
+    #[test]
+    fn authenticated_catalog_detects_constraint_index_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.sqlite");
+        let catalog = Catalog::open_authenticated(
+            &path,
+            Arc::new(StateAuthenticator::for_tests([46; 32])),
+        )
+        .unwrap();
+
+        let attacker = Connection::open(&path).unwrap();
+        attacker.execute_batch("DROP INDEX bindings_resource_idx;").unwrap();
+        drop(attacker);
+
+        let error = catalog.snapshot().unwrap_err();
+        assert!(error.to_string().contains("schema or contents changed"));
+    }
+
+    #[test]
+    fn authenticated_open_never_migrates_an_unverified_existing_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.sqlite");
+        let attacker = Connection::open(&path).unwrap();
+        attacker.execute_batch("CREATE TABLE attacker_controlled (value TEXT);").unwrap();
+        drop(attacker);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let error = match Catalog::open_authenticated(
+            &path,
+            Arc::new(StateAuthenticator::for_tests([44; 32])),
+        ) {
+            Ok(_) => panic!("unverified database was migrated"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            CatalogError::UnsupportedSchema { found: 0, expected: SCHEMA_VERSION }
+        ));
+
+        let inspect = Connection::open(&path).unwrap();
+        let version: i64 = inspect.query_row("PRAGMA user_version", [], |row| row.get(0)).unwrap();
+        let projects: i64 = inspect
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type = 'table' AND name = 'projects'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, 0);
+        assert_eq!(projects, 0);
+    }
+
+    #[test]
+    fn authenticated_open_upgrades_a_valid_legacy_row_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.sqlite");
+        let catalog = Catalog::open(&path).unwrap();
+        catalog.upsert_project(&project()).unwrap();
+        let snapshot = catalog.snapshot().unwrap();
+        drop(catalog);
+
+        let auth = Arc::new(StateAuthenticator::for_tests([45; 32]));
+        auth.persist(
+            &path.with_extension("integrity.json"),
+            INTEGRITY_DOMAIN,
+            0,
+            &snapshot,
+        )
+        .unwrap();
+
+        let authenticated = Catalog::open_authenticated(&path, auth).unwrap();
+        assert_eq!(authenticated.snapshot().unwrap(), snapshot);
+    }
+
+    #[test]
+    fn authenticated_catalog_does_not_silently_adopt_existing_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.sqlite");
+        let catalog = Catalog::open(&path).unwrap();
+        catalog.upsert_project(&project()).unwrap();
+        drop(catalog);
+
+        let error = match Catalog::open_authenticated(
+            &path,
+            Arc::new(StateAuthenticator::for_tests([42; 32])),
+        ) {
+            Ok(_) => panic!("existing unauthenticated catalog was adopted"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("refusing to trust"));
     }
 
     #[test]
@@ -582,7 +1076,7 @@ mod tests {
         catalog.upsert_surface(&surface).unwrap();
 
         let relative: String = catalog
-            .connection()
+            .raw_connection()
             .unwrap()
             .query_row(
                 "SELECT relative_path FROM surfaces WHERE id = ?1",
@@ -1089,7 +1583,7 @@ mod tests {
             Some(Path::new("/fixture/upstream-agent.sock"))
         );
         let source_json: String = catalog
-            .connection()
+            .raw_connection()
             .unwrap()
             .query_row(
                 "SELECT source_json FROM resources WHERE id = ?1",

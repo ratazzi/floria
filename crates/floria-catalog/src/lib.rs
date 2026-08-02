@@ -8,7 +8,9 @@ mod catalog;
 mod domain;
 mod error;
 
-pub use catalog::{resolve_catalog_snapshot, resolve_catalog_surface, Catalog};
+pub use catalog::{
+    catalog_surface_semantic_revision, resolve_catalog_snapshot, resolve_catalog_surface, Catalog,
+};
 pub use domain::{
     Binding, BindingScope, CatalogSnapshot, EntrySelection, EntrySpec, Environment, FileBacking,
     FormatInputModel, FormatSpec, ItemLink, ItemMetadata, ManagedFileConfigurationRemoval,
