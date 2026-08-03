@@ -42,4 +42,25 @@ final class DaemonManagerTests: XCTestCase {
 
         XCTAssertEqual(DaemonManager.launchAgentState(from: output), .loaded)
     }
+
+    func testBootstrapRetriesLaunchdInputOutputRace() {
+        let error = DaemonManager.DaemonError.processFailed(
+            executable: "launchctl",
+            arguments: ["bootstrap", "gui/501", "/tmp/floria.plist"],
+            status: 5,
+            output: "Bootstrap failed: 5: Input/output error")
+
+        XCTAssertTrue(DaemonManager.shouldRetryBootstrap(error, completedAttempts: 1))
+        XCTAssertFalse(DaemonManager.shouldRetryBootstrap(error, completedAttempts: 5))
+    }
+
+    func testBootstrapDoesNotRetryUnrelatedLaunchctlFailure() {
+        let error = DaemonManager.DaemonError.processFailed(
+            executable: "launchctl",
+            arguments: ["bootstrap", "gui/501", "/tmp/floria.plist"],
+            status: 78,
+            output: "Invalid property list")
+
+        XCTAssertFalse(DaemonManager.shouldRetryBootstrap(error, completedAttempts: 1))
+    }
 }

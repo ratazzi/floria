@@ -19,6 +19,7 @@ LEGACY_SERVICE_LABEL="dev.floria.hola.ac.daemon"
 LEGACY_SERVICE_TARGET="gui/$(id -u)/${LEGACY_SERVICE_LABEL}"
 LEGACY_LAUNCH_AGENT_PLIST="${HOME}/Library/LaunchAgents/${LEGACY_SERVICE_LABEL}.plist"
 WAIT_SECONDS="${FLORIA_INSTALL_WAIT_SECONDS:-20}"
+DAEMON_WAIT_SECONDS="${FLORIA_INSTALL_DAEMON_WAIT_SECONDS:-60}"
 EXPECTED_REVISION="${VERSION}+${BUILD_NUMBER}"
 
 wait_for_app_to_stop() {
@@ -62,7 +63,11 @@ installed_definition_revision() {
 }
 
 wait_for_current_daemon() {
-    local deadline=$((SECONDS + WAIT_SECONDS))
+    # On a freshly replaced ad-hoc-signed bundle, macOS trust and local integrity checks can
+    # legitimately exceed the 20-second process-launch budget before the control socket becomes
+    # available. Keep that short budget for app lifecycle operations, but allow daemon readiness
+    # a full minute.
+    local deadline=$((SECONDS + DAEMON_WAIT_SECONDS))
     local actual_revision=""
 
     while ((SECONDS < deadline)); do

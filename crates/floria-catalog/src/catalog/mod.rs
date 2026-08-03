@@ -479,12 +479,71 @@ fn require_canonical_schema(snapshot: &CatalogSecuritySnapshot) -> CatalogResult
     let mut expected = Connection::open_in_memory()?;
     migrate(&mut expected)?;
     let expected = schema_objects_from(&expected)?;
-    if snapshot.schema_version != SCHEMA_VERSION || snapshot.schema != expected {
+    if snapshot.schema_version != SCHEMA_VERSION
+        || !schema_objects_equivalent(&snapshot.schema, &expected)
+    {
         return Err(CatalogError::Validation(
             "catalog schema does not exactly match the supported schema".to_string(),
         ));
     }
     Ok(())
+}
+
+fn schema_objects_equivalent(actual: &[SchemaObject], expected: &[SchemaObject]) -> bool {
+    actual.len() == expected.len()
+        && actual.iter().zip(expected).all(|(actual, expected)| {
+            actual.kind == expected.kind
+                && actual.name == expected.name
+                && actual.table_name == expected.table_name
+                && normalize_schema_sql(&actual.sql) == normalize_schema_sql(&expected.sql)
+        })
+}
+
+/// SQLite preserves the formatting of the DDL used to create an object. Formatting is not part
+/// of the schema's security semantics, so compare token spacing rather than raw source text.
+fn normalize_schema_sql(sql: &str) -> String {
+    let mut normalized = String::with_capacity(sql.len());
+    let mut characters = sql.chars().peekable();
+    let mut quote = None;
+    while let Some(character) = characters.next() {
+        if let Some(terminator) = quote {
+            normalized.push(character);
+            if character == terminator {
+                if characters.peek() == Some(&terminator) {
+                    normalized.push(characters.next().expect("peeked character exists"));
+                } else {
+                    quote = None;
+                }
+            }
+            continue;
+        }
+        match character {
+            '\'' | '"' | '`' => {
+                quote = Some(character);
+                normalized.push(character);
+            }
+            '[' => {
+                quote = Some(']');
+                normalized.push(character);
+            }
+            character if character.is_whitespace() => {
+                while characters.peek().is_some_and(|next| next.is_whitespace()) {
+                    characters.next();
+                }
+                if normalized.chars().last().is_some_and(schema_word_character)
+                    && characters.peek().copied().is_some_and(schema_word_character)
+                {
+                    normalized.push(' ');
+                }
+            }
+            _ => normalized.push(character),
+        }
+    }
+    normalized
+}
+
+fn schema_word_character(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '_' | '$')
 }
 
 mod projects;
@@ -648,6 +707,27 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(persisted, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn canonical_schema_comparison_ignores_sql_formatting() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        migrate(&mut conn).unwrap();
+        let mut snapshot = security_snapshot_from(&conn).unwrap();
+        let original = snapshot.schema.clone();
+        for object in &mut snapshot.schema {
+            object.sql = object.sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        }
+        assert_ne!(snapshot.schema, original);
+        require_canonical_schema(&snapshot).unwrap();
+        assert_ne!(
+            normalize_schema_sql("value TEXT DEFAULT 'a b'"),
+            normalize_schema_sql("value TEXT DEFAULT 'ab'")
+        );
+        assert_ne!(
+            normalize_schema_sql("CREATE TABLE item (value TEXT)"),
+            normalize_schema_sql("CREATE TABLE item (valueTEXT)")
+        );
     }
 
     #[test]

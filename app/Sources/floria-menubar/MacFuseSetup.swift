@@ -1,11 +1,9 @@
 import AppKit
 import SwiftUI
 
-/// First-launch readiness ladder for macFUSE. There is no reliable pre-flight API for
-/// "kext approved": the kext loads lazily on the first mount and the system policy
-/// database needs root. So the ladder is: installed? → let the daemon try to mount →
-/// a healthy agent connection is the proof it worked; a timeout with macFUSE installed
-/// almost always means the system extension still awaits approval.
+/// First-launch readiness ladder for macFUSE. A numbered `/dev/macfuseN` device is
+/// definitive positive evidence that the kernel backend is already available. Its absence
+/// is not definitive until a mount has been attempted because the backend loads lazily.
 enum MacFuseSetupStage: String, Identifiable {
     case installMacFuse
     case approveKext
@@ -16,6 +14,30 @@ enum MacFuseSetupStage: String, Identifiable {
 
     static var isInstalled: Bool {
         FileManager.default.fileExists(atPath: MacFuseSetupStage.filesystemBundlePath)
+    }
+
+    static var isKernelBackendReady: Bool {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: "/dev")) ?? []
+        return kernelBackendReady(deviceNames: names)
+    }
+
+    static func kernelBackendReady(deviceNames: [String]) -> Bool {
+        deviceNames.contains(where: { name in
+            let prefix = "macfuse"
+            guard name.hasPrefix(prefix) else { return false }
+            let suffix = name.dropFirst(prefix.count)
+            return !suffix.isEmpty && suffix.utf8.allSatisfy { (48...57).contains($0) }
+        })
+    }
+
+    /// A daemon can fail for catalog, key, configuration, or launchd reasons. Once the
+    /// numbered device exists, a connection timeout must not be presented as macFUSE setup.
+    static func afterFailedDaemonProbe(
+        isInstalled: Bool,
+        kernelBackendReady: Bool
+    ) -> MacFuseSetupStage? {
+        guard isInstalled else { return .installMacFuse }
+        return kernelBackendReady ? nil : .approveKext
     }
 }
 

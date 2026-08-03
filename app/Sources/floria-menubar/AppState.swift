@@ -208,8 +208,9 @@ final class AppState {
 
     /// Run the macFUSE readiness ladder: not installed → stop the daemon (no crash loop)
     /// and show install guidance; installed → start the daemon and treat an agent
-    /// connection within the timeout as proof the mount works. A failed probe is stopped
-    /// as well: Recheck will make the next deliberate mount attempt after system setup.
+    /// connection within the timeout as proof the mount works. A timeout only becomes
+    /// macFUSE guidance when the kernel device is still absent; otherwise another daemon
+    /// startup error must remain visible as a normal disconnected state.
     private func evaluateMacFuseSetup(timeoutSeconds: Int) {
         macFuseProbeTask?.cancel()
         guard DaemonManager.isProductionApp else { return }
@@ -230,8 +231,13 @@ final class AppState {
                 }
             }
             guard let self, !Task.isCancelled else { return }
-            self.macFuseSetupStage = .approveKext
-            DispatchQueue.global(qos: .utility).async { manager.stop() }
+            let stage = MacFuseSetupStage.afterFailedDaemonProbe(
+                isInstalled: MacFuseSetupStage.isInstalled,
+                kernelBackendReady: MacFuseSetupStage.isKernelBackendReady)
+            self.macFuseSetupStage = stage
+            if stage != nil {
+                DispatchQueue.global(qos: .utility).async { manager.stop() }
+            }
         }
     }
 

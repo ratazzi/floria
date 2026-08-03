@@ -162,7 +162,31 @@ struct DaemonManager: Sendable {
         try plist.write(to: launchAgentURL, options: .atomic)
         try fileManager.setAttributes(
             [.posixPermissions: 0o644], ofItemAtPath: launchAgentURL.path)
-        try runLaunchctl(["bootstrap", "gui/\(getuid())", launchAgentURL.path])
+        try bootstrapLaunchAgent()
+    }
+
+    /// launchd can briefly reject a valid replacement job with EIO immediately after bootout.
+    /// Retrying only that documented status keeps app updates reliable without hiding malformed
+    /// plists, permission failures, or other permanent launchctl errors.
+    private func bootstrapLaunchAgent() throws {
+        var completedAttempts = 0
+
+        while true {
+            completedAttempts += 1
+            do {
+                try runLaunchctl(["bootstrap", "gui/\(getuid())", launchAgentURL.path])
+                return
+            } catch {
+                guard Self.shouldRetryBootstrap(error, completedAttempts: completedAttempts) else {
+                    throw error
+                }
+
+                let delay = min(0.25 * pow(2, Double(completedAttempts - 1)), 2)
+                Self.log.notice(
+                    "launchd is still releasing the previous daemon; retrying bootstrap in \(delay, privacy: .public)s")
+                Thread.sleep(forTimeInterval: delay)
+            }
+        }
     }
 
     private func prepareRuntimeFiles() throws {
@@ -274,6 +298,17 @@ struct DaemonManager: Sendable {
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .contains("state = running")
         return isRunning ? .running : .loaded
+    }
+
+    static func shouldRetryBootstrap(_ error: Error, completedAttempts: Int) -> Bool {
+        guard completedAttempts < 5,
+              case DaemonError.processFailed(
+                  executable: "launchctl", arguments: let arguments, status: 5, output: _) = error,
+              arguments.first == "bootstrap"
+        else {
+            return false
+        }
+        return true
     }
 
     private var currentLaunchAgentState: LaunchAgentState {
