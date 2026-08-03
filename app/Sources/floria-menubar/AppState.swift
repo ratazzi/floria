@@ -208,8 +208,8 @@ final class AppState {
 
     /// Run the macFUSE readiness ladder: not installed → stop the daemon (no crash loop)
     /// and show install guidance; installed → start the daemon and treat an agent
-    /// connection within the timeout as proof the mount works, otherwise assume the
-    /// system extension still needs approval.
+    /// connection within the timeout as proof the mount works. A failed probe is stopped
+    /// as well: Recheck will make the next deliberate mount attempt after system setup.
     private func evaluateMacFuseSetup(timeoutSeconds: Int) {
         macFuseProbeTask?.cancel()
         guard DaemonManager.isProductionApp else { return }
@@ -231,6 +231,7 @@ final class AppState {
             }
             guard let self, !Task.isCancelled else { return }
             self.macFuseSetupStage = .approveKext
+            DispatchQueue.global(qos: .utility).async { manager.stop() }
         }
     }
 
@@ -239,7 +240,9 @@ final class AppState {
     /// kickstarting a loaded job would leave launchd's throttled restart queued and cause a
     /// second unnecessary daemon generation.
     private func scheduleDaemonRecoveryAfterDisconnect() {
-        guard DaemonManager.isProductionApp, MacFuseSetupStage.isInstalled else { return }
+        guard DaemonManager.isProductionApp, MacFuseSetupStage.isInstalled,
+              macFuseSetupStage == nil
+        else { return }
         let manager = daemonManager
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 1) {
             manager.recoverAfterDisconnect()

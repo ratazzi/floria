@@ -1902,6 +1902,15 @@ fn cmd_doctor(config: &Path) -> Result<()> {
     let macfuse = Path::new("/Library/Filesystems/macfuse.fs").exists();
     report("macFUSE installed", macfuse, "/Library/Filesystems/macfuse.fs not found; run `brew install --cask macfuse` and approve the kext");
     ok &= macfuse;
+    if macfuse {
+        let kernel_backend = macfuse_kernel_backend_ready_in(Path::new("/dev"));
+        report(
+            "macFUSE kernel backend ready",
+            kernel_backend,
+            "macFUSE is installed but its kernel device is absent; on Apple silicon, enable third-party kernel extensions in recoveryOS, return to Floria and recheck, then approve macFUSE and restart when macOS asks",
+        );
+        ok &= kernel_backend;
+    }
 
     // 2. Whether the config loads (including permission checks).
     match load(config) {
@@ -1939,7 +1948,7 @@ fn cmd_doctor(config: &Path) -> Result<()> {
                             report("daemon lifecycle (running)", true, "");
                         }
                         (Ok(DaemonLockState::Free), None) => {
-                            report("daemon lifecycle (not running; mount available)", true, "");
+                            report("daemon lifecycle (not running; mount path free)", true, "");
                         }
                         (Ok(DaemonLockState::Free), Some(mount)) if mount.is_floria() => {
                             report(
@@ -2008,6 +2017,23 @@ fn cmd_doctor(config: &Path) -> Result<()> {
     } else {
         anyhow::bail!("doctor found problems (see above)")
     }
+}
+
+fn macfuse_kernel_backend_ready_in(device_directory: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(device_directory) else {
+        return false;
+    };
+    entries
+        .flatten()
+        .any(|entry| is_macfuse_device_name(&entry.file_name()))
+}
+
+fn is_macfuse_device_name(name: &std::ffi::OsStr) -> bool {
+    let bytes = name.as_bytes();
+    let Some(suffix) = bytes.strip_prefix(b"macfuse") else {
+        return false;
+    };
+    !suffix.is_empty() && suffix.iter().all(|byte| byte.is_ascii_digit())
 }
 
 fn report(name: &str, ok: bool, hint: &str) {
@@ -2301,6 +2327,17 @@ mod tests {
         let root = exact_mount(Path::new("/")).unwrap().unwrap();
         assert!(!root.source.is_empty());
         assert!(!root.fs_type.is_empty());
+    }
+
+    #[test]
+    fn macfuse_kernel_backend_requires_a_numbered_device_node() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("macfuse"), b"").unwrap();
+        std::fs::write(dir.path().join("macfuse-control"), b"").unwrap();
+        assert!(!macfuse_kernel_backend_ready_in(dir.path()));
+
+        std::fs::write(dir.path().join("macfuse0"), b"").unwrap();
+        assert!(macfuse_kernel_backend_ready_in(dir.path()));
     }
 
     #[test]

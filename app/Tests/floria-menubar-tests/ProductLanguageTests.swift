@@ -2,6 +2,17 @@ import Foundation
 import XCTest
 
 final class ProductLanguageTests: XCTestCase {
+    func testMacFuseSetupLeadsWithRecoveryAndDoesNotSendUsersToAnEmptyPane() throws {
+        let source = try source("MacFuseSetup.swift")
+
+        XCTAssertTrue(source.contains(#""1. Enable third-party kernel extensions""#))
+        XCTAssertTrue(source.contains(#""2. Approve macFUSE after restarting""#))
+        XCTAssertTrue(source.contains(#""If System Settings has no Allow button yet, that is expected before this step.""#))
+        XCTAssertTrue(source.contains("Do not enable the macFUSE switches under File System Extensions."))
+        XCTAssertTrue(source.contains(#""Copy doctor command""#))
+        XCTAssertFalse(source.contains(#"Button("Open Privacy & Security")"#))
+    }
+
     func testDashboardOffersSafeBackupActionsWithoutDataReplacement() throws {
         let source = try source("CompactDashboardView.swift")
 

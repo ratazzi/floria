@@ -55,6 +55,10 @@ struct MacFuseSetupView: View {
     let stage: MacFuseSetupStage
     @Environment(\.dismiss) private var dismiss
     @State private var copiedCommand = false
+    @State private var copiedDoctorCommand = false
+
+    private static let doctorCommand =
+        #""/Applications/Floria.app/Contents/Resources/floria" doctor --config "$HOME/Library/Application Support/floria/floria.toml""#
 
     private var currentStage: MacFuseSetupStage {
         state.macFuseSetupStage ?? stage
@@ -117,7 +121,7 @@ struct MacFuseSetupView: View {
             .padding(.horizontal, 22)
             .frame(height: 58)
         }
-        .frame(width: 520)
+        .frame(width: 560)
         .onChange(of: state.macFuseSetupStage) { _, stage in
             if stage == nil { dismiss() }
         }
@@ -125,7 +129,7 @@ struct MacFuseSetupView: View {
 
     @ViewBuilder
     private var installContent: some View {
-        Text("macFUSE is not installed. Install it, approve the system extension, then come back and recheck.")
+        Text("macFUSE is not installed. Install it, then complete the two one-time system steps below.")
             .font(.callout)
 
         VStack(alignment: .leading, spacing: 7) {
@@ -157,38 +161,55 @@ struct MacFuseSetupView: View {
 
     @ViewBuilder
     private var approveContent: some View {
-        Text("macFUSE is installed, but the file system could not start. The most common cause is that the system extension has not been approved yet.")
+        Text("macFUSE is installed, but its kernel backend is not ready. On a new Apple silicon Mac, System Settings can show no Allow button until kernel extensions are enabled in recoveryOS first.")
             .font(.callout)
 
         approvalSteps
 
-        Text("Still stuck after approving? Run `floria doctor` in Terminal for a detailed self-check.")
-            .font(.caption)
-            .foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 7) {
+            Text("Still stuck?").font(.callout.weight(.medium))
+            Text("Copy this command into Terminal to check the installed app, key, mount, and macFUSE kernel backend.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(Self.doctorCommand, forType: .string)
+                copiedDoctorCommand = true
+            } label: {
+                Label(
+                    copiedDoctorCommand ? "Doctor command copied" : "Copy doctor command",
+                    systemImage: copiedDoctorCommand ? "checkmark" : "doc.on.doc")
+            }
+        }
     }
 
     @ViewBuilder
     private var approvalSteps: some View {
         VStack(alignment: .leading, spacing: 7) {
-            Text("Approve the kernel extension").font(.callout.weight(.medium))
-            Text("Floria's mount attempts make macOS show a \"System Extension Blocked\" dialog — click \"Open System Settings\" there and Allow, then restart your Mac. Missed the dialog? The approval also lives in System Settings → Privacy & Security, Security section (it only appears while macFUSE is waiting; if there is nothing to allow, see the recoveryOS step below).")
+            Text("1. Enable third-party kernel extensions").font(.callout.weight(.medium))
+            Text("Shut down your Mac, then press and hold the power button until startup options appear. Choose Options → Continue. In recoveryOS, open Utilities → Startup Security Utility, select your startup disk, and choose Security Policy…. Select Reduced Security and enable \"Allow user management of kernel extensions from identified developers\", then restart.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            Button("Open Privacy & Security") {
-                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security") {
-                    NSWorkspace.shared.open(url)
-                }
-            }
+            Text("If System Settings has no Allow button yet, that is expected before this step.")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.orange)
         }
 
-        DisclosureGroup("First kernel extension on this Mac?") {
-            Text("Apple Silicon Macs must once lower their security policy before the approval above appears: shut down, hold the power button to enter recoveryOS, open Startup Security Utility, choose Reduced Security and check \"Allow user management of kernel extensions from identified developers\", then reboot and approve macFUSE as above. This is a one-time step.")
+        VStack(alignment: .leading, spacing: 7) {
+            Text("2. Approve macFUSE after restarting").font(.callout.weight(.medium))
+            Text("Reopen Floria and click Recheck to trigger a new mount attempt. When macOS shows the system-extension alert, use its Open System Settings button, allow macFUSE, and restart when asked.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-                .padding(.top, 4)
+            Text("Do not enable the macFUSE switches under File System Extensions. Those select the FSKit backend; Floria needs the kernel backend to identify the reading process.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Link(
+                "Open the official macFUSE setup guide",
+                destination: URL(string: "https://github.com/macfuse/macfuse/wiki/Getting-Started")!)
+                .font(.caption)
         }
-        .font(.caption.weight(.medium))
     }
 }
