@@ -80,7 +80,7 @@ struct MacFuseSetupView: View {
     @State private var copiedDoctorCommand = false
 
     private static let doctorCommand =
-        #""/Applications/Floria.app/Contents/Resources/floria" doctor --config "$HOME/Library/Application Support/floria/floria.toml""#
+        #""/Applications/Floria.app/Contents/Resources/floria" doctor"#
 
     private var currentStage: MacFuseSetupStage {
         state.macFuseSetupStage ?? stage

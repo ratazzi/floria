@@ -44,6 +44,17 @@ use diagnostics::RuntimeDiagnostics;
 use health::RuntimeHealth;
 use recovery::RuntimeRecoveryKeyExporter;
 
+const RUNTIME_CONFIG_RELATIVE_PATH: &str =
+    "Library/Application Support/floria/floria.toml";
+
+fn default_config_path() -> PathBuf {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .map(|home| home.join(RUNTIME_CONFIG_RELATIVE_PATH))
+        .unwrap_or_else(|| PathBuf::from("floria.toml"))
+}
+
 /// Floria: a userspace filesystem that exposes dynamic content as plain local files (macOS/macFUSE).
 #[derive(Parser)]
 #[command(name = "floria", version, about)]
@@ -56,33 +67,33 @@ struct Cli {
 enum Cmd {
     /// Mount in the foreground (blocks until unmounted).
     Mount {
-        #[arg(short, long, default_value = "floria.toml")]
+        #[arg(short, long, default_value_os_t = default_config_path())]
         config: PathBuf,
     },
     /// Unmount the given mount point.
     Unmount {
         /// Mount point path; defaults to the value from config.
         path: Option<PathBuf>,
-        #[arg(short, long, default_value = "floria.toml")]
+        #[arg(short, long, default_value_os_t = default_config_path())]
         config: PathBuf,
     },
     /// Self-check: macFUSE readiness, mount point, config, and content-source permissions.
     Doctor {
-        #[arg(short, long, default_value = "floria.toml")]
+        #[arg(short, long, default_value_os_t = default_config_path())]
         config: PathBuf,
     },
     /// Protect a regular file in place through the running Floria daemon.
     Protect {
         /// File to protect.
         path: PathBuf,
-        #[arg(short, long, default_value = "floria.toml")]
+        #[arg(short, long, default_value_os_t = default_config_path())]
         config: PathBuf,
     },
     /// Restore a protected file as plaintext and delete its encrypted history.
     Unprotect {
         /// Original path of the protected file, or its id.
         target: String,
-        #[arg(short, long, default_value = "floria.toml")]
+        #[arg(short, long, default_value_os_t = default_config_path())]
         config: PathBuf,
     },
     /// Decrypt a protected secret to stdout (or a file with --to). Accepts a source path or an id.
@@ -95,14 +106,14 @@ enum Cmd {
         /// Write the plaintext here instead of stdout (restores the original mode).
         #[arg(long)]
         to: Option<PathBuf>,
-        #[arg(short, long, default_value = "floria.toml")]
+        #[arg(short, long, default_value_os_t = default_config_path())]
         config: PathBuf,
     },
     /// Show the version history of a protected secret.
     History {
         /// Original path of the protected file, or its store id.
         target: String,
-        #[arg(short, long, default_value = "floria.toml")]
+        #[arg(short, long, default_value_os_t = default_config_path())]
         config: PathBuf,
     },
     /// Roll back a protected secret's head to an earlier version (repoints; nothing is deleted).
@@ -111,12 +122,12 @@ enum Cmd {
         target: String,
         /// Version to make current.
         version: u32,
-        #[arg(short, long, default_value = "floria.toml")]
+        #[arg(short, long, default_value_os_t = default_config_path())]
         config: PathBuf,
     },
     /// List protected secrets.
     List {
-        #[arg(short, long, default_value = "floria.toml")]
+        #[arg(short, long, default_value_os_t = default_config_path())]
         config: PathBuf,
     },
     /// Query the daemon's catalog control plane.
@@ -126,7 +137,7 @@ enum Cmd {
         /// Override the derived control socket path.
         #[arg(long)]
         socket: Option<PathBuf>,
-        #[arg(short, long, default_value = "floria.toml")]
+        #[arg(short, long, default_value_os_t = default_config_path())]
         config: PathBuf,
     },
     /// Create or verify an encrypted backup of all Floria-managed data.
@@ -152,14 +163,14 @@ enum BackupCmd {
     Create {
         /// New directory to create. Existing paths are never overwritten.
         destination: PathBuf,
-        #[arg(short, long, default_value = "floria.toml")]
+        #[arg(short, long, default_value_os_t = default_config_path())]
         config: PathBuf,
     },
     /// Verify checksums, catalog integrity, references, and every encrypted version.
     Verify {
         /// Existing backup directory.
         backup: PathBuf,
-        #[arg(short, long, default_value = "floria.toml")]
+        #[arg(short, long, default_value_os_t = default_config_path())]
         config: PathBuf,
     },
     /// Restore a verified backup into a new standalone data directory.
@@ -168,14 +179,14 @@ enum BackupCmd {
         backup: PathBuf,
         /// New standalone data directory. Existing paths are never overwritten.
         destination: PathBuf,
-        #[arg(short, long, default_value = "floria.toml")]
+        #[arg(short, long, default_value_os_t = default_config_path())]
         config: PathBuf,
     },
     /// Activate a standalone restored data directory after taking a safety backup.
     Activate {
         /// Standalone data directory created by `backup restore`.
         restored: PathBuf,
-        #[arg(short, long, default_value = "floria.toml")]
+        #[arg(short, long, default_value_os_t = default_config_path())]
         config: PathBuf,
     },
 }
@@ -189,7 +200,7 @@ enum DiagnosticsCmd {
         /// Include local file-system paths. Paths are omitted by default.
         #[arg(long)]
         include_paths: bool,
-        #[arg(short, long, default_value = "floria.toml")]
+        #[arg(short, long, default_value_os_t = default_config_path())]
         config: PathBuf,
     },
 }
@@ -203,21 +214,21 @@ enum KeysCmd {
         /// Delete the on-disk private key file after a successful import and verification.
         #[arg(long)]
         remove_file: bool,
-        #[arg(short, long, default_value = "floria.toml")]
+        #[arg(short, long, default_value_os_t = default_config_path())]
         config: PathBuf,
     },
     /// Export the active store key into a password-encrypted recovery file.
     ExportRecovery {
         /// New recovery-key file. Existing paths are never overwritten.
         destination: PathBuf,
-        #[arg(short, long, default_value = "floria.toml")]
+        #[arg(short, long, default_value_os_t = default_config_path())]
         config: PathBuf,
     },
     /// Import a password-encrypted recovery key into an empty Keychain-backed store.
     ImportRecovery {
         /// Recovery-key file created by `keys export-recovery`.
         source: PathBuf,
-        #[arg(short, long, default_value = "floria.toml")]
+        #[arg(short, long, default_value_os_t = default_config_path())]
         config: PathBuf,
     },
 }
@@ -885,7 +896,7 @@ fn enforce_packaged_command_boundary(command: &Cmd) -> Result<()> {
 
 fn packaged_runtime_config_path() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").context("HOME is required for packaged Floria")?;
-    Ok(PathBuf::from(home).join("Library/Application Support/floria/floria.toml"))
+    Ok(PathBuf::from(home).join(RUNTIME_CONFIG_RELATIVE_PATH))
 }
 
 fn packaged_config_path() -> Result<PathBuf> {
@@ -2118,13 +2129,86 @@ mod tests {
         );
     }
 
+    fn parsed_config(args: &[&str]) -> PathBuf {
+        match Cli::try_parse_from(args.iter().copied()).unwrap().command {
+            Cmd::Mount { config }
+            | Cmd::Unmount { config, .. }
+            | Cmd::Doctor { config }
+            | Cmd::Protect { config, .. }
+            | Cmd::Unprotect { config, .. }
+            | Cmd::Reveal { config, .. }
+            | Cmd::History { config, .. }
+            | Cmd::Rollback { config, .. }
+            | Cmd::List { config }
+            | Cmd::Control { config, .. } => config,
+            Cmd::Backup { command } => match command {
+                BackupCmd::Create { config, .. }
+                | BackupCmd::Verify { config, .. }
+                | BackupCmd::Restore { config, .. }
+                | BackupCmd::Activate { config, .. } => config,
+            },
+            Cmd::Diagnostics { command } => match command {
+                DiagnosticsCmd::Export { config, .. } => config,
+            },
+            Cmd::Keys { command } => match command {
+                KeysCmd::Import { config, .. }
+                | KeysCmd::ExportRecovery { config, .. }
+                | KeysCmd::ImportRecovery { config, .. } => config,
+            },
+        }
+    }
+
+    #[test]
+    fn every_cli_command_uses_the_managed_config_by_default_and_allows_an_override() {
+        let commands: &[&[&str]] = &[
+            &["floria", "mount"],
+            &["floria", "unmount"],
+            &["floria", "doctor"],
+            &["floria", "protect", "/tmp/.env"],
+            &["floria", "unprotect", "/tmp/.env"],
+            &["floria", "reveal", "/tmp/.env"],
+            &["floria", "history", "/tmp/.env"],
+            &["floria", "rollback", "/tmp/.env", "1"],
+            &["floria", "list"],
+            &["floria", "control", "ping"],
+            &["floria", "backup", "create", "/tmp/backup"],
+            &["floria", "backup", "verify", "/tmp/backup"],
+            &[
+                "floria",
+                "backup",
+                "restore",
+                "/tmp/backup",
+                "/tmp/restored",
+            ],
+            &["floria", "backup", "activate", "/tmp/restored"],
+            &["floria", "diagnostics", "export", "/tmp/diagnostics"],
+            &["floria", "keys", "import"],
+            &["floria", "keys", "export-recovery", "/tmp/recovery.age"],
+            &["floria", "keys", "import-recovery", "/tmp/recovery.age"],
+        ];
+
+        for args in commands {
+            assert_eq!(parsed_config(args), default_config_path(), "{args:?}");
+        }
+
+        assert_eq!(
+            parsed_config(&[
+                "floria",
+                "doctor",
+                "--config",
+                "/tmp/custom-floria.toml",
+            ]),
+            PathBuf::from("/tmp/custom-floria.toml")
+        );
+    }
+
     #[test]
     fn protect_has_one_managed_lifecycle_without_legacy_storage_switches() {
         let protect = Cli::try_parse_from(["floria", "protect", "/tmp/.env"]).unwrap();
         match protect.command {
             Cmd::Protect { path, config } => {
                 assert_eq!(path, PathBuf::from("/tmp/.env"));
-                assert_eq!(config, PathBuf::from("floria.toml"));
+                assert_eq!(config, default_config_path());
             }
             _ => panic!("expected protect"),
         }
@@ -2140,7 +2224,7 @@ mod tests {
         match unprotect.command {
             Cmd::Unprotect { target, config } => {
                 assert_eq!(target, "/tmp/.env");
-                assert_eq!(config, PathBuf::from("floria.toml"));
+                assert_eq!(config, default_config_path());
             }
             _ => panic!("expected unprotect"),
         }
@@ -2185,7 +2269,7 @@ mod tests {
                 command: BackupCmd::Create { destination, config },
             } => {
                 assert_eq!(destination, PathBuf::from("/tmp/floria-backup"));
-                assert_eq!(config, PathBuf::from("floria.toml"));
+                assert_eq!(config, default_config_path());
             }
             _ => panic!("expected backup create"),
         }
@@ -2197,7 +2281,7 @@ mod tests {
                 command: BackupCmd::Verify { backup, config },
             } => {
                 assert_eq!(backup, PathBuf::from("/tmp/floria-backup"));
-                assert_eq!(config, PathBuf::from("floria.toml"));
+                assert_eq!(config, default_config_path());
             }
             _ => panic!("expected backup verify"),
         }
@@ -2216,7 +2300,7 @@ mod tests {
             } => {
                 assert_eq!(backup, PathBuf::from("/tmp/floria-backup"));
                 assert_eq!(destination, PathBuf::from("/tmp/floria-restored"));
-                assert_eq!(config, PathBuf::from("floria.toml"));
+                assert_eq!(config, default_config_path());
             }
             _ => panic!("expected backup restore"),
         }
@@ -2229,7 +2313,7 @@ mod tests {
                 command: BackupCmd::Activate { restored, config },
             } => {
                 assert_eq!(restored, PathBuf::from("/tmp/floria-restored"));
-                assert_eq!(config, PathBuf::from("floria.toml"));
+                assert_eq!(config, default_config_path());
             }
             _ => panic!("expected backup activate"),
         }
@@ -2255,7 +2339,7 @@ mod tests {
             } => {
                 assert_eq!(destination, PathBuf::from("/tmp/Floria Diagnostics"));
                 assert!(!include_paths);
-                assert_eq!(config, PathBuf::from("floria.toml"));
+                assert_eq!(config, default_config_path());
             }
             _ => panic!("expected diagnostics export"),
         }
@@ -2286,7 +2370,7 @@ mod tests {
                 command: KeysCmd::ExportRecovery { destination, config },
             } => {
                 assert_eq!(destination, PathBuf::from("/tmp/recovery.age"));
-                assert_eq!(config, PathBuf::from("floria.toml"));
+                assert_eq!(config, default_config_path());
             }
             _ => panic!("expected recovery export"),
         }
@@ -2299,7 +2383,7 @@ mod tests {
                 command: KeysCmd::ImportRecovery { source, config },
             } => {
                 assert_eq!(source, PathBuf::from("/tmp/recovery.age"));
-                assert_eq!(config, PathBuf::from("floria.toml"));
+                assert_eq!(config, default_config_path());
             }
             _ => panic!("expected recovery import"),
         }

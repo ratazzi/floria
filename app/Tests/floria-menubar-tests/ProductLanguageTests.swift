@@ -10,6 +10,8 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertTrue(source.contains(#""If System Settings has no Allow button yet, that is expected before this step.""#))
         XCTAssertTrue(source.contains("Do not enable the macFUSE switches under File System Extensions."))
         XCTAssertTrue(source.contains(#""Copy doctor command""#))
+        XCTAssertTrue(source.contains(#""/Applications/Floria.app/Contents/Resources/floria" doctor"#))
+        XCTAssertFalse(source.contains("doctor --config"))
         XCTAssertFalse(source.contains(#"Button("Open Privacy & Security")"#))
     }
 
