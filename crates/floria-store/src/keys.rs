@@ -99,12 +99,7 @@ impl KeychainKeyProvider {
     fn read_key() -> StoreResult<Zeroizing<Vec<u8>>> {
         security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
             .map(Zeroizing::new)
-            .map_err(|e| {
-                StoreError::Key(format!(
-                    "read Keychain item {KEYCHAIN_SERVICE}/{KEYCHAIN_ACCOUNT}: {e} \
-                     (run `floria keys import` to store the key)"
-                ))
-            })
+            .map_err(keychain_read_error)
     }
 
     pub fn export_private_key() -> StoreResult<Zeroizing<Vec<u8>>> {
@@ -210,6 +205,21 @@ impl KeychainKeyProvider {
     }
 }
 
+fn keychain_read_error(error: security_framework::base::Error) -> StoreError {
+    if error.code() == security_framework_sys::base::errSecItemNotFound {
+        StoreError::Key(format!(
+            "Keychain item {KEYCHAIN_SERVICE}/{KEYCHAIN_ACCOUNT} is missing \
+             (run `floria keys import` to store or restore the key)"
+        ))
+    } else {
+        StoreError::Key(format!(
+            "cannot read Keychain item {KEYCHAIN_SERVICE}/{KEYCHAIN_ACCOUNT}: {error}; \
+             unlock the login Keychain and run the installed Floria app so macOS can authorize \
+             access (do not import a replacement key unless the item is genuinely missing)"
+        ))
+    }
+}
+
 fn store_root_has_data(root: &Path) -> StoreResult<bool> {
     let entries = match std::fs::read_dir(root) {
         Ok(entries) => entries,
@@ -286,6 +296,22 @@ impl age::Callbacks for PassCallbacks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keychain_read_errors_only_suggest_import_when_the_item_is_missing() {
+        let missing = keychain_read_error(security_framework::base::Error::from_code(
+            security_framework_sys::base::errSecItemNotFound,
+        ))
+        .to_string();
+        assert!(missing.contains("keys import"));
+
+        // errSecInteractionNotAllowed is not exported by security-framework-sys.
+        let inaccessible =
+            keychain_read_error(security_framework::base::Error::from_code(-25308)).to_string();
+        assert!(inaccessible.contains("run the installed Floria app"));
+        assert!(inaccessible.contains("do not import a replacement key"));
+        assert!(!inaccessible.contains("keys import"));
+    }
 
     #[test]
     fn missing_or_lock_only_store_is_safe_for_first_key_generation() {
