@@ -15,6 +15,8 @@
 mod reply;
 mod read_session;
 mod tree;
+#[cfg(all(target_os = "macos", not(feature = "macos-no-mount")))]
+mod macos_mount;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -1632,19 +1634,25 @@ pub fn mount_with_audit(
         files = cfg.files.len(),
         "mounting floria"
     );
-    let session = fuser::spawn_mount2(fs, &mount_point, &config)?;
-
     let (tx, rx) = std::sync::mpsc::channel();
     ctrlc::set_handler(move || {
         let _ = tx.send(());
     })
     .map_err(|e| anyhow::anyhow!("install signal handler: {e}"))?;
 
+    #[cfg(all(target_os = "macos", not(feature = "macos-no-mount")))]
+    let session = macos_mount::spawn(fs, &mount_point, &config)?;
+    #[cfg(not(all(target_os = "macos", not(feature = "macos-no-mount"))))]
+    let session = fuser::spawn_mount2(fs, &mount_point, &config)?;
+
     tracing::info!("mounted; press Ctrl-C to unmount");
     let _ = rx.recv();
 
     tracing::info!(mount = %mount_point.display(), "unmounting");
-    drop(session); // BackgroundSession unmounts on drop
+    #[cfg(all(target_os = "macos", not(feature = "macos-no-mount")))]
+    session.unmount_and_join()?;
+    #[cfg(not(all(target_os = "macos", not(feature = "macos-no-mount"))))]
+    drop(session); // fuser's mounted BackgroundSession unmounts on drop.
     Ok(())
 }
 
