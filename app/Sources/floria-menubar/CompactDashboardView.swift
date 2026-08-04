@@ -58,6 +58,7 @@ private struct ProjectEventMatcher {
 }
 
 private enum DashboardIssueAction {
+    case reconnectDaemon
     case reload
     case openWorkspace
 }
@@ -713,7 +714,7 @@ struct DashboardView: View {
                 DashboardIssue(
                     id: "daemon", title: "Floria daemon is offline",
                     detail: "Some Managed items may be unavailable.",
-                    actionTitle: "Retry", action: .reload))
+                    actionTitle: "Retry", action: .reconnectDaemon))
         }
         if let error = state.workspace.lastError {
             result.append(
@@ -830,6 +831,8 @@ struct DashboardView: View {
 
     private func handle(_ action: DashboardIssueAction) {
         switch action {
+        case .reconnectDaemon:
+            state.recheckMacFuseSetup()
         case .reload:
             reload()
         case .openWorkspace:

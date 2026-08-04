@@ -30,6 +30,10 @@ final class DaemonManagerTests: XCTestCase {
         """
 
         XCTAssertEqual(DaemonManager.launchAgentState(from: output), .loaded)
+        XCTAssertEqual(
+            DaemonManager.launchAgentStatus(from: output),
+            DaemonManager.LaunchAgentStatus(state: .loaded, runs: 3, lastExitCode: 1))
+        XCTAssertTrue(DaemonManager.launchAgentStatus(from: output).hasFailedRun)
     }
 
     func testLaunchAgentStateIsLoadedWhenLaunchdOmitsState() {
@@ -41,6 +45,19 @@ final class DaemonManagerTests: XCTestCase {
         """
 
         XCTAssertEqual(DaemonManager.launchAgentState(from: output), .loaded)
+        XCTAssertFalse(DaemonManager.launchAgentStatus(from: output).hasFailedRun)
+    }
+
+    func testRunningLaunchAgentIsNotTreatedAsAFailedStartup() {
+        let output = """
+        gui/501/floria.hola.ac.daemon = {
+            state = running
+            runs = 2
+            last exit code = 1
+        }
+        """
+
+        XCTAssertFalse(DaemonManager.launchAgentStatus(from: output).hasFailedRun)
     }
 
     func testBootstrapRetriesLaunchdInputOutputRace() {

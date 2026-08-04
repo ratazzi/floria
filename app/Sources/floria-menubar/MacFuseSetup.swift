@@ -7,6 +7,7 @@ import SwiftUI
 enum MacFuseSetupStage: String, Identifiable {
     case installMacFuse
     case approveKext
+    case mountFailed
 
     var id: String { rawValue }
 
@@ -30,6 +31,33 @@ enum MacFuseSetupStage: String, Identifiable {
         })
     }
 
+    static var isFloriaMounted: Bool {
+        let mountPath = (NSHomeDirectory() as NSString).appendingPathComponent(".floria")
+        var status = statfs()
+        guard statfs(mountPath, &status) == 0 else { return false }
+        let typeName = withUnsafePointer(to: &status.f_fstypename) { pointer in
+            pointer.withMemoryRebound(to: CChar.self, capacity: Int(MFSNAMELEN)) {
+                String(cString: $0)
+            }
+        }
+        return filesystemIsMacFuse(typeName: typeName)
+    }
+
+    static func filesystemIsMacFuse(typeName: String) -> Bool {
+        typeName == "macfuse" || typeName == "osxfuse"
+    }
+
+    /// The daemon opens its agent socket before entering the blocking FUSE mount call. A brief
+    /// GUI connection therefore proves only that startup reached the agent, not that macFUSE
+    /// accepted the mount. Require the numbered kernel device as independent readiness proof.
+    static func daemonConnectionProvesReady(
+        connected: Bool,
+        kernelBackendReady: Bool,
+        floriaMounted: Bool
+    ) -> Bool {
+        connected && kernelBackendReady && floriaMounted
+    }
+
     /// A daemon can fail for catalog, key, configuration, or launchd reasons. Once the
     /// numbered device exists, a connection timeout must not be presented as macFUSE setup.
     static func afterFailedDaemonProbe(
@@ -37,12 +65,13 @@ enum MacFuseSetupStage: String, Identifiable {
         kernelBackendReady: Bool
     ) -> MacFuseSetupStage? {
         guard isInstalled else { return .installMacFuse }
-        return kernelBackendReady ? nil : .approveKext
+        return kernelBackendReady ? .mountFailed : .approveKext
     }
 }
 
 /// Compact menubar hint that setup is pending; the dashboard sheet carries the details.
 struct MacFuseSetupBanner: View {
+    let stage: MacFuseSetupStage
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
@@ -54,8 +83,9 @@ struct MacFuseSetupBanner: View {
                 Image(systemName: "externaldrive.badge.exclamationmark")
                     .foregroundStyle(.orange)
                 VStack(alignment: .leading, spacing: 1) {
-                    Text("macFUSE setup required").font(.callout.weight(.medium))
-                    Text("Floria is paused until the file system is ready. Click for instructions.")
+                    Text(stage == .mountFailed ? "Floria could not start" : "macFUSE setup required")
+                        .font(.callout.weight(.medium))
+                    Text("Floria is paused until the file system is ready. Click for details.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -78,9 +108,12 @@ struct MacFuseSetupView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var copiedCommand = false
     @State private var copiedDoctorCommand = false
+    @State private var copiedManualLoadCommand = false
 
     private static let doctorCommand =
         #""/Applications/Floria.app/Contents/Resources/floria" doctor"#
+    private static let manualLoadCommand =
+        "/usr/bin/sudo /usr/bin/kmutil load -p /Library/Filesystems/macfuse.fs/Contents/Extensions/26/macfuse.kext"
 
     private var currentStage: MacFuseSetupStage {
         state.macFuseSetupStage ?? stage
@@ -95,8 +128,12 @@ struct MacFuseSetupView: View {
                     .frame(width: 42, height: 42)
                     .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 11))
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Set Up macFUSE").font(.title2.bold())
-                    Text("Floria needs the macFUSE file system to serve your secrets as local files.")
+                    Text(currentStage == .mountFailed ? "Floria Couldn’t Start" : "Set Up macFUSE")
+                        .font(.title2.bold())
+                    Text(
+                        currentStage == .mountFailed
+                            ? "macFUSE is ready, but Floria did not finish mounting."
+                            : "Floria needs the macFUSE file system to serve your secrets as local files.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -111,6 +148,8 @@ struct MacFuseSetupView: View {
                     installContent
                 case .approveKext:
                     approveContent
+                case .mountFailed:
+                    mountFailedContent
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -206,6 +245,35 @@ struct MacFuseSetupView: View {
     }
 
     @ViewBuilder
+    private var mountFailedContent: some View {
+        Text("The macFUSE kernel backend is available, but Floria did not finish starting its file system. No recoveryOS or System Settings action is needed for this state.")
+            .font(.callout)
+
+        VStack(alignment: .leading, spacing: 7) {
+            Text("Check for a Keychain prompt").font(.callout.weight(.medium))
+            Text("If macOS is asking Floria to access an item in your login Keychain, enter this Mac’s login password and choose Always Allow. Development builds can require this again after the app is replaced. Then return here and click Recheck.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Text("Collect the startup diagnosis").font(.callout.weight(.medium))
+            Text("Click Recheck to retry once. If it still fails, copy this command into Terminal and keep its complete output; it checks the installed app, key, mount, daemon, and macFUSE backend without revealing secret plaintext.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(Self.doctorCommand, forType: .string)
+                copiedDoctorCommand = true
+            } label: {
+                Label(
+                    copiedDoctorCommand ? "Doctor command copied" : "Copy doctor command",
+                    systemImage: copiedDoctorCommand ? "checkmark" : "doc.on.doc")
+            }
+        }
+    }
+
+    @ViewBuilder
     private var approvalSteps: some View {
         VStack(alignment: .leading, spacing: 7) {
             Text("1. Enable third-party kernel extensions").font(.callout.weight(.medium))
@@ -228,6 +296,19 @@ struct MacFuseSetupView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            Text("No alert or Allow button after Recheck? Run the official macFUSE troubleshooting command in Terminal, enter your administrator password, then return to Privacy & Security.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(Self.manualLoadCommand, forType: .string)
+                copiedManualLoadCommand = true
+            } label: {
+                Label(
+                    copiedManualLoadCommand ? "Manual load command copied" : "Copy manual load command",
+                    systemImage: copiedManualLoadCommand ? "checkmark" : "terminal")
+            }
             Link(
                 "Open the official macFUSE setup guide",
                 destination: URL(string: "https://github.com/macfuse/macfuse/wiki/Getting-Started")!)

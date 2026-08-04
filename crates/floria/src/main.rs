@@ -918,6 +918,7 @@ fn cmd_mount(config: &Path) -> Result<()> {
         .with_context(|| format!("creating mount point {}", cfg.mount_path.display()))?;
     let support_dir = support_dir(&cfg)?.to_path_buf();
     let _instance = DaemonInstance::acquire(&support_dir)?;
+    tracing::info!("checking the dedicated Floria store key in the login Keychain");
     initialize_store_key_if_needed(&cfg)?;
     recover_stale_mount(&cfg.mount_path)?;
     let catalog_path = support_dir.join("catalog.sqlite");
@@ -1952,6 +1953,14 @@ fn cmd_doctor(config: &Path) -> Result<()> {
                 }
             }
 
+            match validate_existing_audit_log(&cfg.audit_log) {
+                Ok(()) => report("audit log permissions", true, ""),
+                Err(error) => {
+                    report("audit log permissions", false, &format!("{error:#}"));
+                    ok = false;
+                }
+            }
+
             match (support_dir(&cfg), exact_mount(&cfg.mount_path)) {
                 (Ok(support_dir), Ok(mount)) => {
                     match (daemon_lock_state(support_dir), mount) {
@@ -2028,6 +2037,38 @@ fn cmd_doctor(config: &Path) -> Result<()> {
     } else {
         anyhow::bail!("doctor found problems (see above)")
     }
+}
+
+fn validate_existing_audit_log(path: &Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("inspecting audit log {}", path.display()));
+        }
+    };
+    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+        anyhow::bail!("audit log must be a regular file: {}", path.display());
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        anyhow::bail!(
+            "audit log must be owned by the current user: {}",
+            path.display()
+        );
+    }
+    let mode = metadata.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        anyhow::bail!(
+            "audit log must be private, found mode {mode:04o}: {}; run `chmod 600 {}`",
+            path.display(),
+            shell_quote(path)
+        );
+    }
+    Ok(())
+}
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
 }
 
 fn macfuse_kernel_backend_ready_in(device_directory: &Path) -> bool {
@@ -2422,6 +2463,22 @@ mod tests {
 
         std::fs::write(dir.path().join("macfuse0"), b"").unwrap();
         assert!(macfuse_kernel_backend_ready_in(dir.path()));
+    }
+
+    #[test]
+    fn doctor_accepts_a_missing_or_private_audit_log_and_rejects_public_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let audit = dir.path().join("audit log.jsonl");
+
+        validate_existing_audit_log(&audit).unwrap();
+        std::fs::write(&audit, b"").unwrap();
+        std::fs::set_permissions(&audit, std::fs::Permissions::from_mode(0o600)).unwrap();
+        validate_existing_audit_log(&audit).unwrap();
+
+        std::fs::set_permissions(&audit, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let error = validate_existing_audit_log(&audit).unwrap_err().to_string();
+        assert!(error.contains("found mode 0644"), "{error}");
+        assert!(error.contains("chmod 600 '"), "{error}");
     }
 
     #[test]

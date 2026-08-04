@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import os
 
 /// One line of the recent-access list, decoded from an AccessEvent.
 struct RecentAccess: Identifiable {
@@ -67,6 +68,10 @@ struct RecentAccess: Identifiable {
 /// App-wide observable state: agent connection, recent access feed, prompt dispatch.
 @Observable @MainActor
 final class AppState {
+    private static let setupLog = Logger(
+        subsystem: ProductIdentity.bundleIdentifier,
+        category: "macfuse-setup")
+
     var connected = false
     /// Non-nil while macFUSE setup is incomplete; drives the setup sheet.
     var macFuseSetupStage: MacFuseSetupStage?
@@ -115,12 +120,6 @@ final class AppState {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.connected = up
-                if up, !self.macFusePreview {
-                    // A live agent connection is definitive proof the mount is up; any
-                    // pending macFUSE setup guidance is obsolete.
-                    self.macFuseSetupStage = nil
-                    self.macFuseProbeTask?.cancel()
-                }
                 if up {
                     Task {
                         await self.workspace.reload()
@@ -207,27 +206,67 @@ final class AppState {
     }
 
     /// Run the macFUSE readiness ladder: not installed → stop the daemon (no crash loop)
-    /// and show install guidance; installed → start the daemon and treat an agent
-    /// connection within the timeout as proof the mount works. A timeout only becomes
-    /// macFUSE guidance when the kernel device is still absent; otherwise another daemon
-    /// startup error must remain visible as a normal disconnected state.
+    /// and show install guidance; installed → start the daemon and require an agent connection,
+    /// a numbered kernel device, and an actual Floria macFUSE mount. The agent socket opens
+    /// before the blocking mount call, so a connection and global device nodes are not sufficient.
+    /// A missing numbered device is
+    /// shown after the first probe second so setup does not look inert while launchd, Keychain,
+    /// or macFUSE is waiting; the sheet remains provisional and closes only after the mount exists.
+    /// Once the numbered device exists, another startup error is shown as a daemon mount failure.
     private func evaluateMacFuseSetup(timeoutSeconds: Int) {
         macFuseProbeTask?.cancel()
         guard DaemonManager.isProductionApp else { return }
         let manager = daemonManager
         guard MacFuseSetupStage.isInstalled else {
+            Self.setupLog.notice("macFUSE setup probe found no installation")
             macFuseSetupStage = .installMacFuse
             DispatchQueue.global(qos: .utility).async { manager.stop() }
             return
         }
+        Self.setupLog.notice(
+            "macFUSE setup probe started; kernel_backend_ready=\(MacFuseSetupStage.isKernelBackendReady, privacy: .public) timeout_seconds=\(timeoutSeconds, privacy: .public)")
         DispatchQueue.global(qos: .utility).async { manager.ensureRunning() }
         macFuseProbeTask = Task { @MainActor [weak self] in
-            for _ in 0..<timeoutSeconds {
+            var loggedPremountConnection = false
+            var observedFailedRun = false
+            for elapsedSeconds in 0..<timeoutSeconds {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 guard let self, !Task.isCancelled else { return }
-                if self.connected {
+                let kernelBackendReady = MacFuseSetupStage.isKernelBackendReady
+                let floriaMounted = MacFuseSetupStage.isFloriaMounted
+                if MacFuseSetupStage.daemonConnectionProvesReady(
+                    connected: self.connected,
+                    kernelBackendReady: kernelBackendReady,
+                    floriaMounted: floriaMounted)
+                {
+                    Self.setupLog.notice("macFUSE setup probe observed the live Floria mount")
                     self.macFuseSetupStage = nil
                     return
+                }
+                if self.connected && !floriaMounted && !loggedPremountConnection {
+                    Self.setupLog.notice(
+                        "ignoring a pre-mount agent connection until the Floria mount is live")
+                    loggedPremountConnection = true
+                }
+                if elapsedSeconds == 0 && !kernelBackendReady {
+                    Self.setupLog.notice(
+                        "presenting provisional macFUSE setup guidance after one probe second")
+                    self.macFuseSetupStage = .approveKext
+                }
+                // launchd reports a completed non-zero run as soon as the mount attempt exits.
+                // After a short grace period, use that result instead of making a known-failed
+                // setup wait through the full timeout before showing actionable guidance.
+                if elapsedSeconds >= 1 {
+                    let failed = await Task.detached(priority: .utility) {
+                        manager.startupAttemptHasFailed()
+                    }.value
+                    guard !Task.isCancelled else { return }
+                    if failed {
+                        Self.setupLog.notice(
+                            "macFUSE setup probe observed a failed LaunchAgent run")
+                        observedFailedRun = true
+                        break
+                    }
                 }
             }
             guard let self, !Task.isCancelled else { return }
@@ -235,8 +274,14 @@ final class AppState {
                 isInstalled: MacFuseSetupStage.isInstalled,
                 kernelBackendReady: MacFuseSetupStage.isKernelBackendReady)
             self.macFuseSetupStage = stage
-            if stage != nil {
+            if stage == .approveKext || observedFailedRun {
+                Self.setupLog.notice("macFUSE setup probe pausing the daemon")
                 DispatchQueue.global(qos: .utility).async { manager.stop() }
+            } else if stage == .mountFailed {
+                // A still-running process may be waiting for the login Keychain authorization
+                // dialog. Keep it alive so approving that dialog can resume this exact startup.
+                Self.setupLog.notice(
+                    "Floria has not mounted yet; leaving the running daemon available to resume")
             }
         }
     }

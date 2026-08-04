@@ -101,8 +101,8 @@ struct MenuBarView: View {
     var body: some View {
         VStack(spacing: 0) {
             MenuBarHeader(searchText: $searchText, countLabel: countLabel)
-            if state.macFuseSetupStage != nil {
-                MacFuseSetupBanner()
+            if let stage = state.macFuseSetupStage {
+                MacFuseSetupBanner(stage: stage)
                 Divider()
             }
             PolicyModeControl(

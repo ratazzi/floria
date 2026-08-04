@@ -284,20 +284,45 @@ struct DaemonManager: Sendable {
             fromPropertyList: plist, format: .xml, options: 0)
     }
 
-    enum LaunchAgentState: Equatable {
+    enum LaunchAgentState: Equatable, Sendable {
         case notLoaded
         case loaded
         case running
     }
 
-    static func launchAgentState(from output: String?) -> LaunchAgentState {
-        guard let output else { return .notLoaded }
+    struct LaunchAgentStatus: Equatable, Sendable {
+        let state: LaunchAgentState
+        let runs: Int
+        let lastExitCode: Int?
 
-        let isRunning = output
+        var hasFailedRun: Bool {
+            state != .running && runs > 0 && lastExitCode.map { $0 != 0 } == true
+        }
+    }
+
+    static func launchAgentStatus(from output: String?) -> LaunchAgentStatus {
+        guard let output else {
+            return LaunchAgentStatus(state: .notLoaded, runs: 0, lastExitCode: nil)
+        }
+
+        let lines = output
             .split(whereSeparator: \.isNewline)
             .map { $0.trimmingCharacters(in: .whitespaces) }
-            .contains("state = running")
-        return isRunning ? .running : .loaded
+        let isRunning = lines.contains("state = running")
+        return LaunchAgentStatus(
+            state: isRunning ? .running : .loaded,
+            runs: integerValue(named: "runs", in: lines) ?? 0,
+            lastExitCode: integerValue(named: "last exit code", in: lines))
+    }
+
+    static func launchAgentState(from output: String?) -> LaunchAgentState {
+        launchAgentStatus(from: output).state
+    }
+
+    private static func integerValue(named name: String, in lines: [String]) -> Int? {
+        let prefix = "\(name) = "
+        guard let line = lines.first(where: { $0.hasPrefix(prefix) }) else { return nil }
+        return Int(line.dropFirst(prefix.count))
     }
 
     static func shouldRetryBootstrap(_ error: Error, completedAttempts: Int) -> Bool {
@@ -313,6 +338,12 @@ struct DaemonManager: Sendable {
 
     private var currentLaunchAgentState: LaunchAgentState {
         Self.launchAgentState(from: try? runLaunchctl(["print", serviceTarget]))
+    }
+
+    /// A completed non-zero launchd run is stronger evidence than waiting for the entire
+    /// connection timeout. Setup can react as soon as the first mount attempt has failed.
+    func startupAttemptHasFailed() -> Bool {
+        Self.launchAgentStatus(from: try? runLaunchctl(["print", serviceTarget])).hasFailedRun
     }
 
     @discardableResult

@@ -9,10 +9,41 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertTrue(source.contains(#""2. Approve macFUSE after restarting""#))
         XCTAssertTrue(source.contains(#""If System Settings has no Allow button yet, that is expected before this step.""#))
         XCTAssertTrue(source.contains("Do not enable the macFUSE switches under File System Extensions."))
+        XCTAssertTrue(source.contains("No alert or Allow button after Recheck?"))
+        XCTAssertTrue(source.contains(#""Copy manual load command""#))
+        XCTAssertTrue(
+            source.contains(
+                "/usr/bin/sudo /usr/bin/kmutil load -p /Library/Filesystems/macfuse.fs/Contents/Extensions/26/macfuse.kext"))
         XCTAssertTrue(source.contains(#""Copy doctor command""#))
         XCTAssertTrue(source.contains(#""/Applications/Floria.app/Contents/Resources/floria" doctor"#))
         XCTAssertFalse(source.contains("doctor --config"))
         XCTAssertFalse(source.contains(#"Button("Open Privacy & Security")"#))
+    }
+
+    func testOfflineDaemonRetryActuallyReconcilesTheDaemon() throws {
+        let source = try source("CompactDashboardView.swift")
+
+        XCTAssertTrue(source.contains("case reconnectDaemon"))
+        XCTAssertTrue(source.contains(#"actionTitle: "Retry", action: .reconnectDaemon"#))
+        XCTAssertTrue(source.contains("state.recheckMacFuseSetup()"))
+    }
+
+    func testMissingKernelDeviceIsPresentedDuringTheProbeInsteadOfAfterTheFullTimeout() throws {
+        let source = try source("AppState.swift")
+
+        XCTAssertTrue(source.contains("elapsedSeconds == 0 && !kernelBackendReady"))
+        XCTAssertTrue(source.contains("self.macFuseSetupStage = .approveKext"))
+    }
+
+    func testSetupDismissalRequiresTheActualFloriaMount() throws {
+        let state = try source("AppState.swift")
+        let setup = try source("MacFuseSetup.swift")
+
+        XCTAssertTrue(state.contains("floriaMounted: floriaMounted"))
+        XCTAssertTrue(state.contains("observed the live Floria mount"))
+        XCTAssertFalse(state.contains("A live agent connection is definitive proof the mount is up"))
+        XCTAssertTrue(setup.contains("connected && kernelBackendReady && floriaMounted"))
+        XCTAssertTrue(setup.contains("No recoveryOS or System Settings action is needed"))
     }
 
     func testDashboardOffersSafeBackupActionsWithoutDataReplacement() throws {
