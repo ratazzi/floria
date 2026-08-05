@@ -1142,7 +1142,8 @@ fn create_discovered_surface(
         }
     }
     catalog.upsert_surface(surface)?;
-    if let Err(error) = ensure_file_surface_link(surface, mount_path) {
+    let snapshot = catalog.snapshot()?;
+    if let Err(error) = ensure_file_surface_link_in_snapshot(&snapshot, surface, mount_path) {
         let _ = catalog.remove_surface(&surface.id);
         let _ = std::fs::remove_file(path);
         return Err(DispatchError::Validation(error.to_string()));
@@ -1402,7 +1403,8 @@ pub(super) fn replace_discovered_file_with_surface(
         let _ = std::fs::rename(&backup, path);
         return Err(DispatchError::Catalog(error));
     }
-    if let Err(error) = ensure_file_surface_link(surface, mount_path) {
+    let snapshot = catalog.snapshot()?;
+    if let Err(error) = ensure_file_surface_link_in_snapshot(&snapshot, surface, mount_path) {
         let _ = catalog.remove_surface(&surface.id);
         let _ = std::fs::rename(&backup, path);
         return Err(DispatchError::Validation(error.to_string()));
@@ -1503,6 +1505,12 @@ pub(super) fn discovery_review_plan(
 ) -> Result<DiscoveryReviewPlan, DispatchError> {
     let snapshot = catalog.snapshot()?;
     let configured_secret_ids = snapshot.file_surface_secret_ids();
+    let records = store.list()?;
+    let managed_links = match mount_path {
+        Some(mount_path) => managed_file_links(&snapshot, &records, mount_path)
+            .map_err(|error| DispatchError::Validation(error.to_string()))?,
+        None => Vec::new(),
+    };
     let mut managed_items = Vec::new();
 
     for surface in snapshot.surfaces.iter().filter(|surface| surface.kind.is_file()) {
@@ -1522,11 +1530,7 @@ pub(super) fn discovery_review_plan(
             .iter()
             .find(|project| project.id == environment.project_id)
             .map(|project| project.path.clone());
-        let expected_target = mount_path.map(|mount_path| {
-            mount_path
-                .join(floria_core::config::SURFACES_DIR)
-                .join(&surface.id)
-        });
+        let managed_link = managed_links.iter().find(|link| link.path() == path);
         managed_items.push(DiscoveryManagedItem {
             id: surface.id.clone(),
             path: path.to_path_buf(),
@@ -1538,12 +1542,13 @@ pub(super) fn discovery_review_plan(
             project_path,
             environment: Some(environment.name.clone()),
             kind: DiscoveryManagedItemKind::Surface,
-            status: discovery_managed_path_status(path, expected_target.as_deref()),
+            status: discovery_managed_path_status(path, managed_link),
         });
     }
 
-    for record in store.list()? {
-        let SecretOrigin::File { source_path } = record.origin else { continue };
+    for record in records {
+        let SecretOrigin::File { source_path } = &record.origin else { continue };
+        let source_path = source_path.clone();
         if configured_secret_ids.contains(record.id.as_str()) {
             continue;
         }
@@ -1559,13 +1564,8 @@ pub(super) fn discovery_review_plan(
             })
             .max_by_key(|project| project.path.components().count())
             .map(|project| project.path.clone());
-        let expected_target = mount_path.map(|mount_path| {
-            mount_path
-                .join(floria_core::config::SECRETS_DIR)
-                .join(record.id.to_string())
-        });
-        let status =
-            discovery_managed_path_status(&source_path, expected_target.as_deref());
+        let managed_link = managed_links.iter().find(|link| link.path() == source_path);
+        let status = discovery_managed_path_status(&source_path, managed_link);
         managed_items.push(DiscoveryManagedItem {
             id: record.id.to_string(),
             relative_path: discovery_relative_path(
@@ -1651,12 +1651,14 @@ fn discovery_normalized_path(path: &Path) -> PathBuf {
 
 fn discovery_managed_path_status(
     path: &Path,
-    expected_target: Option<&Path>,
+    managed_link: Option<&ManagedSymlink>,
 ) -> ManagedLinkStatus {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             let target = std::fs::read_link(path).ok();
-            if expected_target.is_none_or(|expected| target.as_deref() == Some(expected)) {
+            if managed_link.is_none_or(|link| {
+                target.as_deref().is_some_and(|target| link.owns_target(target))
+            }) {
                 ManagedLinkStatus::Linked
             } else {
                 ManagedLinkStatus::Replaced

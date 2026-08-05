@@ -979,6 +979,7 @@ mod tests {
             ManagedPolicyItem {
                 object: ManagedObject::Surface {
                     surface_id: "fixture-agent".to_string(),
+                    item_id: "fixture-agent".to_string(),
                 },
                 enforcement: Enforcement::TouchId,
             },
@@ -1172,7 +1173,10 @@ mod tests {
             .unwrap();
 
         let surface = ManagedPolicyItem {
-            object: ManagedObject::Surface { surface_id: "fixture".to_string() },
+            object: ManagedObject::Surface {
+                surface_id: "fixture".to_string(),
+                item_id: "fixture".to_string(),
+            },
             enforcement: Enforcement::Allow,
         };
         agent.replace_managed_policy(vec![

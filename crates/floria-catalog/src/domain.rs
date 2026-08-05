@@ -519,37 +519,57 @@ pub struct CatalogSnapshot {
 }
 
 impl CatalogSnapshot {
+    /// Stable identity used by the public `items/` namespace for a file Surface.
+    ///
+    /// A direct Env File is a configured view of an existing protected file, so it retains the
+    /// backing Secret id. Other Surfaces are independently created Managed Items and use their
+    /// own stable Surface id.
+    pub fn managed_item_id_for_surface<'a>(&'a self, surface: &'a Surface) -> &'a str {
+        if !surface.kind.is_file() {
+            return &surface.id;
+        }
+        let resource_id = match &surface.input {
+            SurfaceInput::Resource { resource_id } => Some(resource_id.as_str()),
+            SurfaceInput::Bindings { binding_ids } if binding_ids.len() == 1 => self
+                .bindings
+                .iter()
+                .find(|binding| binding.id == binding_ids[0])
+                .map(|binding| binding.resource_id.as_str()),
+            _ => None,
+        };
+        let Some(resource_id) = resource_id else {
+            return &surface.id;
+        };
+        self.resources
+            .iter()
+            .find(|resource| {
+                resource.id == resource_id
+                    && resource.kind == ResourceKind::EnvFile
+                    && surface.path.as_ref().is_some_and(|surface_path| {
+                        resource
+                            .origin
+                            .sources
+                            .iter()
+                            .any(|source| source.path == *surface_path)
+                    })
+            })
+            .and_then(|resource| match &resource.source {
+                ResourceSource::SecretRef { secret_id } => Some(secret_id.as_str()),
+                _ => None,
+            })
+            .unwrap_or(&surface.id)
+    }
+
     /// Stored secrets whose former file-origin path is now represented by a configured file
     /// surface. This is the semantic boundary between byte-preserving managed files and
     /// explicitly configured outputs.
     pub fn file_surface_secret_ids(&self) -> HashSet<&str> {
-        let mut resource_ids = HashSet::<&str>::new();
-        for surface in self.surfaces.iter().filter(|surface| surface.kind.is_file()) {
-            match &surface.input {
-                SurfaceInput::Resource { resource_id } => {
-                    resource_ids.insert(resource_id);
-                }
-                SurfaceInput::Bindings { binding_ids }
-                | SurfaceInput::SshAgent { binding_ids, .. } => {
-                    for binding in self
-                        .bindings
-                        .iter()
-                        .filter(|binding| binding_ids.contains(&binding.id))
-                    {
-                        resource_ids.insert(&binding.resource_id);
-                    }
-                }
-            }
-        }
-        self.resources
+        self.surfaces
             .iter()
-            .filter(|resource| resource_ids.contains(resource.id.as_str()))
-            .filter_map(|resource| match &resource.source {
-                ResourceSource::SecretRef { secret_id } => Some(secret_id.as_str()),
-                ResourceSource::Literal { .. }
-                | ResourceSource::Command { .. }
-                | ResourceSource::Socket => None,
+            .filter(|surface| {
+                self.managed_item_id_for_surface(surface) != surface.id.as_str()
             })
+            .map(|surface| self.managed_item_id_for_surface(surface))
             .collect()
     }
 }
@@ -643,7 +663,15 @@ mod tests {
             source: ResourceSource::SecretRef { secret_id: secret_id.to_string() },
             enforcement: Enforcement::Prompt,
             metadata: ItemMetadata::default(),
-            origin: ResourceOrigin::default(),
+            origin: ResourceOrigin {
+                kind: OriginKind::Discovered,
+                sources: vec![OriginSource {
+                    path: PathBuf::from("/fixture/.env"),
+                    project_id: Some("fixture-project".to_string()),
+                    environment: Some("Development".to_string()),
+                    imported_at: "2026-08-05T00:00:00Z".to_string(),
+                }],
+            },
         };
         let snapshot = CatalogSnapshot {
             resources: vec![
@@ -677,6 +705,73 @@ mod tests {
         assert_eq!(
             snapshot.file_surface_secret_ids(),
             HashSet::from(["configured-secret"])
+        );
+    }
+
+    #[test]
+    fn managed_item_identity_only_follows_a_file_to_its_origin_surface() {
+        let origin_path = PathBuf::from("/fixture/.env");
+        let resource = Resource {
+            id: "fixture-resource".to_string(),
+            name: ".env".to_string(),
+            kind: ResourceKind::EnvFile,
+            shape: ValueShape::KeyValueSet,
+            codec: ResourceCodec::Dotenv,
+            default_env_key: None,
+            entries: Vec::new(),
+            source: ResourceSource::SecretRef {
+                secret_id: "fixture-secret".to_string(),
+            },
+            enforcement: Enforcement::Prompt,
+            metadata: ItemMetadata::default(),
+            origin: ResourceOrigin {
+                kind: OriginKind::Discovered,
+                sources: vec![OriginSource {
+                    path: origin_path.clone(),
+                    project_id: Some("fixture-project".to_string()),
+                    environment: Some("Development".to_string()),
+                    imported_at: "2026-08-05T00:00:00Z".to_string(),
+                }],
+            },
+        };
+        let make_surface = |id: &str, path: PathBuf| Surface {
+            id: id.to_string(),
+            environment_id: "fixture-environment".to_string(),
+            name: path
+                .file_name()
+                .expect("fixture path has a basename")
+                .to_string_lossy()
+                .into_owned(),
+            kind: SurfaceKind::File(FileBacking::EnvFileDirect),
+            path: Some(path),
+            input: SurfaceInput::Resource {
+                resource_id: resource.id.clone(),
+            },
+            enforcement: Enforcement::Prompt,
+            position: 0,
+        };
+        let configured_file = make_surface("configured-file", origin_path);
+        let additional_output = make_surface(
+            "additional-output",
+            PathBuf::from("/fixture/generated/.env"),
+        );
+        let snapshot = CatalogSnapshot {
+            resources: vec![resource],
+            surfaces: vec![configured_file.clone(), additional_output.clone()],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            snapshot.managed_item_id_for_surface(&configured_file),
+            "fixture-secret"
+        );
+        assert_eq!(
+            snapshot.managed_item_id_for_surface(&additional_output),
+            "additional-output"
+        );
+        assert_eq!(
+            snapshot.file_surface_secret_ids(),
+            HashSet::from(["fixture-secret"])
         );
     }
 

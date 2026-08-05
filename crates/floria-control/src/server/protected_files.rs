@@ -108,14 +108,13 @@ pub(super) fn configure_managed_file(
             source_path.display()
         )));
     }
-    let expected = mount_path
-        .join(floria_core::config::SECRETS_DIR)
-        .join(secret_id.to_string());
+    let managed_link = managed_protected_file_link(&record, mount_path)
+        .map_err(|error| DispatchError::Validation(error.to_string()))?;
     let actual = std::fs::read_link(source_path).map_err(|source| DispatchError::Io {
         path: source_path.clone(),
         source,
     })?;
-    if actual != expected {
+    if !managed_link.owns_target(&actual) {
         return Err(DispatchError::Validation(format!(
             "{} no longer points to its managed file",
             source_path.display()
@@ -358,8 +357,6 @@ pub(super) fn restore_managed_file(
                 Err(error) => {
                     rollback_configured_file_links(
                         &restored_paths,
-                        mount_path,
-                        surface_id,
                         &plaintext,
                     );
                     return Err(DispatchError::Catalog(error));
@@ -370,8 +367,6 @@ pub(super) fn restore_managed_file(
             if let Err(error) = catalog.remove_surface(surface_id) {
                 rollback_configured_file_links(
                     &restored_paths,
-                    mount_path,
-                    surface_id,
                     &plaintext,
                 );
                 return Err(DispatchError::Catalog(error));
@@ -405,16 +400,19 @@ pub(super) fn restore_managed_file(
     })
 }
 
+struct RestoredConfiguredLink {
+    path: PathBuf,
+    target: PathBuf,
+}
+
 fn restore_configured_file_links(
     snapshot: &CatalogSnapshot,
     surface: &Surface,
     mount_path: &Path,
     plaintext: &[u8],
     mode: u32,
-) -> Result<Vec<PathBuf>, DispatchError> {
-    let target = mount_path
-        .join(floria_core::config::SURFACES_DIR)
-        .join(&surface.id);
+) -> Result<Vec<RestoredConfiguredLink>, DispatchError> {
+    let item_id = snapshot.managed_item_id_for_surface(surface);
     let instances = file_surface_instances(snapshot)
         .map_err(|error| DispatchError::Validation(error.to_string()))?
         .into_iter()
@@ -425,56 +423,70 @@ fn restore_configured_file_links(
         let instance_path = instance.path.ok_or_else(|| {
             DispatchError::Validation(format!("file surface {:?} has no path", instance.id))
         })?;
-        match replace_symlink_with_file_if_target(&instance_path, &target, plaintext, mode) {
-            Ok(true) => restored.push(instance_path),
-            Ok(false) if Some(&instance_path) == surface.path.as_ref() => {
-                rollback_configured_file_links(
-                    &restored,
-                    mount_path,
-                    &surface.id,
-                    plaintext,
-                );
+        let canonical = managed_item_target(mount_path, item_id, &instance_path)
+            .map_err(|error| DispatchError::Validation(error.to_string()))?;
+        let mut legacy = vec![
+            mount_path
+                .join(floria_core::config::SURFACES_DIR)
+                .join(&surface.id),
+        ];
+        if item_id != surface.id {
+            legacy.push(
+                mount_path
+                    .join(floria_core::config::SECRETS_DIR)
+                    .join(item_id),
+            );
+        }
+        let link = ManagedSymlink::with_legacy_targets(&instance_path, canonical, legacy);
+        let actual = std::fs::read_link(&instance_path).ok();
+        let owned_target = actual.as_deref().filter(|target| link.owns_target(target));
+        match owned_target {
+            Some(target) => match replace_symlink_with_file_if_target(
+                &instance_path,
+                target,
+                plaintext,
+                mode,
+            ) {
+                Ok(true) => restored.push(RestoredConfiguredLink {
+                    path: instance_path,
+                    target: target.to_path_buf(),
+                }),
+                Ok(false) => {}
+                Err(source) => {
+                    rollback_configured_file_links(&restored, plaintext);
+                    return Err(DispatchError::Io { path: instance_path, source });
+                }
+            },
+            None if Some(&instance_path) == surface.path.as_ref() => {
+                rollback_configured_file_links(&restored, plaintext);
                 return Err(DispatchError::Validation(format!(
                     "{} no longer points to its configured managed file",
                     instance_path.display()
                 )));
             }
-            Ok(false) => {}
-            Err(source) => {
-                rollback_configured_file_links(
-                    &restored,
-                    mount_path,
-                    &surface.id,
-                    plaintext,
-                );
-                return Err(DispatchError::Io {
-                    path: instance_path,
-                    source,
-                });
-            }
+            None => {}
         }
     }
     Ok(restored)
 }
 
 fn rollback_configured_file_links(
-    restored_paths: &[PathBuf],
-    mount_path: &Path,
-    surface_id: &str,
+    restored_paths: &[RestoredConfiguredLink],
     plaintext: &[u8],
 ) {
-    let target = mount_path
-        .join(floria_core::config::SURFACES_DIR)
-        .join(surface_id);
-    for path in restored_paths.iter().rev() {
-        match replace_regular_file_with_symlink_if_matches(path, &target, plaintext) {
+    for restored in restored_paths.iter().rev() {
+        match replace_regular_file_with_symlink_if_matches(
+            &restored.path,
+            &restored.target,
+            plaintext,
+        ) {
             Ok(true) => {}
             Ok(false) => tracing::warn!(
-                path = %path.display(),
+                path = %restored.path.display(),
                 "configured file changed before rollback; preserving its plaintext"
             ),
             Err(error) => tracing::warn!(
-                path = %path.display(),
+                path = %restored.path.display(),
                 %error,
                 "rolling back configured file restore failed"
             ),
@@ -515,12 +527,10 @@ pub(super) fn protected_file(
     mount_path: &Path,
     snapshot: &CatalogSnapshot,
 ) -> Option<ProtectedFile> {
-    let SecretOrigin::File { source_path } = record.origin else { return None };
-    let expected = mount_path
-        .join(floria_core::config::SECRETS_DIR)
-        .join(record.id.to_string());
-    let linked = ManagedSymlink::new(&source_path, expected)
-        .is_ready()
+    let SecretOrigin::File { source_path } = &record.origin else { return None };
+    let source_path = source_path.clone();
+    let linked = managed_protected_file_link(&record, mount_path)
+        .and_then(|link| link.is_ready())
         .unwrap_or(false);
     let environment_ids = effective_file_environment_ids(
         snapshot,
@@ -629,19 +639,18 @@ fn protect_file_with_initial_enforcement(
                 path.display()
             ))
         })?;
-        let expected = mount_path
-            .join(floria_core::config::SECRETS_DIR)
-            .join(record.id.to_string());
+        let managed_link = managed_protected_file_link(&record, mount_path)
+            .map_err(|error| DispatchError::Validation(error.to_string()))?;
         let actual = std::fs::read_link(&path).map_err(|source| DispatchError::Io {
             path: path.clone(),
             source,
         })?;
-        if actual != expected {
+        if !managed_link.owns_target(&actual) {
             return Err(DispatchError::Validation(format!(
                 "{} points to {}, not the managed target {}",
                 path.display(),
                 actual.display(),
-                expected.display()
+                managed_link.expected_target().display()
             )));
         }
         return Ok(ControlResult::FileProtected {
@@ -687,9 +696,13 @@ fn protect_file_with_initial_enforcement(
         ),
     };
 
-    let target = mount_path
-        .join(floria_core::config::SECRETS_DIR)
-        .join(id.to_string());
+    let record = store
+        .record(&id)?
+        .ok_or_else(|| DispatchError::Validation(format!("protected file {id} disappeared")))?;
+    let target = managed_protected_file_link(&record, mount_path)
+        .map_err(|error| DispatchError::Validation(error.to_string()))?
+        .expected_target()
+        .to_path_buf();
     match replace_regular_file_with_symlink_if_unchanged(
         &absolute,
         &target,
@@ -709,9 +722,6 @@ fn protect_file_with_initial_enforcement(
             return Err(DispatchError::Io { path: absolute, source });
         }
     }
-    let record = store
-        .record(&id)?
-        .ok_or_else(|| DispatchError::Validation(format!("protected file {id} disappeared")))?;
     let snapshot = catalog.snapshot()?;
     Ok(ControlResult::FileProtected {
         file: protected_file(record, mount_path, &snapshot)
@@ -982,9 +992,8 @@ pub(super) fn restore_file(
         )));
     }
     let SecretOrigin::File { source_path } = &record.origin else { unreachable!() };
-    let expected = mount_path
-        .join(floria_core::config::SECRETS_DIR)
-        .join(id.to_string());
+    let managed_link = managed_protected_file_link(&record, mount_path)
+        .map_err(|error| DispatchError::Validation(error.to_string()))?;
     let metadata = std::fs::symlink_metadata(source_path).map_err(|source| DispatchError::Io {
         path: source_path.clone(),
         source,
@@ -999,12 +1008,12 @@ pub(super) fn restore_file(
         path: source_path.clone(),
         source,
     })?;
-    if actual != expected {
+    if !managed_link.owns_target(&actual) {
         return Err(DispatchError::Validation(format!(
             "{} points to {}, not the managed target {}",
             source_path.display(),
             actual.display(),
-            expected.display()
+            managed_link.expected_target().display()
         )));
     }
 
@@ -1016,7 +1025,7 @@ pub(super) fn restore_file(
         },
     )?;
     let restored =
-        replace_symlink_with_file_if_target(source_path, &expected, &plaintext, record.mode)
+        replace_symlink_with_file_if_target(source_path, &actual, &plaintext, record.mode)
             .map_err(|source| DispatchError::Io {
                 path: source_path.clone(),
                 source,

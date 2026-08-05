@@ -17,6 +17,9 @@ use crate::source::{CommandSource, ContentSource, LiteralSource};
 pub const SECRETS_DIR: &str = "secrets";
 /// Virtual directory containing catalog-backed rendered surfaces (`surfaces/<id>`).
 pub const SURFACES_DIR: &str = "surfaces";
+/// Stable public namespace used by persistent Managed Links
+/// (`items/<managed-item-id>/<basename>`).
+pub const ITEMS_DIR: &str = "items";
 
 /// Raw TOML structure, deserialized directly. Validation/resolution happens in [`Config::resolve`].
 #[derive(Debug, Deserialize)]
@@ -279,6 +282,21 @@ fn build_ruleset(rule_cfgs: Vec<RuleCfg>, files: &[FileEntry]) -> Result<RuleSet
         object: ObjectMatch::default(),
         path_glob: compile_glob(&format!("{SURFACES_DIR}/**"))
             .expect("`surfaces/**` is a valid glob"),
+        ops: RuleOps::READ_WRITE_SIGN,
+        enforcement: Enforcement::Prompt,
+        enabled: true,
+    });
+
+    // Persistent Managed Links use the stable public item namespace. Object-specific managed
+    // rules override this default; keeping a prompt fallback here makes an incomplete live-policy
+    // refresh fail closed instead of falling through to the read-only monitor-mode default.
+    rules.push(Rule {
+        id: "items-default".to_string(),
+        priority: BUILTIN_DEFAULT_PRIORITY,
+        subject: SubjectMatch::default(),
+        object: ObjectMatch::default(),
+        path_glob: compile_glob(&format!("{ITEMS_DIR}/**"))
+            .expect("`items/**` is a valid glob"),
         ops: RuleOps::READ_WRITE_SIGN,
         enforcement: Enforcement::Prompt,
         enabled: true,
@@ -673,8 +691,8 @@ mod tests {
         )
         .unwrap();
 
-        // explicit rule + one per-file rule + two protected namespaces + catch-all
-        assert_eq!(rules.len(), 5);
+        // explicit rule + one per-file rule + three protected namespaces + catch-all
+        assert_eq!(rules.len(), 6);
 
         // any secrets/<id> path is prompted by the built-in rule — for reads AND writes
         let id = ProcessIdentity::bare(1, 501, 20);
@@ -695,6 +713,15 @@ mod tests {
         assert_eq!(
             decide(&rules, &id, "surfaces/fixture-dotenv", Operation::Write),
             (Enforcement::Prompt, Some("surfaces-default".to_string()))
+        );
+        assert_eq!(
+            decide(
+                &rules,
+                &id,
+                "items/fixture-item/.env",
+                Operation::Read,
+            ),
+            (Enforcement::Prompt, Some("items-default".to_string()))
         );
 
         // explicit deny rule wins for prod

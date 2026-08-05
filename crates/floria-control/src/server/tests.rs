@@ -819,8 +819,9 @@
         assert_eq!(
             std::fs::read_link(worktree.join(".envrc")).unwrap(),
             mount
-                .join(floria_core::config::SECRETS_DIR)
+                .join(floria_core::config::ITEMS_DIR)
                 .join(store.list().unwrap()[0].id.to_string())
+                .join(".envrc")
         );
 
         let repaired = dispatch(
@@ -1273,8 +1274,9 @@
         assert_eq!(
             std::fs::read_link(&source_path).unwrap(),
             mount_path
-                .join(floria_core::config::SURFACES_DIR)
+                .join(floria_core::config::ITEMS_DIR)
                 .join(&snapshot.surfaces[0].id)
+                .join(".env")
         );
         assert!(!project_path
             .read_dir()
@@ -1336,8 +1338,9 @@
         assert_eq!(
             std::fs::read_link(&source_path).unwrap(),
             mount_path
-                .join(floria_core::config::SECRETS_DIR)
+                .join(floria_core::config::ITEMS_DIR)
                 .join(FIXTURE_SECRET_ID)
+                .join(".dev.vars")
         );
         let secret_id: SecretId = FIXTURE_SECRET_ID.parse().unwrap();
         assert_eq!(
@@ -3526,7 +3529,10 @@
         assert!(std::fs::symlink_metadata(&source).unwrap().file_type().is_symlink());
         assert_eq!(
             std::fs::read_link(&source).unwrap(),
-            mount.join(floria_core::config::SECRETS_DIR).join(FIXTURE_SECRET_ID)
+            mount
+                .join(floria_core::config::ITEMS_DIR)
+                .join(FIXTURE_SECRET_ID)
+                .join(".envrc")
         );
         std::fs::remove_file(&source).unwrap();
         symlink("../foreign/.envrc", &source).unwrap();
@@ -3538,7 +3544,10 @@
         );
         assert_eq!(
             std::fs::read_link(&source).unwrap(),
-            mount.join(floria_core::config::SECRETS_DIR).join(FIXTURE_SECRET_ID)
+            mount
+                .join(floria_core::config::ITEMS_DIR)
+                .join(FIXTURE_SECRET_ID)
+                .join(".envrc")
         );
         symlink(
             mount.join(floria_core::config::SECRETS_DIR).join(FIXTURE_SECRET_ID),
@@ -3807,7 +3816,10 @@
         );
         assert_eq!(
             std::fs::read_link(&source).unwrap(),
-            mount.join(floria_core::config::SURFACES_DIR).join(&surface.id)
+            mount
+                .join(floria_core::config::ITEMS_DIR)
+                .join(FIXTURE_SECRET_ID)
+                .join(".dev.vars")
         );
         symlink(
             mount.join(floria_core::config::SURFACES_DIR).join(&surface.id),

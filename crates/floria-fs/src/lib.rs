@@ -18,6 +18,8 @@ mod tree;
 #[cfg(all(target_os = "macos", not(feature = "macos-no-mount")))]
 mod macos_mount;
 
+use std::collections::{BTreeMap, HashSet};
+use std::ffi::OsString;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -25,7 +27,7 @@ use std::time::SystemTime;
 use floria_catalog::Catalog;
 use floria_core::audit::{AuditDependency, AuditLog};
 use floria_core::authz::{AuthRequest, Authorizer, Decision, Operation};
-use floria_core::config::{ResolvedConfig, SECRETS_DIR, SURFACES_DIR};
+use floria_core::config::{ResolvedConfig, ITEMS_DIR, SECRETS_DIR, SURFACES_DIR};
 use floria_core::identity::ProcessIdentity;
 use floria_core::snapshot::content_version_of;
 use floria_core::source::{ContentSource, SourceCtx};
@@ -131,6 +133,189 @@ struct SurfaceNs {
     inos: InoMap,
 }
 
+/// One stable public Managed Item. The item id survives a byte-preserving file becoming a direct
+/// configurable Env File because both representations use the backing Secret id.
+#[derive(Clone)]
+struct ManagedItem {
+    id: String,
+    basename: OsString,
+    backing: ManagedItemBacking,
+}
+
+#[derive(Clone)]
+enum ManagedItemBacking {
+    Secret(String),
+    Surface(String),
+}
+
+/// Dynamic `items/<managed-item-id>/<basename>` namespace.
+///
+/// This is an Adapter over the existing store and surface registry, not a third source of truth:
+/// no bytes or catalog rows are copied when the public namespace is introduced.
+struct ItemsNs {
+    store: Arc<dyn SecretStore>,
+    registry: Option<Arc<SurfaceRegistry>>,
+    root_ino: u64,
+    dir_inos: InoMap,
+    file_inos: InoMap,
+    inventory: DashMap<String, ManagedItem>,
+}
+
+impl ItemsNs {
+    fn new(
+        store: Arc<dyn SecretStore>,
+        registry: Option<Arc<SurfaceRegistry>>,
+        root_ino: u64,
+        next_ino: Arc<AtomicU64>,
+    ) -> Self {
+        ItemsNs {
+            store,
+            registry,
+            root_ino,
+            dir_inos: InoMap::new(root_ino, Arc::clone(&next_ino)),
+            file_inos: InoMap::new(root_ino, next_ino),
+            inventory: DashMap::new(),
+        }
+    }
+
+    fn item_id_for_surface(plan: &ResolvedAccessPlan) -> String {
+        plan.catalog_snapshot()
+            .managed_item_id_for_surface(&plan.surface)
+            .to_string()
+    }
+
+    fn surface_item(plan: ResolvedAccessPlan) -> Option<ManagedItem> {
+        let basename = plan
+            .surface
+            .path
+            .as_deref()
+            .and_then(std::path::Path::file_name)
+            .map(std::ffi::OsStr::to_os_string)
+            .unwrap_or_else(|| OsString::from(&plan.surface.name));
+        if basename.is_empty() {
+            return None;
+        }
+        Some(ManagedItem {
+            id: Self::item_id_for_surface(&plan),
+            basename,
+            backing: ManagedItemBacking::Surface(plan.surface.id),
+        })
+    }
+
+    fn secret_item(record: SecretRecord) -> Option<ManagedItem> {
+        let basename = record.source_path()?.file_name()?.to_os_string();
+        Some(ManagedItem {
+            id: record.id.to_string(),
+            basename,
+            backing: ManagedItemBacking::Secret(record.id.to_string()),
+        })
+    }
+
+    fn list(&self) -> Vec<ManagedItem> {
+        let mut items = BTreeMap::new();
+        let mut configured_secret_ids = HashSet::new();
+        if let Some(registry) = &self.registry {
+            let plans = registry.list();
+            if let Some(plan) = plans.first() {
+                configured_secret_ids.extend(
+                    plan.catalog_snapshot()
+                        .file_surface_secret_ids()
+                        .into_iter()
+                        .map(str::to_string),
+                );
+            }
+            for plan in plans {
+                if let Some(item) = Self::surface_item(plan) {
+                    items.insert(item.id.clone(), item);
+                }
+            }
+        }
+        for record in self.store.list().unwrap_or_default() {
+            if configured_secret_ids.contains(record.id.as_str()) {
+                continue;
+            }
+            if let Some(item) = Self::secret_item(record) {
+                // A direct file Surface is the configured view of the same Managed Item and
+                // therefore takes precedence over its raw Secret adapter.
+                items.entry(item.id.clone()).or_insert(item);
+            }
+        }
+        let items = items.into_values().collect::<Vec<_>>();
+        self.inventory.clear();
+        for item in &items {
+            self.inventory.insert(item.id.clone(), item.clone());
+        }
+        items
+    }
+
+    fn get(&self, id: &str) -> Option<ManagedItem> {
+        if let Some(item) = self.inventory.get(id).map(|item| item.clone()) {
+            if let Some(current) = self.current_item(&item) {
+                return Some(current);
+            }
+            self.inventory.remove(id);
+        }
+        self.list().into_iter().find(|item| item.id == id)
+    }
+
+    /// Resolve a cached descriptor against the live store/registry before it can affect an open.
+    /// The cache only avoids full inventory scans; it is never an authority for content.
+    fn current_item(&self, item: &ManagedItem) -> Option<ManagedItem> {
+        let current = match &item.backing {
+            ManagedItemBacking::Secret(id) => {
+                let secret_id = id.parse::<SecretId>().ok()?;
+                let record = self.store.record(&secret_id).ok().flatten()?;
+                if self.configured_secret_ids().contains(id) {
+                    return None;
+                }
+                Self::secret_item(record)?
+            }
+            ManagedItemBacking::Surface(surface_id) => {
+                Self::surface_item(self.surface_plan(surface_id)?)?
+            }
+        };
+        (current.id == item.id).then_some(current)
+    }
+
+    fn configured_secret_ids(&self) -> HashSet<String> {
+        self.registry
+            .as_ref()
+            .and_then(|registry| registry.list().into_iter().next())
+            .map(|plan| {
+                plan.catalog_snapshot()
+                    .file_surface_secret_ids()
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn surface_plan(&self, surface_id: &str) -> Option<ResolvedAccessPlan> {
+        self.registry.as_ref()?.get(surface_id)
+    }
+
+    fn dir_ino_for(&self, id: &str) -> u64 {
+        self.dir_inos.ino_for(id)
+    }
+
+    fn file_ino_for(&self, id: &str) -> u64 {
+        self.file_inos.ino_for(id)
+    }
+
+    fn item_for_dir_ino(&self, ino: u64) -> Option<ManagedItem> {
+        self.dir_inos.id_for_ino(ino).and_then(|id| self.get(&id))
+    }
+
+    fn owns_dir_ino(&self, ino: u64) -> bool {
+        self.dir_inos.id_for_ino(ino).is_some()
+    }
+
+    fn item_for_file_ino(&self, ino: u64) -> Option<ManagedItem> {
+        self.file_inos.id_for_ino(ino).and_then(|id| self.get(&id))
+    }
+}
+
 impl SurfaceNs {
     fn new(
         registry: Arc<SurfaceRegistry>,
@@ -178,6 +363,9 @@ struct Shared {
     /// Live catalog-backed dotenv namespace. Metadata comes from an in-memory registry; values
     /// and secret versions are resolved only after authorization on each open.
     surfaces: Option<SurfaceNs>,
+    /// Stable public namespace for persistent Managed Links. The legacy namespaces stay live
+    /// alongside it so existing installations can roll back without moving any encrypted data.
+    items: Option<ItemsNs>,
     /// Stable timestamp used for all attributes (captured at mount time, never changes),
     /// so watchers don't trigger accidentally.
     mount_epoch: SystemTime,
@@ -213,11 +401,12 @@ impl Floria {
             (None, None) => None,
         };
 
-        // The static tree only owns config files and the two namespace directories. Secret and
-        // surface children allocate from one shared inode sequence, so their numbers never clash.
+        // The static tree only owns config files and namespace roots. Dynamic children allocate
+        // from one shared inode sequence, so their numbers never clash.
         let tree = Tree::build(&cfg.files);
         let next_ino = Arc::new(AtomicU64::new(tree.next_ino()));
         let secret_catalog = catalog.clone();
+        let item_registry = surface_registry.clone();
         let surfaces = match (catalog, store.as_ref(), surface_registry) {
             (Some(catalog), Some(store), Some(registry)) => Some(SurfaceNs::new(
                 registry,
@@ -234,6 +423,14 @@ impl Floria {
             }
             _ => None,
         };
+        let items = store.as_ref().map(|store| {
+            ItemsNs::new(
+                Arc::clone(store),
+                item_registry,
+                tree.items_dir_ino(),
+                Arc::clone(&next_ino),
+            )
+        });
         let secrets = store.map(|store| {
             SecretsNs::new(
                 store,
@@ -253,6 +450,7 @@ impl Floria {
             authorizer,
             secrets,
             surfaces,
+            items,
             mount_epoch: SystemTime::now(),
             mount_uid,
             mount_gid,
@@ -320,8 +518,58 @@ impl Shared {
         ))
     }
 
+    fn item_file_attr(&self, ino: u64, item: &ManagedItem) -> Option<fuser::FileAttr> {
+        match &item.backing {
+            ManagedItemBacking::Secret(id) => self.secret_attr(ino, id),
+            ManagedItemBacking::Surface(surface_id) => self.surface_attr(
+                ino,
+                &self.items.as_ref()?.surface_plan(surface_id)?,
+            ),
+        }
+    }
+
+    fn item_open_target(&self, item: ManagedItem) -> Option<OpenTarget> {
+        let virtual_path = format!(
+            "{ITEMS_DIR}/{}/{}",
+            item.id,
+            item.basename.to_string_lossy()
+        );
+        match item.backing {
+            ManagedItemBacking::Secret(id) => Some(OpenTarget {
+                virtual_path,
+                display: self.secret_display(&id),
+                object_revision: None,
+                direct_io: true,
+                kind: OpenKind::Secret(id),
+            }),
+            ManagedItemBacking::Surface(surface_id) => {
+                let plan = self.items.as_ref()?.surface_plan(&surface_id)?;
+                let kind = match &plan.backing {
+                    SurfaceBacking::Composed { .. } => OpenKind::ComposedSurface(plan.clone()),
+                    SurfaceBacking::EnvFileDirect { .. } => {
+                        OpenKind::DirectEnvFileSurface(plan.clone())
+                    }
+                };
+                Some(OpenTarget {
+                    virtual_path,
+                    display: plan.surface.path.as_ref().map(|path| path.display().to_string()),
+                    object_revision: Some(plan.semantic_revision().to_string()),
+                    direct_io: true,
+                    kind,
+                })
+            }
+        }
+    }
+
     /// Resolve an inode to what `open()` should serve: a dynamic surface/secret or static file.
     fn resolve_open_target(&self, ino: u64) -> Result<OpenTarget, Errno> {
+        if let Some(item) = self
+            .items
+            .as_ref()
+            .and_then(|items| items.item_for_file_ino(ino))
+        {
+            return self.item_open_target(item).ok_or(Errno::ENOENT);
+        }
         if let Some(ns) = &self.surfaces {
             if let Some(registered) = ns.surface_for_ino(ino) {
                 let kind = match &registered.backing {
@@ -411,7 +659,18 @@ impl Shared {
     }
 
     fn dynamic_path(&self, ino: u64) -> Option<String> {
-        self.surface_path(ino).or_else(|| self.secret_path(ino))
+        self.items
+            .as_ref()
+            .and_then(|items| items.item_for_file_ino(ino))
+            .map(|item| {
+                format!(
+                    "{ITEMS_DIR}/{}/{}",
+                    item.id,
+                    item.basename.to_string_lossy()
+                )
+            })
+            .or_else(|| self.surface_path(ino))
+            .or_else(|| self.secret_path(ino))
     }
 
     /// Commit a dirty write buffer: append it to the store as a new immutable version and move
@@ -437,7 +696,7 @@ impl Shared {
                 .map(|target| target.clone())
                 .ok_or_else(|| CommitFailure::io("write authorization plan vanished"))?;
             match target {
-                WriteOpenTarget::Secret(id) => {
+                WriteOpenTarget::Secret { id, virtual_path } => {
                     let ns = self
                         .secrets
                         .as_ref()
@@ -453,9 +712,9 @@ impl Shared {
                         &bytes,
                     )
                     .map_err(CommitFailure::surface)?;
-                    Ok((format!("{SECRETS_DIR}/{id}"), version))
+                    Ok((virtual_path, version))
                 }
-                WriteOpenTarget::DirectEnvFile(plan) => {
+                WriteOpenTarget::DirectEnvFile { plan, virtual_path } => {
                     let ns = self
                         .surfaces
                         .as_ref()
@@ -464,10 +723,7 @@ impl Shared {
                         .resolver
                         .commit_direct_env_file_plan(&plan, &bytes)
                         .map_err(CommitFailure::surface)?;
-                    Ok((
-                        format!("{SURFACES_DIR}/{}", plan.surface.id),
-                        committed.version,
-                    ))
+                    Ok((virtual_path, committed.version))
                 }
             }
         })();
@@ -624,9 +880,15 @@ impl Shared {
         // Generated static sources stay read-only.
         let wants_write = flags & libc::O_ACCMODE != libc::O_RDONLY;
         let write_target = match (&target.kind, wants_write) {
-            (OpenKind::Secret(id), true) => Some(WriteOpenTarget::Secret(id.clone())),
+            (OpenKind::Secret(id), true) => Some(WriteOpenTarget::Secret {
+                id: id.clone(),
+                virtual_path: target.virtual_path.clone(),
+            }),
             (OpenKind::DirectEnvFileSurface(plan), true) => {
-                Some(WriteOpenTarget::DirectEnvFile(Box::new(plan.clone())))
+                Some(WriteOpenTarget::DirectEnvFile {
+                    plan: Box::new(plan.clone()),
+                    virtual_path: target.virtual_path.clone(),
+                })
             }
             (_, true) => {
                 reply.error(errno(libc::EROFS));
@@ -655,8 +917,8 @@ impl Shared {
                 Vec::new()
             } else {
                 let result = match &write_target {
-                    WriteOpenTarget::Secret(id) => self.decrypt_secret(id),
-                    WriteOpenTarget::DirectEnvFile(plan) => self
+                    WriteOpenTarget::Secret { id, .. } => self.decrypt_secret(id),
+                    WriteOpenTarget::DirectEnvFile { plan, .. } => self
                         .surfaces
                         .as_ref()
                         .ok_or_else(|| "surface resolver is unavailable".to_string())
@@ -913,17 +1175,15 @@ enum OpenKind {
 
 #[derive(Clone)]
 enum WriteOpenTarget {
-    Secret(String),
-    DirectEnvFile(Box<ResolvedAccessPlan>),
+    Secret { id: String, virtual_path: String },
+    DirectEnvFile { plan: Box<ResolvedAccessPlan>, virtual_path: String },
 }
 
 impl WriteOpenTarget {
     fn virtual_path(&self) -> String {
         match self {
-            WriteOpenTarget::Secret(id) => format!("{SECRETS_DIR}/{id}"),
-            WriteOpenTarget::DirectEnvFile(plan) => {
-                format!("{SURFACES_DIR}/{}", plan.surface.id)
-            }
+            WriteOpenTarget::Secret { virtual_path, .. }
+            | WriteOpenTarget::DirectEnvFile { virtual_path, .. } => virtual_path.clone(),
         }
     }
 }
@@ -1007,6 +1267,41 @@ impl fuser::Filesystem for Floria {
 
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &std::ffi::OsStr, reply: ReplyEntry) {
         // Any name not in the tree (including macOS noise like .DS_Store / ._*) returns ENOENT; never generates content.
+        if let Some(items) = &self.inner.items {
+            if parent.0 == items.root_ino {
+                let Some(id) = name.to_str() else {
+                    reply.error(Errno::ENOENT);
+                    return;
+                };
+                match items.get(id) {
+                    Some(_) => {
+                        let ino = items.dir_ino_for(id);
+                        let attr = dir_attr(
+                            ino,
+                            0o555,
+                            self.inner.mount_epoch,
+                            self.inner.mount_uid,
+                            self.inner.mount_gid,
+                        );
+                        reply.entry(&TTL, &attr, fuser::Generation(0));
+                    }
+                    None => reply.error(Errno::ENOENT),
+                }
+                return;
+            }
+            if let Some(item) = items.item_for_dir_ino(parent.0) {
+                if name != item.basename.as_os_str() {
+                    reply.error(Errno::ENOENT);
+                    return;
+                }
+                let ino = items.file_ino_for(&item.id);
+                match self.inner.item_file_attr(ino, &item) {
+                    Some(attr) => reply.entry(&TTL, &attr, fuser::Generation(0)),
+                    None => reply.error(Errno::ENOENT),
+                }
+                return;
+            }
+        }
         let Some(name) = name.to_str() else {
             reply.error(Errno::ENOENT);
             return;
@@ -1064,6 +1359,37 @@ impl fuser::Filesystem for Floria {
     }
 
     fn getattr(&self, _req: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
+        if let Some(items) = &self.inner.items {
+            // A directory inode contains no secret data. Once allocated it can remain visible
+            // for the mount lifetime; child lookup/open still revalidates the live inventory.
+            if items.owns_dir_ino(ino.0) {
+                let attr = dir_attr(
+                    ino.0,
+                    0o555,
+                    self.inner.mount_epoch,
+                    self.inner.mount_uid,
+                    self.inner.mount_gid,
+                );
+                reply.attr(&TTL, &attr);
+                return;
+            }
+            if let Some(item) = items.item_for_file_ino(ino.0) {
+                match self.inner.item_file_attr(ino.0, &item) {
+                    Some(mut attr) => {
+                        if let Some(len) = fh
+                            .map(|file| file.0)
+                            .filter(|&file| self.inner.writes.owns(file))
+                            .and_then(|file| self.inner.writes.len(file))
+                        {
+                            attr.size = len;
+                        }
+                        reply.attr(&TTL, &attr)
+                    }
+                    None => reply.error(Errno::ENOENT),
+                }
+                return;
+            }
+        }
         if let Some(ns) = &self.inner.surfaces {
             if let Some(id) = ns.id_for_ino(ino.0) {
                 match ns
@@ -1113,6 +1439,15 @@ impl fuser::Filesystem for Floria {
     }
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+        if self
+            .inner
+            .items
+            .as_ref()
+            .is_some_and(|items| items.owns_dir_ino(ino.0))
+        {
+            reply.opened(FileHandle(0), fuser::FopenFlags::empty());
+            return;
+        }
         match self.inner.tree.get(ino.0).map(|n| &n.kind) {
             Some(NodeKind::Dir) => reply.opened(FileHandle(0), fuser::FopenFlags::empty()),
             Some(_) => reply.error(Errno::ENOTDIR),
@@ -1128,6 +1463,28 @@ impl fuser::Filesystem for Floria {
         offset: u64,
         mut reply: ReplyDirectory,
     ) {
+        if let Some(items) = &self.inner.items {
+            if let Some(item) = items.item_for_dir_ino(ino.0) {
+                let entries = [
+                    (ino.0, FileType::Directory, OsString::from(".")),
+                    (items.root_ino, FileType::Directory, OsString::from("..")),
+                    (
+                        items.file_ino_for(&item.id),
+                        FileType::RegularFile,
+                        item.basename,
+                    ),
+                ];
+                for (index, (child_ino, kind, name)) in
+                    entries.iter().enumerate().skip(offset as usize)
+                {
+                    if reply.add(INodeNo(*child_ino), (index + 1) as u64, *kind, name) {
+                        break;
+                    }
+                }
+                reply.ok();
+                return;
+            }
+        }
         let Some(node) = self.inner.tree.get(ino.0) else {
             reply.error(Errno::ENOENT);
             return;
@@ -1151,6 +1508,31 @@ impl fuser::Filesystem for Floria {
                     entries.iter().enumerate().skip(offset as usize)
                 {
                     if reply.add(INodeNo(*child_ino), (index + 1) as u64, *kind, name.as_str()) {
+                        break;
+                    }
+                }
+                reply.ok();
+                return;
+            }
+        }
+
+        if let Some(items) = &self.inner.items {
+            if ino.0 == items.root_ino {
+                let mut entries: Vec<(u64, FileType, OsString)> = vec![
+                    (ino.0, FileType::Directory, OsString::from(".")),
+                    (node.parent, FileType::Directory, OsString::from("..")),
+                ];
+                for item in items.list() {
+                    entries.push((
+                        items.dir_ino_for(&item.id),
+                        FileType::Directory,
+                        OsString::from(item.id),
+                    ));
+                }
+                for (index, (child_ino, kind, name)) in
+                    entries.iter().enumerate().skip(offset as usize)
+                {
+                    if reply.add(INodeNo(*child_ino), (index + 1) as u64, *kind, name) {
                         break;
                     }
                 }
@@ -1833,7 +2215,21 @@ mod tests {
         }
 
         fn list(&self) -> StoreResult<Vec<SecretRecord>> {
-            unimplemented!()
+            let entries = self.entries.lock().unwrap();
+            Ok(entries
+                .iter()
+                .map(|(id, entry)| SecretRecord {
+                    id: id.parse().expect("fixture ids are UUIDs"),
+                    origin: entry.origin.clone(),
+                    mode: entry.mode,
+                    size: entry.versions[(entry.head - 1) as usize].len() as u64,
+                    created: "fixture-time".to_string(),
+                    current_version: entry.head,
+                    enforcement: Enforcement::Prompt,
+                    environment_ids: None,
+                    metadata: Default::default(),
+                })
+                .collect())
         }
 
         fn get_by_path(&self, _source_path: &Path) -> StoreResult<Option<SecretRecord>> {
@@ -2112,6 +2508,12 @@ mod tests {
         let tree = Tree::build(files);
         let next_ino = Arc::new(AtomicU64::new(tree.next_ino()));
         let mutations = Arc::new(ManagedMutationCoordinator::new());
+        let items = ItemsNs::new(
+            Arc::clone(&store),
+            registry.clone(),
+            tree.items_dir_ino(),
+            Arc::clone(&next_ino),
+        );
         let secrets = SecretsNs::new(
             Arc::clone(&store),
             catalog.clone(),
@@ -2137,6 +2539,7 @@ mod tests {
             authorizer: Arc::new(AllowAll),
             secrets: Some(secrets),
             surfaces,
+            items: Some(items),
             mount_epoch: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
             mount_uid: 501,
             mount_gid: 20,
@@ -2303,6 +2706,52 @@ mod tests {
     }
 
     #[test]
+    fn public_items_alias_existing_backings_without_replacing_legacy_namespaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = surface_catalog(&tmp.path().join("catalog.sqlite"));
+        let registry = Arc::new(SurfaceRegistry::from_snapshot(&catalog.snapshot().unwrap()));
+        let store = Arc::new(ReadWriteStore::fixture());
+        let shared = shared_fixture(
+            &[],
+            store as Arc<dyn SecretStore>,
+            Some(catalog),
+            Some(registry),
+            tmp.path(),
+        );
+        let items = shared.items.as_ref().unwrap();
+
+        let raw = items.get(RAW_SECRET_ID).expect("raw protected file item");
+        assert_eq!(raw.basename, "protected.txt");
+        let raw_target = shared
+            .resolve_open_target(items.file_ino_for(RAW_SECRET_ID))
+            .unwrap();
+        assert_eq!(
+            raw_target.virtual_path,
+            format!("items/{RAW_SECRET_ID}/protected.txt")
+        );
+        assert!(matches!(raw_target.kind, OpenKind::Secret(_)));
+
+        let direct = items
+            .get("fixture-direct-surface")
+            .expect("direct file surface item");
+        assert_eq!(direct.basename, ".env.source");
+        let direct_target = shared
+            .resolve_open_target(items.file_ino_for("fixture-direct-surface"))
+            .unwrap();
+        assert_eq!(
+            direct_target.virtual_path,
+            "items/fixture-direct-surface/.env.source"
+        );
+        assert!(matches!(direct_target.kind, OpenKind::DirectEnvFileSurface(_)));
+
+        // The old adapters remain independently addressable for rollback.
+        let legacy = shared
+            .resolve_open_target(shared.secrets.as_ref().unwrap().ino_for(RAW_SECRET_ID))
+            .unwrap();
+        assert_eq!(legacy.virtual_path, format!("secrets/{RAW_SECRET_ID}"));
+    }
+
+    #[test]
     fn file_surfaces_resolve_to_stable_paths_and_generate_auditable_snapshots() {
         let tmp = tempfile::tempdir().unwrap();
         let catalog = surface_catalog(&tmp.path().join("catalog.sqlite"));
@@ -2426,7 +2875,13 @@ mod tests {
             .insert(raw_ino, Arc::clone(&identity), Vec::new());
         shared
             .write_targets
-            .insert(raw_fh, WriteOpenTarget::Secret(RAW_SECRET_ID.to_string()));
+            .insert(
+                raw_fh,
+                WriteOpenTarget::Secret {
+                    id: RAW_SECRET_ID.to_string(),
+                    virtual_path: format!("secrets/{RAW_SECRET_ID}"),
+                },
+            );
         shared
             .writes
             .write_at(raw_fh, 0, b"first line\nsecond line")
@@ -2455,7 +2910,10 @@ mod tests {
             .unwrap();
         shared.write_targets.insert(
             direct_fh,
-            WriteOpenTarget::DirectEnvFile(Box::new(direct_plan.clone())),
+            WriteOpenTarget::DirectEnvFile {
+                plan: Box::new(direct_plan.clone()),
+                virtual_path: "surfaces/fixture-direct-surface".to_string(),
+            },
         );
         let mut rebound_resource = catalog
             .snapshot()
@@ -2484,7 +2942,10 @@ mod tests {
         let invalid_fh = shared.writes.insert(direct_ino, identity, Vec::new());
         shared.write_targets.insert(
             invalid_fh,
-            WriteOpenTarget::DirectEnvFile(Box::new(direct_plan)),
+            WriteOpenTarget::DirectEnvFile {
+                plan: Box::new(direct_plan),
+                virtual_path: "surfaces/fixture-direct-surface".to_string(),
+            },
         );
         shared
             .writes
@@ -2658,6 +3119,12 @@ mod tests {
     fn shared_with_store(store: Arc<dyn SecretStore>, tmp: &Path) -> Arc<Shared> {
         let tree = Tree::build(&[]);
         let next_ino = Arc::new(AtomicU64::new(tree.next_ino()));
+        let items = ItemsNs::new(
+            Arc::clone(&store),
+            None,
+            tree.items_dir_ino(),
+            Arc::clone(&next_ino),
+        );
         let secrets = SecretsNs::new(
             store,
             None,
@@ -2674,6 +3141,7 @@ mod tests {
             authorizer: Arc::new(AllowAll),
             secrets: Some(secrets),
             surfaces: None,
+            items: Some(items),
             mount_epoch: SystemTime::now(),
             mount_uid: 501,
             mount_gid: 20,
@@ -2702,7 +3170,13 @@ mod tests {
             .insert(ino, Arc::new(ProcessIdentity::bare(1, 501, 20)), Vec::new());
         shared
             .write_targets
-            .insert(fh, WriteOpenTarget::Secret(id.to_string()));
+            .insert(
+                fh,
+                WriteOpenTarget::Secret {
+                    id: id.to_string(),
+                    virtual_path: format!("secrets/{id}"),
+                },
+            );
         shared.writes.write_at(fh, 0, b"old").unwrap();
 
         // A commits "old" and parks inside the store append.

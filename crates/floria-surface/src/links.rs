@@ -8,7 +8,7 @@ use std::path::{Component, Path, PathBuf};
 use floria_catalog::{
     CatalogSnapshot, ProjectCheckout, ProjectCheckoutKind, Surface, SurfaceKind,
 };
-use floria_core::config::{SECRETS_DIR, SURFACES_DIR};
+use floria_core::config::{ITEMS_DIR, SECRETS_DIR, SURFACES_DIR};
 use floria_store::{SecretRecord, SecretStore};
 
 use crate::error::{SurfaceError, SurfaceResult};
@@ -41,6 +41,7 @@ pub enum ManagedLinkStatus {
 pub struct ManagedSymlink {
     path: PathBuf,
     expected: PathBuf,
+    accepted_legacy_targets: Vec<PathBuf>,
 }
 
 enum ManagedLinkInspection {
@@ -52,7 +53,27 @@ enum ManagedLinkInspection {
 
 impl ManagedSymlink {
     pub fn new(path: impl Into<PathBuf>, expected: impl Into<PathBuf>) -> Self {
-        Self { path: path.into(), expected: expected.into() }
+        Self {
+            path: path.into(),
+            expected: expected.into(),
+            accepted_legacy_targets: Vec::new(),
+        }
+    }
+
+    /// Build a link plan whose canonical target is used for new/explicitly repaired links while
+    /// existing legacy targets remain healthy. This is the rollback boundary for namespace
+    /// migration: inspecting an old installation never rewrites it.
+    pub fn with_legacy_targets(
+        path: impl Into<PathBuf>,
+        expected: impl Into<PathBuf>,
+        accepted_legacy_targets: impl IntoIterator<Item = PathBuf>,
+    ) -> Self {
+        let expected = expected.into();
+        let accepted_legacy_targets = accepted_legacy_targets
+            .into_iter()
+            .filter(|target| target != &expected)
+            .collect();
+        Self { path: path.into(), expected, accepted_legacy_targets }
     }
 
     pub fn path(&self) -> &Path {
@@ -77,10 +98,18 @@ impl ManagedSymlink {
         self.status().map(|status| status == ManagedLinkStatus::Ready)
     }
 
+    pub fn owns_target(&self, target: &Path) -> bool {
+        target == self.expected
+            || self
+                .accepted_legacy_targets
+                .iter()
+                .any(|accepted| target == accepted)
+    }
+
     fn ensure(&self) -> SurfaceResult<SurfaceLinkState> {
         match self.inspect()? {
             ManagedLinkInspection::Ready => Ok(SurfaceLinkState::Ready),
-            ManagedLinkInspection::Missing => create_link(&self.path, &self.expected),
+            ManagedLinkInspection::Missing => create_link(self),
             ManagedLinkInspection::ForeignSymlink(actual) => Err(link_conflict(
                 &self.path,
                 &self.expected,
@@ -110,7 +139,7 @@ impl ManagedSymlink {
                         })?;
                     }
                 }
-                create_link(&self.path, &self.expected)
+                create_link(self)
             }
             ManagedLinkInspection::ForeignSymlink(_) => {
                 replace_file_with_symlink(&self.path, &self.expected).map_err(|source| {
@@ -152,7 +181,7 @@ impl ManagedSymlink {
             path: self.path.clone(),
             source,
         })?;
-        Ok(if actual == self.expected {
+        Ok(if self.owns_target(&actual) {
             ManagedLinkInspection::Ready
         } else {
             ManagedLinkInspection::ForeignSymlink(actual)
@@ -230,9 +259,29 @@ pub fn ensure_file_surface_link(
         });
     }
     validate_surface_id(&surface.id)?;
-    let path = file_surface_path(surface)?;
-    let expected = mount_path.join(SURFACES_DIR).join(&surface.id);
-    ManagedSymlink::new(path, expected).ensure()
+    surface_link(surface, &surface.id, mount_path)?.ensure()
+}
+
+/// Ensure a file Surface through its stable Managed Item identity. Direct configurable files
+/// retain their backing Secret UUID; composed outputs use the Surface id.
+pub fn ensure_file_surface_link_in_snapshot(
+    snapshot: &CatalogSnapshot,
+    surface: &Surface,
+    mount_path: &Path,
+) -> SurfaceResult<SurfaceLinkState> {
+    if !is_file_surface(surface.kind) {
+        return Err(SurfaceError::UnsupportedSurface {
+            surface_id: surface.id.clone(),
+            kind: format!("{:?}", surface.kind),
+        });
+    }
+    validate_surface_id(&surface.id)?;
+    surface_link(
+        surface,
+        snapshot.managed_item_id_for_surface(surface),
+        mount_path,
+    )?
+    .ensure()
 }
 
 /// Remove a project-facing link only when it still points to this exact mounted surface.
@@ -246,7 +295,7 @@ pub fn remove_file_surface_link(
     }
     validate_surface_id(&surface.id)?;
     let path = file_surface_path(surface)?;
-    let expected = mount_path.join(SURFACES_DIR).join(&surface.id);
+    let link = surface_link(surface, &surface.id, mount_path)?;
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -268,7 +317,7 @@ pub fn remove_file_surface_link(
         path: path.to_path_buf(),
         source,
     })?;
-    if actual != expected {
+    if !link.owns_target(&actual) {
         return Ok(SurfaceLinkRemoval::Preserved);
     }
     std::fs::remove_file(path).map_err(|source| SurfaceError::LinkIo {
@@ -290,6 +339,89 @@ fn file_surface_path(surface: &Surface) -> SurfaceResult<&Path> {
     })
 }
 
+pub fn managed_item_target(
+    mount_path: &Path,
+    item_id: &str,
+    materialized_path: &Path,
+) -> SurfaceResult<PathBuf> {
+    validate_surface_id(item_id)?;
+    let basename = materialized_path.file_name().ok_or_else(|| {
+        SurfaceError::CheckoutMaterialization {
+            surface_id: item_id.to_string(),
+            reason: format!("path {} has no file name", materialized_path.display()),
+        }
+    })?;
+    Ok(mount_path.join(ITEMS_DIR).join(item_id).join(basename))
+}
+
+fn surface_link(
+    surface: &Surface,
+    item_id: &str,
+    mount_path: &Path,
+) -> SurfaceResult<ManagedSymlink> {
+    let path = file_surface_path(surface)?.to_path_buf();
+    let expected = managed_item_target(mount_path, item_id, &path)?;
+    let mut legacy = vec![mount_path.join(SURFACES_DIR).join(&surface.id)];
+    if item_id != surface.id {
+        legacy.push(mount_path.join(SECRETS_DIR).join(item_id));
+    }
+    Ok(ManagedSymlink::with_legacy_targets(
+        path,
+        expected,
+        legacy,
+    ))
+}
+
+fn protected_file_link(
+    record: &SecretRecord,
+    path: PathBuf,
+    mount_path: &Path,
+) -> SurfaceResult<ManagedSymlink> {
+    let id = record.id.to_string();
+    let absolute_target = managed_item_target(mount_path, &id, &path)?;
+    let expected = if record.source_path() == Some(path.as_path()) {
+        home_relative_target(&path, &absolute_target).unwrap_or(absolute_target)
+    } else {
+        absolute_target
+    };
+    Ok(ManagedSymlink::with_legacy_targets(
+        path,
+        expected,
+        [mount_path.join(SECRETS_DIR).join(id)],
+    ))
+}
+
+/// HOME-level files use a username-free relative link so dotfiles/migration tools can copy the
+/// link bytes between Macs. Project/worktree links remain absolute and are reconciled locally.
+fn home_relative_target(source_path: &Path, absolute_target: &Path) -> Option<PathBuf> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    home_relative_target_from(&home, source_path, absolute_target)
+}
+
+fn home_relative_target_from(
+    home: &Path,
+    source_path: &Path,
+    absolute_target: &Path,
+) -> Option<PathBuf> {
+    if source_path.parent()? != home {
+        return None;
+    }
+    let relative = absolute_target.strip_prefix(home).ok()?;
+    (!relative.as_os_str().is_empty()).then(|| relative.to_path_buf())
+}
+
+/// Canonical/legacy-aware link plan for a file-origin Secret at its original source path.
+pub fn managed_protected_file_link(
+    record: &SecretRecord,
+    mount_path: &Path,
+) -> SurfaceResult<ManagedSymlink> {
+    let path = record.source_path().ok_or_else(|| SurfaceError::CheckoutMaterialization {
+        surface_id: record.id.to_string(),
+        reason: "Managed Secret has no file-origin path".to_string(),
+    })?;
+    protected_file_link(record, path.to_path_buf(), mount_path)
+}
+
 fn validate_surface_id(id: &str) -> SurfaceResult<()> {
     let mut components = Path::new(id).components();
     let valid_component = matches!(components.next(), Some(Component::Normal(component)) if component == id);
@@ -303,17 +435,17 @@ fn validate_surface_id(id: &str) -> SurfaceResult<()> {
     }
 }
 
-fn create_link(path: &Path, expected: &Path) -> SurfaceResult<SurfaceLinkState> {
-    match symlink(expected, path) {
+fn create_link(link: &ManagedSymlink) -> SurfaceResult<SurfaceLinkState> {
+    match symlink(&link.expected, &link.path) {
         Ok(()) => Ok(SurfaceLinkState::Created),
         // Another process may have created the path after the lstat. Re-inspect it and only
         // accept the exact link we wanted.
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            ManagedSymlink::new(path, expected).ensure()
+            link.ensure()
         }
         Err(source) => Err(SurfaceError::LinkIo {
             operation: "creating",
-            path: path.to_path_buf(),
+            path: link.path.clone(),
             source,
         }),
     }
@@ -332,6 +464,7 @@ pub struct ProtectedCheckoutLink {
     secret_id: floria_store::SecretId,
     path: PathBuf,
     target: PathBuf,
+    accepted_legacy_targets: Vec<PathBuf>,
     mode: u32,
     current_version: u32,
 }
@@ -363,46 +496,54 @@ pub fn managed_file_links(
 ) -> SurfaceResult<Vec<ManagedSymlink>> {
     let surfaces = file_surface_instances(snapshot)?;
     let configured_secret_ids = snapshot.file_surface_secret_ids();
-    let mut links = BTreeMap::<PathBuf, PathBuf>::new();
+    let mut links = BTreeMap::<PathBuf, ManagedSymlink>::new();
 
     for surface in surfaces {
-        let path = file_surface_path(&surface)?.to_path_buf();
-        insert_managed_link(
-            &mut links,
-            path,
-            mount_path.join(SURFACES_DIR).join(surface.id),
+        let link = surface_link(
+            &surface,
+            snapshot.managed_item_id_for_surface(&surface),
+            mount_path,
         )?;
+        insert_managed_link(&mut links, link)?;
     }
     for record in records.iter().filter(|record| {
         !configured_secret_ids.contains(record.id.as_str()) && record.source_path().is_some()
     }) {
-        insert_managed_link(
-            &mut links,
+        let link = protected_file_link(
+            record,
             record.source_path().expect("filtered file origin").to_path_buf(),
-            mount_path.join(SECRETS_DIR).join(record.id.to_string()),
+            mount_path,
         )?;
+        insert_managed_link(&mut links, link)?;
     }
     for link in protected_checkout_links(snapshot, records, mount_path) {
-        insert_managed_link(&mut links, link.path, link.target)?;
+        insert_managed_link(
+            &mut links,
+            ManagedSymlink::with_legacy_targets(
+                link.path,
+                link.target,
+                link.accepted_legacy_targets,
+            ),
+        )?;
     }
 
-    Ok(links
-        .into_iter()
-        .map(|(path, expected)| ManagedSymlink::new(path, expected))
-        .collect())
+    Ok(links.into_values().collect())
 }
 
 fn insert_managed_link(
-    links: &mut BTreeMap<PathBuf, PathBuf>,
-    path: PathBuf,
-    expected: PathBuf,
+    links: &mut BTreeMap<PathBuf, ManagedSymlink>,
+    link: ManagedSymlink,
 ) -> SurfaceResult<()> {
-    if let Some(existing) = links.insert(path.clone(), expected.clone()) {
-        if existing != expected {
+    let path = link.path.clone();
+    if let Some(existing) = links.insert(path.clone(), link.clone()) {
+        if existing.expected != link.expected {
             return Err(link_conflict(
                 &path,
-                &expected,
-                format!("catalog also resolves this path to {}", existing.display()),
+                &link.expected,
+                format!(
+                    "catalog also resolves this path to {}",
+                    existing.expected.display()
+                ),
             ));
         }
     }
@@ -459,7 +600,6 @@ fn protected_checkout_links_excluding(
         {
             continue;
         }
-        let target = mount_path.join(SECRETS_DIR).join(record.id.to_string());
         for checkout in snapshot.checkouts.iter().filter(|checkout| {
             checkout.kind == ProjectCheckoutKind::Worktree
                 && checkout.project_id == project.id
@@ -474,10 +614,14 @@ fn protected_checkout_links_excluding(
             if excluded_paths.contains(&path) {
                 continue;
             }
+            let Ok(managed) = protected_file_link(record, path.clone(), mount_path) else {
+                continue;
+            };
             links.push(ProtectedCheckoutLink {
                 secret_id: record.id.clone(),
                 path,
-                target: target.clone(),
+                target: managed.expected,
+                accepted_legacy_targets: managed.accepted_legacy_targets,
                 mode: record.mode,
                 current_version: record.current_version,
             });
@@ -512,7 +656,7 @@ pub fn release_protected_links_for_file_surfaces(
         .into_iter()
         .filter(|link| surfaced_paths.contains(&link.path))
     {
-        if !is_exact_symlink(&link.path, &link.target)? {
+        if link.current_owned_target()?.is_none() {
             continue;
         }
         std::fs::remove_file(&link.path)?;
@@ -562,7 +706,7 @@ pub fn remove_excluded_protected_checkout_links(
         .iter()
         .filter(|old| !next.iter().any(|new| old.same_location(new)))
     {
-        if is_exact_symlink(&link.path, &link.target)? {
+        if link.current_owned_target()?.is_some() {
             std::fs::remove_file(&link.path)?;
             changed = true;
         }
@@ -592,6 +736,17 @@ impl ProtectedCheckoutLink {
             && self.path == other.path
             && self.target == other.target
     }
+
+    fn current_owned_target(&self) -> io::Result<Option<PathBuf>> {
+        let actual = match std::fs::read_link(&self.path) {
+            Ok(actual) => actual,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::InvalidInput => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        Ok((actual == self.target || self.accepted_legacy_targets.contains(&actual))
+            .then_some(actual))
+    }
 }
 
 fn reconcile_protected_links(
@@ -618,7 +773,7 @@ fn restore_removed_links(
 ) -> io::Result<()> {
     let mut groups = HashMap::<floria_store::SecretId, Vec<&ProtectedCheckoutLink>>::new();
     for link in links {
-        if is_exact_symlink(&link.path, &link.target)? {
+        if link.current_owned_target()?.is_some() {
             groups.entry(link.secret_id.clone()).or_default().push(link);
         }
     }
@@ -633,12 +788,8 @@ fn restore_removed_links(
 }
 
 fn restore_exact_link(link: &ProtectedCheckoutLink, plaintext: &[u8]) -> io::Result<()> {
-    let _ = replace_symlink_with_file_if_target(
-        &link.path,
-        &link.target,
-        plaintext,
-        link.mode,
-    )?;
+    let Some(actual) = link.current_owned_target()? else { return Ok(()) };
+    let _ = replace_symlink_with_file_if_target(&link.path, &actual, plaintext, link.mode)?;
     Ok(())
 }
 
@@ -1007,13 +1158,34 @@ mod tests {
     }
 
     #[test]
+    fn home_level_target_is_portable_but_project_target_stays_machine_local() {
+        let home = Path::new("/Users/fixture");
+        let target = home.join(".floria/items/fixture/.pgpass");
+        assert_eq!(
+            home_relative_target_from(home, &home.join(".pgpass"), &target),
+            Some(PathBuf::from(".floria/items/fixture/.pgpass"))
+        );
+        assert_eq!(
+            home_relative_target_from(
+                home,
+                &home.join("workspace/project/.pgpass"),
+                &target,
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn creates_project_link_and_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("project");
         std::fs::create_dir(&project).unwrap();
         let surface = fixture_surface(project.join(".env"));
         let mount = dir.path().join("mount");
-        let expected = mount.join(SURFACES_DIR).join("fixture-dotenv");
+        let expected = mount
+            .join(ITEMS_DIR)
+            .join("fixture-dotenv")
+            .join(".env");
 
         assert_eq!(
             ensure_file_surface_link(&surface, &mount).unwrap(),
@@ -1186,7 +1358,10 @@ mod tests {
         };
         let mount = dir.path().join("mount");
         let path = worktree.join(".env");
-        let expected = mount.join(SURFACES_DIR).join("fixture-dotenv");
+        let expected = mount
+            .join(ITEMS_DIR)
+            .join("fixture-dotenv")
+            .join(".env");
         symlink("../project/.env", &path).unwrap();
 
         managed_file_links(&snapshot, &[], &mount)
@@ -1365,7 +1540,10 @@ mod tests {
         assert!(std::fs::symlink_metadata(&identical).unwrap().file_type().is_symlink());
         assert_eq!(
             std::fs::read_link(&identical).unwrap(),
-            mount.join(SECRETS_DIR).join(identical_id.to_string())
+            mount
+                .join(ITEMS_DIR)
+                .join(identical_id.to_string())
+                .join("mise.local.toml")
         );
 
         let divergent = worktree.join(".envrc");
@@ -1376,7 +1554,10 @@ mod tests {
         assert!(std::fs::symlink_metadata(&missing).unwrap().file_type().is_symlink());
         assert_eq!(
             std::fs::read_link(&missing).unwrap(),
-            mount.join(SECRETS_DIR).join(missing_id.to_string())
+            mount
+                .join(ITEMS_DIR)
+                .join(missing_id.to_string())
+                .join(".pgpass")
         );
     }
 
@@ -1453,7 +1634,10 @@ mod tests {
 
         assert_eq!(
             std::fs::read_link(development_worktree.join(".env")).unwrap(),
-            mount.join(SURFACES_DIR).join("fixture-dotenv")
+            mount
+                .join(ITEMS_DIR)
+                .join("fixture-dotenv")
+                .join(".env")
         );
         assert_eq!(
             std::fs::read_link(staging_worktree.join(".env")).unwrap(),
@@ -1645,7 +1829,7 @@ mod tests {
         refresh_protected_checkout_links(&mut active_links, links, &store).unwrap();
         assert_eq!(
             std::fs::read_link(worktree.join(".env")).unwrap(),
-            mount.join(SECRETS_DIR).join(id.to_string())
+            mount.join(ITEMS_DIR).join(id.to_string()).join(".env")
         );
 
         refresh_protected_checkout_links(&mut active_links, Vec::new(), &store).unwrap();

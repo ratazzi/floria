@@ -22,8 +22,10 @@ use floria_platform::{PeerAccess, SocketPeerVerifier};
 use floria_ssh::ManagedKeyError;
 use floria_store::{NewSecret, SecretId, SecretOrigin, SecretRecord, SecretStore, StoreError};
 use floria_surface::{
-    checkout_link_issues, decode_source, ensure_file_surface_link, file_surface_instances,
-    managed_file_links, protected_checkout_links, remove_excluded_protected_checkout_links,
+    checkout_link_issues, decode_source, ensure_file_surface_link_in_snapshot,
+    file_surface_instances,
+    managed_file_links, managed_item_target, managed_protected_file_link,
+    protected_checkout_links, remove_excluded_protected_checkout_links,
     replace_regular_file_with_symlink_if_matches,
     replace_regular_file_with_symlink_if_unchanged,
     replace_symlink_with_file_if_target, restore_protected_checkout_links,

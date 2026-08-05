@@ -1,5 +1,7 @@
 use floria_core::authz::Enforcement;
-use floria_core::config::{SECRETS_DIR, SURFACES_DIR};
+use std::collections::BTreeMap;
+
+use floria_core::config::{ITEMS_DIR, SECRETS_DIR, SURFACES_DIR};
 use floria_core::rules::{
     compile_glob, exact_path_glob, ObjectMatch, Rule, RuleOps, SubjectMatch,
     MANAGED_ITEM_PRIORITY, MANAGED_RESOURCE_PRIORITY,
@@ -16,7 +18,7 @@ pub struct ManagedPolicyItem {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ManagedObject {
     Secret { secret_id: String },
-    Surface { surface_id: String },
+    Surface { surface_id: String, item_id: String },
     SshResource { resource_id: String },
 }
 
@@ -37,9 +39,10 @@ pub fn normalize_managed_policy(mut items: Vec<ManagedPolicyItem>) -> Vec<Manage
 }
 
 pub fn managed_rules(items: &[ManagedPolicyItem]) -> Vec<Rule> {
-    items
-        .iter()
-        .map(|item| match &item.object {
+    let mut rules = Vec::with_capacity(items.len() * 2);
+    let mut item_enforcement = BTreeMap::<String, Enforcement>::new();
+    for item in items {
+        let rule = match &item.object {
             ManagedObject::Secret { secret_id } => Rule {
                 id: format!("managed:secret:{secret_id}"),
                 priority: MANAGED_ITEM_PRIORITY,
@@ -50,7 +53,7 @@ pub fn managed_rules(items: &[ManagedPolicyItem]) -> Vec<Rule> {
                 enforcement: item.enforcement,
                 enabled: true,
             },
-            ManagedObject::Surface { surface_id } => Rule {
+            ManagedObject::Surface { surface_id, .. } => Rule {
                 id: format!("managed:surface:{surface_id}"),
                 priority: MANAGED_ITEM_PRIORITY,
                 subject: SubjectMatch::default(),
@@ -71,8 +74,35 @@ pub fn managed_rules(items: &[ManagedPolicyItem]) -> Vec<Rule> {
                 enforcement: item.enforcement,
                 enabled: true,
             },
-        })
-        .collect()
+        };
+        rules.push(rule);
+
+        let item_id = match &item.object {
+            ManagedObject::Secret { secret_id } => Some(secret_id),
+            ManagedObject::Surface { item_id, .. } => Some(item_id),
+            ManagedObject::SshResource { .. } => None,
+        };
+        if let Some(item_id) = item_id {
+            item_enforcement
+                .entry(item_id.clone())
+                .and_modify(|current| *current = stricter(*current, item.enforcement))
+                .or_insert(item.enforcement);
+        }
+    }
+    for (item_id, enforcement) in item_enforcement {
+        rules.push(Rule {
+            id: format!("managed:item:{item_id}"),
+            priority: MANAGED_ITEM_PRIORITY,
+            subject: SubjectMatch::default(),
+            object: ObjectMatch::default(),
+            path_glob: compile_glob(&format!("{ITEMS_DIR}/{item_id}/**"))
+                .expect("managed item ids produce a valid path glob"),
+            ops: RuleOps::READ_WRITE_SIGN,
+            enforcement,
+            enabled: true,
+        });
+    }
+    rules
 }
 
 fn stricter(left: Enforcement, right: Enforcement) -> Enforcement {
@@ -98,7 +128,10 @@ mod tests {
     fn normalization_sorts_and_merges_duplicate_objects_by_strictness() {
         let normalized = normalize_managed_policy(vec![
             ManagedPolicyItem {
-                object: ManagedObject::Surface { surface_id: "b".to_string() },
+                object: ManagedObject::Surface {
+                    surface_id: "b".to_string(),
+                    item_id: "b".to_string(),
+                },
                 enforcement: Enforcement::Prompt,
             },
             ManagedPolicyItem {
@@ -119,7 +152,10 @@ mod tests {
                     enforcement: Enforcement::TouchId,
                 },
                 ManagedPolicyItem {
-                    object: ManagedObject::Surface { surface_id: "b".to_string() },
+                    object: ManagedObject::Surface {
+                        surface_id: "b".to_string(),
+                        item_id: "b".to_string(),
+                    },
                     enforcement: Enforcement::Prompt,
                 },
             ]
@@ -130,7 +166,10 @@ mod tests {
     fn ssh_resource_rule_overrides_its_surface_rule() {
         let items = vec![
             ManagedPolicyItem {
-                object: ManagedObject::Surface { surface_id: "agent".to_string() },
+                object: ManagedObject::Surface {
+                    surface_id: "agent".to_string(),
+                    item_id: "agent".to_string(),
+                },
                 enforcement: Enforcement::TouchId,
             },
             ManagedPolicyItem {
@@ -153,6 +192,40 @@ mod tests {
             (
                 Enforcement::Allow,
                 Some("managed:ssh-resource:key".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn public_item_path_uses_the_strictest_policy_for_one_stable_identity() {
+        let items = vec![
+            ManagedPolicyItem {
+                object: ManagedObject::Secret { secret_id: "stable".to_string() },
+                enforcement: Enforcement::Allow,
+            },
+            ManagedPolicyItem {
+                object: ManagedObject::Surface {
+                    surface_id: "configured-view".to_string(),
+                    item_id: "stable".to_string(),
+                },
+                enforcement: Enforcement::TouchId,
+            },
+        ];
+        let rules = RuleSet::new(managed_rules(&items));
+        let identity = ProcessIdentity::bare(1, 501, 20);
+        let request = RuleRequest {
+            identity: &identity,
+            path: "items/stable/.env",
+            repo: None,
+            operation: Operation::Read,
+            object: RuleObject::default(),
+        };
+
+        assert_eq!(
+            rules.decide(&request),
+            (
+                Enforcement::TouchId,
+                Some("managed:item:stable".to_string())
             )
         );
     }

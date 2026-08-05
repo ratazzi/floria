@@ -27,7 +27,7 @@ use floria_store::{
     AgeDirStore, KeychainKeyProvider, SecretId, SecretRecord, SecretStore, SshKeyProvider,
 };
 use floria_surface::{
-    ensure_file_surface_link, file_surface_instances, protected_checkout_links,
+    ensure_file_surface_link_in_snapshot, file_surface_instances, protected_checkout_links,
     refresh_protected_checkout_links, release_protected_links_for_file_surfaces,
     remove_file_surface_link, ProtectedCheckoutLink, SurfaceLinkRemoval, SurfaceLinkState,
     SurfaceRegistry,
@@ -992,7 +992,7 @@ fn cmd_mount(config: &Path) -> Result<()> {
         &cfg.mount_path,
     )
     .context("transitioning protected worktree links to configured surfaces")?;
-    reconcile_file_links(&linked_file_surfaces, &cfg.mount_path);
+    reconcile_file_links(&snapshot, &linked_file_surfaces, &cfg.mount_path);
     let mut linked_protected_files = Vec::new();
     refresh_protected_checkout_links(
         &mut linked_protected_files,
@@ -1336,7 +1336,7 @@ impl CatalogObserver for RuntimeCatalogObserver {
             tracing::warn!(%error, "listing protected files for runtime refresh failed");
         }
         self.surface_registry.replace(snapshot);
-        reconcile_file_links(&next_links, &self.mount_path);
+        reconcile_file_links(snapshot, &next_links, &self.mount_path);
         *previous_links = next_links;
         drop(previous_links);
         if let Err(error) = self.ssh_runtime.replace(snapshot) {
@@ -1395,7 +1395,10 @@ fn managed_policy_items(
 
     for surface in &snapshot.surfaces {
         items.push(ManagedPolicyItem {
-            object: ManagedObject::Surface { surface_id: surface.id.clone() },
+            object: ManagedObject::Surface {
+                surface_id: surface.id.clone(),
+                item_id: snapshot.managed_item_id_for_surface(surface).to_string(),
+            },
             enforcement: surface.enforcement,
         });
     }
@@ -1435,10 +1438,14 @@ fn cleanup_removed_file_links(
     }
 }
 
-fn reconcile_file_links(surfaces: &[Surface], mount_path: &Path) {
+fn reconcile_file_links(
+    snapshot: &CatalogSnapshot,
+    surfaces: &[Surface],
+    mount_path: &Path,
+) {
     for surface in surfaces {
         let path = surface.path.as_deref().expect("file surface has a project path");
-        match ensure_file_surface_link(surface, mount_path) {
+        match ensure_file_surface_link_in_snapshot(snapshot, surface, mount_path) {
             Ok(SurfaceLinkState::Created) => tracing::info!(
                 surface = %surface.id,
                 path = %path.display(),
@@ -2564,7 +2571,10 @@ mod tests {
             enforcement: Enforcement::Allow,
         }));
         assert!(items.contains(&ManagedPolicyItem {
-            object: ManagedObject::Surface { surface_id: "combined".to_string() },
+            object: ManagedObject::Surface {
+                surface_id: "combined".to_string(),
+                item_id: "combined".to_string(),
+            },
             enforcement: Enforcement::Allow,
         }));
         assert!(items.contains(&ManagedPolicyItem {

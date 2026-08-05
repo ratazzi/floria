@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use floria_core::config::{FileEntry, SECRETS_DIR, SURFACES_DIR};
+use floria_core::config::{FileEntry, ITEMS_DIR, SECRETS_DIR, SURFACES_DIR};
 use floria_core::source::ContentSource;
 
 /// Root inode. FUSE convention: root = 1.
@@ -17,6 +17,8 @@ pub struct Tree {
     /// Inode of the always-present catalog surface directory. Its children come from the
     /// in-memory surface registry maintained by the control plane.
     surfaces_dir_ino: u64,
+    /// Root of the stable two-level public Managed Item namespace.
+    items_dir_ino: u64,
     /// First inode not used by the static tree; dynamic namespaces allocate from here.
     next_ino: u64,
 }
@@ -62,6 +64,7 @@ impl Tree {
             children: HashMap::new(),
             secrets_dir_ino: 0,
             surfaces_dir_ino: 0,
+            items_dir_ino: 0,
             next_ino: 0,
         };
         tree.nodes.insert(
@@ -124,6 +127,12 @@ impl Tree {
         // by the fs layer against the store, so newly protected files appear without a remount.
         let secrets_dir_ino = tree.ensure_dir(ROOT_INO, SECRETS_DIR, &mut next_ino);
         tree.secrets_dir_ino = secrets_dir_ino;
+
+        // Persistent links target this namespace. Its item directories and leaf files are
+        // supplied dynamically by the fs layer; the legacy namespaces remain mounted so an
+        // upgrade never invalidates an existing link.
+        let items_dir_ino = tree.ensure_dir(ROOT_INO, ITEMS_DIR, &mut next_ino);
+        tree.items_dir_ino = items_dir_ino;
         tree.next_ino = next_ino;
 
         tree
@@ -136,6 +145,10 @@ impl Tree {
 
     pub fn surfaces_dir_ino(&self) -> u64 {
         self.surfaces_dir_ino
+    }
+
+    pub fn items_dir_ino(&self) -> u64 {
+        self.items_dir_ino
     }
 
     /// First inode not used by the static tree (start of the dynamic secrets range).
@@ -194,5 +207,11 @@ mod tests {
             Some(tree.secrets_dir_ino())
         );
         assert_ne!(tree.surfaces_dir_ino(), tree.secrets_dir_ino());
+        assert_eq!(
+            tree.lookup_child(ROOT_INO, ITEMS_DIR),
+            Some(tree.items_dir_ino())
+        );
+        assert_ne!(tree.items_dir_ino(), tree.secrets_dir_ino());
+        assert_ne!(tree.items_dir_ino(), tree.surfaces_dir_ino());
     }
 }
