@@ -101,7 +101,18 @@ pub(super) fn migrate(conn: &mut Connection) -> CatalogResult<()> {
                    (kind != 'unix_socket' AND relative_path != ''))
         );
         CREATE INDEX surfaces_environment_idx ON surfaces(environment_id, position);
-        PRAGMA user_version = 13;",
+
+        CREATE TABLE replication_outbox (
+            intent_id TEXT PRIMARY KEY,
+            logical_id TEXT NOT NULL,
+            parents_json TEXT NOT NULL,
+            store_versions_json TEXT NOT NULL,
+            catalog_payload BLOB NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX replication_outbox_created_idx
+            ON replication_outbox(created_at, intent_id);
+        PRAGMA user_version = 14;",
     )?;
     tx.commit()?;
     Ok(())

@@ -14,12 +14,12 @@ use crate::domain::{
     Binding, BindingScope, CatalogSnapshot, EntrySelection, Environment, FileBacking,
     FormatInputModel, ManagedFileConfigurationRemoval, OriginKind, OriginSource, Project,
     ProjectCheckout, ProjectCheckoutKind, ResolvedEnvironment, ResolvedExport, Resource,
-    ResourceBindingUsage, ResourceCodec, ResourceKind, ResourceOrigin, ResourceSource,
-    ResourceUsage, Surface, SurfaceFormat, SurfaceInput, SurfaceKind, ValueShape,
+    ReplicationOutboxEntry, ResourceBindingUsage, ResourceCodec, ResourceKind, ResourceOrigin,
+    ResourceSource, ResourceUsage, Surface, SurfaceFormat, SurfaceInput, SurfaceKind, ValueShape,
 };
 use crate::error::{CatalogError, CatalogResult};
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 14;
 const INTEGRITY_DOMAIN: &str = "catalog-security-state";
 
 #[derive(Clone)]
@@ -38,6 +38,7 @@ struct CatalogSecuritySnapshot {
     schema_version: i64,
     schema: Vec<SchemaObject>,
     catalog: CatalogSnapshot,
+    outbox: Vec<ReplicationOutboxEntry>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,7 +50,7 @@ struct SchemaObject {
 }
 
 /// Compatibility reader for the short-lived development checkpoint that authenticated rows but
-/// not schema. It is accepted only when the live schema exactly matches a freshly-created v13
+/// not schema. It is accepted only when the live schema exactly matches a freshly-created v14
 /// schema, then immediately upgraded to `CatalogSecuritySnapshot`.
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -224,7 +225,7 @@ impl Catalog {
     }
 
     pub fn snapshot(&self) -> CatalogResult<CatalogSnapshot> {
-        self.with_authenticated_read(|_, snapshot| Ok(snapshot.clone()))
+        self.with_authenticated_read(|_, snapshot| Ok(snapshot.catalog.clone()))
     }
 
     /// Check SQLite integrity and validate the complete live catalog without modifying it.
@@ -234,7 +235,7 @@ impl Catalog {
     pub fn verify_integrity(&self) -> CatalogResult<CatalogSnapshot> {
         self.with_authenticated_read(|conn, snapshot| {
             run_physical_integrity_checks(conn)?;
-            Ok(snapshot.clone())
+            Ok(snapshot.catalog.clone())
         })
     }
 
@@ -326,7 +327,7 @@ impl Catalog {
     /// after another writer has replaced the rows it referred to.
     fn with_authenticated_read<T>(
         &self,
-        operation: impl FnOnce(&Transaction<'_>, &CatalogSnapshot) -> CatalogResult<T>,
+        operation: impl FnOnce(&Transaction<'_>, &CatalogSecuritySnapshot) -> CatalogResult<T>,
     ) -> CatalogResult<T> {
         let _mutation = self.integrity.as_ref().map(|integrity| {
             integrity.mutation.lock().expect("catalog integrity lock poisoned")
@@ -335,7 +336,7 @@ impl Catalog {
         let tx = conn.transaction()?;
         let current = security_snapshot_from(&tx)?;
         self.verify_security_snapshot(&current)?;
-        let result = operation(&tx, &current.catalog)?;
+        let result = operation(&tx, &current)?;
         tx.commit()?;
         Ok(result)
     }
@@ -451,8 +452,9 @@ fn security_snapshot_from(conn: &Connection) -> CatalogResult<CatalogSecuritySna
         )));
     }
     let catalog = snapshot_from(conn)?;
+    let outbox = outbox_from(conn)?;
     validate_snapshot_conflicts(&catalog)?;
-    Ok(CatalogSecuritySnapshot { schema_version, schema, catalog })
+    Ok(CatalogSecuritySnapshot { schema_version, schema, catalog, outbox })
 }
 
 fn schema_objects_from(conn: &Connection) -> CatalogResult<Vec<SchemaObject>> {
@@ -551,8 +553,10 @@ mod resources;
 mod schema;
 mod snapshot;
 mod surfaces;
+mod outbox;
 mod validation;
 
+use outbox::outbox_from;
 use schema::migrate;
 use snapshot::{snapshot_from, validate_snapshot_conflicts};
 pub use snapshot::{
@@ -676,6 +680,20 @@ mod tests {
         (dir, catalog)
     }
 
+    fn replication_outbox_entry() -> ReplicationOutboxEntry {
+        ReplicationOutboxEntry {
+            intent_id: "11111111-1111-4111-8111-111111111111".to_string(),
+            logical_id: "managed-item-1".to_string(),
+            parents: vec!["revision-one".to_string()],
+            store_versions: vec![crate::domain::ReplicationStoreVersionRef {
+                secret_id: "22222222-2222-4222-8222-222222222222".to_string(),
+                version: 2,
+            }],
+            catalog_payload: br#"{"kind":"fixture"}"#.to_vec(),
+            created_at: "2026-08-06T00:00:00Z".to_string(),
+        }
+    }
+
     #[test]
     fn rejects_old_schema_during_development() {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -738,6 +756,54 @@ mod tests {
 
         assert_eq!(snapshot.projects, vec![project()]);
         assert_eq!(snapshot.environments, vec![environment()]);
+    }
+
+    #[test]
+    fn replication_outbox_is_immutable_idempotent_and_removable() {
+        let (_dir, catalog) = catalog();
+        let entry = replication_outbox_entry();
+
+        catalog.enqueue_replication_outbox(&entry).unwrap();
+        catalog.enqueue_replication_outbox(&entry).unwrap();
+        assert_eq!(catalog.replication_outbox().unwrap(), vec![entry.clone()]);
+
+        let mut collision = entry.clone();
+        collision.catalog_payload = br#"{"kind":"different"}"#.to_vec();
+        assert!(catalog
+            .enqueue_replication_outbox(&collision)
+            .unwrap_err()
+            .to_string()
+            .contains("different committed state"));
+
+        catalog.remove_replication_outbox(&entry.intent_id).unwrap();
+        assert!(catalog.replication_outbox().unwrap().is_empty());
+    }
+
+    #[test]
+    fn authenticated_catalog_detects_outbox_tampering() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.sqlite");
+        let catalog = Catalog::open_authenticated(
+            &path,
+            Arc::new(StateAuthenticator::for_tests([47; 32])),
+        )
+        .unwrap();
+        let entry = replication_outbox_entry();
+        catalog.enqueue_replication_outbox(&entry).unwrap();
+
+        let attacker = Connection::open(&path).unwrap();
+        attacker
+            .execute(
+                "UPDATE replication_outbox SET catalog_payload = X'00' WHERE intent_id = ?1",
+                params![entry.intent_id],
+            )
+            .unwrap();
+
+        assert!(catalog
+            .replication_outbox()
+            .unwrap_err()
+            .to_string()
+            .contains("outside"));
     }
 
     #[test]

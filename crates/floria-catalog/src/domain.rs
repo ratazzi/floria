@@ -518,6 +518,29 @@ pub struct CatalogSnapshot {
     pub surfaces: Vec<Surface>,
 }
 
+/// One immutable local-store version referenced by a replication outbox row.
+/// Export never rereads a mutable store head.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicationStoreVersionRef {
+    pub secret_id: String,
+    pub version: u32,
+}
+
+/// A committed shared mutation waiting for sequence allocation, signing, and publication.
+/// `catalog_payload` contains only shared catalog state; secret bytes remain in the referenced
+/// immutable store versions.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicationOutboxEntry {
+    pub intent_id: String,
+    pub logical_id: String,
+    #[serde(default)]
+    pub parents: Vec<String>,
+    #[serde(default)]
+    pub store_versions: Vec<ReplicationStoreVersionRef>,
+    pub catalog_payload: Vec<u8>,
+    pub created_at: String,
+}
+
 impl CatalogSnapshot {
     /// Stable identity used by the public `items/` namespace for a file Surface.
     ///

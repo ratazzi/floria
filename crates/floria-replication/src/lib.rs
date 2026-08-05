@@ -11,13 +11,16 @@ use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use age::x25519;
 use base64::Engine;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
+use floria_catalog::{Catalog, ReplicationOutboxEntry};
+use floria_integrity::StateAuthenticator;
+use floria_store::{AgeDirStore, SecretId, SecretStore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use signature::{Signer, Verifier};
@@ -48,6 +51,12 @@ pub enum ReplicationError {
     Encryption(String),
     #[error("replication signature failed: {0}")]
     Signature(String),
+    #[error("replication local-state integrity failed: {0}")]
+    Integrity(#[from] floria_integrity::IntegrityError),
+    #[error("replication catalog failed: {0}")]
+    Catalog(#[from] floria_catalog::CatalogError),
+    #[error("replication local store failed: {0}")]
+    Store(#[from] floria_store::StoreError),
 }
 
 pub type ReplicationResult<T> = Result<T, ReplicationError>;
@@ -109,6 +118,304 @@ pub struct PreparedPublication {
     operation: Vec<u8>,
 }
 
+/// A local-store mutation that must become an immutable version before the catalog outbox can
+/// commit. `mutation_id` is written into that version's authenticated metadata.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntentStoreMutation {
+    pub secret_id: String,
+    pub mutation_id: String,
+}
+
+/// Durable pre-commit evidence for one shared mutation. It deliberately contains no plaintext;
+/// secret data is recovered only through the stable local-store mutation identities.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicationIntent {
+    pub intent_id: String,
+    pub logical_id: String,
+    #[serde(default)]
+    pub parents: Vec<String>,
+    #[serde(default)]
+    pub store_mutations: Vec<IntentStoreMutation>,
+    pub catalog_payload: Vec<u8>,
+    pub created_at: String,
+    #[serde(default)]
+    prepared: Option<PreparedPublication>,
+}
+
+impl ReplicationIntent {
+    pub fn new(
+        intent_id: impl Into<String>,
+        logical_id: impl Into<String>,
+        parents: Vec<String>,
+        store_mutations: Vec<IntentStoreMutation>,
+        catalog_payload: Vec<u8>,
+        created_at: impl Into<String>,
+    ) -> ReplicationResult<Self> {
+        let intent = Self {
+            intent_id: intent_id.into(),
+            logical_id: logical_id.into(),
+            parents,
+            store_mutations,
+            catalog_payload,
+            created_at: created_at.into(),
+            prepared: None,
+        };
+        validate_intent(&intent)?;
+        Ok(intent)
+    }
+
+    pub fn prepared(&self) -> Option<&PreparedPublication> {
+        self.prepared.as_ref()
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct IntentJournalState {
+    entries: Vec<ReplicationIntent>,
+    #[serde(default)]
+    accepted_operations: BTreeMap<String, BTreeMap<u64, String>>,
+}
+
+struct IntentJournalMemory {
+    generation: u64,
+    state: IntentJournalState,
+}
+
+/// Authenticated local crash-recovery journal. This is not the sync package and never leaves the
+/// device; it bridges store/catalog/outbox commits that cannot share one physical transaction.
+pub struct ReplicationIntentJournal {
+    path: PathBuf,
+    domain: String,
+    authenticator: Arc<StateAuthenticator>,
+    memory: Mutex<IntentJournalMemory>,
+}
+
+impl ReplicationIntentJournal {
+    pub fn open(
+        path: impl Into<PathBuf>,
+        vault_id: &str,
+        authenticator: Arc<StateAuthenticator>,
+    ) -> ReplicationResult<Self> {
+        require_uuid("vault id", vault_id)?;
+        let path = path.into();
+        let domain = format!("replication-intents:{vault_id}");
+        let loaded = authenticator.load::<IntentJournalState>(&path, &domain)?;
+        let (generation, state) = match loaded.value {
+            Some(state) => (loaded.generation, state),
+            None if loaded.generation == 0 => {
+                let state = IntentJournalState::default();
+                let generation = authenticator.persist(&path, &domain, 0, &state)?;
+                (generation, state)
+            }
+            None => {
+                return Err(ReplicationError::Invalid(format!(
+                    "replication intent journal {} is missing at authenticated generation {}",
+                    path.display(),
+                    loaded.generation
+                )))
+            }
+        };
+        validate_journal(&state)?;
+        Ok(Self {
+            path,
+            domain,
+            authenticator,
+            memory: Mutex::new(IntentJournalMemory { generation, state }),
+        })
+    }
+
+    pub fn entries(&self) -> Vec<ReplicationIntent> {
+        self.memory
+            .lock()
+            .expect("replication intent journal poisoned")
+            .state
+            .entries
+            .clone()
+    }
+
+    pub fn device_sequence(&self, device_id: &str) -> u64 {
+        self.memory
+            .lock()
+            .expect("replication intent journal poisoned")
+            .state
+            .accepted_operations
+            .get(device_id)
+            .and_then(|operations| operations.last_key_value().map(|(sequence, _)| *sequence))
+            .unwrap_or(0)
+    }
+
+    pub fn accepted_operations(&self, device_id: &str) -> BTreeMap<u64, String> {
+        self.memory
+            .lock()
+            .expect("replication intent journal poisoned")
+            .state
+            .accepted_operations
+            .get(device_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn accept_device_operation(
+        &self,
+        device_id: &str,
+        sequence: u64,
+        operation_id: &str,
+    ) -> ReplicationResult<()> {
+        require_uuid("device id", device_id)?;
+        require_uuid("operation id", operation_id)?;
+        if sequence == 0 {
+            return Err(ReplicationError::Invalid(
+                "device operation sequence starts at 1".to_string(),
+            ));
+        }
+        self.mutate(|state| {
+            let operations = state
+                .accepted_operations
+                .entry(device_id.to_string())
+                .or_default();
+            let expected = operations
+                .last_key_value()
+                .map_or(Some(1), |(current, _)| current.checked_add(1))
+                .ok_or_else(|| {
+                    ReplicationError::Invalid(format!(
+                        "device {device_id} operation sequence overflow"
+                    ))
+                })?;
+            if operations.get(&sequence).is_some_and(|existing| existing == operation_id) {
+                return Ok(());
+            }
+            if sequence != expected {
+                return Err(ReplicationError::Invalid(format!(
+                    "device {device_id} checkpoint expected sequence {expected}, got {sequence}"
+                )));
+            }
+            operations.insert(sequence, operation_id.to_string());
+            Ok(())
+        })
+    }
+
+    /// Establish durable evidence before touching the encrypted store or catalog.
+    pub fn enqueue(&self, intent: ReplicationIntent) -> ReplicationResult<()> {
+        validate_intent(&intent)?;
+        self.mutate(|state| {
+            if let Some(existing) = state
+                .entries
+                .iter()
+                .find(|existing| existing.intent_id == intent.intent_id)
+            {
+                if existing == &intent {
+                    return Ok(());
+                }
+                return Err(ReplicationError::Invalid(format!(
+                    "replication intent {} already names different state",
+                    intent.intent_id
+                )));
+            }
+            state.entries.push(intent);
+            state.entries.sort_by(|left, right| {
+                left.created_at
+                    .cmp(&right.created_at)
+                    .then(left.intent_id.cmp(&right.intent_id))
+            });
+            Ok(())
+        })
+    }
+
+    /// Save the exact signed bytes before any package publication. An existing signed value can
+    /// only be retried byte-for-byte.
+    pub fn save_prepared(
+        &self,
+        intent_id: &str,
+        prepared: PreparedPublication,
+    ) -> ReplicationResult<()> {
+        require_uuid("replication intent id", intent_id)?;
+        if prepared.operation_id != intent_id {
+            return Err(ReplicationError::Invalid(
+                "prepared operation id does not match its durable intent".to_string(),
+            ));
+        }
+        self.mutate(|state| {
+            let intent = state
+                .entries
+                .iter_mut()
+                .find(|intent| intent.intent_id == intent_id)
+                .ok_or_else(|| {
+                    ReplicationError::Invalid(format!(
+                        "replication intent {intent_id} does not exist"
+                    ))
+                })?;
+            match &intent.prepared {
+                Some(existing) if existing == &prepared => Ok(()),
+                Some(_) => Err(ReplicationError::Invalid(format!(
+                    "replication intent {intent_id} already has different signed bytes"
+                ))),
+                None => {
+                    intent.prepared = Some(prepared);
+                    Ok(())
+                }
+            }
+        })
+    }
+
+    /// Remove a published intent. Signed-but-unpublished intents cannot use the discard path.
+    pub fn complete(&self, intent_id: &str) -> ReplicationResult<()> {
+        self.remove(intent_id, true)
+    }
+
+    /// Drop a business mutation proven not to have committed anywhere. Once signed, evidence is
+    /// retained until publication or explicit recovery.
+    pub fn discard_unsigned(&self, intent_id: &str) -> ReplicationResult<()> {
+        self.remove(intent_id, false)
+    }
+
+    fn remove(&self, intent_id: &str, require_prepared: bool) -> ReplicationResult<()> {
+        require_uuid("replication intent id", intent_id)?;
+        self.mutate(|state| {
+            let index = state
+                .entries
+                .iter()
+                .position(|intent| intent.intent_id == intent_id)
+                .ok_or_else(|| {
+                    ReplicationError::Invalid(format!(
+                        "replication intent {intent_id} does not exist"
+                    ))
+                })?;
+            let prepared = state.entries[index].prepared.is_some();
+            if require_prepared && !prepared {
+                return Err(ReplicationError::Invalid(format!(
+                    "replication intent {intent_id} has not been signed"
+                )));
+            }
+            if !require_prepared && prepared {
+                return Err(ReplicationError::Invalid(format!(
+                    "signed replication intent {intent_id} cannot be discarded"
+                )));
+            }
+            state.entries.remove(index);
+            Ok(())
+        })
+    }
+
+    fn mutate(
+        &self,
+        operation: impl FnOnce(&mut IntentJournalState) -> ReplicationResult<()>,
+    ) -> ReplicationResult<()> {
+        let mut memory = self.memory.lock().expect("replication intent journal poisoned");
+        let mut next = memory.state.clone();
+        operation(&mut next)?;
+        validate_journal(&next)?;
+        let generation = self.authenticator.persist(
+            &self.path,
+            &self.domain,
+            memory.generation,
+            &next,
+        )?;
+        memory.generation = generation;
+        memory.state = next;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedMutation {
     pub device_id: String,
@@ -134,11 +441,23 @@ pub struct DamagedFile {
     pub reason: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservedOperation {
+    pub device_id: String,
+    pub sequence: u64,
+    pub operation_id: String,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PackageScan {
+    /// Every unique, validly signed slot, including operations whose object is still pending or
+    /// damaged. Self-fencing must use this set rather than only successfully materialized values.
+    pub observed: Vec<ObservedOperation>,
     pub verified: Vec<VerifiedMutation>,
     pub pending: Vec<PendingOperation>,
     pub damaged: Vec<DamagedFile>,
+    /// Devices whose valid signed history is internally inconsistent and must not publish.
+    pub fenced_devices: Vec<String>,
     pub duplicate_files: usize,
 }
 
@@ -364,6 +683,10 @@ impl ReplicationPackage {
         &self.root
     }
 
+    pub fn device_id(&self) -> &str {
+        &self.device.device_id
+    }
+
     pub fn prepare(&self, mutation: PackageMutation<'_>) -> ReplicationResult<PreparedPublication> {
         if mutation.sequence == 0 {
             return Err(ReplicationError::Invalid(
@@ -435,7 +758,7 @@ impl ReplicationPackage {
         let operations_root = self.root.join("operations");
         let mut slots: BTreeMap<(String, u64), (PathBuf, Vec<u8>, OperationDocument)> =
             BTreeMap::new();
-        let mut operation_ids: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut operation_ids: HashMap<String, (Vec<u8>, String)> = HashMap::new();
         let mut equivocated = HashSet::new();
 
         for path in regular_files_recursively(&operations_root)? {
@@ -460,7 +783,9 @@ impl ReplicationPackage {
                 report.damaged.push(DamagedFile { path, reason: error.to_string() });
                 continue;
             }
-            if let Some(existing) = operation_ids.get(&operation.operation_id) {
+            if let Some((existing, existing_device_id)) =
+                operation_ids.get(&operation.operation_id)
+            {
                 if existing == &bytes {
                     report.duplicate_files += 1;
                     continue;
@@ -472,9 +797,14 @@ impl ReplicationPackage {
                         operation.operation_id
                     ),
                 });
+                report.fenced_devices.push(existing_device_id.clone());
+                report.fenced_devices.push(operation.device_id.clone());
                 continue;
             }
-            operation_ids.insert(operation.operation_id.clone(), bytes.clone());
+            operation_ids.insert(
+                operation.operation_id.clone(),
+                (bytes.clone(), operation.device_id.clone()),
+            );
             let slot = (operation.device_id.clone(), operation.sequence);
             if equivocated.contains(&slot) {
                 report.damaged.push(DamagedFile {
@@ -504,6 +834,7 @@ impl ReplicationPackage {
                             operation.device_id, operation.sequence
                         ),
                     });
+                    report.fenced_devices.push(operation.device_id.clone());
                     slots.remove(&slot);
                     equivocated.insert(slot);
                 }
@@ -514,6 +845,11 @@ impl ReplicationPackage {
 
         let mut expected_sequences: HashMap<String, u64> = HashMap::new();
         for ((device_id, sequence), (path, _, operation)) in slots {
+            report.observed.push(ObservedOperation {
+                device_id: device_id.clone(),
+                sequence,
+                operation_id: operation.operation_id.clone(),
+            });
             let expected = expected_sequences.entry(device_id.clone()).or_insert(1);
             if sequence != *expected {
                 report.pending.push(PendingOperation {
@@ -533,6 +869,13 @@ impl ReplicationPackage {
                 .cmp(&right.device_id)
                 .then(left.sequence.cmp(&right.sequence))
         });
+        report.observed.sort_by(|left, right| {
+            left.device_id
+                .cmp(&right.device_id)
+                .then(left.sequence.cmp(&right.sequence))
+        });
+        report.fenced_devices.sort();
+        report.fenced_devices.dedup();
         Ok(report)
     }
 
@@ -677,6 +1020,341 @@ impl ReplicationPackage {
         });
         Ok(true)
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReplicationReport {
+    pub published: usize,
+    pub observed: usize,
+    pub pending: usize,
+    pub damaged: usize,
+    pub local_device_fenced: bool,
+    pub messages: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct ExportCommit<'a> {
+    format_version: u32,
+    catalog_payload: &'a [u8],
+    store_values: Vec<ExportStoreValue<'a>>,
+}
+
+#[derive(Serialize)]
+struct ExportStoreValue<'a> {
+    secret_id: &'a str,
+    version: u32,
+    value: &'a [u8],
+}
+
+/// Single entry point for the stage-2 replication loop. Directory parsing, self-fencing,
+/// immutable local-store reads, exact signed retry, and outbox completion stay behind `sync()`.
+pub struct ReplicationEngine {
+    package: ReplicationPackage,
+    intents: Arc<ReplicationIntentJournal>,
+    catalog: Arc<Catalog>,
+    store: Arc<AgeDirStore>,
+}
+
+impl ReplicationEngine {
+    pub fn open(
+        directory: impl Into<PathBuf>,
+        device: DeviceKeyMaterial,
+        local_state_directory: &Path,
+        authenticator: Arc<StateAuthenticator>,
+        catalog: Arc<Catalog>,
+        store: Arc<AgeDirStore>,
+    ) -> ReplicationResult<Self> {
+        let package = ReplicationPackage::open(directory, device)?;
+        ensure_private_local_state_directory(local_state_directory)?;
+        let intents = Arc::new(ReplicationIntentJournal::open(
+            local_state_directory.join(format!("replication-{}.json", package.vault_id())),
+            package.vault_id(),
+            authenticator,
+        )?);
+        Ok(Self { package, intents, catalog, store })
+    }
+
+    pub fn from_parts(
+        package: ReplicationPackage,
+        intents: Arc<ReplicationIntentJournal>,
+        catalog: Arc<Catalog>,
+        store: Arc<AgeDirStore>,
+    ) -> Self {
+        Self { package, intents, catalog, store }
+    }
+
+    pub fn sync(&self) -> ReplicationResult<ReplicationReport> {
+        let scan = self.package.scan()?;
+        let mut report = ReplicationReport {
+            observed: scan.observed.len(),
+            pending: scan.pending.len(),
+            damaged: scan.damaged.len(),
+            ..Default::default()
+        };
+        if scan
+            .fenced_devices
+            .iter()
+            .any(|device| device == self.package.device_id())
+        {
+            return Ok(fence_report(
+                report,
+                "the local Device has conflicting valid signed operations",
+            ));
+        }
+
+        let local_observed = scan
+            .observed
+            .iter()
+            .filter(|operation| operation.device_id == self.package.device_id())
+            .map(|operation| (operation.sequence, operation.operation_id.clone()))
+            .collect::<BTreeMap<_, _>>();
+        let accepted = self.intents.accepted_operations(self.package.device_id());
+        for (sequence, operation_id) in &accepted {
+            if local_observed.get(sequence) != Some(operation_id) {
+                return Ok(fence_report(
+                    report,
+                    format!(
+                        "the Replication Directory no longer contains accepted local operation {sequence}"
+                    ),
+                ));
+            }
+        }
+
+        let mut checkpoint = self.intents.device_sequence(self.package.device_id());
+        let journal_entries = self.intents.entries();
+        for (sequence, operation_id) in local_observed.range((
+            std::ops::Bound::Excluded(checkpoint),
+            std::ops::Bound::Unbounded,
+        )) {
+            let Some(expected) = checkpoint.checked_add(1) else {
+                return Ok(fence_report(report, "the local Device sequence overflowed"));
+            };
+            if *sequence != expected {
+                return Ok(fence_report(
+                    report,
+                    format!("the local Device history has a gap before sequence {sequence}"),
+                ));
+            }
+            let Some(prepared) = journal_entries.iter().find_map(|intent| {
+                intent.prepared().filter(|prepared| {
+                    prepared.sequence == *sequence && prepared.operation_id == *operation_id
+                })
+            }) else {
+                return Ok(fence_report(
+                    report,
+                    format!(
+                        "the local Device is behind signed operation {sequence} without matching recovery evidence"
+                    ),
+                ));
+            };
+            self.package.publish(prepared)?;
+            self.intents.accept_device_operation(
+                self.package.device_id(),
+                *sequence,
+                operation_id,
+            )?;
+            checkpoint = *sequence;
+        }
+
+        let outbox = self.catalog.replication_outbox()?;
+        let outbox_ids = outbox
+            .iter()
+            .map(|entry| entry.intent_id.as_str())
+            .collect::<HashSet<_>>();
+        for intent in self.intents.entries() {
+            if outbox_ids.contains(intent.intent_id.as_str()) {
+                continue;
+            }
+            match intent.prepared() {
+                Some(prepared)
+                    if self
+                        .intents
+                        .accepted_operations(self.package.device_id())
+                        .get(&prepared.sequence)
+                        == Some(&prepared.operation_id) =>
+                {
+                    self.intents.complete(&intent.intent_id)?;
+                }
+                Some(_) => {
+                    return Ok(fence_report(
+                        report,
+                        format!(
+                            "signed intent {} has neither an outbox row nor an accepted operation",
+                            intent.intent_id
+                        ),
+                    ));
+                }
+                None if self.intent_has_no_store_writes(&intent)? => {
+                    self.intents.discard_unsigned(&intent.intent_id)?;
+                }
+                None => {
+                    return Ok(fence_report(
+                        report,
+                        format!(
+                            "intent {} reached the local store but has no committed outbox row",
+                            intent.intent_id
+                        ),
+                    ));
+                }
+            }
+        }
+
+        for entry in outbox {
+            let intent = self
+                .intents
+                .entries()
+                .into_iter()
+                .find(|intent| intent.intent_id == entry.intent_id)
+                .ok_or_else(|| {
+                    ReplicationError::Invalid(format!(
+                        "committed outbox intent {} has no durable pre-commit journal entry",
+                        entry.intent_id
+                    ))
+                })?;
+            validate_committed_intent(&intent, &entry, self.store.as_ref())?;
+
+            let prepared = match intent.prepared() {
+                Some(prepared) => prepared.clone(),
+                None => {
+                    let value = self.export_value(&entry)?;
+                    let next = self
+                        .intents
+                        .device_sequence(self.package.device_id())
+                        .checked_add(1)
+                        .ok_or_else(|| {
+                            ReplicationError::Invalid(
+                                "local Device sequence overflow".to_string(),
+                            )
+                        })?;
+                    let prepared = self.package.prepare(PackageMutation {
+                        sequence: next,
+                        operation_id: &entry.intent_id,
+                        logical_id: &entry.logical_id,
+                        parents: &entry.parents,
+                        value: &value,
+                    })?;
+                    self.intents.save_prepared(&entry.intent_id, prepared.clone())?;
+                    prepared
+                }
+            };
+
+            self.package.publish(&prepared)?;
+            let accepted = self.intents.accepted_operations(self.package.device_id());
+            match accepted.get(&prepared.sequence) {
+                Some(operation_id) if operation_id == &prepared.operation_id => {}
+                Some(_) => {
+                    return Ok(fence_report(
+                        report,
+                        format!(
+                            "local sequence {} is already assigned to another operation",
+                            prepared.sequence
+                        ),
+                    ));
+                }
+                None => self.intents.accept_device_operation(
+                    self.package.device_id(),
+                    prepared.sequence,
+                    &prepared.operation_id,
+                )?,
+            }
+            self.catalog.remove_replication_outbox(&entry.intent_id)?;
+            self.intents.complete(&entry.intent_id)?;
+            report.published += 1;
+        }
+        Ok(report)
+    }
+
+    fn intent_has_no_store_writes(&self, intent: &ReplicationIntent) -> ReplicationResult<bool> {
+        for mutation in &intent.store_mutations {
+            let secret_id: SecretId = mutation.secret_id.parse()?;
+            if self
+                .store
+                .version_for_mutation(&secret_id, &mutation.mutation_id)?
+                .is_some()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    fn export_value(&self, entry: &ReplicationOutboxEntry) -> ReplicationResult<Zeroizing<Vec<u8>>> {
+        let _maintenance = self.store.lock_for_maintenance()?;
+        let plaintexts = entry
+            .store_versions
+            .iter()
+            .map(|reference| {
+                let secret_id: SecretId = reference.secret_id.parse()?;
+                self.store.get_version(&secret_id, reference.version)
+            })
+            .collect::<Result<Vec<_>, floria_store::StoreError>>()?;
+        let store_values = entry
+            .store_versions
+            .iter()
+            .zip(&plaintexts)
+            .map(|(reference, value)| ExportStoreValue {
+                secret_id: &reference.secret_id,
+                version: reference.version,
+                value: value.as_slice(),
+            })
+            .collect();
+        Ok(Zeroizing::new(serde_json::to_vec(&ExportCommit {
+            format_version: FORMAT_VERSION,
+            catalog_payload: &entry.catalog_payload,
+            store_values,
+        })?))
+    }
+}
+
+fn validate_committed_intent(
+    intent: &ReplicationIntent,
+    outbox: &ReplicationOutboxEntry,
+    store: &AgeDirStore,
+) -> ReplicationResult<()> {
+    if intent.intent_id != outbox.intent_id
+        || intent.logical_id != outbox.logical_id
+        || intent.parents != outbox.parents
+        || intent.catalog_payload != outbox.catalog_payload
+    {
+        return Err(ReplicationError::Invalid(format!(
+            "outbox intent {} does not match its durable pre-commit state",
+            outbox.intent_id
+        )));
+    }
+    if intent.store_mutations.len() != outbox.store_versions.len() {
+        return Err(ReplicationError::Invalid(format!(
+            "outbox intent {} has a different store mutation count",
+            outbox.intent_id
+        )));
+    }
+    for mutation in &intent.store_mutations {
+        let reference = outbox
+            .store_versions
+            .iter()
+            .find(|reference| reference.secret_id == mutation.secret_id)
+            .ok_or_else(|| {
+                ReplicationError::Invalid(format!(
+                    "outbox intent {} lost store mutation {}",
+                    outbox.intent_id, mutation.mutation_id
+                ))
+            })?;
+        let secret_id: SecretId = mutation.secret_id.parse()?;
+        if store.version_for_mutation(&secret_id, &mutation.mutation_id)?
+            != Some(reference.version)
+        {
+            return Err(ReplicationError::Invalid(format!(
+                "outbox intent {} does not reference its immutable store version",
+                outbox.intent_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn fence_report(mut report: ReplicationReport, message: impl Into<String>) -> ReplicationReport {
+    report.local_device_fenced = true;
+    report.messages.push(message.into());
+    report
 }
 
 fn write_genesis_device(
@@ -960,6 +1638,42 @@ fn create_private_directory(path: &Path) -> ReplicationResult<()> {
         .map_err(|source| io_error(path, source))
 }
 
+fn ensure_private_local_state_directory(path: &Path) -> ReplicationResult<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Err(ReplicationError::Invalid(format!(
+                "replication local-state path {} is not a real directory",
+                path.display()
+            )))
+        }
+        Ok(metadata) if metadata.permissions().mode() & 0o077 != 0 => {
+            Err(ReplicationError::Invalid(format!(
+                "replication local-state directory {} must not be accessible by group or others",
+                path.display()
+            )))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let parent = path.parent().ok_or_else(|| {
+                ReplicationError::Invalid(format!(
+                    "replication local-state path {} has no parent",
+                    path.display()
+                ))
+            })?;
+            let parent_metadata = fs::symlink_metadata(parent)
+                .map_err(|source| io_error(parent, source))?;
+            if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
+                return Err(ReplicationError::Invalid(format!(
+                    "replication local-state parent {} is not a real directory",
+                    parent.display()
+                )));
+            }
+            create_private_directory(path)
+        }
+        Err(source) => Err(io_error(path, source)),
+    }
+}
+
 fn path_exists(path: &Path) -> ReplicationResult<bool> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
@@ -1028,6 +1742,77 @@ fn require_uuid(label: &str, value: &str) -> ReplicationResult<()> {
         .map_err(|_| ReplicationError::Invalid(format!("{label} is not a UUID: {value:?}")))
 }
 
+fn validate_intent(intent: &ReplicationIntent) -> ReplicationResult<()> {
+    require_uuid("replication intent id", &intent.intent_id)?;
+    if intent.logical_id.trim().is_empty() {
+        return Err(ReplicationError::Invalid(
+            "replication intent logical id is empty".to_string(),
+        ));
+    }
+    if intent.catalog_payload.is_empty() {
+        return Err(ReplicationError::Invalid(
+            "replication intent catalog payload is empty".to_string(),
+        ));
+    }
+    if intent.created_at.trim().is_empty() {
+        return Err(ReplicationError::Invalid(
+            "replication intent creation time is empty".to_string(),
+        ));
+    }
+    let mut mutation_ids = HashSet::new();
+    for mutation in &intent.store_mutations {
+        require_uuid("replication store secret id", &mutation.secret_id)?;
+        require_uuid("replication store mutation id", &mutation.mutation_id)?;
+        if !mutation_ids.insert(&mutation.mutation_id) {
+            return Err(ReplicationError::Invalid(format!(
+                "replication store mutation {} is duplicated",
+                mutation.mutation_id
+            )));
+        }
+    }
+    if let Some(prepared) = &intent.prepared {
+        if prepared.operation_id != intent.intent_id {
+            return Err(ReplicationError::Invalid(
+                "prepared operation id does not match its durable intent".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_journal(state: &IntentJournalState) -> ReplicationResult<()> {
+    let mut ids = HashSet::new();
+    for intent in &state.entries {
+        validate_intent(intent)?;
+        if !ids.insert(&intent.intent_id) {
+            return Err(ReplicationError::Invalid(format!(
+                "replication intent {} appears more than once",
+                intent.intent_id
+            )));
+        }
+    }
+    for (device_id, operations) in &state.accepted_operations {
+        require_uuid("device checkpoint id", device_id)?;
+        for (index, (sequence, operation_id)) in operations.iter().enumerate() {
+            let expected = u64::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_add(1))
+                .ok_or_else(|| {
+                    ReplicationError::Invalid(format!(
+                        "device checkpoint {device_id} sequence overflow"
+                    ))
+                })?;
+            if *sequence != expected {
+                return Err(ReplicationError::Invalid(format!(
+                    "device checkpoint {device_id} has a gap before sequence {sequence}"
+                )));
+            }
+            require_uuid("checkpoint operation id", operation_id)?;
+        }
+    }
+    Ok(())
+}
+
 fn io_error(path: &Path, source: io::Error) -> ReplicationError {
     ReplicationError::Io { path: path.to_path_buf(), source }
 }
@@ -1035,6 +1820,9 @@ fn io_error(path: &Path, source: io::Error) -> ReplicationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use floria_catalog::ReplicationStoreVersionRef;
+    use floria_store::{KeyProvider, NewSecret, StoreResult};
+    use std::os::unix::fs::PermissionsExt;
 
     const VAULT_ID: &str = "11111111-1111-4111-8111-111111111111";
     const DEVICE_ID: &str = "22222222-2222-4222-8222-222222222222";
@@ -1055,6 +1843,33 @@ mod tests {
         )
         .unwrap();
         (directory, package)
+    }
+
+    fn intent(intent_id: &str) -> ReplicationIntent {
+        ReplicationIntent::new(
+            intent_id,
+            "managed-item-1",
+            vec!["revision-one".to_string()],
+            vec![IntentStoreMutation {
+                secret_id: "55555555-5555-4555-8555-555555555555".to_string(),
+                mutation_id: "66666666-6666-4666-8666-666666666666".to_string(),
+            }],
+            br#"{"kind":"fixture"}"#.to_vec(),
+            "2026-08-06T00:00:00Z",
+        )
+        .unwrap()
+    }
+
+    struct LocalStoreKeys(x25519::Identity);
+
+    impl KeyProvider for LocalStoreKeys {
+        fn recipients(&self) -> StoreResult<Vec<Box<dyn age::Recipient + Send>>> {
+            Ok(vec![Box::new(self.0.to_public())])
+        }
+
+        fn identity(&self) -> StoreResult<Box<dyn age::Identity>> {
+            Ok(Box::new(self.0.clone()))
+        }
     }
 
     #[test]
@@ -1282,5 +2097,203 @@ mod tests {
                 .unwrap(),
             "iGeZuPC-ulM5c5tLijmtXWaKPNQsaQX7djOuLPjM1o0hmI91TNixOcqsMBTnLA9GOIexEoS6-ydW4G5PJsx6BA"
         );
+    }
+
+    #[test]
+    fn intent_journal_is_private_authenticated_and_reopens() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("replication-intents.json");
+        let authenticator = Arc::new(StateAuthenticator::for_tests([71; 32]));
+        let journal =
+            ReplicationIntentJournal::open(&path, VAULT_ID, Arc::clone(&authenticator)).unwrap();
+        let entry = intent(OPERATION_ID);
+        journal.enqueue(entry.clone()).unwrap();
+        journal.enqueue(entry.clone()).unwrap();
+        drop(journal);
+
+        let reopened =
+            ReplicationIntentJournal::open(&path, VAULT_ID, Arc::clone(&authenticator)).unwrap();
+
+        assert_eq!(reopened.entries(), vec![entry]);
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn signed_intent_keeps_exact_prepared_bytes_until_completion() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("replication-intents.json");
+        let authenticator = Arc::new(StateAuthenticator::for_tests([72; 32]));
+        let journal = ReplicationIntentJournal::open(&path, VAULT_ID, authenticator).unwrap();
+        journal.enqueue(intent(OPERATION_ID)).unwrap();
+        let package = ReplicationPackage::create(
+            directory.path().join("Personal.floriavault"),
+            VAULT_ID,
+            "2026-08-06T00:00:00Z",
+            keys(7, x25519::Identity::generate()),
+        )
+        .unwrap();
+        let prepared = package
+            .prepare(PackageMutation {
+                sequence: 1,
+                operation_id: OPERATION_ID,
+                logical_id: "managed-item-1",
+                parents: &[],
+                value: b"fixture payload",
+            })
+            .unwrap();
+
+        journal.save_prepared(OPERATION_ID, prepared.clone()).unwrap();
+        journal.save_prepared(OPERATION_ID, prepared.clone()).unwrap();
+        assert_eq!(journal.entries()[0].prepared(), Some(&prepared));
+        assert!(journal.discard_unsigned(OPERATION_ID).unwrap_err().to_string().contains("signed"));
+
+        let different = package
+            .prepare(PackageMutation {
+                sequence: 1,
+                operation_id: OPERATION_ID,
+                logical_id: "managed-item-1",
+                parents: &[],
+                value: b"different fixture payload",
+            })
+            .unwrap();
+        assert!(journal
+            .save_prepared(OPERATION_ID, different)
+            .unwrap_err()
+            .to_string()
+            .contains("different signed bytes"));
+
+        journal.complete(OPERATION_ID).unwrap();
+        assert!(journal.entries().is_empty());
+    }
+
+    #[test]
+    fn missing_intent_file_is_not_reset_after_an_authenticated_checkpoint() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("replication-intents.json");
+        let authenticator = Arc::new(StateAuthenticator::for_tests([73; 32]));
+        let journal =
+            ReplicationIntentJournal::open(&path, VAULT_ID, Arc::clone(&authenticator)).unwrap();
+        journal.enqueue(intent(OPERATION_ID)).unwrap();
+        drop(journal);
+        fs::remove_file(&path).unwrap();
+
+        let error = ReplicationIntentJournal::open(&path, VAULT_ID, authenticator)
+            .err()
+            .unwrap();
+
+        assert!(error.to_string().contains("missing at authenticated generation"));
+    }
+
+    #[test]
+    fn engine_publishes_committed_outbox_from_the_exact_store_version() {
+        let directory = tempfile::tempdir().unwrap();
+        let package = ReplicationPackage::create(
+            directory.path().join("Personal.floriavault"),
+            VAULT_ID,
+            "2026-08-06T00:00:00Z",
+            keys(7, x25519::Identity::generate()),
+        )
+        .unwrap();
+        let authenticator = Arc::new(StateAuthenticator::for_tests([74; 32]));
+        let intents = Arc::new(
+            ReplicationIntentJournal::open(
+                directory.path().join("replication-intents.json"),
+                VAULT_ID,
+                authenticator,
+            )
+            .unwrap(),
+        );
+        let catalog = Arc::new(Catalog::open(directory.path().join("catalog.sqlite")).unwrap());
+        let store = Arc::new(
+            AgeDirStore::open(
+                directory.path().join("store"),
+                Arc::new(LocalStoreKeys(x25519::Identity::generate())),
+            )
+            .unwrap(),
+        );
+        let secret_id: SecretId = "55555555-5555-4555-8555-555555555555".parse().unwrap();
+        let mutation_id = "66666666-6666-4666-8666-666666666666";
+        let catalog_payload = br#"{"kind":"fixture"}"#.to_vec();
+        intents.enqueue(intent(OPERATION_ID)).unwrap();
+        store
+            .put_identified(
+                secret_id.clone(),
+                NewSecret::managed("replicated fixture"),
+                b"fixture payload, not a credential",
+                mutation_id,
+            )
+            .unwrap();
+        catalog
+            .enqueue_replication_outbox(&ReplicationOutboxEntry {
+                intent_id: OPERATION_ID.to_string(),
+                logical_id: "managed-item-1".to_string(),
+                parents: vec!["revision-one".to_string()],
+                store_versions: vec![ReplicationStoreVersionRef {
+                    secret_id: secret_id.to_string(),
+                    version: 1,
+                }],
+                catalog_payload,
+                created_at: "2026-08-06T00:00:00Z".to_string(),
+            })
+            .unwrap();
+        let engine = ReplicationEngine::from_parts(
+            package,
+            Arc::clone(&intents),
+            Arc::clone(&catalog),
+            Arc::clone(&store),
+        );
+
+        let report = engine.sync().unwrap();
+
+        assert_eq!(report.published, 1);
+        assert!(!report.local_device_fenced);
+        assert!(catalog.replication_outbox().unwrap().is_empty());
+        assert!(intents.entries().is_empty());
+        assert_eq!(intents.device_sequence(DEVICE_ID), 1);
+        let scan = engine.package.scan().unwrap();
+        assert_eq!(scan.verified.len(), 1);
+    }
+
+    #[test]
+    fn engine_self_fences_when_an_accepted_local_operation_disappears() {
+        let (directory, package) = package();
+        let authenticator = Arc::new(StateAuthenticator::for_tests([75; 32]));
+        let intents = Arc::new(
+            ReplicationIntentJournal::open(
+                directory.path().join("replication-intents.json"),
+                VAULT_ID,
+                authenticator,
+            )
+            .unwrap(),
+        );
+        let catalog = Arc::new(Catalog::open(directory.path().join("catalog.sqlite")).unwrap());
+        let store = Arc::new(
+            AgeDirStore::open(
+                directory.path().join("store"),
+                Arc::new(LocalStoreKeys(x25519::Identity::generate())),
+            )
+            .unwrap(),
+        );
+        let prepared = package
+            .prepare(PackageMutation {
+                sequence: 1,
+                operation_id: OPERATION_ID,
+                logical_id: "managed-item-1",
+                parents: &[],
+                value: b"fixture payload",
+            })
+            .unwrap();
+        package.publish(&prepared).unwrap();
+        intents.enqueue(intent(OPERATION_ID)).unwrap();
+        intents.save_prepared(OPERATION_ID, prepared.clone()).unwrap();
+        intents.accept_device_operation(DEVICE_ID, 1, OPERATION_ID).unwrap();
+        intents.complete(OPERATION_ID).unwrap();
+        fs::remove_file(package.operation_path(&prepared)).unwrap();
+        let engine = ReplicationEngine::from_parts(package, intents, catalog, store);
+
+        let report = engine.sync().unwrap();
+
+        assert!(report.local_device_fenced);
+        assert!(report.messages[0].contains("no longer contains accepted"));
     }
 }

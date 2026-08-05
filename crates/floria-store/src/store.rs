@@ -146,6 +146,9 @@ pub struct VersionRecord {
     pub size: u64,
     pub created: String,
     pub note: Option<String>,
+    /// Stable identity of the cross-backend mutation that created this version.
+    /// Ordinary local and legacy versions do not have one.
+    pub mutation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -228,6 +231,8 @@ struct VersionMetaFile {
     created: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    mutation_id: Option<String>,
 }
 
 /// Portable age-encrypted directory store.
@@ -401,6 +406,7 @@ impl AgeDirStore {
                         size: version.size,
                         created: version.created,
                         note: version.note,
+                        mutation_id: version.mutation_id,
                     },
                     ciphertext_sha256: base64::engine::general_purpose::URL_SAFE_NO_PAD
                         .encode(Sha256::digest(ciphertext)),
@@ -452,6 +458,146 @@ impl AgeDirStore {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Create version 1 at a caller-selected stable Secret id and bind it to a durable mutation.
+    /// Retrying the same mutation is idempotent; reusing the id for different bytes is rejected.
+    pub fn put_identified(
+        &self,
+        id: SecretId,
+        meta: NewSecret,
+        plaintext: &[u8],
+        mutation_id: &str,
+    ) -> StoreResult<SecretId> {
+        validate_mutation_id(mutation_id)?;
+        self.put_internal(id, meta, plaintext, Some(mutation_id.to_string()))
+    }
+
+    /// Append one immutable version associated with a durable cross-backend mutation.
+    /// A retry returns the original version and never creates a second version.
+    pub fn append_version_identified(
+        &self,
+        id: &SecretId,
+        plaintext: &[u8],
+        mutation_id: &str,
+    ) -> StoreResult<u32> {
+        validate_mutation_id(mutation_id)?;
+        self.append_version_internal(id, plaintext, Some(mutation_id.to_string()))
+    }
+
+    /// Find the immutable version produced by a durable mutation without reading mutable head.
+    pub fn version_for_mutation(
+        &self,
+        id: &SecretId,
+        mutation_id: &str,
+    ) -> StoreResult<Option<u32>> {
+        validate_mutation_id(mutation_id)?;
+        self.verify_security_state()?;
+        Ok(self
+            .history_unverified(id)?
+            .into_iter()
+            .find(|version| version.mutation_id.as_deref() == Some(mutation_id))
+            .map(|version| version.version))
+    }
+
+    fn put_internal(
+        &self,
+        id: SecretId,
+        meta: NewSecret,
+        plaintext: &[u8],
+        mutation_id: Option<String>,
+    ) -> StoreResult<SecretId> {
+        let mode = meta.mode;
+        let enforcement = meta.enforcement;
+        let (source_path, managed_label) = validate_new_secret_origin(meta.origin)?;
+        let _lock = self.lock_exclusive()?;
+        self.verify_security_state()?;
+        if self.entry_dir(&id).exists() {
+            if let Some(expected) = mutation_id.as_deref() {
+                if let Some(version) = self
+                    .history_unverified(&id)?
+                    .into_iter()
+                    .find(|version| version.mutation_id.as_deref() == Some(expected))
+                {
+                    let existing = self.get_version(&id, version.version)?;
+                    if existing.as_slice() != plaintext {
+                        return Err(StoreError::Invalid(format!(
+                            "mutation {expected} was already used for different secret bytes"
+                        )));
+                    }
+                    return Ok(id);
+                }
+            }
+            return Err(StoreError::Invalid(format!(
+                "secret id {id} already exists for a different mutation"
+            )));
+        }
+        let vdir = self.versions_dir(&id);
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&vdir)
+            .map_err(|error| StoreError::io(&vdir, error))?;
+        self.write_version(&id, 1, plaintext, None, mutation_id)?;
+        self.write_meta(
+            &id,
+            &MetaFile {
+                format: STORE_FORMAT_VERSION,
+                id: id.to_string(),
+                source_path,
+                managed_label,
+                mode,
+                created: now_rfc3339(),
+                current_version: 1,
+                enforcement,
+                environment_ids: None,
+                metadata: ItemMetadata::default(),
+            },
+        )?;
+        self.seal_security_state()?;
+        Ok(id)
+    }
+
+    fn append_version_internal(
+        &self,
+        id: &SecretId,
+        plaintext: &[u8],
+        mutation_id: Option<String>,
+    ) -> StoreResult<u32> {
+        // The immutable version is published before the mutable head. A retry carrying a stable
+        // mutation id finds that exact version and completes only the missing head transition.
+        let _lock = self.lock_exclusive()?;
+        self.verify_security_state()?;
+        let mut meta = self.read_meta(id)?;
+        if let Some(expected) = mutation_id.as_deref() {
+            if let Some(version) = self
+                .history_unverified(id)?
+                .into_iter()
+                .find(|version| version.mutation_id.as_deref() == Some(expected))
+            {
+                let existing = self.get_version(id, version.version)?;
+                if existing.as_slice() != plaintext {
+                    return Err(StoreError::Invalid(format!(
+                        "mutation {expected} was already used for different secret bytes"
+                    )));
+                }
+                if meta.current_version != version.version {
+                    meta.current_version = version.version;
+                    self.write_meta(id, &meta)?;
+                    self.seal_security_state()?;
+                }
+                return Ok(version.version);
+            }
+        }
+        let next = self
+            .max_version(id)?
+            .checked_add(1)
+            .ok_or_else(|| StoreError::Invalid(format!("secret {id} version overflow")))?;
+        self.write_version(id, next, plaintext, None, mutation_id)?;
+        meta.current_version = next;
+        self.write_meta(id, &meta)?;
+        self.seal_security_state()?;
+        Ok(next)
     }
 
     /// Copy one immutable, internally consistent encrypted-store snapshot.
@@ -642,6 +788,7 @@ impl AgeDirStore {
                         size: vm.size,
                         created: vm.created,
                         note: vm.note,
+                        mutation_id: vm.mutation_id,
                     });
                 }
             }
@@ -678,6 +825,7 @@ impl AgeDirStore {
         version: u32,
         plaintext: &[u8],
         note: Option<String>,
+        mutation_id: Option<String>,
     ) -> StoreResult<()> {
         let bound = encode_bound_payload(id, version, plaintext)?;
         let ciphertext = self.encrypt(&bound)?;
@@ -687,6 +835,7 @@ impl AgeDirStore {
             size: plaintext.len() as u64,
             created: now_rfc3339(),
             note,
+            mutation_id,
         };
         let text = toml::to_string_pretty(&vmeta)
             .map_err(|e| StoreError::Crypto(format!("serialize version meta: {e}")))?;
@@ -920,50 +1069,7 @@ fn copy_store_contents(source: &Path, destination: &Path) -> StoreResult<()> {
 
 impl SecretStore for AgeDirStore {
     fn put(&self, meta: NewSecret, plaintext: &[u8]) -> StoreResult<SecretId> {
-        let mode = meta.mode;
-        let enforcement = meta.enforcement;
-        let (source_path, managed_label) = match meta.origin {
-            SecretOrigin::File { source_path } if source_path.is_absolute() => {
-                (Some(source_path.to_string_lossy().into_owned()), None)
-            }
-            SecretOrigin::File { source_path } => {
-                return Err(StoreError::Invalid(format!(
-                    "file secret source path must be absolute: {}",
-                    source_path.display()
-                )))
-            }
-            SecretOrigin::Managed { label } if !label.trim().is_empty() => (None, Some(label)),
-            SecretOrigin::Managed { .. } => {
-                return Err(StoreError::Invalid("managed secret label cannot be empty".to_string()))
-            }
-        };
-        let _lock = self.lock_exclusive()?;
-        self.verify_security_state()?;
-        let id = SecretId::generate();
-        let vdir = self.versions_dir(&id);
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&vdir)
-            .map_err(|e| StoreError::io(&vdir, e))?;
-        self.write_version(&id, 1, plaintext, None)?;
-        self.write_meta(
-            &id,
-            &MetaFile {
-            format: STORE_FORMAT_VERSION,
-                id: id.to_string(),
-                source_path,
-                managed_label,
-                mode,
-                created: now_rfc3339(),
-                current_version: 1,
-                enforcement,
-                environment_ids: None,
-                metadata: ItemMetadata::default(),
-            },
-        )?;
-        self.seal_security_state()?;
-        Ok(id)
+        self.put_internal(SecretId::generate(), meta, plaintext, None)
     }
 
     fn get(&self, id: &SecretId) -> StoreResult<Zeroizing<Vec<u8>>> {
@@ -994,17 +1100,7 @@ impl SecretStore for AgeDirStore {
     }
 
     fn append_version(&self, id: &SecretId, plaintext: &[u8]) -> StoreResult<u32> {
-        // Order matters: write the immutable version first, then move the head. A crash between
-        // the two leaves an orphan version (harmless) rather than a dangling head.
-        let _lock = self.lock_exclusive()?;
-        self.verify_security_state()?;
-        let mut meta = self.read_meta(id)?;
-        let next = self.max_version(id)?.saturating_add(1);
-        self.write_version(id, next, plaintext, None)?;
-        meta.current_version = next;
-        self.write_meta(id, &meta)?;
-        self.seal_security_state()?;
-        Ok(next)
+        self.append_version_internal(id, plaintext, None)
     }
 
     fn history(&self, id: &SecretId) -> StoreResult<Vec<VersionRecord>> {
@@ -1130,6 +1226,30 @@ fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
+fn validate_mutation_id(mutation_id: &str) -> StoreResult<()> {
+    uuid::Uuid::parse_str(mutation_id)
+        .map(|_| ())
+        .map_err(|_| StoreError::Invalid(format!("invalid mutation id {mutation_id:?}")))
+}
+
+fn validate_new_secret_origin(
+    origin: SecretOrigin,
+) -> StoreResult<(Option<String>, Option<String>)> {
+    match origin {
+        SecretOrigin::File { source_path } if source_path.is_absolute() => {
+            Ok((Some(source_path.to_string_lossy().into_owned()), None))
+        }
+        SecretOrigin::File { source_path } => Err(StoreError::Invalid(format!(
+            "file secret source path must be absolute: {}",
+            source_path.display()
+        ))),
+        SecretOrigin::Managed { label } if !label.trim().is_empty() => Ok((None, Some(label))),
+        SecretOrigin::Managed { .. } => {
+            Err(StoreError::Invalid("managed secret label cannot be empty".to_string()))
+        }
+    }
+}
+
 /// Write a file with mode 0600, atomically: write+fsync a `.tmp` sibling, then rename over the
 /// target. A crash mid-write leaves the old content intact (this guards the head pointer in
 /// `meta.toml`). Concurrent writers are serialized by the store lock, so the fixed temp name is safe.
@@ -1225,6 +1345,74 @@ mod tests {
         // ciphertext on disk must not contain the plaintext
         let blob = std::fs::read(s.version_blob(&id, 1)).unwrap();
         assert!(!blob.windows(secret.len()).any(|w| w == secret));
+    }
+
+    #[test]
+    fn identified_put_is_idempotent_at_a_caller_selected_secret_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path().to_path_buf());
+        let id: SecretId = "11111111-1111-4111-8111-111111111111".parse().unwrap();
+        let mutation_id = "22222222-2222-4222-8222-222222222222";
+        let value = b"fixture payload, not a credential";
+
+        let first = store
+            .put_identified(
+                id.clone(),
+                NewSecret::managed("replicated fixture"),
+                value,
+                mutation_id,
+            )
+            .unwrap();
+        let retry = store
+            .put_identified(
+                id.clone(),
+                NewSecret::managed("replicated fixture"),
+                value,
+                mutation_id,
+            )
+            .unwrap();
+
+        assert_eq!(first, id);
+        assert_eq!(retry, id);
+        assert_eq!(store.version_for_mutation(&id, mutation_id).unwrap(), Some(1));
+        assert_eq!(store.history(&id).unwrap().len(), 1);
+        assert!(store
+            .put_identified(
+                id,
+                NewSecret::managed("replicated fixture"),
+                b"different fixture bytes",
+                mutation_id,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("different secret bytes"));
+    }
+
+    #[test]
+    fn identified_append_reuses_the_original_immutable_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path().to_path_buf());
+        let id = store
+            .put(NewSecret::managed("replicated fixture"), b"version one")
+            .unwrap();
+        let mutation_id = "33333333-3333-4333-8333-333333333333";
+
+        let first = store
+            .append_version_identified(&id, b"version two", mutation_id)
+            .unwrap();
+        let retry = store
+            .append_version_identified(&id, b"version two", mutation_id)
+            .unwrap();
+
+        assert_eq!(first, 2);
+        assert_eq!(retry, 2);
+        assert_eq!(store.version_for_mutation(&id, mutation_id).unwrap(), Some(2));
+        assert_eq!(store.history(&id).unwrap().len(), 2);
+        assert!(store
+            .append_version_identified(&id, b"different version two", mutation_id)
+            .unwrap_err()
+            .to_string()
+            .contains("different secret bytes"));
     }
 
     #[test]

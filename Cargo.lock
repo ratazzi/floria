@@ -854,6 +854,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -970,6 +971,9 @@ dependencies = [
  "age",
  "base64 0.22.1",
  "ed25519-dalek",
+ "floria-catalog",
+ "floria-integrity",
+ "floria-store",
  "libc",
  "serde",
  "serde_json",
