@@ -37,6 +37,7 @@ tempfile = "3"
 notify = "8.2"
 rusqlite = { version = "0.40", features = ["backup", "bundled"] }
 signature = "2"
+ed25519-dalek = "2.2"
 rsa = "0.9.10"
 ssh-key = { version = "0.6.7", features = ["ed25519", "encryption", "getrandom", "p256", "p384", "p521", "rsa"] }
 security-framework = "3"
@@ -54,3 +55,4 @@ floria-surface = { path = "crates/floria-surface" }
 floria-ssh = { path = "crates/floria-ssh" }
 floria-backup = { path = "crates/floria-backup" }
 floria-integrity = { path = "crates/floria-integrity" }
+floria-replication = { path = "crates/floria-replication" }
