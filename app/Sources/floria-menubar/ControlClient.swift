@@ -135,6 +135,54 @@ final class ControlClient: @unchecked Sendable {
         return report
     }
 
+    func replicationStatus() async throws -> ReplicationStatus {
+        try await replicationStatusRequest(.replicationStatus)
+    }
+
+    func createReplicationPackage(at path: String) async throws -> ReplicationStatus {
+        try await replicationStatusRequest(.replicationCreate(directory: path))
+    }
+
+    func openReplicationPackage(at path: String) async throws -> ReplicationStatus {
+        try await replicationStatusRequest(.replicationOpen(directory: path))
+    }
+
+    func syncReplicationPackage() async throws -> ReplicationStatus {
+        try await replicationStatusRequest(.replicationSync)
+    }
+
+    func disableReplication() async throws -> ReplicationStatus {
+        try await replicationStatusRequest(.replicationDisable)
+    }
+
+    func replicationEnrollment() async throws -> ReplicationEnrollment {
+        guard let enrollment: ReplicationEnrollment = try await request(
+            .replicationEnrollment,
+            expecting: "replication_enrollment",
+            as: ReplicationEnrollment.self)
+        else {
+            throw ControlClientError.missingResult("replication_enrollment")
+        }
+        return enrollment
+    }
+
+    func enrollReplicationDevice(_ enrollment: ReplicationEnrollment) async throws
+        -> ReplicationStatus
+    {
+        try await replicationStatusRequest(.replicationEnroll(enrollment))
+    }
+
+    private func replicationStatusRequest(_ command: ControlCommand) async throws
+        -> ReplicationStatus
+    {
+        guard let status: ReplicationStatus = try await request(
+            command, expecting: "replication_status", as: ReplicationStatus.self)
+        else {
+            throw ControlClientError.missingResult("replication_status")
+        }
+        return status
+    }
+
     func snapshot() async throws -> CatalogSnapshot {
         guard let snapshot: CatalogSnapshot = try await request(
             .snapshot, expecting: "snapshot", as: CatalogSnapshot.self)

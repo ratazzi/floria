@@ -961,6 +961,47 @@ struct DiagnosticsReport: Codable, Equatable, Sendable {
     }
 }
 
+enum ReplicationMode: String, Codable, Sendable {
+    case off
+    case waitingForEnrollment = "waiting_for_enrollment"
+    case active
+    case fenced
+    case error
+}
+
+struct ReplicationStatus: Codable, Equatable, Sendable {
+    let mode: ReplicationMode
+    let directory: String?
+    let deviceID: String?
+    let vaultID: String?
+    let keyGeneration: UInt32?
+    let published: Int
+    let imported: Int
+    let pending: Int
+    let conflicts: Int
+    let damaged: Int
+    let message: String?
+
+    enum CodingKeys: String, CodingKey {
+        case mode, directory, published, imported, pending, conflicts, damaged, message
+        case deviceID = "device_id"
+        case vaultID = "vault_id"
+        case keyGeneration = "key_generation"
+    }
+}
+
+struct ReplicationEnrollment: Codable, Equatable, Sendable {
+    let deviceID: String
+    let signingPublicKey: String
+    let wrappingRecipient: String
+
+    enum CodingKeys: String, CodingKey {
+        case deviceID = "device_id"
+        case signingPublicKey = "signing_public_key"
+        case wrappingRecipient = "wrapping_recipient"
+    }
+}
+
 enum ControlCommand: Sendable {
     case ping
     case health
@@ -974,6 +1015,13 @@ enum ControlCommand: Sendable {
     case backupVerify(backup: String)
     case recoveryKeyExport(destination: String, passphrase: String)
     case diagnosticsExport(destination: String, includePaths: Bool)
+    case replicationStatus
+    case replicationCreate(directory: String)
+    case replicationOpen(directory: String)
+    case replicationSync
+    case replicationDisable
+    case replicationEnrollment
+    case replicationEnroll(ReplicationEnrollment)
     case snapshot
     case discover(paths: [String])
     case discoverStart(paths: [String])
@@ -1048,6 +1096,13 @@ enum ControlCommand: Sendable {
         case .backupVerify: "backup_verify"
         case .recoveryKeyExport: "recovery_key_export"
         case .diagnosticsExport: "diagnostics_export"
+        case .replicationStatus: "replication_status"
+        case .replicationCreate: "replication_create"
+        case .replicationOpen: "replication_open"
+        case .replicationSync: "replication_sync"
+        case .replicationDisable: "replication_disable"
+        case .replicationEnrollment: "replication_enrollment"
+        case .replicationEnroll: "replication_enroll"
         case .snapshot: "snapshot"
         case .discover: "discover"
         case .discoverStart: "discover_start"
@@ -1097,8 +1152,10 @@ enum ControlCommand: Sendable {
 
     func requestData(requestID: UInt64, encoder: JSONEncoder) throws -> Data {
         switch self {
-        case .ping, .health, .policyModeGet, .grantList, .grantClear, .snapshot, .projectCheckoutInventory,
-            .sshConfigStatus, .sshConfigInstall, .sshConfigRemove, .protectedFiles:
+        case .ping, .health, .policyModeGet, .grantList, .grantClear, .replicationStatus,
+            .replicationSync, .replicationDisable, .replicationEnrollment, .snapshot,
+            .projectCheckoutInventory, .sshConfigStatus, .sshConfigInstall, .sshConfigRemove,
+            .protectedFiles:
             return try encoder.encode(ControlRequestWithoutParams(requestID: requestID, method: method))
         case .policyModeSet(let mode, let durationSecs):
             return try encoder.encode(
@@ -1137,6 +1194,16 @@ enum ControlCommand: Sendable {
                     requestID: requestID, method: method,
                     params: DiagnosticsExportParams(
                         destination: destination, includePaths: includePaths)))
+        case .replicationCreate(let directory), .replicationOpen(let directory):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: ReplicationDirectoryParams(directory: directory)))
+        case .replicationEnroll(let enrollment):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: ReplicationEnrollParams(enrollment: enrollment)))
         case .discover(let paths):
             return try encoder.encode(
                 ControlRequest(
@@ -1339,6 +1406,8 @@ private struct DiagnosticsExportParams: Encodable {
     let destination: String
     let includePaths: Bool
 }
+private struct ReplicationDirectoryParams: Encodable { let directory: String }
+private struct ReplicationEnrollParams: Encodable { let enrollment: ReplicationEnrollment }
 private struct DiscoverParams: Encodable { let paths: [String] }
 private struct DiscoveryJobIDParams: Encodable { let id: String }
 private struct DiscoverApplyParams: Encodable {

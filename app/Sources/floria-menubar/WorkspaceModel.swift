@@ -928,6 +928,53 @@ final class WorkspaceStore {
             includePaths: includePaths)
     }
 
+    func replicationStatus() async throws -> ReplicationStatus {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        return try await controlClient.replicationStatus()
+    }
+
+    func createReplicationPackage(at path: String) async throws -> ReplicationStatus {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        return try await controlClient.createReplicationPackage(
+            at: (path as NSString).standardizingPath)
+    }
+
+    func openReplicationPackage(at path: String) async throws -> ReplicationStatus {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        let status = try await controlClient.openReplicationPackage(
+            at: (path as NSString).standardizingPath)
+        if status.imported > 0 {
+            await reload(reportErrors: true)
+        }
+        return status
+    }
+
+    func syncReplicationPackage() async throws -> ReplicationStatus {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        let status = try await controlClient.syncReplicationPackage()
+        if status.imported > 0 {
+            await reload(reportErrors: true)
+        }
+        return status
+    }
+
+    func disableReplication() async throws -> ReplicationStatus {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        return try await controlClient.disableReplication()
+    }
+
+    func replicationEnrollment() async throws -> ReplicationEnrollment {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        return try await controlClient.replicationEnrollment()
+    }
+
+    func approveReplicationDevice(_ enrollment: ReplicationEnrollment) async throws
+        -> ReplicationStatus
+    {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        return try await controlClient.enrollReplicationDevice(enrollment)
+    }
+
     func applyDiscovery(
         at paths: [String], imports: [DiscoveryImport],
         separateEntries: [DiscoverySeparateEntry],

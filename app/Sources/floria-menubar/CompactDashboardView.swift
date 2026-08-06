@@ -88,6 +88,7 @@ struct DashboardView: View {
     @State private var backupNotice: BackupNotice?
     @State private var backupOperationInProgress = false
     @State private var showingRecoveryKeyExport = false
+    @State private var showingSync = false
     @FocusState private var searchIsFocused: Bool
     @Environment(\.openWindow) private var openWindow
 
@@ -180,6 +181,9 @@ struct DashboardView: View {
                             "Store this file and its passphrase separately from this Mac.\n\(report.path)"
                     )
                 })
+        }
+        .sheet(isPresented: $showingSync) {
+            SyncView(store: state.workspace)
         }
         .onAppear {
             presentRequestedSystemHealth()
@@ -292,6 +296,10 @@ struct DashboardView: View {
                 }
                 Button("Open Library", systemImage: "rectangle.3.group") {
                     openWorkspace()
+                }
+                Divider()
+                Button("Sync…", systemImage: "arrow.triangle.2.circlepath") {
+                    showingSync = true
                 }
                 Divider()
                 Button("Create Backup…", systemImage: "externaldrive.badge.plus") {

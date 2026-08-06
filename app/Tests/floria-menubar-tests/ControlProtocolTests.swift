@@ -73,6 +73,44 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(report.files, 4)
     }
 
+    func testReplicationCommandsAndStatusMatchRustWireShape() throws {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+
+        let createData = try ControlCommand.replicationCreate(
+            directory: "/tmp/Personal.floriavault"
+        ).requestData(requestID: 64, encoder: encoder)
+        let create = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: createData) as? [String: Any])
+        XCTAssertEqual(create["method"] as? String, "replication_create")
+        XCTAssertEqual(
+            (create["params"] as? [String: Any])?["directory"] as? String,
+            "/tmp/Personal.floriavault")
+
+        let enrollment = ReplicationEnrollment(
+            deviceID: "fixture-device",
+            signingPublicKey: "fixture-signing-key",
+            wrappingRecipient: "fixture-recipient")
+        let enrollData = try ControlCommand.replicationEnroll(enrollment)
+            .requestData(requestID: 65, encoder: encoder)
+        let enroll = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: enrollData) as? [String: Any])
+        XCTAssertEqual(enroll["method"] as? String, "replication_enroll")
+        let enrollParams = try XCTUnwrap(enroll["params"] as? [String: Any])
+        XCTAssertEqual(
+            (enrollParams["enrollment"] as? [String: Any])?["device_id"] as? String,
+            "fixture-device")
+
+        let response = Data(
+            #"{"request_id":64,"status":"ok","result":{"type":"replication_status","value":{"mode":"waiting_for_enrollment","directory":"/tmp/Personal.floriavault","device_id":"fixture-device","vault_id":"fixture-vault","key_generation":2,"published":3,"imported":4,"pending":1,"conflicts":0,"damaged":0,"message":"Approval required"}}}"#.utf8)
+        let decoded = try JSONDecoder().decode(
+            ControlResponseEnvelope<ReplicationStatus>.self, from: response)
+        let status = try XCTUnwrap(decoded.result?.value)
+        XCTAssertEqual(status.mode, .waitingForEnrollment)
+        XCTAssertEqual(status.keyGeneration, 2)
+        XCTAssertEqual(status.pending, 1)
+    }
+
     func testRecoveryKeyExportMatchesRustWireShape() throws {
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
