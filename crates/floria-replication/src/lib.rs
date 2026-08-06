@@ -6,7 +6,7 @@
 //! outboxes, device enrollment, sequence self-fencing, and Local Projection application remain
 //! above this interface.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -458,6 +458,12 @@ pub struct DamagedFile {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogicalConflict {
+    pub logical_id: String,
+    pub head_operation_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ObservedOperation {
     pub device_id: String,
     pub sequence: u64,
@@ -472,6 +478,9 @@ pub struct PackageScan {
     pub verified: Vec<VerifiedMutation>,
     pub pending: Vec<PendingOperation>,
     pub damaged: Vec<DamagedFile>,
+    /// Logical items with more than one causally valid head. Their mutations remain verified but
+    /// are not projected until one signed merge operation names every head as a parent.
+    pub conflicts: Vec<LogicalConflict>,
     /// Devices whose valid signed history is internally inconsistent and must not publish.
     pub fenced_devices: Vec<String>,
     pub duplicate_files: usize,
@@ -824,6 +833,16 @@ impl ReplicationPackage {
         if mutation.logical_id.is_empty() {
             return Err(ReplicationError::Invalid("logical id is empty".to_string()));
         }
+        let mut unique_parents = HashSet::new();
+        for parent in mutation.parents {
+            require_uuid("parent operation id", parent)?;
+            if parent == mutation.operation_id || !unique_parents.insert(parent) {
+                return Err(ReplicationError::Invalid(format!(
+                    "operation {} has an invalid or duplicate parent {parent}",
+                    mutation.operation_id
+                )));
+            }
+        }
         let vault_recipient = self.vault_identity.to_public();
         let object = encrypt(&vault_recipient, mutation.value)?;
         let object_id = digest(&object);
@@ -997,6 +1016,7 @@ impl ReplicationPackage {
                 .cmp(&right.device_id)
                 .then(left.sequence.cmp(&right.sequence))
         });
+        resolve_logical_history(&mut report);
         report.observed.sort_by(|left, right| {
             left.device_id
                 .cmp(&right.device_id)
@@ -1155,6 +1175,78 @@ impl ReplicationPackage {
     }
 }
 
+fn resolve_logical_history(report: &mut PackageScan) {
+    let candidates = std::mem::take(&mut report.verified);
+    let ownership = candidates
+        .iter()
+        .map(|mutation| (mutation.operation_id.clone(), mutation.logical_id.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut remaining = Vec::with_capacity(candidates.len());
+    for mutation in candidates {
+        let mut unique_parents = HashSet::new();
+        let problem = mutation.parents.iter().find_map(|parent| {
+            if !unique_parents.insert(parent.as_str()) {
+                return Some(format!("parent operation {parent} is listed more than once"));
+            }
+            match ownership.get(parent) {
+                None => Some(format!("parent operation {parent} has not arrived")),
+                Some(logical_id) if logical_id != &mutation.logical_id => Some(format!(
+                    "parent operation {parent} belongs to logical item {logical_id}"
+                )),
+                Some(_) => None,
+            }
+        });
+        if let Some(reason) = problem {
+            report.pending.push(PendingOperation {
+                device_id: mutation.device_id,
+                sequence: mutation.sequence,
+                operation_id: mutation.operation_id,
+                reason,
+            });
+        } else {
+            remaining.push(mutation);
+        }
+    }
+
+    let mut emitted = HashSet::new();
+    let mut ordered = Vec::with_capacity(remaining.len());
+    while let Some(index) = remaining
+        .iter()
+        .position(|mutation| mutation.parents.iter().all(|parent| emitted.contains(parent)))
+    {
+        let mutation = remaining.remove(index);
+        emitted.insert(mutation.operation_id.clone());
+        ordered.push(mutation);
+    }
+    for mutation in remaining {
+        report.pending.push(PendingOperation {
+            device_id: mutation.device_id,
+            sequence: mutation.sequence,
+            operation_id: mutation.operation_id,
+            reason: "logical history contains a cycle or an unavailable parent".to_string(),
+        });
+    }
+
+    let mut heads: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for mutation in &ordered {
+        let logical_heads = heads.entry(mutation.logical_id.clone()).or_default();
+        for parent in &mutation.parents {
+            logical_heads.remove(parent);
+        }
+        logical_heads.insert(mutation.operation_id.clone());
+    }
+    report.conflicts = heads
+        .into_iter()
+        .filter_map(|(logical_id, head_operation_ids)| {
+            (head_operation_ids.len() > 1).then(|| LogicalConflict {
+                logical_id,
+                head_operation_ids: head_operation_ids.into_iter().collect(),
+            })
+        })
+        .collect();
+    report.verified = ordered;
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReplicationReport {
     pub published: usize,
@@ -1163,6 +1255,7 @@ pub struct ReplicationReport {
     pub observed: usize,
     pub pending: usize,
     pub damaged: usize,
+    pub conflicts: usize,
     pub local_device_fenced: bool,
     pub messages: Vec<String>,
 }
@@ -1250,6 +1343,7 @@ impl ReplicationEngine {
             observed: scan.observed.len(),
             pending: scan.pending.len(),
             damaged: scan.damaged.len(),
+            conflicts: scan.conflicts.len(),
             ..Default::default()
         };
         if scan
@@ -1263,10 +1357,18 @@ impl ReplicationEngine {
             ));
         }
 
+        let conflicted_logical_ids = scan
+            .conflicts
+            .iter()
+            .map(|conflict| conflict.logical_id.as_str())
+            .collect::<HashSet<_>>();
         for mutation in scan
             .verified
             .iter()
-            .filter(|mutation| mutation.device_id != self.package.device_id())
+            .filter(|mutation| {
+                mutation.device_id != self.package.device_id()
+                    && !conflicted_logical_ids.contains(mutation.logical_id.as_str())
+            })
         {
             let accepted = self.intents.accepted_operations(&mutation.device_id);
             if let Some(operation_id) = accepted.get(&mutation.sequence) {
@@ -1307,6 +1409,14 @@ impl ReplicationEngine {
                 &mutation.operation_id,
             )?;
             report.imported += 1;
+        }
+
+        if !scan.conflicts.is_empty() {
+            report.messages.push(format!(
+                "{} replicated item(s) have concurrent heads and require an explicit merge",
+                scan.conflicts.len()
+            ));
+            return Ok(report);
         }
 
         let local_observed = scan
@@ -2316,6 +2426,8 @@ mod tests {
     const OPERATION_ID: &str = "33333333-3333-4333-8333-333333333333";
     const SECOND_DEVICE_ID: &str = "44444444-4444-4444-8444-444444444444";
     const SECOND_OPERATION_ID: &str = "77777777-7777-4777-8777-777777777777";
+    const GENESIS_CHILD_OPERATION_ID: &str = "99999999-9999-4999-8999-999999999999";
+    const MERGE_OPERATION_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
     fn keys(seed: u8, vault_identity: x25519::Identity) -> DeviceKeyMaterial {
         DeviceKeyMaterial::new(DEVICE_ID, [seed; 32], vault_identity).unwrap()
@@ -2342,7 +2454,7 @@ mod tests {
         ReplicationIntent::new(
             intent_id,
             "managed-item-1",
-            vec!["revision-one".to_string()],
+            Vec::new(),
             vec![IntentStoreMutation {
                 secret_id: "55555555-5555-4555-8555-555555555555".to_string(),
                 mutation_id: "66666666-6666-4666-8666-666666666666".to_string(),
@@ -2543,6 +2655,91 @@ mod tests {
         let error = second.enroll_device(third.enrollment()).unwrap_err();
 
         assert!(error.to_string().contains("only the genesis Device"));
+    }
+
+    #[test]
+    fn concurrent_heads_require_an_explicit_signed_merge() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("Personal.floriavault");
+        let mut genesis = ReplicationPackage::create(
+            &root,
+            VAULT_ID,
+            "2026-08-06T00:00:00Z",
+            keys(7, x25519::Identity::generate()),
+        )
+        .unwrap();
+        let second_wrapping_identity = x25519::Identity::generate();
+        genesis
+            .enroll_device(
+                second_device_keys(8, second_wrapping_identity.clone()).enrollment(),
+            )
+            .unwrap();
+        let second = ReplicationPackage::open(
+            &root,
+            second_device_keys(8, second_wrapping_identity),
+        )
+        .unwrap();
+
+        let base = genesis
+            .prepare(PackageMutation {
+                sequence: 1,
+                operation_id: OPERATION_ID,
+                logical_id: "managed-item-1",
+                parents: &[],
+                value: b"base",
+            })
+            .unwrap();
+        genesis.publish(&base).unwrap();
+        let base_parent = vec![OPERATION_ID.to_string()];
+        let genesis_child = genesis
+            .prepare(PackageMutation {
+                sequence: 2,
+                operation_id: GENESIS_CHILD_OPERATION_ID,
+                logical_id: "managed-item-1",
+                parents: &base_parent,
+                value: b"genesis branch",
+            })
+            .unwrap();
+        genesis.publish(&genesis_child).unwrap();
+        let second_child = second
+            .prepare(PackageMutation {
+                sequence: 1,
+                operation_id: SECOND_OPERATION_ID,
+                logical_id: "managed-item-1",
+                parents: &base_parent,
+                value: b"second branch",
+            })
+            .unwrap();
+        second.publish(&second_child).unwrap();
+
+        let conflicted = genesis.scan().unwrap();
+        assert!(conflicted.pending.is_empty());
+        assert_eq!(conflicted.conflicts.len(), 1);
+        assert_eq!(
+            conflicted.conflicts[0].head_operation_ids,
+            vec![SECOND_OPERATION_ID.to_string(), GENESIS_CHILD_OPERATION_ID.to_string()]
+        );
+
+        let merge_parents = vec![
+            GENESIS_CHILD_OPERATION_ID.to_string(),
+            SECOND_OPERATION_ID.to_string(),
+        ];
+        let merge = genesis
+            .prepare(PackageMutation {
+                sequence: 3,
+                operation_id: MERGE_OPERATION_ID,
+                logical_id: "managed-item-1",
+                parents: &merge_parents,
+                value: b"merged",
+            })
+            .unwrap();
+        genesis.publish(&merge).unwrap();
+
+        let resolved = second.scan().unwrap();
+        assert!(resolved.pending.is_empty());
+        assert!(resolved.conflicts.is_empty());
+        assert_eq!(resolved.verified.len(), 4);
+        assert_eq!(resolved.verified.last().unwrap().operation_id, MERGE_OPERATION_ID);
     }
 
     #[test]
@@ -2871,7 +3068,7 @@ mod tests {
             .enqueue_replication_outbox(&ReplicationOutboxEntry {
                 intent_id: OPERATION_ID.to_string(),
                 logical_id: "managed-item-1".to_string(),
-                parents: vec!["revision-one".to_string()],
+                parents: Vec::new(),
                 store_versions: vec![ReplicationStoreVersionRef {
                     secret_id: secret_id.to_string(),
                     version: 1,
