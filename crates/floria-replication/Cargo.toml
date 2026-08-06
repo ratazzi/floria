@@ -12,6 +12,7 @@ floria-catalog = { workspace = true }
 floria-core = { workspace = true }
 floria-integrity = { workspace = true }
 floria-store = { workspace = true }
+floria-surface = { workspace = true }
 libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

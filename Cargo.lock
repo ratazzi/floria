@@ -975,6 +975,7 @@ dependencies = [
  "floria-core",
  "floria-integrity",
  "floria-store",
+ "floria-surface",
  "libc",
  "serde",
  "serde_json",

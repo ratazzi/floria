@@ -24,6 +24,7 @@ use floria_core::authz::Enforcement;
 use floria_core::metadata::ItemMetadata;
 use floria_integrity::StateAuthenticator;
 use floria_store::{AgeDirStore, NewSecret, SecretId, SecretOrigin, SecretStore};
+use floria_surface::ManagedMutationCoordinator;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use signature::{Signer, Verifier};
@@ -38,6 +39,7 @@ const OPERATION_SIGNATURE_CONTEXT: &[u8] = b"floria-operation-v1\0";
 const MAX_DESCRIPTOR_BYTES: u64 = 64 * 1024;
 const MAX_OPERATION_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_OBJECT_BYTES: u64 = 1024 * 1024 * 1024;
+const VAULT_STATE_LOGICAL_ID: &str = "vault-state/v1";
 
 #[derive(Debug, Error)]
 pub enum ReplicationError {
@@ -153,6 +155,8 @@ pub struct ReplicationIntent {
     pub parents: Vec<String>,
     #[serde(default)]
     pub store_mutations: Vec<IntentStoreMutation>,
+    #[serde(default)]
+    pub store_versions: Vec<floria_catalog::ReplicationStoreVersionRef>,
     pub catalog_payload: Vec<u8>,
     pub created_at: String,
     #[serde(default)]
@@ -173,6 +177,28 @@ impl ReplicationIntent {
             logical_id: logical_id.into(),
             parents,
             store_mutations,
+            store_versions: Vec::new(),
+            catalog_payload,
+            created_at: created_at.into(),
+            prepared: None,
+        };
+        validate_intent(&intent)?;
+        Ok(intent)
+    }
+
+    fn snapshot(
+        intent_id: impl Into<String>,
+        parents: Vec<String>,
+        store_versions: Vec<floria_catalog::ReplicationStoreVersionRef>,
+        catalog_payload: Vec<u8>,
+        created_at: impl Into<String>,
+    ) -> ReplicationResult<Self> {
+        let intent = Self {
+            intent_id: intent_id.into(),
+            logical_id: VAULT_STATE_LOGICAL_ID.to_string(),
+            parents,
+            store_mutations: Vec::new(),
+            store_versions,
             catalog_payload,
             created_at: created_at.into(),
             prepared: None,
@@ -1554,6 +1580,7 @@ pub struct ReplicationEngine {
     intents: Arc<ReplicationIntentJournal>,
     catalog: Arc<Catalog>,
     store: Arc<AgeDirStore>,
+    mutations: Arc<ManagedMutationCoordinator>,
 }
 
 impl ReplicationEngine {
@@ -1564,6 +1591,7 @@ impl ReplicationEngine {
         authenticator: Arc<StateAuthenticator>,
         catalog: Arc<Catalog>,
         store: Arc<AgeDirStore>,
+        mutations: Arc<ManagedMutationCoordinator>,
     ) -> ReplicationResult<Self> {
         let package = ReplicationPackage::open(directory, device)?;
         ensure_private_local_state_directory(local_state_directory)?;
@@ -1572,7 +1600,7 @@ impl ReplicationEngine {
             package.vault_id(),
             authenticator,
         )?);
-        Ok(Self { package, intents, catalog, store })
+        Ok(Self { package, intents, catalog, store, mutations })
     }
 
     pub fn from_parts(
@@ -1581,10 +1609,114 @@ impl ReplicationEngine {
         catalog: Arc<Catalog>,
         store: Arc<AgeDirStore>,
     ) -> Self {
-        Self { package, intents, catalog, store }
+        Self {
+            package,
+            intents,
+            catalog,
+            store,
+            mutations: Arc::new(ManagedMutationCoordinator::new()),
+        }
+    }
+
+    pub fn from_parts_with_mutations(
+        package: ReplicationPackage,
+        intents: Arc<ReplicationIntentJournal>,
+        catalog: Arc<Catalog>,
+        store: Arc<AgeDirStore>,
+        mutations: Arc<ManagedMutationCoordinator>,
+    ) -> Self {
+        Self { package, intents, catalog, store, mutations }
+    }
+
+    /// Stage one complete, portable Vault-state snapshot after the caller has serialized normal
+    /// catalog/store mutations through `ManagedMutationCoordinator`. Unchanged state and an
+    /// already-staged outbox are both idempotent no-ops.
+    pub fn stage_current_snapshot(&self, created_at: &str) -> ReplicationResult<bool> {
+        self.mutations.run(|| self.stage_current_snapshot_uncoordinated(created_at))
+    }
+
+    fn stage_current_snapshot_uncoordinated(&self, created_at: &str) -> ReplicationResult<bool> {
+        if created_at.trim().is_empty() {
+            return Err(ReplicationError::Invalid(
+                "replication snapshot creation time is empty".to_string(),
+            ));
+        }
+        if !self.catalog.replication_outbox()?.is_empty() {
+            return Ok(false);
+        }
+        let scan = self.package.scan()?;
+        if !scan.pending.is_empty() || !scan.damaged.is_empty() || !scan.conflicts.is_empty() {
+            return Err(ReplicationError::Invalid(
+                "replication package must be fully synchronized before staging local state"
+                    .to_string(),
+            ));
+        }
+        let latest = scan
+            .verified
+            .iter()
+            .rfind(|mutation| mutation.logical_id == VAULT_STATE_LOGICAL_ID);
+        let parents = latest
+            .map(|mutation| vec![mutation.operation_id.clone()])
+            .unwrap_or_default();
+        let projection = self.catalog.replicated_catalog()?;
+        let catalog_payload = serde_json::to_vec(&projection)?;
+        let secret_ids = projection
+            .resources
+            .iter()
+            .filter_map(|resource| match &resource.source {
+                floria_catalog::ResourceSource::SecretRef { secret_id } => {
+                    Some(secret_id.clone())
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let store_versions = secret_ids
+            .into_iter()
+            .map(|secret_id| {
+                let parsed: SecretId = secret_id.parse()?;
+                let record = self.store.record(&parsed)?.ok_or_else(|| {
+                    ReplicationError::Invalid(format!(
+                        "portable catalog references missing secret {secret_id}"
+                    ))
+                })?;
+                Ok(floria_catalog::ReplicationStoreVersionRef {
+                    secret_id,
+                    version: record.current_version,
+                })
+            })
+            .collect::<ReplicationResult<Vec<_>>>()?;
+        let intent_id = uuid::Uuid::new_v4().to_string();
+        let entry = ReplicationOutboxEntry {
+            intent_id: intent_id.clone(),
+            logical_id: VAULT_STATE_LOGICAL_ID.to_string(),
+            parents: parents.clone(),
+            store_versions: store_versions.clone(),
+            catalog_payload: catalog_payload.clone(),
+            created_at: created_at.to_string(),
+        };
+        let encoded = self.export_value(&entry)?;
+        if latest.is_some_and(|mutation| mutation.value.as_slice() == encoded.as_slice()) {
+            return Ok(false);
+        }
+        self.intents.enqueue(ReplicationIntent::snapshot(
+            &intent_id,
+            parents,
+            store_versions,
+            catalog_payload,
+            created_at,
+        )?)?;
+        if let Err(error) = self.catalog.enqueue_replication_outbox(&entry) {
+            let _ = self.intents.discard_unsigned(&intent_id);
+            return Err(error.into());
+        }
+        Ok(true)
     }
 
     pub fn sync(&self) -> ReplicationResult<ReplicationReport> {
+        self.mutations.run(|| self.sync_uncoordinated())
+    }
+
+    fn sync_uncoordinated(&self) -> ReplicationResult<ReplicationReport> {
         let scan = self.package.scan()?;
         let mut report = ReplicationReport {
             observed: scan.observed.len(),
@@ -2032,7 +2164,7 @@ fn validate_committed_intent(
             outbox.intent_id
         )));
     }
-    if intent.store_mutations.len() != outbox.store_versions.len() {
+    if intent.store_mutations.len() + intent.store_versions.len() != outbox.store_versions.len() {
         return Err(ReplicationError::Invalid(format!(
             "outbox intent {} has a different store mutation count",
             outbox.intent_id
@@ -2056,6 +2188,25 @@ fn validate_committed_intent(
             return Err(ReplicationError::Invalid(format!(
                 "outbox intent {} does not reference its immutable store version",
                 outbox.intent_id
+            )));
+        }
+    }
+    for expected in &intent.store_versions {
+        if !outbox.store_versions.contains(expected) {
+            return Err(ReplicationError::Invalid(format!(
+                "outbox intent {} lost immutable store version {}:{}",
+                outbox.intent_id, expected.secret_id, expected.version
+            )));
+        }
+        let secret_id: SecretId = expected.secret_id.parse()?;
+        if !store
+            .history(&secret_id)?
+            .iter()
+            .any(|version| version.version == expected.version)
+        {
+            return Err(ReplicationError::Invalid(format!(
+                "outbox intent {} references unavailable store version {}:{}",
+                outbox.intent_id, expected.secret_id, expected.version
             )));
         }
     }
@@ -2862,6 +3013,7 @@ fn validate_intent(intent: &ReplicationIntent) -> ReplicationResult<()> {
         ));
     }
     let mut mutation_ids = HashSet::new();
+    let mut secret_ids = HashSet::new();
     for mutation in &intent.store_mutations {
         require_uuid("replication store secret id", &mutation.secret_id)?;
         require_uuid("replication store mutation id", &mutation.mutation_id)?;
@@ -2869,6 +3021,21 @@ fn validate_intent(intent: &ReplicationIntent) -> ReplicationResult<()> {
             return Err(ReplicationError::Invalid(format!(
                 "replication store mutation {} is duplicated",
                 mutation.mutation_id
+            )));
+        }
+        if !secret_ids.insert(&mutation.secret_id) {
+            return Err(ReplicationError::Invalid(format!(
+                "replication store secret {} appears more than once",
+                mutation.secret_id
+            )));
+        }
+    }
+    for reference in &intent.store_versions {
+        require_uuid("replication store secret id", &reference.secret_id)?;
+        if reference.version == 0 || !secret_ids.insert(&reference.secret_id) {
+            return Err(ReplicationError::Invalid(format!(
+                "replication store version {}:{} is invalid or duplicated",
+                reference.secret_id, reference.version
             )));
         }
     }
@@ -3806,20 +3973,6 @@ mod tests {
         );
         let secret_id: SecretId = "55555555-5555-4555-8555-555555555555".parse().unwrap();
         let store_mutation_id = "66666666-6666-4666-8666-666666666666";
-        let catalog_payload = serde_json::to_vec(&projection(&secret_id)).unwrap();
-        let durable_intent = ReplicationIntent::new(
-            OPERATION_ID,
-            "managed-item-1",
-            Vec::new(),
-            vec![IntentStoreMutation {
-                secret_id: secret_id.to_string(),
-                mutation_id: store_mutation_id.to_string(),
-            }],
-            catalog_payload.clone(),
-            "2026-08-06T00:00:00Z",
-        )
-        .unwrap();
-        source_intents.enqueue(durable_intent).unwrap();
         source_store
             .put_identified(
                 secret_id.clone(),
@@ -3829,17 +3982,7 @@ mod tests {
             )
             .unwrap();
         source_catalog
-            .enqueue_replication_outbox(&ReplicationOutboxEntry {
-                intent_id: OPERATION_ID.to_string(),
-                logical_id: "managed-item-1".to_string(),
-                parents: Vec::new(),
-                store_versions: vec![ReplicationStoreVersionRef {
-                    secret_id: secret_id.to_string(),
-                    version: 1,
-                }],
-                catalog_payload,
-                created_at: "2026-08-06T00:00:00Z".to_string(),
-            })
+            .apply_replicated_catalog(&projection(&secret_id))
             .unwrap();
         let source = ReplicationEngine::from_parts(
             package,
@@ -3847,7 +3990,10 @@ mod tests {
             source_catalog,
             source_store,
         );
+        assert!(source.stage_current_snapshot("2026-08-06T00:00:00Z").unwrap());
+        assert!(!source.stage_current_snapshot("2026-08-06T00:00:01Z").unwrap());
         assert_eq!(source.sync().unwrap().published, 1);
+        assert!(!source.stage_current_snapshot("2026-08-06T00:00:02Z").unwrap());
 
         let restored_catalog = Arc::new(
             Catalog::open(directory.path().join("restored-catalog.sqlite")).unwrap(),
