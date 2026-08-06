@@ -1,6 +1,6 @@
 import Foundation
 
-let supportedControlProtocolVersion: UInt32 = 8
+let supportedControlProtocolVersion: UInt32 = 9
 
 struct ControlServerInfo: Decodable, Equatable, Sendable {
     let protocolVersion: UInt32?
@@ -981,6 +981,7 @@ struct ReplicationStatus: Codable, Equatable, Sendable {
     let pending: Int
     let conflicts: Int
     let damaged: Int
+    let damagedFiles: [String]
     let devices: [ReplicationDevice]
     let message: String?
 
@@ -989,6 +990,7 @@ struct ReplicationStatus: Codable, Equatable, Sendable {
         case deviceID = "device_id"
         case vaultID = "vault_id"
         case keyGeneration = "key_generation"
+        case damagedFiles = "damaged_files"
     }
 }
 

@@ -39,6 +39,7 @@ const OPERATION_SIGNATURE_CONTEXT: &[u8] = b"floria-operation-v1\0";
 const MAX_DESCRIPTOR_BYTES: u64 = 64 * 1024;
 const MAX_OPERATION_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_OBJECT_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_REPORTED_DAMAGED_FILES: usize = 20;
 const VAULT_STATE_LOGICAL_ID: &str = "vault-state/v1";
 
 #[derive(Debug, Error)]
@@ -1754,6 +1755,10 @@ pub struct ReplicationReport {
     pub observed: usize,
     pub pending: usize,
     pub damaged: usize,
+    /// Package-relative files that failed structural, digest, signature, or decryption checks.
+    /// Callers may reveal these files, but must never delete them automatically: some are
+    /// evidence of a signed Device fork rather than disposable sync-provider conflict copies.
+    pub damaged_files: Vec<PathBuf>,
     pub conflicts: usize,
     pub local_device_fenced: bool,
     pub messages: Vec<String>,
@@ -2162,6 +2167,7 @@ impl ReplicationEngine {
             observed: scan.observed.len(),
             pending: scan.pending.len(),
             damaged: scan.damaged.len(),
+            damaged_files: relative_damaged_paths(&self.package.root, &scan.damaged),
             conflicts: scan.conflicts.len(),
             ..Default::default()
         };
@@ -2381,6 +2387,7 @@ impl ReplicationEngine {
         report.observed = scan.observed.len();
         report.pending = scan.pending.len();
         report.damaged = scan.damaged.len();
+        report.damaged_files = relative_damaged_paths(&self.package.root, &scan.damaged);
         report.conflicts = scan.conflicts.len();
         if scan
             .fenced_devices
@@ -2710,6 +2717,17 @@ fn fence_report(mut report: ReplicationReport, message: impl Into<String>) -> Re
     report.local_device_fenced = true;
     report.messages.push(message.into());
     report
+}
+
+fn relative_damaged_paths(root: &Path, damaged: &[DamagedFile]) -> Vec<PathBuf> {
+    let mut paths = damaged
+        .iter()
+        .filter_map(|file| file.path.strip_prefix(root).ok().map(Path::to_path_buf))
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    paths.truncate(MAX_REPORTED_DAMAGED_FILES);
+    paths
 }
 
 fn device_unsigned(
@@ -4554,6 +4572,20 @@ mod tests {
 
         assert_eq!(scan.damaged.len(), 1);
         assert!(scan.damaged[0].reason.contains("actual digest"));
+    }
+
+    #[test]
+    fn engine_reports_damaged_files_relative_to_the_replication_package() {
+        let (directory, package) = package();
+        let root = package.root.clone();
+        let (engine, _, _) = engine_for_package(directory.path(), "damaged", package, [43; 32]);
+        let relative = PathBuf::from("objects").join(format!("{}.age", "0".repeat(64)));
+        fs::write(root.join(&relative), b"not an age ciphertext").unwrap();
+
+        let report = engine.sync().unwrap();
+
+        assert_eq!(report.damaged, 1);
+        assert_eq!(report.damaged_files, vec![relative]);
     }
 
     #[test]

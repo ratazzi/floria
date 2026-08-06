@@ -1589,6 +1589,7 @@ impl DaemonReplicationService {
             report.observed = published.observed;
             report.pending = published.pending;
             report.damaged = published.damaged;
+            report.damaged_files = published.damaged_files;
             report.conflicts = published.conflicts;
             report.local_device_fenced = published.local_device_fenced;
             report.messages.extend(published.messages);
@@ -1608,6 +1609,7 @@ impl DaemonReplicationService {
             pending: state.last_report.pending,
             conflicts: state.last_report.conflicts,
             damaged: state.last_report.damaged,
+            damaged_files: state.last_report.damaged_files.clone(),
             devices: state
                 .engine
                 .as_ref()

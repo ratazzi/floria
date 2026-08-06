@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 const MAX_MSG: usize = 8 << 20;
-pub const CONTROL_PROTOCOL_VERSION: u32 = 8;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 9;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRequest {
@@ -271,6 +271,7 @@ pub struct ReplicationStatus {
     pub pending: usize,
     pub conflicts: usize,
     pub damaged: usize,
+    pub damaged_files: Vec<PathBuf>,
     pub devices: Vec<ReplicationDevice>,
     pub message: Option<String>,
 }
@@ -1033,6 +1034,7 @@ mod tests {
                 pending: 1,
                 conflicts: 0,
                 damaged: 0,
+                damaged_files: vec![PathBuf::from("objects/damaged.age")],
                 devices: vec![ReplicationDevice {
                     device_id: "fixture-device".to_string(),
                     device_name: Some("Fixture Mac".to_string()),
@@ -1049,6 +1051,7 @@ mod tests {
         assert_eq!(status["value"]["mode"], "waiting_for_enrollment");
         assert_eq!(status["value"]["key_generation"], 2);
         assert_eq!(status["value"]["pending"], 1);
+        assert_eq!(status["value"]["damaged_files"][0], "objects/damaged.age");
         assert_eq!(status["value"]["devices"][0]["device_name"], "Fixture Mac");
     }
 

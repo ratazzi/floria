@@ -67,6 +67,17 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertFalse(source.contains("AppStorage"))
     }
 
+    func testSyncProblemsLeadToTheSpecificFilesWithoutDeletingEvidence() throws {
+        let source = try source("SyncView.swift")
+
+        XCTAssertTrue(source.contains("status.damagedFiles"))
+        XCTAssertTrue(source.contains(#"Button("Show")"#))
+        XCTAssertTrue(source.contains(#""Some synced files couldn’t be verified""#))
+        XCTAssertTrue(source.contains(#""Waiting for your sync tool""#))
+        XCTAssertFalse(source.contains("deleteReplicationDamage"))
+        XCTAssertFalse(source.contains(#"Button("Repair Sync")"#))
+    }
+
     func testFirstProjectEmptyStateOffersDiscoveryDirectly() throws {
         let source = try source("CompactDashboardView.swift")
 

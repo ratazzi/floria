@@ -185,9 +185,7 @@ struct SyncView: View {
                     .help(directory)
                 Spacer()
                 Button("Show in Finder") {
-                    NSWorkspace.shared.activateFileViewerSelecting([
-                        URL(fileURLWithPath: directory)
-                    ])
+                    showReplicationDirectory(directory)
                 }
                 .controlSize(.small)
             }
@@ -237,6 +235,82 @@ struct SyncView: View {
                             .buttonStyle(.borderedProminent)
                             Button("Sync Again", systemImage: "arrow.clockwise") {
                                 perform { try await store.syncReplicationPackage() }
+                            }
+                            Button("Stop Syncing…", role: .destructive) {
+                                showingDisableConfirmation = true
+                            }
+                        }
+                    }
+                } else if status.damaged > 0 {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text(
+                            "Floria ignored files that could not be verified. Your local Library is unchanged. Let your sync tool finish first; if the same files remain, inspect or restore them from its history."
+                        )
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        if !status.damagedFiles.isEmpty {
+                            let visibleDamagedFiles = Array(status.damagedFiles.prefix(5))
+                            VStack(spacing: 0) {
+                                ForEach(Array(visibleDamagedFiles.enumerated()), id: \.element) {
+                                    index, path in
+                                    HStack(spacing: 10) {
+                                        Image(systemName: "doc.badge.exclamationmark")
+                                            .foregroundStyle(.orange)
+                                            .frame(width: 20)
+                                        Text(path)
+                                            .font(.caption.monospaced())
+                                            .lineLimit(1)
+                                            .truncationMode(.middle)
+                                        Spacer()
+                                        Button("Show") {
+                                            showReplicationFile(path, in: status.directory)
+                                        }
+                                        .controlSize(.small)
+                                    }
+                                    .padding(.horizontal, 10)
+                                    .frame(minHeight: 40)
+                                    if index < visibleDamagedFiles.count - 1 {
+                                        Divider().padding(.leading, 40)
+                                    }
+                                }
+                            }
+                            .background(
+                                Color.secondary.opacity(0.06),
+                                in: RoundedRectangle(cornerRadius: 9))
+                        }
+                        HStack(spacing: 10) {
+                            Button("Check Again", systemImage: "arrow.clockwise") {
+                                perform { try await store.syncReplicationPackage() }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            if let directory = status.directory {
+                                Button("Show Sync Folder", systemImage: "folder") {
+                                    showReplicationDirectory(directory)
+                                }
+                            }
+                            Button("Stop Syncing…", role: .destructive) {
+                                showingDisableConfirmation = true
+                            }
+                        }
+                    }
+                } else if status.pending > 0 {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text(
+                            "Your sync tool has not delivered all encrypted files yet. You can keep using the local Library; Floria will check again automatically."
+                        )
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        HStack(spacing: 10) {
+                            Button("Check Again", systemImage: "arrow.clockwise") {
+                                perform { try await store.syncReplicationPackage() }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            if let directory = status.directory {
+                                Button("Show Sync Folder", systemImage: "folder") {
+                                    showReplicationDirectory(directory)
+                                }
                             }
                             Button("Stop Syncing…", role: .destructive) {
                                 showingDisableConfirmation = true
@@ -493,6 +567,8 @@ struct SyncView: View {
 
     private func statusTitle(_ status: ReplicationStatus) -> String {
         if status.conflicts > 0 { return "Choose which version to keep" }
+        if status.damaged > 0 { return "Some synced files couldn’t be verified" }
+        if status.pending > 0 { return "Waiting for your sync tool" }
         return switch status.mode {
         case .off: "Sync is off"
         case .waitingForEnrollment: "Approval needed"
@@ -514,6 +590,9 @@ struct SyncView: View {
         case .removed:
             return "Create a new identity to request access again."
         case .active:
+            if status.damaged > 0 {
+                return "(status.damaged) encrypted file verification issue\(status.damaged == 1 ? "" : "s") found."
+            }
             if status.pending > 0 {
                 return "Waiting for \(status.pending) item\(status.pending == 1 ? "" : "s") to arrive."
             }
@@ -525,6 +604,8 @@ struct SyncView: View {
 
     private func statusSymbol(_ status: ReplicationStatus) -> String {
         if status.conflicts > 0 { return "exclamationmark.triangle.fill" }
+        if status.damaged > 0 { return "exclamationmark.triangle.fill" }
+        if status.pending > 0 { return "clock.arrow.circlepath" }
         return switch status.mode {
         case .off: "icloud.slash"
         case .waitingForEnrollment: "person.badge.key"
@@ -536,7 +617,7 @@ struct SyncView: View {
     }
 
     private func statusColor(_ status: ReplicationStatus) -> Color {
-        if status.conflicts > 0 { return .orange }
+        if status.conflicts > 0 || status.damaged > 0 || status.pending > 0 { return .orange }
         return switch status.mode {
         case .active: .green
         case .off: .secondary
@@ -548,6 +629,17 @@ struct SyncView: View {
         let home = NSHomeDirectory()
         guard path == home || path.hasPrefix(home + "/") else { return path }
         return "~" + path.dropFirst(home.count)
+    }
+
+    private func showReplicationDirectory(_ path: String) {
+        NSWorkspace.shared.open(URL(fileURLWithPath: path, isDirectory: true))
+    }
+
+    private func showReplicationFile(_ relativePath: String, in directory: String?) {
+        guard let directory else { return }
+        let file = URL(fileURLWithPath: directory, isDirectory: true)
+            .appendingPathComponent(relativePath)
+        NSWorkspace.shared.activateFileViewerSelecting([file])
     }
 
     private func shortDeviceID(_ id: String) -> String {
