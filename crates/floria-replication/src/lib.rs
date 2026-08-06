@@ -1976,68 +1976,6 @@ impl ReplicationEngine {
             ));
         }
 
-        let conflicted_logical_ids = scan
-            .conflicts
-            .iter()
-            .map(|conflict| conflict.logical_id.as_str())
-            .collect::<HashSet<_>>();
-        for mutation in scan
-            .verified
-            .iter()
-            .filter(|mutation| {
-                mutation.device_id != self.package.device_id()
-                    && !conflicted_logical_ids.contains(mutation.logical_id.as_str())
-            })
-        {
-            let accepted = self.intents.accepted_operations(&mutation.device_id);
-            if let Some(operation_id) = accepted.get(&mutation.sequence) {
-                if operation_id != &mutation.operation_id {
-                    return Ok(fence_report(
-                        report,
-                        format!(
-                            "accepted operation {}:{} was replaced",
-                            mutation.device_id, mutation.sequence
-                        ),
-                    ));
-                }
-                continue;
-            }
-            let expected = self
-                .intents
-                .device_sequence(&mutation.device_id)
-                .checked_add(1)
-                .ok_or_else(|| {
-                    ReplicationError::Invalid(format!(
-                        "device {} operation sequence overflow",
-                        mutation.device_id
-                    ))
-                })?;
-            if mutation.sequence != expected {
-                return Ok(fence_report(
-                    report,
-                    format!(
-                        "device {} local projection expected sequence {expected}, got {}",
-                        mutation.device_id, mutation.sequence
-                    ),
-                ));
-            }
-            self.apply_verified_mutation(mutation)?;
-            self.intents.accept_device_operation(
-                &mutation.device_id,
-                mutation.sequence,
-                &mutation.operation_id,
-            )?;
-            report.imported += 1;
-        }
-
-        if !scan.conflicts.is_empty() {
-            report.messages.push(format!(
-                "{} replicated item(s) have concurrent heads and require an explicit merge",
-                scan.conflicts.len()
-            ));
-            return Ok(report);
-        }
-
         let local_observed = scan
             .observed
             .iter()
@@ -2223,6 +2161,83 @@ impl ReplicationEngine {
             self.catalog.remove_replication_outbox(&entry.intent_id)?;
             self.intents.complete(&entry.intent_id)?;
             report.published += 1;
+        }
+
+        // Publish the exact local projection before importing newly arrived remote state. If both
+        // Devices changed the same parent, the refreshed scan now exposes two heads while this
+        // Device keeps showing its own branch; importing first would silently replace the local
+        // projection even though its signed operation still becomes a conflict.
+        let scan = if report.published > 0 {
+            self.package.scan()?
+        } else {
+            scan
+        };
+        report.observed = scan.observed.len();
+        report.pending = scan.pending.len();
+        report.damaged = scan.damaged.len();
+        report.conflicts = scan.conflicts.len();
+        if scan
+            .fenced_devices
+            .iter()
+            .any(|device| device == self.package.device_id())
+        {
+            return Ok(fence_report(
+                report,
+                "the local Device has conflicting valid signed operations",
+            ));
+        }
+        if !scan.conflicts.is_empty() {
+            report.messages.push(format!(
+                "{} replicated item(s) have concurrent heads and require an explicit merge",
+                scan.conflicts.len()
+            ));
+            return Ok(report);
+        }
+
+        for mutation in scan
+            .verified
+            .iter()
+            .filter(|mutation| mutation.device_id != self.package.device_id())
+        {
+            let accepted = self.intents.accepted_operations(&mutation.device_id);
+            if let Some(operation_id) = accepted.get(&mutation.sequence) {
+                if operation_id != &mutation.operation_id {
+                    return Ok(fence_report(
+                        report,
+                        format!(
+                            "accepted operation {}:{} was replaced",
+                            mutation.device_id, mutation.sequence
+                        ),
+                    ));
+                }
+                continue;
+            }
+            let expected = self
+                .intents
+                .device_sequence(&mutation.device_id)
+                .checked_add(1)
+                .ok_or_else(|| {
+                    ReplicationError::Invalid(format!(
+                        "device {} operation sequence overflow",
+                        mutation.device_id
+                    ))
+                })?;
+            if mutation.sequence != expected {
+                return Ok(fence_report(
+                    report,
+                    format!(
+                        "device {} local projection expected sequence {expected}, got {}",
+                        mutation.device_id, mutation.sequence
+                    ),
+                ));
+            }
+            self.apply_verified_mutation(mutation)?;
+            self.intents.accept_device_operation(
+                &mutation.device_id,
+                mutation.sequence,
+                &mutation.operation_id,
+            )?;
+            report.imported += 1;
         }
         Ok(report)
     }
@@ -3496,8 +3511,8 @@ fn io_error(path: &Path, source: io::Error) -> ReplicationError {
 mod tests {
     use super::*;
     use floria_catalog::{
-        EntrySpec, ReplicatedCatalog, ReplicationStoreVersionRef, Resource, ResourceCodec,
-        ResourceKind, ResourceSource, ValueShape,
+        EntrySpec, ReplicatedCatalog, ReplicatedProject, ReplicationStoreVersionRef, Resource,
+        ResourceCodec, ResourceKind, ResourceSource, ValueShape,
     };
     use floria_store::{KeyProvider, NewSecret, StoreResult};
     use std::os::unix::fs::PermissionsExt;
@@ -3578,6 +3593,48 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    fn project_projection(name: &str) -> ReplicatedCatalog {
+        ReplicatedCatalog {
+            projects: vec![ReplicatedProject {
+                id: "project-1".to_string(),
+                name: name.to_string(),
+                default_environment_id: None,
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn engine_for_package(
+        directory: &Path,
+        label: &str,
+        package: ReplicationPackage,
+        authentication_key: [u8; 32],
+    ) -> (ReplicationEngine, Arc<Catalog>) {
+        let catalog = Arc::new(
+            Catalog::open(directory.join(format!("{label}-catalog.sqlite"))).unwrap(),
+        );
+        let engine = ReplicationEngine::from_parts(
+            package,
+            Arc::new(
+                ReplicationIntentJournal::open(
+                    directory.join(format!("{label}-intents.json")),
+                    VAULT_ID,
+                    Arc::new(StateAuthenticator::for_tests(authentication_key)),
+                )
+                .unwrap(),
+            ),
+            Arc::clone(&catalog),
+            Arc::new(
+                AgeDirStore::open(
+                    directory.join(format!("{label}-store")),
+                    Arc::new(LocalStoreKeys(x25519::Identity::generate())),
+                )
+                .unwrap(),
+            ),
+        );
+        (engine, catalog)
     }
 
     struct LocalStoreKeys(x25519::Identity);
@@ -3831,6 +3888,63 @@ mod tests {
         assert!(resolved.conflicts.is_empty());
         assert_eq!(resolved.verified.len(), 4);
         assert_eq!(resolved.verified.last().unwrap().operation_id, MERGE_OPERATION_ID);
+    }
+
+    #[test]
+    fn concurrent_local_snapshots_keep_each_devices_projection_and_report_the_conflict() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("Personal.floriavault");
+        let mut genesis = ReplicationPackage::create(
+            &root,
+            VAULT_ID,
+            "2026-08-06T00:00:00Z",
+            keys(7, x25519::Identity::generate()),
+        )
+        .unwrap();
+        let second_wrapping_identity = x25519::Identity::generate();
+        genesis
+            .enroll_device(
+                second_device_keys(8, second_wrapping_identity.clone()).enrollment(),
+            )
+            .unwrap();
+        let second = ReplicationPackage::open(
+            &root,
+            second_device_keys(8, second_wrapping_identity),
+        )
+        .unwrap();
+        let (genesis, genesis_catalog) =
+            engine_for_package(directory.path(), "genesis", genesis, [81; 32]);
+        let (second, second_catalog) =
+            engine_for_package(directory.path(), "second", second, [82; 32]);
+
+        assert!(genesis.stage_current_snapshot("base").unwrap());
+        assert_eq!(genesis.sync().unwrap().published, 1);
+        assert_eq!(second.sync().unwrap().imported, 1);
+
+        genesis_catalog
+            .apply_replicated_catalog(&project_projection("Genesis branch"))
+            .unwrap();
+        second_catalog
+            .apply_replicated_catalog(&project_projection("Second branch"))
+            .unwrap();
+        assert!(genesis.stage_current_snapshot("genesis edit").unwrap());
+        assert!(second.stage_current_snapshot("second edit").unwrap());
+
+        assert_eq!(genesis.sync().unwrap().published, 1);
+        let second_report = second.sync().unwrap();
+
+        assert_eq!(second_report.published, 1);
+        assert_eq!(second_report.imported, 0);
+        assert_eq!(second_report.conflicts, 1);
+        assert_eq!(
+            genesis_catalog.replicated_catalog().unwrap(),
+            project_projection("Genesis branch")
+        );
+        assert_eq!(
+            second_catalog.replicated_catalog().unwrap(),
+            project_projection("Second branch")
+        );
+        assert_eq!(genesis.sync().unwrap().conflicts, 1);
     }
 
     #[test]
