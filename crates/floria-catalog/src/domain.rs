@@ -518,6 +518,56 @@ pub struct CatalogSnapshot {
     pub surfaces: Vec<Surface>,
 }
 
+/// Portable catalog state carried inside an encrypted replication Operation.
+///
+/// Checkout paths, resource endpoints, and import origins are deliberately absent: they are
+/// device-local overlays and are preserved when this projection is applied on another Mac.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicatedCatalog {
+    pub format_version: u32,
+    pub projects: Vec<ReplicatedProject>,
+    pub environments: Vec<Environment>,
+    pub resources: Vec<Resource>,
+    pub bindings: Vec<Binding>,
+    pub surfaces: Vec<ReplicatedSurface>,
+}
+
+impl Default for ReplicatedCatalog {
+    fn default() -> Self {
+        Self {
+            format_version: 1,
+            projects: Vec::new(),
+            environments: Vec::new(),
+            resources: Vec::new(),
+            bindings: Vec::new(),
+            surfaces: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicatedProject {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub default_environment_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicatedSurface {
+    pub id: String,
+    pub environment_id: String,
+    pub name: String,
+    pub kind: SurfaceKind,
+    /// Project-relative path. Socket surfaces carry `None`.
+    #[serde(default)]
+    pub relative_path: Option<PathBuf>,
+    pub input: SurfaceInput,
+    pub enforcement: Enforcement,
+    #[serde(default)]
+    pub position: i64,
+}
+
 /// One immutable local-store version referenced by a replication outbox row.
 /// Export never rereads a mutable store head.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

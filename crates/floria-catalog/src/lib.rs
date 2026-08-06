@@ -14,8 +14,9 @@ pub use catalog::{
 pub use domain::{
     Binding, BindingScope, CatalogSnapshot, EntrySelection, EntrySpec, Environment, FileBacking,
     FormatInputModel, FormatSpec, ItemLink, ItemMetadata, ManagedFileConfigurationRemoval,
-    OriginKind, OriginSource, Project, ProjectCheckout, ProjectCheckoutKind, ResolvedEnvironment,
-    ReplicationOutboxEntry, ReplicationStoreVersionRef, ResolvedExport, Resource,
+    OriginKind, OriginSource, Project, ProjectCheckout, ProjectCheckoutKind, ReplicatedCatalog,
+    ReplicatedProject, ReplicatedSurface, ResolvedEnvironment, ReplicationOutboxEntry,
+    ReplicationStoreVersionRef, ResolvedExport, Resource,
     ResourceBindingUsage, ResourceCodec, ResourceKind, ResourceOrigin, ResourceSource,
     ResourceUsage, SshRouteSpec, Surface, SurfaceFormat, SurfaceInput, SurfaceKind, ValueShape,
 };

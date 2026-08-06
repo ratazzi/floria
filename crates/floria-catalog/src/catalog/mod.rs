@@ -14,8 +14,9 @@ use crate::domain::{
     Binding, BindingScope, CatalogSnapshot, EntrySelection, Environment, FileBacking,
     FormatInputModel, ManagedFileConfigurationRemoval, OriginKind, OriginSource, Project,
     ProjectCheckout, ProjectCheckoutKind, ResolvedEnvironment, ResolvedExport, Resource,
-    ReplicationOutboxEntry, ResourceBindingUsage, ResourceCodec, ResourceKind, ResourceOrigin,
-    ResourceSource, ResourceUsage, Surface, SurfaceFormat, SurfaceInput, SurfaceKind, ValueShape,
+    ReplicatedCatalog, ReplicatedProject, ReplicatedSurface, ReplicationOutboxEntry,
+    ResourceBindingUsage, ResourceCodec, ResourceKind, ResourceOrigin, ResourceSource,
+    ResourceUsage, Surface, SurfaceFormat, SurfaceInput, SurfaceKind, ValueShape,
 };
 use crate::error::{CatalogError, CatalogResult};
 
@@ -39,6 +40,10 @@ struct CatalogSecuritySnapshot {
     schema: Vec<SchemaObject>,
     catalog: CatalogSnapshot,
     outbox: Vec<ReplicationOutboxEntry>,
+    /// Portable rows can exist before this Mac registers a primary checkout, so the runtime
+    /// snapshot's path-dependent joins cannot be their integrity boundary.
+    #[serde(default)]
+    replicated_catalog: ReplicatedCatalog,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,7 +157,21 @@ impl Catalog {
         let current = security_snapshot_from(&self.raw_connection()?)?;
         match loaded.value {
             Some(AuthenticatedCatalogState::Current(authenticated)) => {
-                if authenticated != current {
+                if authenticated == current {
+                    // Already current.
+                } else if authenticated.replicated_catalog == ReplicatedCatalog::default()
+                    && authenticated.schema_version == current.schema_version
+                    && authenticated.schema == current.schema
+                    && authenticated.catalog == current.catalog
+                    && authenticated.outbox == current.outbox
+                {
+                    authenticator.persist(
+                        &sidecar,
+                        INTEGRITY_DOMAIN,
+                        loaded.generation,
+                        &current,
+                    )?;
+                } else {
                     return Err(CatalogError::Validation(
                         "catalog contents do not match the authenticated security-state snapshot"
                             .to_string(),
@@ -177,6 +196,7 @@ impl Catalog {
             None
                 if loaded.generation == 0
                     && (current.catalog == CatalogSnapshot::default()
+                        && current.replicated_catalog == ReplicatedCatalog::default()
                         || option_env!("FLORIA_INSECURE_DEVELOPMENT_BUILD") == Some("1")) =>
             {
                 require_canonical_schema(&current)?;
@@ -453,8 +473,16 @@ fn security_snapshot_from(conn: &Connection) -> CatalogResult<CatalogSecuritySna
     }
     let catalog = snapshot_from(conn)?;
     let outbox = outbox_from(conn)?;
+    let replicated_catalog = replicated_catalog_from(conn, &catalog)?;
     validate_snapshot_conflicts(&catalog)?;
-    Ok(CatalogSecuritySnapshot { schema_version, schema, catalog, outbox })
+    replication::validate_replicated_catalog(&replicated_catalog)?;
+    Ok(CatalogSecuritySnapshot {
+        schema_version,
+        schema,
+        catalog,
+        outbox,
+        replicated_catalog,
+    })
 }
 
 fn schema_objects_from(conn: &Connection) -> CatalogResult<Vec<SchemaObject>> {
@@ -554,9 +582,11 @@ mod schema;
 mod snapshot;
 mod surfaces;
 mod outbox;
+mod replication;
 mod validation;
 
 use outbox::outbox_from;
+use replication::replicated_catalog_from;
 use schema::migrate;
 use snapshot::{snapshot_from, validate_snapshot_conflicts};
 pub use snapshot::{

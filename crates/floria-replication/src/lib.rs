@@ -18,14 +18,16 @@ use std::sync::{Arc, Mutex};
 use age::x25519;
 use base64::Engine;
 use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
-use floria_catalog::{Catalog, ReplicationOutboxEntry};
+use floria_catalog::{Catalog, ReplicatedCatalog, ReplicationOutboxEntry};
+use floria_core::authz::Enforcement;
+use floria_core::metadata::ItemMetadata;
 use floria_integrity::StateAuthenticator;
-use floria_store::{AgeDirStore, SecretId, SecretStore};
+use floria_store::{AgeDirStore, NewSecret, SecretId, SecretOrigin, SecretStore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use signature::{Signer, Verifier};
 use thiserror::Error;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 const FORMAT_VERSION: u32 = 1;
 const VAULT_SIGNATURE_CONTEXT: &[u8] = b"floria-vault-v1\0";
@@ -1025,6 +1027,7 @@ impl ReplicationPackage {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReplicationReport {
     pub published: usize,
+    pub imported: usize,
     pub observed: usize,
     pub pending: usize,
     pub damaged: usize,
@@ -1032,18 +1035,44 @@ pub struct ReplicationReport {
     pub messages: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct ExportCommit<'a> {
     format_version: u32,
-    catalog_payload: &'a [u8],
+    catalog_payload: std::borrow::Cow<'a, [u8]>,
     store_values: Vec<ExportStoreValue<'a>>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct ExportStoreValue<'a> {
-    secret_id: &'a str,
+    secret_id: std::borrow::Cow<'a, str>,
     version: u32,
-    value: &'a [u8],
+    descriptor: ExportStoreDescriptor,
+    value: std::borrow::Cow<'a, [u8]>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ExportStoreDescriptor {
+    label: String,
+    mode: u32,
+    enforcement: Enforcement,
+    environment_ids: Option<Vec<String>>,
+    metadata: ItemMetadata,
+}
+
+impl Drop for ExportCommit<'_> {
+    fn drop(&mut self) {
+        if let std::borrow::Cow::Owned(payload) = &mut self.catalog_payload {
+            payload.zeroize();
+        }
+    }
+}
+
+impl Drop for ExportStoreValue<'_> {
+    fn drop(&mut self) {
+        if let std::borrow::Cow::Owned(value) = &mut self.value {
+            value.zeroize();
+        }
+    }
 }
 
 /// Single entry point for the stage-2 replication loop. Directory parsing, self-fencing,
@@ -1100,6 +1129,52 @@ impl ReplicationEngine {
                 report,
                 "the local Device has conflicting valid signed operations",
             ));
+        }
+
+        for mutation in scan
+            .verified
+            .iter()
+            .filter(|mutation| mutation.device_id != self.package.device_id())
+        {
+            let accepted = self.intents.accepted_operations(&mutation.device_id);
+            if let Some(operation_id) = accepted.get(&mutation.sequence) {
+                if operation_id != &mutation.operation_id {
+                    return Ok(fence_report(
+                        report,
+                        format!(
+                            "accepted operation {}:{} was replaced",
+                            mutation.device_id, mutation.sequence
+                        ),
+                    ));
+                }
+                continue;
+            }
+            let expected = self
+                .intents
+                .device_sequence(&mutation.device_id)
+                .checked_add(1)
+                .ok_or_else(|| {
+                    ReplicationError::Invalid(format!(
+                        "device {} operation sequence overflow",
+                        mutation.device_id
+                    ))
+                })?;
+            if mutation.sequence != expected {
+                return Ok(fence_report(
+                    report,
+                    format!(
+                        "device {} local projection expected sequence {expected}, got {}",
+                        mutation.device_id, mutation.sequence
+                    ),
+                ));
+            }
+            self.apply_verified_mutation(mutation)?;
+            self.intents.accept_device_operation(
+                &mutation.device_id,
+                mutation.sequence,
+                &mutation.operation_id,
+            )?;
+            report.imported += 1;
         }
 
         let local_observed = scan
@@ -1264,6 +1339,96 @@ impl ReplicationEngine {
         Ok(report)
     }
 
+    fn apply_verified_mutation(&self, mutation: &VerifiedMutation) -> ReplicationResult<()> {
+        let commit: ExportCommit<'_> = serde_json::from_slice(&mutation.value)?;
+        if commit.format_version != FORMAT_VERSION {
+            return Err(ReplicationError::Invalid(format!(
+                "unsupported exported commit format {}",
+                commit.format_version
+            )));
+        }
+        let projection: ReplicatedCatalog = serde_json::from_slice(&commit.catalog_payload)?;
+        let referenced_secret_ids = projection
+            .resources
+            .iter()
+            .filter_map(|resource| match &resource.source {
+                floria_catalog::ResourceSource::SecretRef { secret_id } => Some(secret_id.as_str()),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let mut imported_secret_ids = HashSet::new();
+        for imported in &commit.store_values {
+            if imported.version == 0
+                || !referenced_secret_ids.contains(imported.secret_id.as_ref())
+                || !imported_secret_ids.insert(imported.secret_id.as_ref())
+            {
+                return Err(ReplicationError::Invalid(format!(
+                    "operation {} contains an invalid or duplicate store value",
+                    mutation.operation_id
+                )));
+            }
+            let secret_id: SecretId = imported.secret_id.parse()?;
+            match self.store.record(&secret_id)? {
+                None if imported.version == 1 => {
+                    self.store.put_identified(
+                        secret_id.clone(),
+                        NewSecret {
+                            origin: SecretOrigin::Managed {
+                                label: imported.descriptor.label.clone(),
+                            },
+                            mode: imported.descriptor.mode,
+                            enforcement: imported.descriptor.enforcement,
+                        },
+                        imported.value.as_ref(),
+                        &mutation.operation_id,
+                    )?;
+                }
+                None => {
+                    return Err(ReplicationError::Invalid(format!(
+                        "operation {} starts secret {} at version {}, not 1",
+                        mutation.operation_id, secret_id, imported.version
+                    )))
+                }
+                Some(record) => match self
+                    .store
+                    .version_for_mutation(&secret_id, &mutation.operation_id)?
+                {
+                    Some(version) if version == imported.version => {}
+                    Some(version) => {
+                        return Err(ReplicationError::Invalid(format!(
+                            "operation {} already created store version {version}, not {}",
+                            mutation.operation_id, imported.version
+                        )))
+                    }
+                    None if record.current_version.checked_add(1) == Some(imported.version) => {
+                        self.store.append_version_identified(
+                            &secret_id,
+                            imported.value.as_ref(),
+                            &mutation.operation_id,
+                        )?;
+                    }
+                    None => {
+                        return Err(ReplicationError::Invalid(format!(
+                            "operation {} cannot append secret {} version {} after local version {}",
+                            mutation.operation_id,
+                            secret_id,
+                            imported.version,
+                            record.current_version
+                        )))
+                    }
+                },
+            }
+            self.store.update_settings(
+                &secret_id,
+                imported.descriptor.metadata.clone(),
+                imported.descriptor.enforcement,
+                imported.descriptor.environment_ids.clone(),
+            )?;
+        }
+        self.catalog.apply_replicated_catalog(&projection)?;
+        Ok(())
+    }
+
     fn intent_has_no_store_writes(&self, intent: &ReplicationIntent) -> ReplicationResult<bool> {
         for mutation in &intent.store_mutations {
             let secret_id: SecretId = mutation.secret_id.parse()?;
@@ -1288,21 +1453,51 @@ impl ReplicationEngine {
                 self.store.get_version(&secret_id, reference.version)
             })
             .collect::<Result<Vec<_>, floria_store::StoreError>>()?;
+        let records = entry
+            .store_versions
+            .iter()
+            .map(|reference| {
+                let secret_id: SecretId = reference.secret_id.parse()?;
+                self.store.record(&secret_id)?.ok_or_else(|| {
+                    floria_store::StoreError::NotFound(reference.secret_id.clone())
+                })
+            })
+            .collect::<Result<Vec<_>, floria_store::StoreError>>()?;
         let store_values = entry
             .store_versions
             .iter()
-            .zip(&plaintexts)
-            .map(|(reference, value)| ExportStoreValue {
-                secret_id: &reference.secret_id,
+            .zip(plaintexts.iter().zip(&records))
+            .map(|(reference, (value, record))| ExportStoreValue {
+                secret_id: std::borrow::Cow::Borrowed(&reference.secret_id),
                 version: reference.version,
-                value: value.as_slice(),
+                descriptor: ExportStoreDescriptor {
+                    label: portable_store_label(&record.origin),
+                    mode: record.mode,
+                    enforcement: record.enforcement,
+                    environment_ids: record.environment_ids.clone(),
+                    metadata: record.metadata.clone(),
+                },
+                value: std::borrow::Cow::Borrowed(value.as_slice()),
             })
             .collect();
-        Ok(Zeroizing::new(serde_json::to_vec(&ExportCommit {
+        let encoded = serde_json::to_vec(&ExportCommit {
             format_version: FORMAT_VERSION,
-            catalog_payload: &entry.catalog_payload,
+            catalog_payload: std::borrow::Cow::Borrowed(&entry.catalog_payload),
             store_values,
-        })?))
+        })?;
+        Ok(Zeroizing::new(encoded))
+    }
+}
+
+fn portable_store_label(origin: &SecretOrigin) -> String {
+    match origin {
+        SecretOrigin::Managed { label } => label.clone(),
+        SecretOrigin::File { source_path } => source_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.is_empty())
+            .unwrap_or("Managed file")
+            .to_string(),
     }
 }
 
@@ -1820,7 +2015,10 @@ fn io_error(path: &Path, source: io::Error) -> ReplicationError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use floria_catalog::ReplicationStoreVersionRef;
+    use floria_catalog::{
+        EntrySpec, ReplicatedCatalog, ReplicationStoreVersionRef, Resource, ResourceCodec,
+        ResourceKind, ResourceSource, ValueShape,
+    };
     use floria_store::{KeyProvider, NewSecret, StoreResult};
     use std::os::unix::fs::PermissionsExt;
 
@@ -1858,6 +2056,30 @@ mod tests {
             "2026-08-06T00:00:00Z",
         )
         .unwrap()
+    }
+
+    fn projection(secret_id: &SecretId) -> ReplicatedCatalog {
+        ReplicatedCatalog {
+            resources: vec![Resource {
+                id: "resource-1".to_string(),
+                name: "Fixture value".to_string(),
+                kind: ResourceKind::SharedSecret,
+                shape: ValueShape::Scalar,
+                codec: ResourceCodec::Opaque,
+                default_env_key: Some("FIXTURE_VALUE".to_string()),
+                entries: vec![EntrySpec {
+                    address: "value".to_string(),
+                    label: "FIXTURE_VALUE".to_string(),
+                    key: Some("FIXTURE_VALUE".to_string()),
+                    sensitive: true,
+                }],
+                source: ResourceSource::SecretRef { secret_id: secret_id.to_string() },
+                enforcement: Enforcement::Prompt,
+                metadata: Default::default(),
+                origin: Default::default(),
+            }],
+            ..Default::default()
+        }
     }
 
     struct LocalStoreKeys(x25519::Identity);
@@ -2295,5 +2517,118 @@ mod tests {
 
         assert!(report.local_device_fenced);
         assert!(report.messages[0].contains("no longer contains accepted"));
+    }
+
+    #[test]
+    fn verified_commit_replays_into_an_empty_catalog_and_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault_identity = x25519::Identity::generate();
+        let package = ReplicationPackage::create(
+            directory.path().join("Personal.floriavault"),
+            VAULT_ID,
+            "2026-08-06T00:00:00Z",
+            keys(7, vault_identity.clone()),
+        )
+        .unwrap();
+        let source_intents = Arc::new(
+            ReplicationIntentJournal::open(
+                directory.path().join("source-intents.json"),
+                VAULT_ID,
+                Arc::new(StateAuthenticator::for_tests([76; 32])),
+            )
+            .unwrap(),
+        );
+        let source_catalog = Arc::new(
+            Catalog::open(directory.path().join("source-catalog.sqlite")).unwrap(),
+        );
+        let source_store = Arc::new(
+            AgeDirStore::open(
+                directory.path().join("source-store"),
+                Arc::new(LocalStoreKeys(x25519::Identity::generate())),
+            )
+            .unwrap(),
+        );
+        let secret_id: SecretId = "55555555-5555-4555-8555-555555555555".parse().unwrap();
+        let store_mutation_id = "66666666-6666-4666-8666-666666666666";
+        let catalog_payload = serde_json::to_vec(&projection(&secret_id)).unwrap();
+        let durable_intent = ReplicationIntent::new(
+            OPERATION_ID,
+            "managed-item-1",
+            Vec::new(),
+            vec![IntentStoreMutation {
+                secret_id: secret_id.to_string(),
+                mutation_id: store_mutation_id.to_string(),
+            }],
+            catalog_payload.clone(),
+            "2026-08-06T00:00:00Z",
+        )
+        .unwrap();
+        source_intents.enqueue(durable_intent).unwrap();
+        source_store
+            .put_identified(
+                secret_id.clone(),
+                NewSecret::managed("Fixture value"),
+                b"fixture payload, not a credential",
+                store_mutation_id,
+            )
+            .unwrap();
+        source_catalog
+            .enqueue_replication_outbox(&ReplicationOutboxEntry {
+                intent_id: OPERATION_ID.to_string(),
+                logical_id: "managed-item-1".to_string(),
+                parents: Vec::new(),
+                store_versions: vec![ReplicationStoreVersionRef {
+                    secret_id: secret_id.to_string(),
+                    version: 1,
+                }],
+                catalog_payload,
+                created_at: "2026-08-06T00:00:00Z".to_string(),
+            })
+            .unwrap();
+        let source = ReplicationEngine::from_parts(
+            package,
+            source_intents,
+            source_catalog,
+            source_store,
+        );
+        assert_eq!(source.sync().unwrap().published, 1);
+        let scan = source.package.scan().unwrap();
+
+        let target_catalog = Arc::new(
+            Catalog::open(directory.path().join("target-catalog.sqlite")).unwrap(),
+        );
+        let target_store = Arc::new(
+            AgeDirStore::open(
+                directory.path().join("target-store"),
+                Arc::new(LocalStoreKeys(x25519::Identity::generate())),
+            )
+            .unwrap(),
+        );
+        let target = ReplicationEngine::from_parts(
+            ReplicationPackage::open(
+                directory.path().join("Personal.floriavault"),
+                keys(7, vault_identity),
+            )
+            .unwrap(),
+            Arc::new(
+                ReplicationIntentJournal::open(
+                    directory.path().join("target-intents.json"),
+                    VAULT_ID,
+                    Arc::new(StateAuthenticator::for_tests([77; 32])),
+                )
+                .unwrap(),
+            ),
+            Arc::clone(&target_catalog),
+            Arc::clone(&target_store),
+        );
+
+        target.apply_verified_mutation(&scan.verified[0]).unwrap();
+        target.apply_verified_mutation(&scan.verified[0]).unwrap();
+
+        assert_eq!(
+            target_store.get(&secret_id).unwrap().as_slice(),
+            b"fixture payload, not a credential"
+        );
+        assert_eq!(target_catalog.replicated_catalog().unwrap(), projection(&secret_id));
     }
 }

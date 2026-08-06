@@ -9,6 +9,7 @@ age = { workspace = true }
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
 floria-catalog = { workspace = true }
+floria-core = { workspace = true }
 floria-integrity = { workspace = true }
 floria-store = { workspace = true }
 libc = { workspace = true }

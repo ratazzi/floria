@@ -972,6 +972,7 @@ dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
  "floria-catalog",
+ "floria-core",
  "floria-integrity",
  "floria-store",
  "libc",
