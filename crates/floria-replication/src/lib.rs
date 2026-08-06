@@ -33,6 +33,7 @@ use zeroize::{Zeroize, Zeroizing};
 const FORMAT_VERSION: u32 = 1;
 const VAULT_SIGNATURE_CONTEXT: &[u8] = b"floria-vault-v1\0";
 const DEVICE_SIGNATURE_CONTEXT: &[u8] = b"floria-device-v1\0";
+const KEY_GENERATION_SIGNATURE_CONTEXT: &[u8] = b"floria-key-generation-v1\0";
 const OPERATION_SIGNATURE_CONTEXT: &[u8] = b"floria-operation-v1\0";
 const MAX_DESCRIPTOR_BYTES: u64 = 64 * 1024;
 const MAX_OPERATION_BYTES: u64 = 4 * 1024 * 1024;
@@ -435,6 +436,7 @@ impl ReplicationIntentJournal {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedMutation {
     pub device_id: String,
+    pub key_generation: u32,
     pub sequence: u64,
     pub operation_id: String,
     pub logical_id: String,
@@ -525,6 +527,7 @@ struct DeviceUnsigned {
     signing_public_key: String,
     wrapping_recipient: String,
     authorized_by: String,
+    enrolled_generation: u32,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -535,6 +538,7 @@ struct DeviceDocument {
     signing_public_key: String,
     wrapping_recipient: String,
     authorized_by: String,
+    enrolled_generation: u32,
     signature: String,
 }
 
@@ -547,6 +551,44 @@ impl DeviceDocument {
             signing_public_key: self.signing_public_key.clone(),
             wrapping_recipient: self.wrapping_recipient.clone(),
             authorized_by: self.authorized_by.clone(),
+            enrolled_generation: self.enrolled_generation,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct KeyGenerationUnsigned {
+    format_version: u32,
+    vault_id: String,
+    generation: u32,
+    previous_generation: Option<u32>,
+    authorized_by: String,
+    envelopes: BTreeMap<String, String>,
+    revoked_devices: BTreeMap<String, u64>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct KeyGenerationDocument {
+    format_version: u32,
+    vault_id: String,
+    generation: u32,
+    previous_generation: Option<u32>,
+    authorized_by: String,
+    envelopes: BTreeMap<String, String>,
+    revoked_devices: BTreeMap<String, u64>,
+    signature: String,
+}
+
+impl KeyGenerationDocument {
+    fn unsigned(&self) -> KeyGenerationUnsigned {
+        KeyGenerationUnsigned {
+            format_version: self.format_version,
+            vault_id: self.vault_id.clone(),
+            generation: self.generation,
+            previous_generation: self.previous_generation,
+            authorized_by: self.authorized_by.clone(),
+            envelopes: self.envelopes.clone(),
+            revoked_devices: self.revoked_devices.clone(),
         }
     }
 }
@@ -556,6 +598,7 @@ struct OperationUnsigned {
     format_version: u32,
     vault_id: String,
     device_id: String,
+    key_generation: u32,
     sequence: u64,
     operation_id: String,
     ciphertext: String,
@@ -566,6 +609,7 @@ struct OperationDocument {
     format_version: u32,
     vault_id: String,
     device_id: String,
+    key_generation: u32,
     sequence: u64,
     operation_id: String,
     ciphertext: String,
@@ -578,6 +622,7 @@ impl OperationDocument {
             format_version: self.format_version,
             vault_id: self.vault_id.clone(),
             device_id: self.device_id.clone(),
+            key_generation: self.key_generation,
             sequence: self.sequence,
             operation_id: self.operation_id.clone(),
             ciphertext: self.ciphertext.clone(),
@@ -605,8 +650,17 @@ pub struct ReplicationPackage {
     root: PathBuf,
     vault: VaultDocument,
     device: DeviceKeyMaterial,
-    vault_identity: Arc<x25519::Identity>,
-    trusted_devices: HashMap<String, VerifyingKey>,
+    vault_identities: BTreeMap<u32, Arc<x25519::Identity>>,
+    current_generation: u32,
+    trusted_devices: HashMap<String, TrustedDevice>,
+}
+
+struct TrustedDevice {
+    verifying_key: VerifyingKey,
+    wrapping_recipient: x25519::Recipient,
+    enrolled_generation: u32,
+    revoked_generation: Option<u32>,
+    revoked_after_sequence: Option<u64>,
 }
 
 impl ReplicationPackage {
@@ -634,6 +688,7 @@ impl ReplicationPackage {
 
         let result = (|| {
             create_private_directory(&temporary.join("devices"))?;
+            create_private_directory(&temporary.join("generations"))?;
             create_private_directory(&temporary.join("operations"))?;
             create_private_directory(&temporary.join("objects"))?;
             create_private_directory(&temporary.join("checkpoints"))?;
@@ -668,12 +723,26 @@ impl ReplicationPackage {
                 &device_directory.join("identity.json"),
                 &vault,
                 &device.enrollment(),
+                1,
                 &device.signing_key,
             )?;
             write_vault_envelope(
                 &device_directory.join("envelopes/1.age"),
                 &vault_identity,
                 &device.wrapping_identity.to_public(),
+            )?;
+            write_key_generation(
+                &temporary.join("generations").join(generation_filename(1)),
+                &vault,
+                1,
+                None,
+                &vault_identity,
+                &BTreeMap::from([(
+                    device.device_id.clone(),
+                    device.wrapping_identity.to_public(),
+                )]),
+                BTreeMap::new(),
+                &device.signing_key,
             )?;
             sync_directory(&temporary)?;
             rename_directory_exclusive(&temporary, &root)?;
@@ -688,12 +757,23 @@ impl ReplicationPackage {
             }
         };
 
-        let trusted_devices = HashMap::from([(device.device_id.clone(), device.verifying_key())]);
+        let trusted_devices = HashMap::from([(
+            device.device_id.clone(),
+            TrustedDevice {
+                verifying_key: device.verifying_key(),
+                wrapping_recipient: device.wrapping_identity.to_public(),
+                enrolled_generation: 1,
+                revoked_generation: None,
+                revoked_after_sequence: None,
+            },
+        )]);
+        let vault_identities = BTreeMap::from([(1, Arc::new(vault_identity))]);
         Ok(Self {
             root,
             vault,
             device,
-            vault_identity: Arc::new(vault_identity),
+            vault_identities,
+            current_generation: 1,
             trusted_devices,
         })
     }
@@ -706,35 +786,38 @@ impl ReplicationPackage {
         let bytes = read_untrusted_file(&root.join("vault.json"), MAX_DESCRIPTOR_BYTES)?;
         let vault: VaultDocument = serde_json::from_slice(&bytes)?;
         validate_vault(&vault)?;
-        let trusted_devices = load_trusted_devices(&root, &vault)?;
-        let expected_key = trusted_devices.get(&device.device_id).ok_or_else(|| {
+        let mut trusted_devices = load_trusted_devices(&root, &vault)?;
+        let generations = load_key_generations(&root, &vault)?;
+        apply_generation_membership(&mut trusted_devices, &generations, &vault)?;
+        let expected = trusted_devices.get(&device.device_id).ok_or_else(|| {
             ReplicationError::Invalid(format!(
                 "device {} is not enrolled in this Vault",
                 device.device_id
             ))
         })?;
-        if expected_key != &device.verifying_key() {
+        if expected.verifying_key != device.verifying_key()
+            || expected.wrapping_recipient != device.wrapping_identity.to_public()
+        {
             return Err(ReplicationError::Invalid(
-                "device signing key does not match its enrolled identity".to_string(),
+                "Device private keys do not match its enrolled identity".to_string(),
             ));
         }
-        let envelope_path = root
-            .join("devices")
-            .join(&device.device_id)
-            .join("envelopes/1.age");
-        let envelope = read_untrusted_file(&envelope_path, MAX_DESCRIPTOR_BYTES)?;
-        let identity_text = decrypt(&device.wrapping_identity, &envelope)?;
-        let identity_text = std::str::from_utf8(&identity_text).map_err(|_| {
-            ReplicationError::Encryption("Vault envelope is not UTF-8".to_string())
+        if let Some(generation) = expected.revoked_generation {
+            return Err(ReplicationError::Invalid(format!(
+                "Device {} was revoked at key generation {generation}",
+                device.device_id
+            )));
+        }
+        let current_generation = *generations.keys().next_back().ok_or_else(|| {
+            ReplicationError::Invalid("Vault has no key generation".to_string())
         })?;
-        let vault_identity = identity_text.parse::<x25519::Identity>().map_err(|error| {
-            ReplicationError::Encryption(format!("Vault envelope identity is invalid: {error}"))
-        })?;
+        let vault_identities = load_vault_identities(&root, &device, &generations)?;
         Ok(Self {
             root,
             vault,
             device,
-            vault_identity: Arc::new(vault_identity),
+            vault_identities,
+            current_generation,
             trusted_devices,
         })
     }
@@ -749,12 +832,26 @@ impl ReplicationPackage {
             ));
         }
         validate_enrollment(&enrollment)?;
+        if self
+            .trusted_devices
+            .get(&enrollment.device_id)
+            .and_then(|device| device.revoked_generation)
+            .is_some()
+        {
+            return Err(ReplicationError::Invalid(format!(
+                "revoked Device {} must re-enroll with a new Device id",
+                enrollment.device_id
+            )));
+        }
 
         let devices_root = self.root.join("devices");
         let target = devices_root.join(&enrollment.device_id);
         if path_exists(&target)? {
             let existing = read_device_identity(&target.join("identity.json"), &self.vault)?;
-            if existing.unsigned() != device_unsigned(&self.vault, &enrollment) {
+            if existing.device_id != enrollment.device_id
+                || existing.signing_public_key != enrollment.signing_public_key
+                || existing.wrapping_recipient != enrollment.wrapping_recipient
+            {
                 return Err(ReplicationError::Invalid(format!(
                     "device {} is already enrolled with different public keys",
                     enrollment.device_id
@@ -763,7 +860,23 @@ impl ReplicationPackage {
             read_untrusted_file(&target.join("envelopes/1.age"), MAX_DESCRIPTOR_BYTES)?;
             self.trusted_devices.insert(
                 enrollment.device_id.clone(),
-                verifying_key("Device public key", &enrollment.signing_public_key)?,
+                TrustedDevice {
+                    verifying_key: verifying_key(
+                        "Device public key",
+                        &enrollment.signing_public_key,
+                    )?,
+                    wrapping_recipient: enrollment
+                        .wrapping_recipient
+                        .parse::<x25519::Recipient>()
+                        .map_err(|error| {
+                            ReplicationError::Invalid(format!(
+                                "invalid Device wrapping recipient: {error}"
+                            ))
+                        })?,
+                    enrolled_generation: existing.enrolled_generation,
+                    revoked_generation: None,
+                    revoked_after_sequence: None,
+                },
             );
             self.ensure_device_directories(&enrollment.device_id)?;
             return Ok(());
@@ -781,20 +894,24 @@ impl ReplicationPackage {
                 &temporary.join("identity.json"),
                 &self.vault,
                 &enrollment,
+                self.current_generation,
                 &self.device.signing_key,
             )?;
-            write_vault_envelope(
-                &temporary.join("envelopes/1.age"),
-                self.vault_identity.as_ref(),
-                &enrollment
-                    .wrapping_recipient
-                    .parse::<x25519::Recipient>()
-                    .map_err(|error| {
-                        ReplicationError::Invalid(format!(
-                            "invalid Device wrapping recipient: {error}"
-                        ))
-                    })?,
-            )?;
+            let recipient = enrollment
+                .wrapping_recipient
+                .parse::<x25519::Recipient>()
+                .map_err(|error| {
+                    ReplicationError::Invalid(format!(
+                        "invalid Device wrapping recipient: {error}"
+                    ))
+                })?;
+            for (generation, vault_identity) in &self.vault_identities {
+                write_vault_envelope(
+                    &temporary.join("envelopes").join(envelope_filename(*generation)),
+                    vault_identity.as_ref(),
+                    &recipient,
+                )?;
+            }
             sync_directory(&temporary)?;
             rename_directory_exclusive(&temporary, &target)?;
             sync_directory(&devices_root)
@@ -806,13 +923,103 @@ impl ReplicationPackage {
 
         self.trusted_devices.insert(
             enrollment.device_id.clone(),
-            verifying_key("Device public key", &enrollment.signing_public_key)?,
+            TrustedDevice {
+                verifying_key: verifying_key(
+                    "Device public key",
+                    &enrollment.signing_public_key,
+                )?,
+                wrapping_recipient: enrollment
+                    .wrapping_recipient
+                    .parse::<x25519::Recipient>()
+                    .map_err(|error| {
+                        ReplicationError::Invalid(format!(
+                            "invalid Device wrapping recipient: {error}"
+                        ))
+                    })?,
+                enrolled_generation: self.current_generation,
+                revoked_generation: None,
+                revoked_after_sequence: None,
+            },
         );
         self.ensure_device_directories(&enrollment.device_id)
     }
 
+    /// Revoke a non-genesis Device and rotate the Vault data key. The signed generation document
+    /// atomically binds the new envelopes to the revoked Device's final accepted sequence.
+    pub fn revoke_device(&mut self, device_id: &str) -> ReplicationResult<u32> {
+        if self.device.device_id != self.vault.genesis_device_id {
+            return Err(ReplicationError::Invalid(
+                "only the genesis Device may revoke another Device".to_string(),
+            ));
+        }
+        require_uuid("revoked Device id", device_id)?;
+        if device_id == self.vault.genesis_device_id {
+            return Err(ReplicationError::Invalid(
+                "v1 cannot revoke the genesis Device".to_string(),
+            ));
+        }
+        let target = self.trusted_devices.get(device_id).ok_or_else(|| {
+            ReplicationError::Invalid(format!("Device {device_id} is not enrolled"))
+        })?;
+        if target.revoked_generation.is_some() {
+            return Err(ReplicationError::Invalid(format!(
+                "Device {device_id} is already revoked"
+            )));
+        }
+
+        let scan = self.scan()?;
+        let final_sequence = scan
+            .observed
+            .iter()
+            .filter(|operation| operation.device_id == device_id)
+            .map(|operation| operation.sequence)
+            .max()
+            .unwrap_or(0);
+        let generation = self.current_generation.checked_add(1).ok_or_else(|| {
+            ReplicationError::Invalid("Vault key generation overflow".to_string())
+        })?;
+        let vault_identity = x25519::Identity::generate();
+        let recipients = self
+            .trusted_devices
+            .iter()
+            .filter(|(candidate_id, device)| {
+                candidate_id.as_str() != device_id && device.revoked_generation.is_none()
+            })
+            .map(|(candidate_id, device)| {
+                (candidate_id.clone(), device.wrapping_recipient.clone())
+            })
+            .collect::<BTreeMap<_, _>>();
+        write_key_generation(
+            &self
+                .root
+                .join("generations")
+                .join(generation_filename(generation)),
+            &self.vault,
+            generation,
+            Some(self.current_generation),
+            &vault_identity,
+            &recipients,
+            BTreeMap::from([(device_id.to_string(), final_sequence)]),
+            &self.device.signing_key,
+        )?;
+
+        let target = self
+            .trusted_devices
+            .get_mut(device_id)
+            .expect("revocation target was validated above");
+        target.revoked_generation = Some(generation);
+        target.revoked_after_sequence = Some(final_sequence);
+        self.vault_identities.insert(generation, Arc::new(vault_identity));
+        self.current_generation = generation;
+        Ok(generation)
+    }
+
     pub fn vault_id(&self) -> &str {
         &self.vault.vault_id
+    }
+
+    pub fn current_generation(&self) -> u32 {
+        self.current_generation
     }
 
     pub fn root(&self) -> &Path {
@@ -843,7 +1050,13 @@ impl ReplicationPackage {
                 )));
             }
         }
-        let vault_recipient = self.vault_identity.to_public();
+        let vault_identity = self.vault_identities.get(&self.current_generation).ok_or_else(|| {
+            ReplicationError::Invalid(format!(
+                "local Device cannot decrypt current key generation {}",
+                self.current_generation
+            ))
+        })?;
+        let vault_recipient = vault_identity.to_public();
         let object = encrypt(&vault_recipient, mutation.value)?;
         let object_id = digest(&object);
         let payload = OperationPayload {
@@ -860,6 +1073,7 @@ impl ReplicationPackage {
             format_version: FORMAT_VERSION,
             vault_id: self.vault.vault_id.clone(),
             device_id: self.device.device_id.clone(),
+            key_generation: self.current_generation,
             sequence: mutation.sequence,
             operation_id: mutation.operation_id.to_string(),
             ciphertext: encode(&ciphertext),
@@ -873,6 +1087,7 @@ impl ReplicationPackage {
             format_version: unsigned.format_version,
             vault_id: unsigned.vault_id,
             device_id: unsigned.device_id,
+            key_generation: unsigned.key_generation,
             sequence: unsigned.sequence,
             operation_id: unsigned.operation_id.clone(),
             ciphertext: unsigned.ciphertext,
@@ -1078,6 +1293,25 @@ impl ReplicationPackage {
                 operation.device_id
             ))
         })?;
+        if operation.key_generation == 0 || operation.key_generation > self.current_generation {
+            return Err(ReplicationError::Invalid(format!(
+                "operation names unavailable key generation {}",
+                operation.key_generation
+            )));
+        }
+        if operation.key_generation < device_key.enrolled_generation
+            || device_key
+                .revoked_generation
+                .is_some_and(|generation| operation.key_generation >= generation)
+            || device_key
+                .revoked_after_sequence
+                .is_some_and(|sequence| operation.sequence > sequence)
+        {
+            return Err(ReplicationError::Invalid(format!(
+                "operation device {} is not authorized for key generation {}",
+                operation.device_id, operation.key_generation
+            )));
+        }
         require_uuid("operation id", &operation.operation_id)?;
         if operation.sequence == 0 {
             return Err(ReplicationError::Invalid(
@@ -1088,7 +1322,7 @@ impl ReplicationPackage {
             OPERATION_SIGNATURE_CONTEXT,
             &operation.unsigned(),
             &operation.signature,
-            device_key,
+            &device_key.verifying_key,
         )
     }
 
@@ -1099,8 +1333,20 @@ impl ReplicationPackage {
         objects: &HashMap<String, Vec<u8>>,
         report: &mut PackageScan,
     ) -> ReplicationResult<bool> {
+        let Some(vault_identity) = self.vault_identities.get(&operation.key_generation) else {
+            report.pending.push(PendingOperation {
+                device_id: operation.device_id,
+                sequence: operation.sequence,
+                operation_id: operation.operation_id,
+                reason: format!(
+                    "key generation {} envelope has not arrived",
+                    operation.key_generation
+                ),
+            });
+            return Ok(false);
+        };
         let ciphertext = decode("operation ciphertext", &operation.ciphertext)?;
-        let plaintext = match decrypt(self.vault_identity.as_ref(), &ciphertext) {
+        let plaintext = match decrypt(vault_identity.as_ref(), &ciphertext) {
             Ok(plaintext) => plaintext,
             Err(error) => {
                 report.damaged.push(DamagedFile {
@@ -1149,7 +1395,7 @@ impl ReplicationPackage {
             });
             return Ok(false);
         }
-        let value = match decrypt(self.vault_identity.as_ref(), object) {
+        let value = match decrypt(vault_identity.as_ref(), object) {
             Ok(value) => value,
             Err(error) => {
                 report.damaged.push(DamagedFile {
@@ -1164,6 +1410,7 @@ impl ReplicationPackage {
         };
         report.verified.push(VerifiedMutation {
             device_id: operation.device_id,
+            key_generation: operation.key_generation,
             sequence: operation.sequence,
             operation_id: operation.operation_id,
             logical_id: payload.logical_id,
@@ -1821,7 +2068,11 @@ fn fence_report(mut report: ReplicationReport, message: impl Into<String>) -> Re
     report
 }
 
-fn device_unsigned(vault: &VaultDocument, enrollment: &DeviceEnrollment) -> DeviceUnsigned {
+fn device_unsigned(
+    vault: &VaultDocument,
+    enrollment: &DeviceEnrollment,
+    enrolled_generation: u32,
+) -> DeviceUnsigned {
     DeviceUnsigned {
         format_version: FORMAT_VERSION,
         vault_id: vault.vault_id.clone(),
@@ -1829,6 +2080,7 @@ fn device_unsigned(vault: &VaultDocument, enrollment: &DeviceEnrollment) -> Devi
         signing_public_key: enrollment.signing_public_key.clone(),
         wrapping_recipient: enrollment.wrapping_recipient.clone(),
         authorized_by: vault.genesis_device_id.clone(),
+        enrolled_generation,
     }
 }
 
@@ -1836,6 +2088,7 @@ fn write_device_identity(
     path: &Path,
     vault: &VaultDocument,
     enrollment: &DeviceEnrollment,
+    enrolled_generation: u32,
     genesis_signing_key: &SigningKey,
 ) -> ReplicationResult<()> {
     validate_enrollment(enrollment)?;
@@ -1846,7 +2099,12 @@ fn write_device_identity(
             "Device enrollment signer is not the genesis Device".to_string(),
         ));
     }
-    let unsigned = device_unsigned(vault, enrollment);
+    if enrolled_generation == 0 {
+        return Err(ReplicationError::Invalid(
+            "Device enrollment generation starts at 1".to_string(),
+        ));
+    }
+    let unsigned = device_unsigned(vault, enrollment, enrolled_generation);
     let signature = sign_struct(DEVICE_SIGNATURE_CONTEXT, &unsigned, genesis_signing_key)?;
     let document = DeviceDocument {
         format_version: unsigned.format_version,
@@ -1855,6 +2113,7 @@ fn write_device_identity(
         signing_public_key: unsigned.signing_public_key,
         wrapping_recipient: unsigned.wrapping_recipient,
         authorized_by: unsigned.authorized_by,
+        enrolled_generation: unsigned.enrolled_generation,
         signature,
     };
     write_new_atomic(path, &serde_json::to_vec_pretty(&document)?)
@@ -1870,12 +2129,170 @@ fn write_vault_envelope(
     write_new_atomic(path, &ciphertext)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn write_key_generation(
+    path: &Path,
+    vault: &VaultDocument,
+    generation: u32,
+    previous_generation: Option<u32>,
+    vault_identity: &x25519::Identity,
+    recipients: &BTreeMap<String, x25519::Recipient>,
+    revoked_devices: BTreeMap<String, u64>,
+    genesis_signing_key: &SigningKey,
+) -> ReplicationResult<()> {
+    if generation == 0
+        || previous_generation != generation.checked_sub(1).filter(|previous| *previous > 0)
+    {
+        return Err(ReplicationError::Invalid(
+            "Vault key generations must form a consecutive chain starting at 1".to_string(),
+        ));
+    }
+    if genesis_signing_key.verifying_key()
+        != verifying_key("genesis public key", &vault.genesis_public_key)?
+    {
+        return Err(ReplicationError::Invalid(
+            "key generation signer is not the genesis Device".to_string(),
+        ));
+    }
+    let encoded_identity = vault_identity.to_string();
+    let envelopes = recipients
+        .iter()
+        .map(|(device_id, recipient)| {
+            require_uuid("envelope Device id", device_id)?;
+            Ok((
+                device_id.clone(),
+                encode(&encrypt(recipient, encoded_identity.expose_secret().as_bytes())?),
+            ))
+        })
+        .collect::<ReplicationResult<BTreeMap<_, _>>>()?;
+    let unsigned = KeyGenerationUnsigned {
+        format_version: FORMAT_VERSION,
+        vault_id: vault.vault_id.clone(),
+        generation,
+        previous_generation,
+        authorized_by: vault.genesis_device_id.clone(),
+        envelopes,
+        revoked_devices,
+    };
+    let signature = sign_struct(
+        KEY_GENERATION_SIGNATURE_CONTEXT,
+        &unsigned,
+        genesis_signing_key,
+    )?;
+    let document = KeyGenerationDocument {
+        format_version: unsigned.format_version,
+        vault_id: unsigned.vault_id,
+        generation: unsigned.generation,
+        previous_generation: unsigned.previous_generation,
+        authorized_by: unsigned.authorized_by,
+        envelopes: unsigned.envelopes,
+        revoked_devices: unsigned.revoked_devices,
+        signature,
+    };
+    write_new_atomic(path, &serde_json::to_vec_pretty(&document)?)
+}
+
+fn generation_filename(generation: u32) -> String {
+    format!("{generation:020}.json")
+}
+
+fn envelope_filename(generation: u32) -> String {
+    format!("{generation}.age")
+}
+
+fn load_key_generations(
+    root: &Path,
+    vault: &VaultDocument,
+) -> ReplicationResult<BTreeMap<u32, KeyGenerationDocument>> {
+    let generations_root = root.join("generations");
+    let mut by_generation: BTreeMap<u32, (Vec<u8>, KeyGenerationDocument)> = BTreeMap::new();
+    for path in regular_files_recursively(&generations_root)? {
+        let bytes = read_untrusted_file(&path, MAX_DESCRIPTOR_BYTES)?;
+        let document: KeyGenerationDocument = serde_json::from_slice(&bytes)?;
+        validate_key_generation(&document, vault)?;
+        match by_generation.get(&document.generation) {
+            Some((existing, _)) if existing != &bytes => {
+                return Err(ReplicationError::Invalid(format!(
+                    "Vault key generation {} has multiple signed documents",
+                    document.generation
+                )));
+            }
+            Some(_) => {}
+            None => {
+                by_generation.insert(document.generation, (bytes, document));
+            }
+        }
+    }
+    if by_generation.is_empty() {
+        return Err(ReplicationError::Invalid(
+            "Vault has no signed key generation".to_string(),
+        ));
+    }
+    let mut expected = 1;
+    for (generation, (_, document)) in &by_generation {
+        if *generation != expected
+            || document.previous_generation
+                != generation.checked_sub(1).filter(|previous| *previous > 0)
+        {
+            return Err(ReplicationError::Invalid(format!(
+                "Vault key generation history has a gap before {generation}"
+            )));
+        }
+        expected = expected.checked_add(1).ok_or_else(|| {
+            ReplicationError::Invalid("Vault key generation overflow".to_string())
+        })?;
+    }
+    Ok(by_generation
+        .into_iter()
+        .map(|(generation, (_, document))| (generation, document))
+        .collect())
+}
+
+fn validate_key_generation(
+    document: &KeyGenerationDocument,
+    vault: &VaultDocument,
+) -> ReplicationResult<()> {
+    if document.format_version != FORMAT_VERSION
+        || document.vault_id != vault.vault_id
+        || document.authorized_by != vault.genesis_device_id
+        || document.generation == 0
+    {
+        return Err(ReplicationError::Invalid(
+            "key generation does not match vault.json".to_string(),
+        ));
+    }
+    for (device_id, envelope) in &document.envelopes {
+        require_uuid("envelope Device id", device_id)?;
+        let bytes = decode("Vault key envelope", envelope)?;
+        if bytes.len() as u64 > MAX_DESCRIPTOR_BYTES {
+            return Err(ReplicationError::Invalid(
+                "Vault key envelope exceeds the format limit".to_string(),
+            ));
+        }
+    }
+    for device_id in document.revoked_devices.keys() {
+        require_uuid("revoked Device id", device_id)?;
+        if document.envelopes.contains_key(device_id) {
+            return Err(ReplicationError::Invalid(format!(
+                "revoked Device {device_id} still has an envelope in generation {}",
+                document.generation
+            )));
+        }
+    }
+    let genesis_key = verifying_key("genesis public key", &vault.genesis_public_key)?;
+    verify_struct(
+        KEY_GENERATION_SIGNATURE_CONTEXT,
+        &document.unsigned(),
+        &document.signature,
+        &genesis_key,
+    )
+}
+
 fn load_trusted_devices(
     root: &Path,
     vault: &VaultDocument,
-) -> ReplicationResult<HashMap<String, VerifyingKey>> {
-    let genesis_key = verifying_key("genesis public key", &vault.genesis_public_key)?;
-    let mut trusted = HashMap::from([(vault.genesis_device_id.clone(), genesis_key)]);
+) -> ReplicationResult<HashMap<String, TrustedDevice>> {
+    let mut trusted: HashMap<String, TrustedDevice> = HashMap::new();
     let devices_root = root.join("devices");
     for entry in fs::read_dir(&devices_root).map_err(|source| io_error(&devices_root, source))? {
         let entry = entry.map_err(|source| io_error(&devices_root, source))?;
@@ -1906,9 +2323,26 @@ fn load_trusted_devices(
                 identity.device_id, directory_device_id
             )));
         }
-        let key = verifying_key("Device public key", &identity.signing_public_key)?;
+        let device = TrustedDevice {
+            verifying_key: verifying_key("Device public key", &identity.signing_public_key)?,
+            wrapping_recipient: identity
+                .wrapping_recipient
+                .parse::<x25519::Recipient>()
+                .map_err(|error| {
+                    ReplicationError::Invalid(format!(
+                        "invalid Device wrapping recipient: {error}"
+                    ))
+                })?,
+            enrolled_generation: identity.enrolled_generation,
+            revoked_generation: None,
+            revoked_after_sequence: None,
+        };
         match trusted.get(&identity.device_id) {
-            Some(existing) if existing != &key => {
+            Some(existing)
+                if existing.verifying_key != device.verifying_key
+                    || existing.wrapping_recipient != device.wrapping_recipient
+                    || existing.enrolled_generation != device.enrolled_generation =>
+            {
                 return Err(ReplicationError::Invalid(format!(
                     "Device {} has conflicting enrolled signing keys",
                     identity.device_id
@@ -1916,11 +2350,84 @@ fn load_trusted_devices(
             }
             Some(_) => {}
             None => {
-                trusted.insert(identity.device_id.clone(), key);
+                trusted.insert(identity.device_id.clone(), device);
             }
         }
     }
+    if !trusted.contains_key(&vault.genesis_device_id) {
+        return Err(ReplicationError::Invalid(
+            "genesis Device identity has not arrived".to_string(),
+        ));
+    }
     Ok(trusted)
+}
+
+fn apply_generation_membership(
+    trusted: &mut HashMap<String, TrustedDevice>,
+    generations: &BTreeMap<u32, KeyGenerationDocument>,
+    vault: &VaultDocument,
+) -> ReplicationResult<()> {
+    let current_generation = *generations.keys().next_back().expect("non-empty generations");
+    for (device_id, device) in trusted.iter() {
+        if device.enrolled_generation == 0 || device.enrolled_generation > current_generation {
+            return Err(ReplicationError::Invalid(format!(
+                "Device {device_id} names unavailable enrollment generation {}",
+                device.enrolled_generation
+            )));
+        }
+    }
+    for (generation, document) in generations {
+        for (device_id, sequence) in &document.revoked_devices {
+            if device_id == &vault.genesis_device_id {
+                return Err(ReplicationError::Invalid(
+                    "v1 cannot revoke the genesis Device".to_string(),
+                ));
+            }
+            let device = trusted.get_mut(device_id).ok_or_else(|| {
+                ReplicationError::Invalid(format!(
+                    "key generation {generation} revokes unknown Device {device_id}"
+                ))
+            })?;
+            if device.enrolled_generation >= *generation || device.revoked_generation.is_some() {
+                return Err(ReplicationError::Invalid(format!(
+                    "Device {device_id} has an invalid revocation at generation {generation}"
+                )));
+            }
+            device.revoked_generation = Some(*generation);
+            device.revoked_after_sequence = Some(*sequence);
+        }
+    }
+    Ok(())
+}
+
+fn load_vault_identities(
+    root: &Path,
+    device: &DeviceKeyMaterial,
+    generations: &BTreeMap<u32, KeyGenerationDocument>,
+) -> ReplicationResult<BTreeMap<u32, Arc<x25519::Identity>>> {
+    let mut identities = BTreeMap::new();
+    for (generation, document) in generations {
+        let envelope = match document.envelopes.get(&device.device_id) {
+            Some(envelope) => decode("Vault key envelope", envelope)?,
+            None => read_untrusted_file(
+                &root
+                    .join("devices")
+                    .join(&device.device_id)
+                    .join("envelopes")
+                    .join(envelope_filename(*generation)),
+                MAX_DESCRIPTOR_BYTES,
+            )?,
+        };
+        let identity_text = decrypt(&device.wrapping_identity, &envelope)?;
+        let identity_text = std::str::from_utf8(&identity_text).map_err(|_| {
+            ReplicationError::Encryption("Vault envelope is not UTF-8".to_string())
+        })?;
+        let identity = identity_text.parse::<x25519::Identity>().map_err(|error| {
+            ReplicationError::Encryption(format!("Vault envelope identity is invalid: {error}"))
+        })?;
+        identities.insert(*generation, Arc::new(identity));
+    }
+    Ok(identities)
 }
 
 fn read_device_identity(
@@ -1965,6 +2472,7 @@ fn validate_device_identity(
     if identity.format_version != FORMAT_VERSION
         || identity.vault_id != vault.vault_id
         || identity.authorized_by != vault.genesis_device_id
+        || identity.enrolled_generation == 0
     {
         return Err(ReplicationError::Invalid(
             "Device identity does not match vault.json".to_string(),
@@ -2428,6 +2936,7 @@ mod tests {
     const SECOND_OPERATION_ID: &str = "77777777-7777-4777-8777-777777777777";
     const GENESIS_CHILD_OPERATION_ID: &str = "99999999-9999-4999-8999-999999999999";
     const MERGE_OPERATION_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const THIRD_OPERATION_ID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
 
     fn keys(seed: u8, vault_identity: x25519::Identity) -> DeviceKeyMaterial {
         DeviceKeyMaterial::new(DEVICE_ID, [seed; 32], vault_identity).unwrap()
@@ -2435,6 +2944,15 @@ mod tests {
 
     fn second_device_keys(seed: u8, wrapping_identity: x25519::Identity) -> DeviceKeyMaterial {
         DeviceKeyMaterial::new(SECOND_DEVICE_ID, [seed; 32], wrapping_identity).unwrap()
+    }
+
+    fn third_device_keys(wrapping_identity: x25519::Identity) -> DeviceKeyMaterial {
+        DeviceKeyMaterial::new(
+            "88888888-8888-4888-8888-888888888888",
+            [9; 32],
+            wrapping_identity,
+        )
+        .unwrap()
     }
 
     fn package() -> (tempfile::TempDir, ReplicationPackage) {
@@ -2601,7 +3119,7 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(error.to_string().contains("replication encryption failed"));
+        assert!(error.to_string().contains("private keys do not match"));
     }
 
     #[test]
@@ -2740,6 +3258,119 @@ mod tests {
         assert!(resolved.conflicts.is_empty());
         assert_eq!(resolved.verified.len(), 4);
         assert_eq!(resolved.verified.last().unwrap().operation_id, MERGE_OPERATION_ID);
+    }
+
+    #[test]
+    fn revocation_rotates_the_vault_key_and_fences_late_operations() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("Personal.floriavault");
+        let genesis_wrapping_identity = x25519::Identity::generate();
+        let mut genesis = ReplicationPackage::create(
+            &root,
+            VAULT_ID,
+            "2026-08-06T00:00:00Z",
+            keys(7, genesis_wrapping_identity.clone()),
+        )
+        .unwrap();
+        let second_wrapping_identity = x25519::Identity::generate();
+        genesis
+            .enroll_device(
+                second_device_keys(8, second_wrapping_identity.clone()).enrollment(),
+            )
+            .unwrap();
+        let second = ReplicationPackage::open(
+            &root,
+            second_device_keys(8, second_wrapping_identity.clone()),
+        )
+        .unwrap();
+        let before_revocation = second
+            .prepare(PackageMutation {
+                sequence: 1,
+                operation_id: SECOND_OPERATION_ID,
+                logical_id: "second-item",
+                parents: &[],
+                value: b"accepted before revocation",
+            })
+            .unwrap();
+        second.publish(&before_revocation).unwrap();
+
+        assert_eq!(genesis.revoke_device(SECOND_DEVICE_ID).unwrap(), 2);
+        assert_eq!(genesis.current_generation(), 2);
+        let re_enrollment = genesis
+            .enroll_device(
+                second_device_keys(8, second_wrapping_identity.clone()).enrollment(),
+            )
+            .unwrap_err();
+        assert!(re_enrollment.to_string().contains("new Device id"));
+        let after_rotation = genesis
+            .prepare(PackageMutation {
+                sequence: 1,
+                operation_id: OPERATION_ID,
+                logical_id: "genesis-item",
+                parents: &[],
+                value: b"new generation",
+            })
+            .unwrap();
+        genesis.publish(&after_rotation).unwrap();
+
+        let late = second
+            .prepare(PackageMutation {
+                sequence: 2,
+                operation_id: GENESIS_CHILD_OPERATION_ID,
+                logical_id: "late-item",
+                parents: &[],
+                value: b"must not be accepted",
+            })
+            .unwrap();
+        second.publish(&late).unwrap();
+
+        let scan = genesis.scan().unwrap();
+        assert_eq!(scan.verified.len(), 2);
+        assert!(scan.damaged.iter().any(|damaged| {
+            damaged.reason.contains("not authorized for key generation")
+        }));
+
+        let reopened = ReplicationPackage::open(
+            &root,
+            keys(7, genesis_wrapping_identity),
+        )
+        .unwrap();
+        assert_eq!(reopened.current_generation(), 2);
+        let revoked_error = match ReplicationPackage::open(
+            &root,
+            second_device_keys(8, second_wrapping_identity),
+        ) {
+            Ok(_) => panic!("revoked Device unexpectedly reopened the Vault"),
+            Err(error) => error,
+        };
+        assert!(revoked_error.to_string().contains("was revoked at key generation 2"));
+
+        let third_wrapping_identity = x25519::Identity::generate();
+        genesis
+            .enroll_device(third_device_keys(third_wrapping_identity.clone()).enrollment())
+            .unwrap();
+        let third = ReplicationPackage::open(
+            &root,
+            third_device_keys(third_wrapping_identity),
+        )
+        .unwrap();
+        assert_eq!(third.current_generation(), 2);
+        let third_publication = third
+            .prepare(PackageMutation {
+                sequence: 1,
+                operation_id: THIRD_OPERATION_ID,
+                logical_id: "third-item",
+                parents: &[],
+                value: b"enrolled after rotation",
+            })
+            .unwrap();
+        third.publish(&third_publication).unwrap();
+        let final_scan = genesis.scan().unwrap();
+        assert!(final_scan.verified.iter().any(|mutation| {
+            mutation.device_id == third.device_id()
+                && mutation.key_generation == 2
+                && mutation.operation_id == THIRD_OPERATION_ID
+        }));
     }
 
     #[test]
