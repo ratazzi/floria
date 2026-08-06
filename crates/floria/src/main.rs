@@ -210,6 +210,8 @@ enum SyncCmd {
     Create { directory: PathBuf },
     Open { directory: PathBuf },
     Now,
+    /// Resolve a sync conflict by keeping this Mac's current managed state.
+    ResolveCurrent,
     Disable,
     /// Print this Mac's public enrollment request as JSON.
     Enrollment,
@@ -1606,6 +1608,30 @@ impl RuntimeReplicationService for DaemonReplicationService {
         Ok(Self::update_after_sync(&mut state, report))
     }
 
+    fn resolve_with_current(&self) -> Result<ReplicationStatus, String> {
+        let mut state = self.state.lock().expect("replication runtime state poisoned");
+        let report = {
+            let engine = state.engine.as_ref().ok_or_else(|| {
+                state
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "replication is not active".to_string())
+            })?;
+            engine
+                .resolve_conflict_with_current(&replication_timestamp())
+                .map_err(|error| error.to_string())
+        };
+        let report = match report {
+            Ok(report) => report,
+            Err(error) => {
+                state.mode = ReplicationMode::Error;
+                state.message = Some(error.clone());
+                return Err(error);
+            }
+        };
+        Ok(Self::update_after_sync(&mut state, report))
+    }
+
     fn disable(&self) -> Result<ReplicationStatus, String> {
         let mut state = self.state.lock().expect("replication runtime state poisoned");
         self.persist_directory(&mut state, None)?;
@@ -1946,6 +1972,7 @@ fn cmd_sync(command: SyncCmd, config: &Path) -> Result<()> {
             directory: absolute_cli_path(&directory)?,
         },
         SyncCmd::Now => ControlCommand::ReplicationSync,
+        SyncCmd::ResolveCurrent => ControlCommand::ReplicationResolveWithCurrent,
         SyncCmd::Disable => ControlCommand::ReplicationDisable,
         SyncCmd::Enrollment => ControlCommand::ReplicationEnrollment,
         SyncCmd::Enroll { request } => {

@@ -958,6 +958,11 @@ final class WorkspaceStore {
         return status
     }
 
+    func resolveReplicationConflictWithCurrent() async throws -> ReplicationStatus {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        return try await controlClient.resolveReplicationConflictWithCurrent()
+    }
+
     func disableReplication() async throws -> ReplicationStatus {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
         return try await controlClient.disableReplication()

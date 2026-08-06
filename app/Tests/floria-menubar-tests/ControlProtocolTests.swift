@@ -15,7 +15,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertNil(request["params"])
 
         let response = Data(
-            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":5,"daemon_version":"0.1.0","schema_version":14,"minimum_schema_version":14,"store_format_version":2,"minimum_store_format_version":1}}}"#.utf8)
+            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":6,"daemon_version":"0.1.0","schema_version":14,"minimum_schema_version":14,"store_format_version":2,"minimum_store_format_version":1}}}"#.utf8)
         let decoded = try JSONDecoder().decode(
             ControlResponseEnvelope<ControlServerInfo>.self, from: response)
         let info = try XCTUnwrap(decoded.result?.value)
@@ -100,6 +100,13 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(
             (enrollParams["enrollment"] as? [String: Any])?["device_id"] as? String,
             "fixture-device")
+
+        let resolveData = try ControlCommand.replicationResolveWithCurrent
+            .requestData(requestID: 66, encoder: encoder)
+        let resolve = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: resolveData) as? [String: Any])
+        XCTAssertEqual(resolve["method"] as? String, "replication_resolve_with_current")
+        XCTAssertNil(resolve["params"])
 
         let response = Data(
             #"{"request_id":64,"status":"ok","result":{"type":"replication_status","value":{"mode":"waiting_for_enrollment","directory":"/tmp/Personal.floriavault","device_id":"fixture-device","vault_id":"fixture-vault","key_generation":2,"published":3,"imported":4,"pending":1,"conflicts":0,"damaged":0,"message":"Approval required"}}}"#.utf8)

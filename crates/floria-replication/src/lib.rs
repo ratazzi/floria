@@ -1692,6 +1692,8 @@ struct ExportCommit<'a> {
 #[derive(Serialize, Deserialize)]
 struct ExportStoreValue<'a> {
     secret_id: std::borrow::Cow<'a, str>,
+    // Identifies the immutable source value captured by this commit. Destination stores keep
+    // their own machine-local version sequence and must not reuse this number as a local version.
     version: u32,
     descriptor: ExportStoreDescriptor,
     value: std::borrow::Cow<'a, [u8]>,
@@ -1860,6 +1862,17 @@ impl ReplicationEngine {
         self.stage_current_snapshot_uncoordinated(created_at)
     }
 
+    /// Resolve the replicated-state conflict by keeping the Local Projection currently visible
+    /// on this Device. The signed merge names every conflicting head, so other Devices converge
+    /// without trusting arrival order or silently selecting a winner.
+    pub fn resolve_conflict_with_current(
+        &self,
+        created_at: &str,
+    ) -> ReplicationResult<ReplicationReport> {
+        self.mutations
+            .run(|| self.resolve_conflict_with_current_uncoordinated(created_at))
+    }
+
     fn stage_current_snapshot_uncoordinated(&self, created_at: &str) -> ReplicationResult<bool> {
         if created_at.trim().is_empty() {
             return Err(ReplicationError::Invalid(
@@ -1887,6 +1900,97 @@ impl ReplicationEngine {
             },
             |entry| vec![entry.intent_id.clone()],
         );
+        let (entry, encoded) = self.build_snapshot_entry(parents, created_at)?;
+        let unchanged = match latest_pending {
+            Some(entry) => self.export_value(entry)?.as_slice() == encoded.as_slice(),
+            None => latest_published
+                .is_some_and(|mutation| mutation.value.as_slice() == encoded.as_slice()),
+        };
+        if unchanged {
+            return Ok(false);
+        }
+        self.enqueue_snapshot(entry)?;
+        Ok(true)
+    }
+
+    fn resolve_conflict_with_current_uncoordinated(
+        &self,
+        created_at: &str,
+    ) -> ReplicationResult<ReplicationReport> {
+        if !self.catalog.replication_outbox()?.is_empty() {
+            return Err(ReplicationError::Invalid(
+                "local changes must finish publishing before resolving a conflict".to_string(),
+            ));
+        }
+        let scan = self.package.scan()?;
+        if !scan.pending.is_empty() || !scan.damaged.is_empty() {
+            return Err(ReplicationError::Invalid(
+                "replication package has incomplete or damaged files".to_string(),
+            ));
+        }
+        if scan
+            .fenced_devices
+            .iter()
+            .any(|device| device == self.package.device_id())
+        {
+            return Err(ReplicationError::Invalid(
+                "the local Device is fenced and cannot resolve conflicts".to_string(),
+            ));
+        }
+        let mut conflicts = scan
+            .conflicts
+            .iter()
+            .filter(|conflict| conflict.logical_id == VAULT_STATE_LOGICAL_ID);
+        let conflict = conflicts.next().ok_or_else(|| {
+            ReplicationError::Invalid("there is no replicated-state conflict to resolve".to_string())
+        })?;
+        if conflicts.next().is_some() || scan.conflicts.len() != 1 {
+            return Err(ReplicationError::Invalid(
+                "multiple replicated conflicts require a newer resolver".to_string(),
+            ));
+        }
+
+        let (entry, _) =
+            self.build_snapshot_entry(conflict.head_operation_ids.clone(), created_at)?;
+        self.enqueue_snapshot(entry)?;
+
+        // The explicit merge acknowledges every parent branch. Checkpoint their per-Device slots
+        // without projecting their values: the current catalog/store is the user-selected merge
+        // result and the queued operation durably names all of those heads.
+        for mutation in scan
+            .verified
+            .iter()
+            .filter(|mutation| mutation.device_id != self.package.device_id())
+        {
+            let accepted = self.intents.accepted_operations(&mutation.device_id);
+            match accepted.get(&mutation.sequence) {
+                Some(operation_id) if operation_id == &mutation.operation_id => continue,
+                Some(_) => {
+                    return Err(ReplicationError::Invalid(format!(
+                        "accepted operation {}:{} was replaced",
+                        mutation.device_id, mutation.sequence
+                    )))
+                }
+                None => self.intents.accept_device_operation(
+                    &mutation.device_id,
+                    mutation.sequence,
+                    &mutation.operation_id,
+                )?,
+            }
+        }
+        self.sync_uncoordinated()
+    }
+
+    fn build_snapshot_entry(
+        &self,
+        parents: Vec<String>,
+        created_at: &str,
+    ) -> ReplicationResult<(ReplicationOutboxEntry, Zeroizing<Vec<u8>>)> {
+        if created_at.trim().is_empty() {
+            return Err(ReplicationError::Invalid(
+                "replication snapshot creation time is empty".to_string(),
+            ));
+        }
         let projection = self.catalog.replicated_catalog()?;
         let catalog_payload = serde_json::to_vec(&projection)?;
         let secret_ids = projection
@@ -1914,36 +2018,32 @@ impl ReplicationEngine {
                 })
             })
             .collect::<ReplicationResult<Vec<_>>>()?;
-        let intent_id = uuid::Uuid::new_v4().to_string();
         let entry = ReplicationOutboxEntry {
-            intent_id: intent_id.clone(),
+            intent_id: uuid::Uuid::new_v4().to_string(),
             logical_id: VAULT_STATE_LOGICAL_ID.to_string(),
-            parents: parents.clone(),
-            store_versions: store_versions.clone(),
-            catalog_payload: catalog_payload.clone(),
-            created_at: created_at.to_string(),
-        };
-        let encoded = self.export_value(&entry)?;
-        let unchanged = match latest_pending {
-            Some(entry) => self.export_value(entry)?.as_slice() == encoded.as_slice(),
-            None => latest_published
-                .is_some_and(|mutation| mutation.value.as_slice() == encoded.as_slice()),
-        };
-        if unchanged {
-            return Ok(false);
-        }
-        self.intents.enqueue(ReplicationIntent::snapshot(
-            &intent_id,
             parents,
             store_versions,
             catalog_payload,
-            created_at,
+            created_at: created_at.to_string(),
+        };
+        let encoded = self.export_value(&entry)?;
+        Ok((entry, encoded))
+    }
+
+    fn enqueue_snapshot(&self, entry: ReplicationOutboxEntry) -> ReplicationResult<()> {
+        let intent_id = entry.intent_id.clone();
+        self.intents.enqueue(ReplicationIntent::snapshot(
+            &intent_id,
+            entry.parents.clone(),
+            entry.store_versions.clone(),
+            entry.catalog_payload.clone(),
+            &entry.created_at,
         )?)?;
         if let Err(error) = self.catalog.enqueue_replication_outbox(&entry) {
             let _ = self.intents.discard_unsigned(&intent_id);
             return Err(error.into());
         }
-        Ok(true)
+        Ok(())
     }
 
     pub fn sync(&self) -> ReplicationResult<ReplicationReport> {
@@ -2272,7 +2372,7 @@ impl ReplicationEngine {
             }
             let secret_id: SecretId = imported.secret_id.parse()?;
             match self.store.record(&secret_id)? {
-                None if imported.version == 1 => {
+                None => {
                     self.store.put_identified(
                         secret_id.clone(),
                         NewSecret {
@@ -2286,38 +2386,17 @@ impl ReplicationEngine {
                         &mutation.operation_id,
                     )?;
                 }
-                None => {
-                    return Err(ReplicationError::Invalid(format!(
-                        "operation {} starts secret {} at version {}, not 1",
-                        mutation.operation_id, secret_id, imported.version
-                    )))
-                }
-                Some(record) => match self
+                Some(_) => match self
                     .store
                     .version_for_mutation(&secret_id, &mutation.operation_id)?
                 {
-                    Some(version) if version == imported.version => {}
-                    Some(version) => {
-                        return Err(ReplicationError::Invalid(format!(
-                            "operation {} already created store version {version}, not {}",
-                            mutation.operation_id, imported.version
-                        )))
-                    }
-                    None if record.current_version.checked_add(1) == Some(imported.version) => {
+                    Some(_) => {}
+                    None => {
                         self.store.append_version_identified(
                             &secret_id,
                             imported.value.as_ref(),
                             &mutation.operation_id,
                         )?;
-                    }
-                    None => {
-                        return Err(ReplicationError::Invalid(format!(
-                            "operation {} cannot append secret {} version {} after local version {}",
-                            mutation.operation_id,
-                            secret_id,
-                            imported.version,
-                            record.current_version
-                        )))
                     }
                 },
             }
@@ -3606,14 +3685,27 @@ mod tests {
         }
     }
 
+    fn project_with_secret_projection(secret_id: &SecretId, name: &str) -> ReplicatedCatalog {
+        let mut projection = projection(secret_id);
+        projection.projects = project_projection(name).projects;
+        projection
+    }
+
     fn engine_for_package(
         directory: &Path,
         label: &str,
         package: ReplicationPackage,
         authentication_key: [u8; 32],
-    ) -> (ReplicationEngine, Arc<Catalog>) {
+    ) -> (ReplicationEngine, Arc<Catalog>, Arc<AgeDirStore>) {
         let catalog = Arc::new(
             Catalog::open(directory.join(format!("{label}-catalog.sqlite"))).unwrap(),
+        );
+        let store = Arc::new(
+            AgeDirStore::open(
+                directory.join(format!("{label}-store")),
+                Arc::new(LocalStoreKeys(x25519::Identity::generate())),
+            )
+            .unwrap(),
         );
         let engine = ReplicationEngine::from_parts(
             package,
@@ -3626,15 +3718,9 @@ mod tests {
                 .unwrap(),
             ),
             Arc::clone(&catalog),
-            Arc::new(
-                AgeDirStore::open(
-                    directory.join(format!("{label}-store")),
-                    Arc::new(LocalStoreKeys(x25519::Identity::generate())),
-                )
-                .unwrap(),
-            ),
+            Arc::clone(&store),
         );
-        (engine, catalog)
+        (engine, catalog, store)
     }
 
     struct LocalStoreKeys(x25519::Identity);
@@ -3912,20 +3998,49 @@ mod tests {
             second_device_keys(8, second_wrapping_identity),
         )
         .unwrap();
-        let (genesis, genesis_catalog) =
+        let (genesis, genesis_catalog, genesis_store) =
             engine_for_package(directory.path(), "genesis", genesis, [81; 32]);
-        let (second, second_catalog) =
+        let (second, second_catalog, second_store) =
             engine_for_package(directory.path(), "second", second, [82; 32]);
+
+        let secret_id: SecretId = "77777777-7777-4777-8777-777777777777".parse().unwrap();
+        genesis_store
+            .put_identified(
+                secret_id.clone(),
+                NewSecret::managed("Conflict resolution fixture"),
+                b"base fixture payload",
+                "88888888-8888-4888-8888-888888888888",
+            )
+            .unwrap();
+        genesis_catalog
+            .apply_replicated_catalog(&project_with_secret_projection(&secret_id, "Base"))
+            .unwrap();
 
         assert!(genesis.stage_current_snapshot("base").unwrap());
         assert_eq!(genesis.sync().unwrap().published, 1);
         assert_eq!(second.sync().unwrap().imported, 1);
+        assert_eq!(
+            second_store.get(&secret_id).unwrap().as_slice(),
+            b"base fixture payload"
+        );
 
+        genesis_store
+            .append_version(&secret_id, b"genesis branch fixture payload")
+            .unwrap();
+        second_store
+            .append_version(&secret_id, b"second branch fixture payload")
+            .unwrap();
         genesis_catalog
-            .apply_replicated_catalog(&project_projection("Genesis branch"))
+            .apply_replicated_catalog(&project_with_secret_projection(
+                &secret_id,
+                "Genesis branch",
+            ))
             .unwrap();
         second_catalog
-            .apply_replicated_catalog(&project_projection("Second branch"))
+            .apply_replicated_catalog(&project_with_secret_projection(
+                &secret_id,
+                "Second branch",
+            ))
             .unwrap();
         assert!(genesis.stage_current_snapshot("genesis edit").unwrap());
         assert!(second.stage_current_snapshot("second edit").unwrap());
@@ -3938,13 +4053,44 @@ mod tests {
         assert_eq!(second_report.conflicts, 1);
         assert_eq!(
             genesis_catalog.replicated_catalog().unwrap(),
-            project_projection("Genesis branch")
+            project_with_secret_projection(&secret_id, "Genesis branch")
         );
         assert_eq!(
             second_catalog.replicated_catalog().unwrap(),
-            project_projection("Second branch")
+            project_with_secret_projection(&secret_id, "Second branch")
+        );
+        assert_eq!(
+            genesis_store.get(&secret_id).unwrap().as_slice(),
+            b"genesis branch fixture payload"
+        );
+        assert_eq!(
+            second_store.get(&secret_id).unwrap().as_slice(),
+            b"second branch fixture payload"
         );
         assert_eq!(genesis.sync().unwrap().conflicts, 1);
+
+        let resolved = second
+            .resolve_conflict_with_current("keep second branch")
+            .unwrap();
+        assert_eq!(resolved.published, 1);
+        assert_eq!(resolved.conflicts, 0);
+        assert_eq!(genesis.sync().unwrap().imported, 2);
+        assert_eq!(
+            genesis_catalog.replicated_catalog().unwrap(),
+            project_with_secret_projection(&secret_id, "Second branch")
+        );
+        assert_eq!(
+            second_catalog.replicated_catalog().unwrap(),
+            project_with_secret_projection(&secret_id, "Second branch")
+        );
+        assert_eq!(
+            genesis_store.get(&secret_id).unwrap().as_slice(),
+            b"second branch fixture payload"
+        );
+        assert_eq!(
+            second_store.get(&secret_id).unwrap().as_slice(),
+            b"second branch fixture payload"
+        );
     }
 
     #[test]

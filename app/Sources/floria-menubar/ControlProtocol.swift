@@ -1,6 +1,6 @@
 import Foundation
 
-let supportedControlProtocolVersion: UInt32 = 5
+let supportedControlProtocolVersion: UInt32 = 6
 
 struct ControlServerInfo: Decodable, Equatable, Sendable {
     let protocolVersion: UInt32?
@@ -1019,6 +1019,7 @@ enum ControlCommand: Sendable {
     case replicationCreate(directory: String)
     case replicationOpen(directory: String)
     case replicationSync
+    case replicationResolveWithCurrent
     case replicationDisable
     case replicationEnrollment
     case replicationEnroll(ReplicationEnrollment)
@@ -1100,6 +1101,7 @@ enum ControlCommand: Sendable {
         case .replicationCreate: "replication_create"
         case .replicationOpen: "replication_open"
         case .replicationSync: "replication_sync"
+        case .replicationResolveWithCurrent: "replication_resolve_with_current"
         case .replicationDisable: "replication_disable"
         case .replicationEnrollment: "replication_enrollment"
         case .replicationEnroll: "replication_enroll"
@@ -1153,7 +1155,8 @@ enum ControlCommand: Sendable {
     func requestData(requestID: UInt64, encoder: JSONEncoder) throws -> Data {
         switch self {
         case .ping, .health, .policyModeGet, .grantList, .grantClear, .replicationStatus,
-            .replicationSync, .replicationDisable, .replicationEnrollment, .snapshot,
+            .replicationSync, .replicationResolveWithCurrent, .replicationDisable,
+            .replicationEnrollment, .snapshot,
             .projectCheckoutInventory, .sshConfigStatus, .sshConfigInstall, .sshConfigRemove,
             .protectedFiles:
             return try encoder.encode(ControlRequestWithoutParams(requestID: requestID, method: method))

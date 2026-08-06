@@ -151,6 +151,10 @@ final class ControlClient: @unchecked Sendable {
         try await replicationStatusRequest(.replicationSync)
     }
 
+    func resolveReplicationConflictWithCurrent() async throws -> ReplicationStatus {
+        try await replicationStatusRequest(.replicationResolveWithCurrent)
+    }
+
     func disableReplication() async throws -> ReplicationStatus {
         try await replicationStatusRequest(.replicationDisable)
     }

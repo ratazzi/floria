@@ -10,6 +10,7 @@ struct SyncView: View {
     @State private var isWorking = false
     @State private var errorMessage: String?
     @State private var showingDisableConfirmation = false
+    @State private var showingKeepCurrentConfirmation = false
     @State private var pendingApproval: ReplicationEnrollment?
     @State private var showingApprovalConfirmation = false
 
@@ -76,6 +77,18 @@ struct SyncView: View {
             )
         }
         .confirmationDialog(
+            "Keep This Mac’s Version?", isPresented: $showingKeepCurrentConfirmation
+        ) {
+            Button("Keep This Mac’s Version") {
+                perform { try await store.resolveReplicationConflictWithCurrent() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(
+                "Every Mac will converge to the managed Library currently shown on this Mac. The other signed version remains in encrypted history."
+            )
+        }
+        .confirmationDialog(
             "Approve Another Mac?", isPresented: $showingApprovalConfirmation,
             presenting: pendingApproval
         ) { enrollment in
@@ -112,12 +125,12 @@ struct SyncView: View {
     @ViewBuilder
     private func statusHeader(_ status: ReplicationStatus) -> some View {
         HStack(alignment: .top, spacing: 12) {
-            Image(systemName: statusSymbol(status.mode))
+            Image(systemName: statusSymbol(status))
                 .font(.title3)
-                .foregroundStyle(statusColor(status.mode))
+                .foregroundStyle(statusColor(status))
                 .frame(width: 24)
             VStack(alignment: .leading, spacing: 5) {
-                Text(statusTitle(status.mode))
+                Text(statusTitle(status))
                     .font(.headline)
                 Text(statusDetail(status))
                     .font(.callout)
@@ -174,16 +187,41 @@ struct SyncView: View {
             }
 
         case .active:
-            HStack(spacing: 10) {
-                Button("Sync Now", systemImage: "arrow.clockwise") {
-                    perform { try await store.syncReplicationPackage() }
-                }
-                .buttonStyle(.borderedProminent)
-                Button("Approve Another Mac…", systemImage: "laptopcomputer.and.arrow.down") {
-                    chooseApprovalRequest()
-                }
-                Button("Stop Syncing…", role: .destructive) {
-                    showingDisableConfirmation = true
+            Group {
+                if status.conflicts > 0 {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text(
+                            "This Mac and another Mac changed the Library independently. Review what this Mac currently shows before choosing it for every Mac."
+                        )
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        HStack(spacing: 10) {
+                            Button("Keep This Mac’s Version") {
+                                showingKeepCurrentConfirmation = true
+                            }
+                            .buttonStyle(.borderedProminent)
+                            Button("Sync Again", systemImage: "arrow.clockwise") {
+                                perform { try await store.syncReplicationPackage() }
+                            }
+                            Button("Stop Syncing…", role: .destructive) {
+                                showingDisableConfirmation = true
+                            }
+                        }
+                    }
+                } else {
+                    HStack(spacing: 10) {
+                        Button("Sync Now", systemImage: "arrow.clockwise") {
+                            perform { try await store.syncReplicationPackage() }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        Button("Approve Another Mac…", systemImage: "laptopcomputer.and.arrow.down") {
+                            chooseApprovalRequest()
+                        }
+                        Button("Stop Syncing…", role: .destructive) {
+                            showingDisableConfirmation = true
+                        }
+                    }
                 }
             }
             .disabled(isWorking)
@@ -353,8 +391,9 @@ struct SyncView: View {
         return try encoder.encode(enrollment)
     }
 
-    private func statusTitle(_ mode: ReplicationMode) -> String {
-        switch mode {
+    private func statusTitle(_ status: ReplicationStatus) -> String {
+        if status.conflicts > 0 { return "Choose which version to keep" }
+        return switch status.mode {
         case .off: "Sync is off"
         case .waitingForEnrollment: "Approval needed"
         case .active: "Sync is on"
@@ -381,8 +420,9 @@ struct SyncView: View {
         }
     }
 
-    private func statusSymbol(_ mode: ReplicationMode) -> String {
-        switch mode {
+    private func statusSymbol(_ status: ReplicationStatus) -> String {
+        if status.conflicts > 0 { return "exclamationmark.triangle.fill" }
+        return switch status.mode {
         case .off: "icloud.slash"
         case .waitingForEnrollment: "person.badge.key"
         case .active: "checkmark.icloud"
@@ -391,8 +431,9 @@ struct SyncView: View {
         }
     }
 
-    private func statusColor(_ mode: ReplicationMode) -> Color {
-        switch mode {
+    private func statusColor(_ status: ReplicationStatus) -> Color {
+        if status.conflicts > 0 { return .orange }
+        return switch status.mode {
         case .active: .green
         case .off: .secondary
         case .waitingForEnrollment, .fenced, .error: .orange

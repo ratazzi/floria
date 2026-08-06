@@ -129,6 +129,7 @@ pub trait RuntimeReplicationService: Send + Sync + 'static {
     fn create(&self, directory: &Path) -> Result<ReplicationStatus, String>;
     fn open(&self, directory: &Path) -> Result<ReplicationStatus, String>;
     fn sync(&self) -> Result<ReplicationStatus, String>;
+    fn resolve_with_current(&self) -> Result<ReplicationStatus, String>;
     fn disable(&self) -> Result<ReplicationStatus, String>;
     fn enrollment(&self) -> Result<ReplicationEnrollment, String>;
     fn enroll(&self, enrollment: ReplicationEnrollment) -> Result<ReplicationStatus, String>;

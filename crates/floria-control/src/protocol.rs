@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 const MAX_MSG: usize = 8 << 20;
-pub const CONTROL_PROTOCOL_VERSION: u32 = 5;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 6;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRequest {
@@ -72,6 +72,7 @@ pub enum ControlCommand {
     ReplicationCreate { directory: PathBuf },
     ReplicationOpen { directory: PathBuf },
     ReplicationSync,
+    ReplicationResolveWithCurrent,
     ReplicationDisable,
     ReplicationEnrollment,
     ReplicationEnroll { enrollment: ReplicationEnrollment },
@@ -981,6 +982,12 @@ mod tests {
             enroll["params"]["enrollment"]["device_id"],
             "fixture-device"
         );
+        let resolve = serde_json::to_value(ControlRequest {
+            request_id: 26,
+            command: ControlCommand::ReplicationResolveWithCurrent,
+        })
+        .unwrap();
+        assert_eq!(resolve["method"], "replication_resolve_with_current");
 
         let status = serde_json::to_value(ControlResult::ReplicationStatus(
             ReplicationStatus {

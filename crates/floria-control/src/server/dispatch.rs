@@ -21,6 +21,7 @@ pub(super) fn dispatch_observed(
         ControlCommand::ReplicationCreate { .. }
             | ControlCommand::ReplicationOpen { .. }
             | ControlCommand::ReplicationSync
+            | ControlCommand::ReplicationResolveWithCurrent
             | ControlCommand::ReplicationDisable
             | ControlCommand::ReplicationEnroll { .. }
     );
@@ -139,6 +140,15 @@ fn dispatch_uncoordinated(
                 )
             })?
             .sync()
+            .map(ControlResult::ReplicationStatus)
+            .map_err(DispatchError::Replication),
+        ControlCommand::ReplicationResolveWithCurrent => replication
+            .ok_or_else(|| {
+                DispatchError::Validation(
+                    "replication is unavailable on this control server".to_string(),
+                )
+            })?
+            .resolve_with_current()
             .map(ControlResult::ReplicationStatus)
             .map_err(DispatchError::Replication),
         ControlCommand::ReplicationDisable => replication
