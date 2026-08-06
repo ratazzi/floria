@@ -5,7 +5,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 
 use floria_catalog::{
     Catalog, CatalogSnapshot, ResourceKind, ResourceSource, Surface,
@@ -40,6 +40,7 @@ use floria_surface::{
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 
@@ -1116,25 +1117,12 @@ fn cmd_mount(config: &Path) -> Result<()> {
     let replication_catalog = catalog.clone();
     std::thread::Builder::new()
         .name("floria-replication".to_string())
-        .spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(15));
-            let mode = replication_worker.status().mode;
-            if matches!(mode, ReplicationMode::Off | ReplicationMode::Fenced) {
-                continue;
-            }
-            match replication_worker.sync() {
-                Ok(status) if status.imported > 0 => {
-                    match replication_catalog.snapshot() {
-                        Ok(snapshot) => replication_observer.catalog_changed(&snapshot),
-                        Err(error) => tracing::warn!(
-                            %error,
-                            "refreshing runtime after replication import failed"
-                        ),
-                    }
-                }
-                Ok(_) => {}
-                Err(error) => tracing::debug!(%error, "periodic replication sync deferred"),
-            }
+        .spawn(move || {
+            run_replication_worker(
+                replication_worker,
+                replication_observer,
+                replication_catalog,
+            )
         })
         .context("starting replication worker")?;
     let replication: Arc<dyn RuntimeReplicationService> = replication;
@@ -1294,6 +1282,107 @@ fn control_backup_report(report: floria_backup::BackupReport) -> ControlBackupRe
 }
 
 const REPLICATION_SETTINGS_DOMAIN: &str = "replication-runtime-settings";
+const REPLICATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+struct ReplicationDirectoryWatcher {
+    watcher: RecommendedWatcher,
+    receiver: mpsc::Receiver<()>,
+    directory: Option<PathBuf>,
+}
+
+impl ReplicationDirectoryWatcher {
+    fn new() -> notify::Result<Self> {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let watcher = notify::recommended_watcher(move |result: notify::Result<notify::Event>| {
+            match result {
+                Ok(event) if !matches!(event.kind, EventKind::Access(_)) => {
+                    let _ = sender.try_send(());
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "replication directory watcher deferred to polling");
+                    let _ = sender.try_send(());
+                }
+            }
+        })?;
+        Ok(Self { watcher, receiver, directory: None })
+    }
+
+    fn replace_directory(&mut self, directory: Option<&Path>) {
+        let requested = directory.map(Path::to_path_buf);
+        if self.directory == requested {
+            return;
+        }
+        if let Some(previous) = self.directory.take() {
+            if let Err(error) = self.watcher.unwatch(&previous) {
+                tracing::debug!(
+                    %error,
+                    path = %previous.display(),
+                    "replication directory was already unwatched"
+                );
+            }
+        }
+        let Some(requested) = requested else { return };
+        match self.watcher.watch(&requested, RecursiveMode::Recursive) {
+            Ok(()) => self.directory = Some(requested),
+            Err(error) => tracing::debug!(
+                %error,
+                path = %requested.display(),
+                "replication directory watcher is waiting for the polling fallback"
+            ),
+        }
+    }
+
+    fn wait_for(&self, timeout: std::time::Duration) -> bool {
+        match self.receiver.recv_timeout(timeout) {
+            Ok(()) => true,
+            Err(mpsc::RecvTimeoutError::Timeout) => false,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                std::thread::sleep(timeout);
+                false
+            }
+        }
+    }
+}
+
+fn run_replication_worker(
+    replication: Arc<DaemonReplicationService>,
+    observer: Arc<dyn CatalogObserver>,
+    catalog: Catalog,
+) -> ! {
+    let mut watcher = match ReplicationDirectoryWatcher::new() {
+        Ok(watcher) => Some(watcher),
+        Err(error) => {
+            tracing::warn!(%error, "replication directory events unavailable; using polling");
+            None
+        }
+    };
+    loop {
+        let before_wait = replication.status();
+        if let Some(watcher) = watcher.as_mut() {
+            watcher.replace_directory(before_wait.directory.as_deref());
+            watcher.wait_for(REPLICATION_POLL_INTERVAL);
+        } else {
+            std::thread::sleep(REPLICATION_POLL_INTERVAL);
+        }
+
+        let mode = replication.status().mode;
+        if matches!(mode, ReplicationMode::Off | ReplicationMode::Fenced) {
+            continue;
+        }
+        match replication.sync() {
+            Ok(status) if status.imported > 0 => match catalog.snapshot() {
+                Ok(snapshot) => observer.catalog_changed(&snapshot),
+                Err(error) => tracing::warn!(
+                    %error,
+                    "refreshing runtime after replication import failed"
+                ),
+            },
+            Ok(_) => {}
+            Err(error) => tracing::debug!(%error, "replication sync deferred"),
+        }
+    }
+}
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct ReplicationRuntimeSettings {
@@ -2936,6 +3025,19 @@ mod tests {
         assert_eq!(reopened.mode, ReplicationMode::Active);
         assert_eq!(reopened.directory.as_deref(), Some(package.as_path()));
         assert_eq!(service.sync().unwrap().mode, ReplicationMode::Active);
+    }
+
+    #[test]
+    fn replication_directory_watcher_wakes_for_nested_package_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let nested = directory.path().join("objects");
+        std::fs::create_dir(&nested).unwrap();
+        let mut watcher = ReplicationDirectoryWatcher::new().unwrap();
+        watcher.replace_directory(Some(directory.path()));
+
+        std::fs::write(nested.join("arrived.age"), b"fixture").unwrap();
+
+        assert!(watcher.wait_for(std::time::Duration::from_secs(5)));
     }
 
     #[test]

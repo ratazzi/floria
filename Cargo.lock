@@ -790,6 +790,7 @@ dependencies = [
  "floria-store",
  "floria-surface",
  "libc",
+ "notify",
  "serde",
  "serde_json",
  "ssh-key",
