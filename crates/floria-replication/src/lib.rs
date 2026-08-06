@@ -1,16 +1,14 @@
-//! Untrusted-directory format for Floria replication packages.
+//! The operation log of a Floria vault's shared half.
 //!
-//! [`ReplicationPackage`] is the storage-format module underneath the future
-//! `ReplicationEngine`. It owns canonical signing bytes, age encryption, immutable publication,
-//! digest validation, conflict-copy normalization, and hostile-directory parsing. Catalog
-//! outboxes, device enrollment, sequence self-fencing, and Local Projection application remain
-//! above this interface.
+//! Since format 5 the shared half IS the storage (`floria-store` owns its layout: `vault.json`,
+//! `objects/`, `devices/`, `generations/`). [`ReplicationPackage`] adds the parts that make it a
+//! replicated log — `operations/`, `checkpoints/`, self-fencing, conflict detection, and device
+//! enrollment — on top of the store's documents. Nothing here copies a version byte: an operation
+//! only names the object the store already wrote.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -18,24 +16,30 @@ use std::sync::{Arc, Mutex, RwLock};
 use age::x25519;
 use age::secrecy::ExposeSecret;
 use base64::Engine;
-use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
+use ed25519_dalek::VerifyingKey;
 use floria_catalog::{Catalog, ReplicatedCatalog, ReplicationOutboxEntry};
 use floria_core::authz::Enforcement;
 use floria_core::metadata::ItemMetadata;
 use floria_integrity::StateAuthenticator;
-use floria_store::{AgeDirStore, NewSecret, SecretId, SecretOrigin, SecretStore};
+// The shared half's document model belongs to the store; re-export what callers need so a vault's
+// public material has one import path.
+pub use floria_store::vault::{
+    self, DeviceEnrollment, EnrollmentRequestDocument, KeyGenerationDocument, SharedLayout,
+    VaultDocument, OPERATION_SIGNATURE_CONTEXT,
+};
+pub use floria_store::{
+    AgeDirStore, DeviceKeyMaterial, DeviceKeyStore, NewSecret, SecretId, SecretOrigin, SecretStore,
+    StoreError,
+};
 use floria_surface::ManagedMutationCoordinator;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use signature::{Signer, Verifier};
 use thiserror::Error;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
+/// Operation envelope format. The signed documents the store owns carry their own
+/// [`vault::VAULT_FORMAT_VERSION`].
 const FORMAT_VERSION: u32 = 1;
-const VAULT_SIGNATURE_CONTEXT: &[u8] = b"floria-vault-v1\0";
-const DEVICE_SIGNATURE_CONTEXT: &[u8] = b"floria-device-v1\0";
-const KEY_GENERATION_SIGNATURE_CONTEXT: &[u8] = b"floria-key-generation-v1\0";
-const OPERATION_SIGNATURE_CONTEXT: &[u8] = b"floria-operation-v1\0";
 const MAX_DESCRIPTOR_BYTES: u64 = 64 * 1024;
 const MAX_OPERATION_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_OBJECT_BYTES: u64 = 1024 * 1024 * 1024;
@@ -77,197 +81,6 @@ pub enum ReplicationError {
 
 pub type ReplicationResult<T> = Result<T, ReplicationError>;
 
-/// Device-local material. Both private keys stay on this Mac; enrollment publishes only their
-/// public halves and a Vault-key envelope encrypted to the wrapping recipient.
-pub struct DeviceKeyMaterial {
-    device_id: String,
-    signing_key: SigningKey,
-    wrapping_identity: x25519::Identity,
-}
-
-impl DeviceKeyMaterial {
-    pub fn generate() -> ReplicationResult<Self> {
-        let mut signing_seed = [0_u8; 32];
-        getrandom::getrandom(&mut signing_seed).map_err(|error| {
-            ReplicationError::Encryption(format!("generate Device signing key: {error}"))
-        })?;
-        let material = Self::new(
-            uuid::Uuid::new_v4().to_string(),
-            signing_seed,
-            x25519::Identity::generate(),
-        );
-        signing_seed.zeroize();
-        material
-    }
-
-    pub fn new(
-        device_id: impl Into<String>,
-        signing_seed: [u8; 32],
-        wrapping_identity: x25519::Identity,
-    ) -> ReplicationResult<Self> {
-        let device_id = device_id.into();
-        require_uuid("device id", &device_id)?;
-        Ok(Self {
-            device_id,
-            signing_key: SigningKey::from_bytes(&signing_seed),
-            wrapping_identity,
-        })
-    }
-
-    pub fn device_id(&self) -> &str {
-        &self.device_id
-    }
-
-    fn verifying_key(&self) -> VerifyingKey {
-        self.signing_key.verifying_key()
-    }
-
-    pub fn enrollment(&self) -> DeviceEnrollment {
-        self.enrollment_named(None)
-    }
-
-    pub fn enrollment_named(&self, device_name: Option<String>) -> DeviceEnrollment {
-        DeviceEnrollment {
-            device_id: self.device_id.clone(),
-            signing_public_key: encode(self.verifying_key().as_bytes()),
-            wrapping_recipient: self.wrapping_identity.to_public().to_string(),
-            device_name,
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct LocalDeviceSecretDocument {
-    format_version: u32,
-    device_id: String,
-    signing_seed: String,
-    wrapping_identity: String,
-}
-
-impl Drop for LocalDeviceSecretDocument {
-    fn drop(&mut self) {
-        self.signing_seed.zeroize();
-        self.wrapping_identity.zeroize();
-    }
-}
-
-/// Encrypted, machine-local persistence for one Device identity. The same `KeyProvider` that
-/// protects the local store wraps these bytes, so enabling replication adds no plaintext key file
-/// and no second platform credential source.
-pub struct DeviceKeyStore {
-    path: PathBuf,
-    keys: Arc<dyn floria_store::KeyProvider>,
-}
-
-impl DeviceKeyStore {
-    pub fn new(
-        path: impl Into<PathBuf>,
-        keys: Arc<dyn floria_store::KeyProvider>,
-    ) -> Self {
-        Self { path: path.into(), keys }
-    }
-
-    pub fn load_or_create(&self) -> ReplicationResult<DeviceKeyMaterial> {
-        let parent = self.path.parent().ok_or_else(|| {
-            ReplicationError::Invalid(format!("{} has no parent directory", self.path.display()))
-        })?;
-        ensure_private_local_state_directory(parent)?;
-        match fs::symlink_metadata(&self.path) {
-            Ok(_) => self.load(),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let material = DeviceKeyMaterial::generate()?;
-                self.persist(&material)?;
-                Ok(material)
-            }
-            Err(source) => Err(io_error(&self.path, source)),
-        }
-    }
-
-    pub fn load(&self) -> ReplicationResult<DeviceKeyMaterial> {
-        let metadata = fs::symlink_metadata(&self.path)
-            .map_err(|source| io_error(&self.path, source))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(ReplicationError::Invalid(format!(
-                "Device key path {} is not a regular file",
-                self.path.display()
-            )));
-        }
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return Err(ReplicationError::Invalid(format!(
-                "Device key file {} must not be accessible by group or others",
-                self.path.display()
-            )));
-        }
-        let ciphertext = read_untrusted_file(&self.path, MAX_DESCRIPTOR_BYTES)?;
-        let plaintext = decrypt_with_provider(self.keys.as_ref(), &ciphertext)?;
-        let document: LocalDeviceSecretDocument = serde_json::from_slice(&plaintext)?;
-        if document.format_version != FORMAT_VERSION {
-            return Err(ReplicationError::Invalid(format!(
-                "unsupported local Device key format {}",
-                document.format_version
-            )));
-        }
-        let signing_seed = decode("Device signing seed", &document.signing_seed)?;
-        let mut signing_seed: [u8; 32] = signing_seed.try_into().map_err(|_| {
-            ReplicationError::Invalid("Device signing seed must be 32 bytes".to_string())
-        })?;
-        let wrapping_identity = document
-            .wrapping_identity
-            .parse::<x25519::Identity>()
-            .map_err(|error| {
-                ReplicationError::Invalid(format!("invalid Device wrapping identity: {error}"))
-            })?;
-        let material = DeviceKeyMaterial::new(
-            document.device_id.clone(),
-            signing_seed,
-            wrapping_identity,
-        );
-        signing_seed.zeroize();
-        material
-    }
-
-    /// Replace a revoked local identity with a fresh Device id and keypair. Callers must only
-    /// expose this after a signed Vault generation identifies the current identity as revoked.
-    pub fn rotate(&self) -> ReplicationResult<DeviceKeyMaterial> {
-        self.load()?;
-        let material = DeviceKeyMaterial::generate()?;
-        let ciphertext = self.encrypt_material(&material)?;
-        write_replace_atomic(&self.path, &ciphertext)?;
-        Ok(material)
-    }
-
-    fn persist(&self, material: &DeviceKeyMaterial) -> ReplicationResult<()> {
-        let ciphertext = self.encrypt_material(material)?;
-        write_new_atomic(&self.path, &ciphertext)
-    }
-
-    fn encrypt_material(&self, material: &DeviceKeyMaterial) -> ReplicationResult<Vec<u8>> {
-        let document = LocalDeviceSecretDocument {
-            format_version: FORMAT_VERSION,
-            device_id: material.device_id.clone(),
-            signing_seed: encode(&material.signing_key.to_bytes()),
-            wrapping_identity: material
-                .wrapping_identity
-                .to_string()
-                .expose_secret()
-                .to_string(),
-        };
-        let plaintext = Zeroizing::new(serde_json::to_vec(&document)?);
-        encrypt_with_provider(self.keys.as_ref(), &plaintext)
-    }
-}
-
-/// Public material approved by the genesis Device. It is safe to move between machines while
-/// the corresponding private keys remain local.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeviceEnrollment {
-    pub device_id: String,
-    pub signing_public_key: String,
-    pub wrapping_recipient: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub device_name: Option<String>,
-}
-
 /// Authenticated device membership projected from signed identity and key-generation documents.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReplicationDevice {
@@ -286,7 +99,9 @@ pub(crate) struct PackageMutation<'a> {
     pub(crate) operation_id: &'a str,
     /// Per-entity deltas of the committed local transaction.
     pub(crate) entities: &'a [EntityPayload],
-    /// Verbatim store version files referenced by the entities, keyed by their digest.
+    /// The store objects the entities reference. They are already in the shared half; this list
+    /// exists so `prepare` can cross-check the references against what the caller believes it is
+    /// publishing.
     pub(crate) objects: &'a [PreparedObject],
 }
 
@@ -296,15 +111,17 @@ pub(crate) struct PackageMutation<'a> {
 pub struct PreparedPublication {
     pub sequence: u64,
     pub operation_id: String,
-    /// Verbatim store version files to publish under `objects/<id>.age` — never re-encrypted.
+    /// The objects this operation names. They are the store's own files and are never copied,
+    /// re-encrypted, or carried in the envelope — only their identity is recorded here.
     objects: Vec<PreparedObject>,
     operation: Vec<u8>,
 }
 
+/// A reference to one immutable version object already sitting in the shared half.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PreparedObject {
     pub(crate) id: String,
-    pub(crate) bytes: Vec<u8>,
+    pub(crate) ciphertext_size: u64,
 }
 
 /// A local-store mutation that must become an immutable version before the catalog outbox can
@@ -736,121 +553,21 @@ pub struct PackageScan {
     pub conflicts: Vec<LogicalConflict>,
     /// Devices whose valid signed history is internally inconsistent and must not publish.
     pub fenced_devices: Vec<String>,
+    /// Self-signed join requests waiting for the genesis Mac's approval. They carry no trust:
+    /// the fingerprint is what a human compares out of band before approving.
+    pub pending_enrollments: Vec<PendingEnrollment>,
     pub duplicate_files: usize,
 }
 
-#[derive(Serialize, Deserialize)]
-struct VaultUnsigned {
-    format_version: u32,
-    vault_id: String,
-    genesis_device_id: String,
-    genesis_public_key: String,
-    created_at: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct VaultDocument {
-    format_version: u32,
-    vault_id: String,
-    genesis_device_id: String,
-    genesis_public_key: String,
-    created_at: String,
-    signature: String,
-}
-
-impl VaultDocument {
-    fn unsigned(&self) -> VaultUnsigned {
-        VaultUnsigned {
-            format_version: self.format_version,
-            vault_id: self.vault_id.clone(),
-            genesis_device_id: self.genesis_device_id.clone(),
-            genesis_public_key: self.genesis_public_key.clone(),
-            created_at: self.created_at.clone(),
-        }
-    }
-}
-
-#[derive(PartialEq, Eq, Serialize, Deserialize)]
-struct DeviceUnsigned {
-    format_version: u32,
-    vault_id: String,
-    device_id: String,
-    signing_public_key: String,
-    wrapping_recipient: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    device_name: Option<String>,
-    authorized_by: String,
-    enrolled_generation: u32,
-}
-
-#[derive(Serialize, Deserialize)]
-struct DeviceDocument {
-    format_version: u32,
-    vault_id: String,
-    device_id: String,
-    signing_public_key: String,
-    wrapping_recipient: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    device_name: Option<String>,
-    authorized_by: String,
-    enrolled_generation: u32,
-    signature: String,
-}
-
-impl DeviceDocument {
-    fn unsigned(&self) -> DeviceUnsigned {
-        DeviceUnsigned {
-            format_version: self.format_version,
-            vault_id: self.vault_id.clone(),
-            device_id: self.device_id.clone(),
-            signing_public_key: self.signing_public_key.clone(),
-            wrapping_recipient: self.wrapping_recipient.clone(),
-            device_name: self.device_name.clone(),
-            authorized_by: self.authorized_by.clone(),
-            enrolled_generation: self.enrolled_generation,
-        }
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct KeyGenerationUnsigned {
-    format_version: u32,
-    vault_id: String,
-    generation: u32,
-    previous_generation: Option<u32>,
-    authorized_by: String,
-    envelopes: BTreeMap<String, String>,
-    revoked_devices: BTreeMap<String, u64>,
-    /// The vault-wide recovery recipient every store encrypts to (from the genesis store).
-    recovery_public: String,
-}
-
-#[derive(Serialize, Deserialize)]
-struct KeyGenerationDocument {
-    format_version: u32,
-    vault_id: String,
-    generation: u32,
-    previous_generation: Option<u32>,
-    authorized_by: String,
-    envelopes: BTreeMap<String, String>,
-    revoked_devices: BTreeMap<String, u64>,
-    recovery_public: String,
-    signature: String,
-}
-
-impl KeyGenerationDocument {
-    fn unsigned(&self) -> KeyGenerationUnsigned {
-        KeyGenerationUnsigned {
-            format_version: self.format_version,
-            vault_id: self.vault_id.clone(),
-            generation: self.generation,
-            previous_generation: self.previous_generation,
-            authorized_by: self.authorized_by.clone(),
-            envelopes: self.envelopes.clone(),
-            revoked_devices: self.revoked_devices.clone(),
-            recovery_public: self.recovery_public.clone(),
-        }
-    }
+/// A device that dropped a valid `request.json` into its own namespace but has no signed
+/// identity yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingEnrollment {
+    pub device_id: String,
+    pub device_name: Option<String>,
+    /// Short fingerprint of the requesting signing key, for on-screen comparison.
+    pub fingerprint: String,
+    pub requested_at: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -916,6 +633,9 @@ enum EntityDelta {
     /// Serialized `ReplicatedCatalog` (metadata only). Transitional single entity until catalog
     /// rows become individual entities.
     Catalog { payload: Vec<u8> },
+    /// The secret no longer exists. Objects stay in the shared half (immutable, possibly still
+    /// referenced by an older head elsewhere); only the receiving device's head document goes.
+    Tombstone,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -941,22 +661,19 @@ struct ObjectReference {
     ciphertext_size: u64,
 }
 
-/// Immutable package-format module. It deliberately has no transport adapter: a normal directory
-/// is the only production representation in v1.
+/// The operation log over a store's shared half. It owns no bytes of its own: the vault, device,
+/// and generation documents belong to the store, and version objects are the store's files.
 pub struct ReplicationPackage {
-    root: PathBuf,
+    store: Arc<AgeDirStore>,
     vault: VaultDocument,
-    device: DeviceKeyMaterial,
+    device: Arc<DeviceKeyMaterial>,
     metadata: RwLock<PackageMetadata>,
 }
 
 struct PackageMetadata {
-    vault_identities: BTreeMap<u32, Arc<x25519::Identity>>,
     current_generation: u32,
     generation_fingerprints: BTreeMap<u32, String>,
     trusted_devices: HashMap<String, TrustedDevice>,
-    /// From the highest signed key-generation document.
-    recovery_public: String,
 }
 
 #[derive(Clone)]
@@ -970,191 +687,50 @@ struct TrustedDevice {
 }
 
 impl ReplicationPackage {
-    pub fn create(
-        root: impl Into<PathBuf>,
-        vault_id: impl Into<String>,
-        created_at: impl Into<String>,
-        device: DeviceKeyMaterial,
-        vault_identity: x25519::Identity,
-        recovery_public: String,
-    ) -> ReplicationResult<Self> {
-        Self::create_named(
-            root,
-            vault_id,
-            created_at,
-            device,
-            None,
-            vault_identity,
-            recovery_public,
-        )
-    }
-
-    /// Create the vault. Generation 1's identity comes from the genesis store (`keys/1`), so the
-    /// version files that store already wrote are decryptable by every enrolled device — the
-    /// zero-transcode property depends on this single key domain.
-    pub fn create_named(
-        root: impl Into<PathBuf>,
-        vault_id: impl Into<String>,
-        created_at: impl Into<String>,
-        device: DeviceKeyMaterial,
-        device_name: Option<String>,
-        vault_identity: x25519::Identity,
-        recovery_public: String,
-    ) -> ReplicationResult<Self> {
-        let root = root.into();
-        let vault_id = vault_id.into();
-        require_uuid("vault id", &vault_id)?;
-        if path_exists(&root)? {
-            return Err(ReplicationError::Invalid(format!(
-                "replication package already exists at {}",
-                root.display()
-            )));
-        }
-        let parent = root.parent().ok_or_else(|| {
-            ReplicationError::Invalid(format!("{} has no parent directory", root.display()))
-        })?;
-        let temporary = parent.join(format!(".floria-vault-{}.tmp", uuid::Uuid::new_v4()));
-        create_private_directory(&temporary)?;
-
-        let result = (|| {
-            create_private_directory(&temporary.join("devices"))?;
-            create_private_directory(&temporary.join("generations"))?;
-            create_private_directory(&temporary.join("operations"))?;
-            create_private_directory(&temporary.join("objects"))?;
-            create_private_directory(&temporary.join("checkpoints"))?;
-
-            let unsigned = VaultUnsigned {
-                format_version: FORMAT_VERSION,
-                vault_id: vault_id.clone(),
-                genesis_device_id: device.device_id.clone(),
-                genesis_public_key: encode(device.verifying_key().as_bytes()),
-                created_at: created_at.into(),
-            };
-            let signature = sign_struct(VAULT_SIGNATURE_CONTEXT, &unsigned, &device.signing_key)?;
-            let vault = VaultDocument {
-                format_version: unsigned.format_version,
-                vault_id: unsigned.vault_id,
-                genesis_device_id: unsigned.genesis_device_id,
-                genesis_public_key: unsigned.genesis_public_key,
-                created_at: unsigned.created_at,
-                signature,
-            };
-            write_new_atomic(
-                &temporary.join("vault.json"),
-                &serde_json::to_vec_pretty(&vault)?,
-            )?;
-
-            let device_directory = temporary.join("devices").join(&device.device_id);
-            create_private_directory(&device_directory)?;
-            create_private_directory(&device_directory.join("envelopes"))?;
-            create_private_directory(&temporary.join("operations").join(&device.device_id))?;
-            create_private_directory(&temporary.join("checkpoints").join(&device.device_id))?;
-            write_device_identity(
-                &device_directory.join("identity.json"),
-                &vault,
-                &device.enrollment_named(device_name.clone()),
-                1,
-                &device.signing_key,
-            )?;
-            write_vault_envelope(
-                &device_directory.join("envelopes/1.age"),
-                &vault_identity,
-                &device.wrapping_identity.to_public(),
-            )?;
-            write_key_generation(
-                &temporary.join("generations").join(generation_filename(1)),
-                &vault,
-                1,
-                None,
-                &vault_identity,
-                &BTreeMap::from([(
-                    device.device_id.clone(),
-                    device.wrapping_identity.to_public(),
-                )]),
-                BTreeMap::new(),
-                &recovery_public,
-                &device.signing_key,
-            )?;
-            sync_directory(&temporary)?;
-            rename_directory_exclusive(&temporary, &root)?;
-            sync_directory(parent)?;
-            Ok(vault)
-        })();
-        let vault = match result {
-            Ok(vault) => vault,
-            Err(error) => {
-                let _ = fs::remove_dir_all(&temporary);
-                return Err(error);
-            }
-        };
-
-        let generations = load_key_generations(&root, &vault)?;
-        let generation_fingerprints = key_generation_fingerprints(&generations)?;
-        let trusted_devices = HashMap::from([(
-            device.device_id.clone(),
-            TrustedDevice {
-                verifying_key: device.verifying_key(),
-                wrapping_recipient: device.wrapping_identity.to_public(),
-                device_name,
-                enrolled_generation: 1,
-                revoked_generation: None,
-                revoked_after_sequence: None,
-            },
-        )]);
-        let vault_identities = BTreeMap::from([(1, Arc::new(vault_identity))]);
+    /// Build the operation log over an open store's shared half. The store has already created
+    /// (or adopted) the vault; this only adds the `operations/` and `checkpoints/` namespaces and
+    /// projects device membership. A store whose device is not enrolled yet reports
+    /// [`ReplicationError::EnrollmentRequired`].
+    pub fn for_store(store: Arc<AgeDirStore>) -> ReplicationResult<Self> {
+        let vault = store.vault_document();
+        let device = store.device();
+        let layout = store.shared_layout();
+        ensure_private_package_directory(&layout.operations_dir())?;
+        ensure_private_package_directory(&layout.checkpoints_dir())?;
+        ensure_private_package_directory(&layout.device_operations_dir(device.device_id()))?;
+        ensure_private_package_directory(&layout.device_checkpoints_dir(device.device_id()))?;
+        let metadata = load_package_metadata(&layout, &vault, &device)?;
         Ok(Self {
-            root,
-            vault,
-            device,
-            metadata: RwLock::new(PackageMetadata {
-                vault_identities,
-                current_generation: 1,
-                generation_fingerprints,
-                trusted_devices,
-                recovery_public,
-            }),
-        })
-    }
-
-    pub fn open(
-        root: impl Into<PathBuf>,
-        device: DeviceKeyMaterial,
-    ) -> ReplicationResult<Self> {
-        let root = root.into();
-        let bytes = read_untrusted_file(&root.join("vault.json"), MAX_DESCRIPTOR_BYTES)?;
-        let vault: VaultDocument = serde_json::from_slice(&bytes)?;
-        validate_vault(&vault)?;
-        let metadata = load_package_metadata(&root, &vault, &device)?;
-        Ok(Self {
-            root,
+            store,
             vault,
             device,
             metadata: RwLock::new(metadata),
         })
     }
 
+    /// The shared half's current location. Never cached: enabling sync moves it.
+    fn layout(&self) -> SharedLayout {
+        self.store.shared_layout()
+    }
+
     /// Authorize another Device without copying either Device's private keys. Only the genesis
-    /// Device may extend the enrollment set in v1; the signed identity and encrypted Vault-key
-    /// envelope are published together as one immutable directory.
+    /// Device may extend the enrollment set in v1: it writes the signed identity and one Vault-key
+    /// envelope per existing generation into the new Device's own namespace.
     pub fn enroll_device(&mut self, enrollment: DeviceEnrollment) -> ReplicationResult<()> {
-        if self.device.device_id != self.vault.genesis_device_id {
+        if self.device.device_id() != self.vault.genesis_device_id {
             return Err(ReplicationError::Invalid(
                 "only the genesis Device may enroll another Device".to_string(),
             ));
         }
-        validate_enrollment(&enrollment)?;
+        vault::validate_enrollment(&enrollment)?;
         self.refresh_metadata()?;
-        let (current_generation, vault_identities, revoked) = {
-            let metadata = self.metadata.read().expect("replication metadata poisoned");
-            (
-                metadata.current_generation,
-                metadata.vault_identities.clone(),
-                metadata
-                    .trusted_devices
-                    .get(&enrollment.device_id)
-                    .and_then(|device| device.revoked_generation),
-            )
-        };
+        let revoked = self
+            .metadata
+            .read()
+            .expect("replication metadata poisoned")
+            .trusted_devices
+            .get(&enrollment.device_id)
+            .and_then(|device| device.revoked_generation);
         if revoked.is_some() {
             return Err(ReplicationError::Invalid(format!(
                 "revoked Device {} must re-enroll with a new Device id",
@@ -1162,10 +738,14 @@ impl ReplicationPackage {
             )));
         }
 
-        let devices_root = self.root.join("devices");
-        let target = devices_root.join(&enrollment.device_id);
-        if path_exists(&target)? {
-            let existing = read_device_identity(&target.join("identity.json"), &self.vault)?;
+        let layout = self.layout();
+        let current_generation = self.store.current_generation()?;
+        ensure_private_package_directory(&layout.device_dir(&enrollment.device_id))?;
+        ensure_private_package_directory(&layout.envelopes_dir(&enrollment.device_id))?;
+
+        let identity_path = layout.device_identity(&enrollment.device_id);
+        if path_exists(&identity_path)? {
+            let existing = vault::read_device_identity(&identity_path, &self.vault)?;
             if existing.device_id != enrollment.device_id
                 || existing.signing_public_key != enrollment.signing_public_key
                 || existing.wrapping_recipient != enrollment.wrapping_recipient
@@ -1175,63 +755,69 @@ impl ReplicationPackage {
                     enrollment.device_id
                 )));
             }
-            read_untrusted_file(&target.join("envelopes/1.age"), MAX_DESCRIPTOR_BYTES)?;
-            self.ensure_device_directories(&enrollment.device_id)?;
-            return self.refresh_metadata();
-        }
-
-        let temporary = devices_root.join(format!(
-            ".device-{}-{}.tmp",
-            enrollment.device_id,
-            uuid::Uuid::new_v4()
-        ));
-        create_private_directory(&temporary)?;
-        let result = (|| {
-            create_private_directory(&temporary.join("envelopes"))?;
-            write_device_identity(
-                &temporary.join("identity.json"),
+        } else {
+            vault::write_device_identity(
+                &identity_path,
                 &self.vault,
                 &enrollment,
                 current_generation,
-                &self.device.signing_key,
+                self.device.signing_key(),
             )?;
-            let recipient = enrollment
-                .wrapping_recipient
-                .parse::<x25519::Recipient>()
-                .map_err(|error| {
-                    ReplicationError::Invalid(format!(
-                        "invalid Device wrapping recipient: {error}"
-                    ))
-                })?;
-            for (generation, vault_identity) in &vault_identities {
-                write_vault_envelope(
-                    &temporary.join("envelopes").join(envelope_filename(*generation)),
-                    vault_identity.as_ref(),
-                    &recipient,
-                )?;
+        }
+
+        let recipient = enrollment
+            .wrapping_recipient
+            .parse::<x25519::Recipient>()
+            .map_err(|error| {
+                ReplicationError::Invalid(format!("invalid Device wrapping recipient: {error}"))
+            })?;
+        for generation in 1..=current_generation {
+            let path = layout.envelope(&enrollment.device_id, generation);
+            if path_exists(&path)? {
+                continue;
             }
-            sync_directory(&temporary)?;
-            rename_directory_exclusive(&temporary, &target)?;
-            sync_directory(&devices_root)
-        })();
-        if let Err(error) = result {
-            let _ = fs::remove_dir_all(&temporary);
-            return Err(error);
+            let identity = self.store.generation_identity(generation)?;
+            let secret = Zeroizing::new(identity.to_string().expose_secret().clone());
+            let envelope = vault::encrypt_to_recipient(&recipient, secret.as_bytes())?;
+            write_new_atomic(&path, &envelope)?;
         }
 
         self.ensure_device_directories(&enrollment.device_id)?;
+        // The request has been answered; leaving it would keep the device listed as pending.
+        let request = layout.enrollment_request(&enrollment.device_id);
+        match fs::remove_file(&request) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(source) => return Err(io_error(&request, source)),
+        }
         self.refresh_metadata()
     }
 
-    /// Revoke a non-genesis Device and rotate the Vault data key. The signed generation document
-    /// atomically binds the new envelopes to the revoked Device's final accepted sequence.
-    pub fn revoke_device(
+    /// Approve a device that published a self-signed join request into the sync directory. The
+    /// caller must have shown the request's fingerprint for out-of-band comparison first: a
+    /// request proves key possession only, never authorization.
+    pub fn enroll_requested(&mut self, device_id: &str) -> ReplicationResult<()> {
+        require_uuid("device id", device_id)?;
+        let request = vault::read_enrollment_request(
+            &self.layout().enrollment_request(device_id),
+            &self.vault,
+        )?;
+        if request.device_id != device_id {
+            return Err(ReplicationError::Invalid(format!(
+                "enrollment request in namespace {device_id} names Device {}",
+                request.device_id
+            )));
+        }
+        self.enroll_device(request.enrollment())
+    }
+
+    /// The surviving devices' wrapping recipients for a revocation, after checking that this
+    /// Device may revoke `device_id` at all.
+    fn revocation_recipients(
         &self,
         device_id: &str,
-        next_identity: x25519::Identity,
-        recovery_public: &str,
-    ) -> ReplicationResult<u32> {
-        if self.device.device_id != self.vault.genesis_device_id {
+    ) -> ReplicationResult<BTreeMap<String, x25519::Recipient>> {
+        if self.device.device_id() != self.vault.genesis_device_id {
             return Err(ReplicationError::Invalid(
                 "only the genesis Device may revoke another Device".to_string(),
             ));
@@ -1242,80 +828,35 @@ impl ReplicationPackage {
                 "v1 cannot revoke the genesis Device".to_string(),
             ));
         }
-        let scan = self.scan()?;
-        let final_sequence = scan
+        let metadata = self.metadata.read().expect("replication metadata poisoned");
+        let target = metadata.trusted_devices.get(device_id).ok_or_else(|| {
+            ReplicationError::Invalid(format!("Device {device_id} is not enrolled"))
+        })?;
+        if target.revoked_generation.is_some() {
+            return Err(ReplicationError::Invalid(format!(
+                "Device {device_id} is already revoked"
+            )));
+        }
+        Ok(metadata
+            .trusted_devices
+            .iter()
+            .filter(|(candidate_id, device)| {
+                candidate_id.as_str() != device_id && device.revoked_generation.is_none()
+            })
+            .map(|(candidate_id, device)| (candidate_id.clone(), device.wrapping_recipient.clone()))
+            .collect())
+    }
+
+    /// The last sequence a device published, which the revoking generation fences it at.
+    fn final_sequence(&self, device_id: &str) -> ReplicationResult<u64> {
+        Ok(self
+            .scan()?
             .observed
             .iter()
             .filter(|operation| operation.device_id == device_id)
             .map(|operation| operation.sequence)
             .max()
-            .unwrap_or(0);
-        let (current_generation, generation, recipients) = {
-            let metadata = self.metadata.read().expect("replication metadata poisoned");
-            let target = metadata.trusted_devices.get(device_id).ok_or_else(|| {
-                ReplicationError::Invalid(format!("Device {device_id} is not enrolled"))
-            })?;
-            if target.revoked_generation.is_some() {
-                return Err(ReplicationError::Invalid(format!(
-                    "Device {device_id} is already revoked"
-                )));
-            }
-            let generation = metadata.current_generation.checked_add(1).ok_or_else(|| {
-                ReplicationError::Invalid("Vault key generation overflow".to_string())
-            })?;
-            let recipients = metadata
-                .trusted_devices
-                .iter()
-                .filter(|(candidate_id, device)| {
-                    candidate_id.as_str() != device_id && device.revoked_generation.is_none()
-                })
-                .map(|(candidate_id, device)| {
-                    (candidate_id.clone(), device.wrapping_recipient.clone())
-                })
-                .collect::<BTreeMap<_, _>>();
-            (metadata.current_generation, generation, recipients)
-        };
-        write_key_generation(
-            &self
-                .root
-                .join("generations")
-                .join(generation_filename(generation)),
-            &self.vault,
-            generation,
-            Some(current_generation),
-            &next_identity,
-            &recipients,
-            BTreeMap::from([(device_id.to_string(), final_sequence)]),
-            recovery_public,
-            &self.device.signing_key,
-        )?;
-        self.refresh_metadata()?;
-        Ok(generation)
-    }
-
-    /// Every generation identity this device can unwrap, as wrappable secret strings
-    /// (for installing into the local store when joining a vault).
-    fn generation_identity_secrets(&self) -> Vec<(u32, Zeroizing<String>)> {
-        self.metadata
-            .read()
-            .expect("replication metadata poisoned")
-            .vault_identities
-            .iter()
-            .map(|(generation, identity)| {
-                (
-                    *generation,
-                    Zeroizing::new(identity.to_string().expose_secret().clone()),
-                )
-            })
-            .collect()
-    }
-
-    fn recovery_public(&self) -> String {
-        self.metadata
-            .read()
-            .expect("replication metadata poisoned")
-            .recovery_public
-            .clone()
+            .unwrap_or(0))
     }
 
     pub fn vault_id(&self) -> &str {
@@ -1340,7 +881,7 @@ impl ReplicationPackage {
                 enrolled_generation: device.enrolled_generation,
                 revoked_generation: device.revoked_generation,
                 is_genesis: device_id == &self.vault.genesis_device_id,
-                is_current: device_id == &self.device.device_id,
+                is_current: device_id == self.device.device_id(),
             })
             .collect::<Vec<_>>();
         devices.sort_by(|left, right| {
@@ -1355,12 +896,14 @@ impl ReplicationPackage {
         devices
     }
 
-    pub fn root(&self) -> &Path {
-        &self.root
+    /// The directory a sync tool moves. It changes when sync is enabled, so callers must not
+    /// cache it either.
+    pub fn root(&self) -> PathBuf {
+        self.store.shared_root()
     }
 
     pub fn device_id(&self) -> &str {
-        &self.device.device_id
+        self.device.device_id()
     }
 
     fn generation_fingerprints(&self) -> BTreeMap<u32, String> {
@@ -1372,7 +915,7 @@ impl ReplicationPackage {
     }
 
     fn refresh_metadata(&self) -> ReplicationResult<()> {
-        let refreshed = load_package_metadata(&self.root, &self.vault, &self.device)?;
+        let refreshed = load_package_metadata(&self.layout(), &self.vault, &self.device)?;
         *self.metadata.write().expect("replication metadata poisoned") = refreshed;
         Ok(())
     }
@@ -1389,8 +932,10 @@ impl ReplicationPackage {
         }
         require_uuid("operation id", mutation.operation_id)?;
         validate_entities(mutation.operation_id, mutation.entities)?;
-        // Every referenced object must be supplied verbatim with a matching digest and size;
-        // unreferenced objects must not ride along.
+        // Objects are not carried: they are the store's own files, already in the shared half.
+        // What must hold is that every reference names a distinct object that is actually there
+        // with the size the entity claims.
+        let layout = self.layout();
         let mut referenced: HashMap<&str, u64> = HashMap::new();
         for entity in mutation.entities {
             if let EntityDelta::Secret(delta) = &entity.delta {
@@ -1404,73 +949,66 @@ impl ReplicationPackage {
                             mutation.operation_id, version.object.id
                         )));
                     }
+                    let path = layout.object(&version.object.id);
+                    let size = fs::metadata(&path)
+                        .map_err(|source| io_error(&path, source))?
+                        .len();
+                    if size != version.object.ciphertext_size {
+                        return Err(ReplicationError::Invalid(format!(
+                            "object {} is {size} bytes but the entity claims {}",
+                            version.object.id, version.object.ciphertext_size
+                        )));
+                    }
                 }
             }
         }
         if referenced.len() != mutation.objects.len() {
             return Err(ReplicationError::Invalid(format!(
-                "operation {} supplies {} object(s) but references {}",
+                "operation {} names {} object(s) but references {}",
                 mutation.operation_id,
                 mutation.objects.len(),
                 referenced.len()
             )));
         }
         for object in mutation.objects {
-            if digest(&object.bytes) != object.id {
-                return Err(ReplicationError::Invalid(format!(
-                    "supplied object {} does not match its digest",
-                    object.id
-                )));
-            }
             match referenced.get(object.id.as_str()) {
-                Some(size) if *size == object.bytes.len() as u64 => {}
+                Some(size) if *size == object.ciphertext_size => {}
                 Some(_) => {
                     return Err(ReplicationError::Invalid(format!(
-                        "supplied object {} does not match its referenced size",
+                        "object {} does not match its referenced size",
                         object.id
                     )))
                 }
                 None => {
                     return Err(ReplicationError::Invalid(format!(
-                        "supplied object {} is not referenced by any entity",
+                        "object {} is not referenced by any entity",
                         object.id
                     )))
                 }
             }
         }
-        let (current_generation, vault_identity) = {
-            let metadata = self.metadata.read().expect("replication metadata poisoned");
-            let identity = metadata
-                .vault_identities
-                .get(&metadata.current_generation)
-                .cloned()
-                .ok_or_else(|| {
-                    ReplicationError::Invalid(format!(
-                        "local Device cannot decrypt current key generation {}",
-                        metadata.current_generation
-                    ))
-                })?;
-            (metadata.current_generation, identity)
-        };
-        let vault_recipient = vault_identity.to_public();
+        // Encrypt to the same generation the store writes under, so both halves of a device's
+        // output name one key domain.
+        let current_generation = self.store.current_generation()?;
+        let recipients = self.store.generation_recipients()?;
         let payload = OperationPayload {
             format_version: PAYLOAD_FORMAT_VERSION,
             entities: mutation.entities.to_vec(),
         };
-        let ciphertext = encrypt(&vault_recipient, &serde_json::to_vec(&payload)?)?;
+        let ciphertext = encrypt(recipients, &serde_json::to_vec(&payload)?)?;
         let unsigned = OperationUnsigned {
             format_version: FORMAT_VERSION,
             vault_id: self.vault.vault_id.clone(),
-            device_id: self.device.device_id.clone(),
+            device_id: self.device.device_id().to_string(),
             key_generation: current_generation,
             sequence: mutation.sequence,
             operation_id: mutation.operation_id.to_string(),
             ciphertext: encode(&ciphertext),
         };
-        let signature = sign_struct(
+        let signature = vault::sign_struct(
             OPERATION_SIGNATURE_CONTEXT,
             &unsigned,
-            &self.device.signing_key,
+            self.device.signing_key(),
         )?;
         let operation = serde_json::to_vec(&OperationDocument {
             format_version: unsigned.format_version,
@@ -1490,38 +1028,22 @@ impl ReplicationPackage {
         })
     }
 
-    /// Publish every Object before the Operation. Existing identical immutable bytes are
-    /// accepted; a colliding canonical path with different bytes is never overwritten.
+    /// Publish the Operation. The objects it names were written by the store when the versions
+    /// were created — there is nothing else to move.
     pub fn publish(&self, prepared: &PreparedPublication) -> ReplicationResult<()> {
         self.refresh_metadata()?;
         self.verify_prepared(prepared)?;
-        for object in &prepared.objects {
-            publish_immutable(
-                &self.root.join("objects").join(format!("{}.age", object.id)),
-                &object.bytes,
-            )?;
-        }
         publish_immutable(&self.operation_path(prepared), &prepared.operation)?;
         Ok(())
     }
 
-    /// Read one verified object's verbatim bytes (digest re-checked).
-    fn read_object(&self, id: &str) -> ReplicationResult<Vec<u8>> {
-        let path = self.root.join("objects").join(format!("{id}.age"));
-        let bytes = read_untrusted_file(&path, MAX_OBJECT_BYTES)?;
-        if digest(&bytes) != id {
-            return Err(ReplicationError::Invalid(format!(
-                "object {id} does not match its digest"
-            )));
-        }
-        Ok(bytes)
-    }
-
     pub fn scan(&self) -> ReplicationResult<PackageScan> {
         self.refresh_metadata()?;
+        let layout = self.layout();
         let mut report = PackageScan::default();
-        let objects = scan_objects(&self.root.join("objects"), &mut report)?;
-        let operations_root = self.root.join("operations");
+        let objects = scan_objects(&layout.objects_dir(), &mut report)?;
+        self.scan_enrollment_requests(&layout, &mut report)?;
+        let operations_root = layout.operations_dir();
         let mut slots: BTreeMap<(String, u64), (PathBuf, Vec<u8>, OperationDocument)> =
             BTreeMap::new();
         let mut operation_ids: HashMap<String, (Vec<u8>, String)> = HashMap::new();
@@ -1646,10 +1168,71 @@ impl ReplicationPackage {
         Ok(report)
     }
 
+    /// Report every device that asked to join and has not been approved. Requests are untrusted
+    /// input from the sync directory: an unparsable or badly signed one is damage, not a request.
+    fn scan_enrollment_requests(
+        &self,
+        layout: &SharedLayout,
+        report: &mut PackageScan,
+    ) -> ReplicationResult<()> {
+        let devices_root = layout.devices_dir();
+        let entries = match fs::read_dir(&devices_root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => return Err(io_error(&devices_root, source)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|source| io_error(&devices_root, source))?;
+            let Some(device_id) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+                continue;
+            };
+            if uuid::Uuid::parse_str(&device_id).is_err() {
+                continue;
+            }
+            let request_path = layout.enrollment_request(&device_id);
+            if !path_exists(&request_path)? {
+                continue;
+            }
+            match vault::read_enrollment_request(&request_path, &self.vault) {
+                Ok(request) if request.device_id == device_id => {
+                    if self
+                        .metadata
+                        .read()
+                        .expect("replication metadata poisoned")
+                        .trusted_devices
+                        .contains_key(&device_id)
+                    {
+                        continue;
+                    }
+                    report.pending_enrollments.push(PendingEnrollment {
+                        device_id,
+                        device_name: request.device_name.clone(),
+                        fingerprint: request.fingerprint(),
+                        requested_at: request.requested_at.clone(),
+                    });
+                }
+                Ok(request) => report.damaged.push(DamagedFile {
+                    path: request_path,
+                    reason: format!(
+                        "enrollment request in namespace {device_id} names Device {}",
+                        request.device_id
+                    ),
+                }),
+                Err(error) => report.damaged.push(DamagedFile {
+                    path: request_path,
+                    reason: error.to_string(),
+                }),
+            }
+        }
+        report
+            .pending_enrollments
+            .sort_by(|left, right| left.device_id.cmp(&right.device_id));
+        Ok(())
+    }
+
     fn operation_path(&self, prepared: &PreparedPublication) -> PathBuf {
-        self.root
-            .join("operations")
-            .join(&self.device.device_id)
+        self.layout()
+            .device_operations_dir(self.device.device_id())
             .join(format!(
                 "{:020}-{}.op",
                 prepared.sequence, prepared.operation_id
@@ -1657,18 +1240,12 @@ impl ReplicationPackage {
     }
 
     fn ensure_device_directories(&self, device_id: &str) -> ReplicationResult<()> {
-        ensure_private_package_directory(&self.root.join("operations").join(device_id))?;
-        ensure_private_package_directory(&self.root.join("checkpoints").join(device_id))
+        let layout = self.layout();
+        ensure_private_package_directory(&layout.device_operations_dir(device_id))?;
+        ensure_private_package_directory(&layout.device_checkpoints_dir(device_id))
     }
 
     fn verify_prepared(&self, prepared: &PreparedPublication) -> ReplicationResult<()> {
-        for object in &prepared.objects {
-            if digest(&object.bytes) != object.id {
-                return Err(ReplicationError::Invalid(
-                    "prepared object digest does not match its id".to_string(),
-                ));
-            }
-        }
         let operation: OperationDocument = serde_json::from_slice(&prepared.operation)?;
         self.validate_operation(&operation)?;
         if operation.sequence != prepared.sequence
@@ -1725,12 +1302,12 @@ impl ReplicationPackage {
                 "operation sequence starts at 1".to_string(),
             ));
         }
-        verify_struct(
+        Ok(vault::verify_struct(
             OPERATION_SIGNATURE_CONTEXT,
             &operation.unsigned(),
             &operation.signature,
             &device_key.verifying_key,
-        )
+        )?)
     }
 
     fn materialize_verified(
@@ -1740,27 +1317,26 @@ impl ReplicationPackage {
         objects: &HashMap<String, Vec<u8>>,
         report: &mut PackageScan,
     ) -> ReplicationResult<bool> {
-        let vault_identity = self
-            .metadata
-            .read()
-            .expect("replication metadata poisoned")
-            .vault_identities
-            .get(&operation.key_generation)
-            .cloned();
-        let Some(vault_identity) = vault_identity else {
-            report.pending.push(PendingOperation {
-                device_id: operation.device_id,
-                sequence: operation.sequence,
-                operation_id: operation.operation_id,
-                reason: format!(
-                    "key generation {} envelope has not arrived",
-                    operation.key_generation
-                ),
-            });
-            return Ok(false);
+        // The store unwraps the generation identity from this device's envelope. A missing
+        // envelope is not damage: enrollment for that generation has not reached us yet.
+        let vault_identity = match self.store.generation_identity(operation.key_generation) {
+            Ok(identity) => identity,
+            Err(StoreError::Key(_)) => {
+                report.pending.push(PendingOperation {
+                    device_id: operation.device_id,
+                    sequence: operation.sequence,
+                    operation_id: operation.operation_id,
+                    reason: format!(
+                        "key generation {} envelope has not arrived",
+                        operation.key_generation
+                    ),
+                });
+                return Ok(false);
+            }
+            Err(error) => return Err(error.into()),
         };
         let ciphertext = decode("operation ciphertext", &operation.ciphertext)?;
-        let plaintext = match decrypt(vault_identity.as_ref(), &ciphertext) {
+        let plaintext = match decrypt(&vault_identity, &ciphertext) {
             Ok(plaintext) => plaintext,
             Err(error) => {
                 report.damaged.push(DamagedFile {
@@ -1813,10 +1389,7 @@ impl ReplicationPackage {
                 };
                 if object.len() as u64 != version.object.ciphertext_size {
                     report.damaged.push(DamagedFile {
-                        path: self
-                            .root
-                            .join("objects")
-                            .join(format!("{}.age", version.object.id)),
+                        path: self.layout().object(&version.object.id),
                         reason: format!("object {} has the wrong size", version.object.id),
                     });
                     return Ok(false);
@@ -1901,6 +1474,14 @@ fn validate_entities(operation_id: &str, entities: &[EntityPayload]) -> Replicat
                 if payload.is_empty() {
                     return Err(ReplicationError::Invalid(format!(
                         "operation {operation_id} catalog entity has an empty payload"
+                    )));
+                }
+            }
+            EntityDelta::Tombstone => {
+                if entity.logical_id.parse::<SecretId>().is_err() {
+                    return Err(ReplicationError::Invalid(format!(
+                        "operation {operation_id} tombstone has a non-uuid id {}",
+                        entity.logical_id
                     )));
                 }
             }
@@ -2000,6 +1581,9 @@ pub struct ReplicationReport {
     /// evidence of a signed Device fork rather than disposable sync-provider conflict copies.
     pub damaged_files: Vec<PathBuf>,
     pub conflicts: usize,
+    /// Devices asking to join this Vault. Approving one requires comparing its fingerprint out
+    /// of band, so this is surfaced to the user rather than acted on automatically.
+    pub pending_enrollments: Vec<PendingEnrollment>,
     pub local_device_fenced: bool,
     pub messages: Vec<String>,
 }
@@ -2069,6 +1653,16 @@ fn fold_known_state(
                     }
                     heads.insert(operation_id.to_string());
                 }
+                EntityDelta::Tombstone => {
+                    // The entity is gone: a later staging pass must not rediscover it as a
+                    // missing local secret and publish the same tombstone again.
+                    state.secrets.remove(&entity.logical_id);
+                    let heads = secret_heads.entry(entity.logical_id.clone()).or_default();
+                    for parent in &entity.parents {
+                        heads.remove(parent);
+                    }
+                    heads.insert(operation_id.to_string());
+                }
             }
         }
     };
@@ -2092,20 +1686,6 @@ fn fold_known_state(
         }
     }
     Ok(state)
-}
-
-/// Generation-1 material for creating a vault from the genesis store. The store's own keys ARE
-/// the vault keys — its version files must decrypt under the vault's generation identities.
-fn genesis_generation_material(
-    store: &AgeDirStore,
-) -> ReplicationResult<(x25519::Identity, String)> {
-    let generation = store.current_generation()?;
-    if generation != 1 {
-        return Err(ReplicationError::Invalid(format!(
-            "creating a vault from a store at key generation {generation} is not supported yet"
-        )));
-    }
-    Ok((store.generation_identity(1)?, store.recovery_recipient()?))
 }
 
 fn descriptor_from_record(record: &floria_store::SecretRecord) -> ExportStoreDescriptor {
@@ -2156,35 +1736,34 @@ impl ReplicationRuntime {
 }
 
 impl ReplicationEngine {
-    pub fn create(
-        directory: impl Into<PathBuf>,
-        vault_id: impl Into<String>,
-        created_at: impl Into<String>,
-        device: DeviceKeyMaterial,
-        runtime: ReplicationRuntime,
-    ) -> ReplicationResult<Self> {
-        Self::create_named(directory, vault_id, created_at, device, None, runtime)
+    /// Drive replication for an open store. The store already is the vault, so there is nothing
+    /// to create: a machine that never enabled sync simply has a single-device vault.
+    pub fn for_runtime(runtime: ReplicationRuntime) -> ReplicationResult<Self> {
+        let package = ReplicationPackage::for_store(Arc::clone(&runtime.store))?;
+        Self::with_runtime(package, runtime)
     }
 
-    pub fn create_named(
-        directory: impl Into<PathBuf>,
-        vault_id: impl Into<String>,
-        created_at: impl Into<String>,
-        device: DeviceKeyMaterial,
+    /// Enable sync: move the authoritative shared half to a user-chosen synced location. This is
+    /// a move of the only copy, never a second one.
+    pub fn enable_sync_at(store: &Arc<AgeDirStore>, target: &Path) -> ReplicationResult<()> {
+        store.relocate_shared(target)?;
+        let layout = store.shared_layout();
+        ensure_private_package_directory(&layout.operations_dir())?;
+        ensure_private_package_directory(&layout.checkpoints_dir())?;
+        Ok(())
+    }
+
+    /// Join an existing vault: adopt its shared half and drop a self-signed join request into
+    /// this device's namespace. Building an engine afterwards reports
+    /// [`ReplicationError::EnrollmentRequired`] until the genesis Mac approves the request.
+    pub fn join_vault_at(
+        store: &Arc<AgeDirStore>,
+        target: &Path,
         device_name: Option<String>,
-        runtime: ReplicationRuntime,
-    ) -> ReplicationResult<Self> {
-        let (vault_identity, recovery_public) = genesis_generation_material(&runtime.store)?;
-        let package = ReplicationPackage::create_named(
-            directory,
-            vault_id,
-            created_at,
-            device,
-            device_name,
-            vault_identity,
-            recovery_public,
-        )?;
-        Self::with_runtime(package, runtime)
+        requested_at: &str,
+    ) -> ReplicationResult<()> {
+        store.adopt_shared_location(target)?;
+        publish_enrollment_request(store, device_name, requested_at)
     }
 
     fn with_runtime(
@@ -2206,15 +1785,6 @@ impl ReplicationEngine {
             store: runtime.store,
             mutations: runtime.mutations,
         })
-    }
-
-    pub fn open(
-        directory: impl Into<PathBuf>,
-        device: DeviceKeyMaterial,
-        runtime: ReplicationRuntime,
-    ) -> ReplicationResult<Self> {
-        let package = ReplicationPackage::open(directory, device)?;
-        Self::with_runtime(package, runtime)
     }
 
     pub fn from_parts(
@@ -2266,31 +1836,29 @@ impl ReplicationEngine {
         self.package.enroll_device(enrollment)
     }
 
+    /// Approve a pending join request after its fingerprint was compared out of band.
+    pub fn enroll_requested(&mut self, device_id: &str) -> ReplicationResult<()> {
+        self.package.enroll_requested(device_id)
+    }
+
+    /// Devices waiting for approval, newest state as of the last directory read.
+    pub fn pending_enrollments(&self) -> ReplicationResult<Vec<PendingEnrollment>> {
+        Ok(self.package.scan()?.pending_enrollments)
+    }
+
+    /// Revoke a Device and rotate the vault's data key in one signed step. The new generation
+    /// document carries envelopes for the surviving devices only, and fences the revoked Device
+    /// at its final published sequence.
     pub fn revoke_device(&self, device_id: &str) -> ReplicationResult<ReplicationReport> {
         self.mutations.run(|| {
-            // The new generation is born in the store (its files are the objects), then the
-            // vault publishes its signed document and envelopes. A crash between the two leaves
-            // the store one generation ahead; the retry reuses it instead of rotating again.
-            let package_generation = self.package.current_generation();
-            let store_generation = self.store.current_generation()?;
-            let next = if store_generation == package_generation.saturating_add(1) {
-                store_generation
-            } else if store_generation == package_generation {
-                self.store.rotate_generation()?
-            } else {
-                return Err(ReplicationError::Invalid(format!(
-                    "store generation {store_generation} and vault generation \
-                     {package_generation} have diverged"
-                )));
-            };
-            let identity = self.store.generation_identity(next)?;
-            let recovery = self.store.recovery_recipient()?;
-            let generation = self.package.revoke_device(device_id, identity, &recovery)?;
-            if generation != next {
-                return Err(ReplicationError::Invalid(format!(
-                    "vault rotated to generation {generation} but the store rotated to {next}"
-                )));
-            }
+            self.package.refresh_metadata()?;
+            let recipients = self.package.revocation_recipients(device_id)?;
+            let final_sequence = self.package.final_sequence(device_id)?;
+            self.store.rotate_generation(
+                &recipients,
+                BTreeMap::from([(device_id.to_string(), final_sequence)]),
+            )?;
+            self.package.refresh_metadata()?;
             self.sync_uncoordinated()
         })
     }
@@ -2442,6 +2010,25 @@ impl ReplicationEngine {
                 }
             }));
         }
+
+        // A replicated secret that no longer exists locally was deleted here: say so explicitly.
+        // Its objects stay in the shared half — other devices may still point older heads at them.
+        for logical_id in known.secrets.keys().collect::<BTreeSet<_>>() {
+            let parsed: SecretId = logical_id.parse()?;
+            if self.store.record(&parsed)?.is_some() {
+                continue;
+            }
+            let known_heads = known
+                .secrets
+                .get(logical_id)
+                .map(|secret| secret.heads.as_slice())
+                .unwrap_or_default();
+            entities.push(EntityPayload {
+                logical_id: logical_id.clone(),
+                parents: parents_for(logical_id, known_heads),
+                delta: EntityDelta::Tombstone,
+            });
+        }
         Ok((entities, store_versions))
     }
 
@@ -2583,86 +2170,15 @@ impl ReplicationEngine {
         self.mutations.run(|| self.sync_uncoordinated())
     }
 
-    /// Align the local store's generation keys with the vault's, so imported version files and
-    /// new local writes share the vault's key domain — the zero-transcode invariant.
-    ///
-    /// Three cases:
-    /// - no overlap (a freshly enrolled device whose store only has its unused self-generated
-    ///   keys): adopt the vault's generation set wholesale — legal only for an empty store;
-    /// - every store generation matches the vault's by public key: install any generations the
-    ///   store is missing (a re-enrolled member learning newer keys) without touching files;
-    /// - a store generation differs from the vault's, or the store holds generations the vault
-    ///   does not know (beyond one pending local rotation): fail loudly — a populated library
-    ///   in a foreign key domain needs a one-time re-key that v1 does not implement.
-    fn reconcile_generations(&self) -> ReplicationResult<()> {
-        let identities = self.package.generation_identity_secrets();
-        if identities.is_empty() {
-            return Ok(());
-        }
-        let recovery = self.package.recovery_public();
-        let mut matched = 0usize;
-        let mut mismatched = false;
-        let mut missing = Vec::new();
-        for (generation, secret) in &identities {
-            let expected = secret
-                .trim()
-                .parse::<x25519::Identity>()
-                .map_err(|error| {
-                    ReplicationError::Invalid(format!(
-                        "vault generation {generation} identity is invalid: {error}"
-                    ))
-                })?
-                .to_public()
-                .to_string();
-            match self.store.generation_public(*generation)? {
-                Some(public) if public == expected => matched += 1,
-                Some(_) => mismatched = true,
-                None => missing.push((*generation, secret)),
-            }
-        }
-        if matched == 0 {
-            // Fresh join: adopt everything. Fails loudly for a populated store.
-            self.store.adopt_generations(&identities, &recovery)?;
-            return Ok(());
-        }
-        if mismatched {
-            return Err(ReplicationError::Invalid(
-                "a local store key generation differs from the vault's; the local library is in \
-                 a foreign key domain"
-                    .to_string(),
-            ));
-        }
-        let vault_max = identities
-            .iter()
-            .map(|(generation, _)| *generation)
-            .max()
-            .expect("identities are non-empty");
-        let store_current = self.store.current_generation()?;
-        if store_current > vault_max.saturating_add(1) {
-            return Err(ReplicationError::Invalid(format!(
-                "store generation {store_current} is ahead of vault generation {vault_max}"
-            )));
-        }
-        if self.store.recovery_recipient()? != recovery {
-            return Err(ReplicationError::Invalid(
-                "the store's recovery recipient differs from the vault's".to_string(),
-            ));
-        }
-        for (generation, secret) in missing {
-            self.store.install_generation(generation, secret)?;
-        }
-        Ok(())
-    }
-
     fn sync_uncoordinated(&self) -> ReplicationResult<ReplicationReport> {
-        self.reconcile_generations()?;
         let scan = self.package.scan()?;
         let mut report = ReplicationReport {
             observed: scan.observed.len(),
             pending: scan.pending.len(),
             damaged: scan.damaged.len(),
-            damaged_files: relative_damaged_paths(&self.package.root, &scan.damaged),
+            damaged_files: relative_damaged_paths(&self.package.root(), &scan.damaged),
             conflicts: scan.conflicts.len(),
+            pending_enrollments: scan.pending_enrollments.clone(),
             ..Default::default()
         };
         if let Err(error) = self
@@ -2830,18 +2346,21 @@ impl ReplicationEngine {
                             entry.intent_id, delta.format_version
                         )));
                     }
-                    // Fetch every referenced version file verbatim from the local store.
-                    // Zero transcoding: the bytes published as objects are the store files.
-                    let mut objects = Vec::with_capacity(entry.store_versions.len());
-                    for reference in &entry.store_versions {
-                        let secret_id: SecretId = reference.secret_id.parse()?;
-                        let export =
-                            self.store.export_version(&secret_id, reference.version)?;
-                        objects.push(PreparedObject {
-                            id: export.digest,
-                            bytes: export.ciphertext,
-                        });
-                    }
+                    // Nothing is fetched from the store: the objects the delta names are the
+                    // files the store already wrote into the shared half.
+                    let objects = delta
+                        .entities
+                        .iter()
+                        .filter_map(|entity| match &entity.delta {
+                            EntityDelta::Secret(secret) => Some(secret),
+                            _ => None,
+                        })
+                        .flat_map(|secret| secret.versions.iter())
+                        .map(|version| PreparedObject {
+                            id: version.object.id.clone(),
+                            ciphertext_size: version.object.ciphertext_size,
+                        })
+                        .collect::<Vec<_>>();
                     let next = self
                         .intents
                         .device_sequence(self.package.device_id())
@@ -2898,8 +2417,9 @@ impl ReplicationEngine {
         report.observed = scan.observed.len();
         report.pending = scan.pending.len();
         report.damaged = scan.damaged.len();
-        report.damaged_files = relative_damaged_paths(&self.package.root, &scan.damaged);
+        report.damaged_files = relative_damaged_paths(&self.package.root(), &scan.damaged);
         report.conflicts = scan.conflicts.len();
+        report.pending_enrollments = scan.pending_enrollments.clone();
         if scan
             .fenced_devices
             .iter()
@@ -2973,14 +2493,17 @@ impl ReplicationEngine {
                     let projection: ReplicatedCatalog = serde_json::from_slice(payload)?;
                     self.catalog.apply_replicated_catalog(&projection)?;
                 }
+                EntityDelta::Tombstone => {
+                    let secret_id: SecretId = entity.logical_id.parse()?;
+                    self.store.remove_replicated_heads(&secret_id)?;
+                }
                 EntityDelta::Secret(delta) => {
                     let secret_id: SecretId = entity.logical_id.parse()?;
                     for version in &delta.versions {
-                        // The object is the exact version file another store wrote: verify and
-                        // land it verbatim. The store re-checks digest, decryptability, payload
-                        // binding, and declared size before trusting it.
-                        let bytes = self.package.read_object(&version.object.id)?;
-                        self.store.import_version(
+                        // No bytes move: the object is already the authoritative file. The store
+                        // re-checks digest, decryptability, payload binding, and declared size
+                        // before adding the row to its local head document.
+                        self.store.register_replicated_version(
                             &secret_id,
                             Some(NewSecret {
                                 origin: SecretOrigin::Managed {
@@ -2989,10 +2512,10 @@ impl ReplicationEngine {
                                 mode: delta.descriptor.mode,
                                 enforcement: delta.descriptor.enforcement,
                             }),
-                            &bytes,
                             &version.version_uuid,
                             version.generation,
                             version.size,
+                            &version.object.id,
                             &mutation.operation_id,
                         )?;
                     }
@@ -3171,204 +2694,59 @@ fn relative_damaged_paths(root: &Path, damaged: &[DamagedFile]) -> Vec<PathBuf> 
     paths
 }
 
-fn device_unsigned(
-    vault: &VaultDocument,
-    enrollment: &DeviceEnrollment,
-    enrolled_generation: u32,
-) -> DeviceUnsigned {
-    DeviceUnsigned {
-        format_version: FORMAT_VERSION,
-        vault_id: vault.vault_id.clone(),
-        device_id: enrollment.device_id.clone(),
-        signing_public_key: enrollment.signing_public_key.clone(),
-        wrapping_recipient: enrollment.wrapping_recipient.clone(),
-        device_name: enrollment.device_name.clone(),
-        authorized_by: vault.genesis_device_id.clone(),
-        enrolled_generation,
-    }
-}
-
-fn write_device_identity(
-    path: &Path,
-    vault: &VaultDocument,
-    enrollment: &DeviceEnrollment,
-    enrolled_generation: u32,
-    genesis_signing_key: &SigningKey,
+/// Announce this device to a vault it wants to join by writing a self-signed request into its own
+/// namespace. The request proves key possession only; the genesis Mac authorizes it after a human
+/// compares [`EnrollmentRequestDocument::fingerprint`] on both screens.
+pub fn publish_enrollment_request(
+    store: &Arc<AgeDirStore>,
+    device_name: Option<String>,
+    requested_at: &str,
 ) -> ReplicationResult<()> {
-    validate_enrollment(enrollment)?;
-    if genesis_signing_key.verifying_key()
-        != verifying_key("genesis public key", &vault.genesis_public_key)?
-    {
-        return Err(ReplicationError::Invalid(
-            "Device enrollment signer is not the genesis Device".to_string(),
-        ));
+    let vault = store.vault_document();
+    let device = store.device();
+    let layout = store.shared_layout();
+    if path_exists(&layout.device_identity(device.device_id()))? {
+        // Already enrolled: there is nothing to ask for.
+        return Ok(());
     }
-    if enrolled_generation == 0 {
-        return Err(ReplicationError::Invalid(
-            "Device enrollment generation starts at 1".to_string(),
-        ));
-    }
-    let unsigned = device_unsigned(vault, enrollment, enrolled_generation);
-    let signature = sign_struct(DEVICE_SIGNATURE_CONTEXT, &unsigned, genesis_signing_key)?;
-    let document = DeviceDocument {
-        format_version: unsigned.format_version,
-        vault_id: unsigned.vault_id,
-        device_id: unsigned.device_id,
-        signing_public_key: unsigned.signing_public_key,
-        wrapping_recipient: unsigned.wrapping_recipient,
-        device_name: unsigned.device_name,
-        authorized_by: unsigned.authorized_by,
-        enrolled_generation: unsigned.enrolled_generation,
-        signature,
-    };
-    write_new_atomic(path, &serde_json::to_vec_pretty(&document)?)
-}
-
-fn write_vault_envelope(
-    path: &Path,
-    vault_identity: &x25519::Identity,
-    recipient: &x25519::Recipient,
-) -> ReplicationResult<()> {
-    let encoded = vault_identity.to_string();
-    let ciphertext = encrypt(recipient, encoded.expose_secret().as_bytes())?;
-    write_new_atomic(path, &ciphertext)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn write_key_generation(
-    path: &Path,
-    vault: &VaultDocument,
-    generation: u32,
-    previous_generation: Option<u32>,
-    vault_identity: &x25519::Identity,
-    recipients: &BTreeMap<String, x25519::Recipient>,
-    revoked_devices: BTreeMap<String, u64>,
-    recovery_public: &str,
-    genesis_signing_key: &SigningKey,
-) -> ReplicationResult<()> {
-    if generation == 0
-        || previous_generation != generation.checked_sub(1).filter(|previous| *previous > 0)
-    {
-        return Err(ReplicationError::Invalid(
-            "Vault key generations must form a consecutive chain starting at 1".to_string(),
-        ));
-    }
-    if genesis_signing_key.verifying_key()
-        != verifying_key("genesis public key", &vault.genesis_public_key)?
-    {
-        return Err(ReplicationError::Invalid(
-            "key generation signer is not the genesis Device".to_string(),
-        ));
-    }
-    let encoded_identity = vault_identity.to_string();
-    let envelopes = recipients
-        .iter()
-        .map(|(device_id, recipient)| {
-            require_uuid("envelope Device id", device_id)?;
-            Ok((
-                device_id.clone(),
-                encode(&encrypt(recipient, encoded_identity.expose_secret().as_bytes())?),
-            ))
-        })
-        .collect::<ReplicationResult<BTreeMap<_, _>>>()?;
-    let unsigned = KeyGenerationUnsigned {
-        format_version: FORMAT_VERSION,
-        vault_id: vault.vault_id.clone(),
-        generation,
-        previous_generation,
-        authorized_by: vault.genesis_device_id.clone(),
-        envelopes,
-        revoked_devices,
-        recovery_public: recovery_public.to_string(),
-    };
-    let signature = sign_struct(
-        KEY_GENERATION_SIGNATURE_CONTEXT,
-        &unsigned,
-        genesis_signing_key,
-    )?;
-    let document = KeyGenerationDocument {
-        format_version: unsigned.format_version,
-        vault_id: unsigned.vault_id,
-        generation: unsigned.generation,
-        previous_generation: unsigned.previous_generation,
-        authorized_by: unsigned.authorized_by,
-        envelopes: unsigned.envelopes,
-        revoked_devices: unsigned.revoked_devices,
-        recovery_public: unsigned.recovery_public,
-        signature,
-    };
-    write_new_atomic(path, &serde_json::to_vec_pretty(&document)?)
-}
-
-fn generation_filename(generation: u32) -> String {
-    format!("{generation:020}.json")
-}
-
-fn envelope_filename(generation: u32) -> String {
-    format!("{generation}.age")
-}
-
-fn load_key_generations(
-    root: &Path,
-    vault: &VaultDocument,
-) -> ReplicationResult<BTreeMap<u32, KeyGenerationDocument>> {
-    let generations_root = root.join("generations");
-    let mut by_generation: BTreeMap<u32, (Vec<u8>, KeyGenerationDocument)> = BTreeMap::new();
-    for path in regular_files_recursively(&generations_root)? {
-        let bytes = read_untrusted_file(&path, MAX_DESCRIPTOR_BYTES)?;
-        let document: KeyGenerationDocument = serde_json::from_slice(&bytes)?;
-        validate_key_generation(&document, vault)?;
-        match by_generation.get(&document.generation) {
-            Some((existing, _)) if existing != &bytes => {
-                return Err(ReplicationError::Invalid(format!(
-                    "Vault key generation {} has multiple signed documents",
-                    document.generation
-                )));
-            }
-            Some(_) => {}
-            None => {
-                by_generation.insert(document.generation, (bytes, document));
-            }
+    let request = device.enrollment_request(&vault, device_name, requested_at)?;
+    let bytes = serde_json::to_vec_pretty(&request)?;
+    ensure_private_package_directory(&layout.device_dir(device.device_id()))?;
+    let path = layout.enrollment_request(device.device_id());
+    match read_untrusted_file(&path, MAX_DESCRIPTOR_BYTES) {
+        Ok(existing) if existing == bytes => Ok(()),
+        Ok(_) => write_replace_atomic(&path, &bytes),
+        Err(ReplicationError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            write_new_atomic(&path, &bytes)
         }
+        Err(error) => Err(error),
     }
-    if by_generation.is_empty() {
-        return Err(ReplicationError::Invalid(
-            "Vault has no signed key generation".to_string(),
-        ));
-    }
-    let mut expected = 1;
-    for (generation, (_, document)) in &by_generation {
-        if *generation != expected
-            || document.previous_generation
-                != generation.checked_sub(1).filter(|previous| *previous > 0)
-        {
-            return Err(ReplicationError::Invalid(format!(
-                "Vault key generation history has a gap before {generation}"
-            )));
-        }
-        expected = expected.checked_add(1).ok_or_else(|| {
-            ReplicationError::Invalid("Vault key generation overflow".to_string())
-        })?;
-    }
-    Ok(by_generation
-        .into_iter()
-        .map(|(generation, (_, document))| (generation, document))
-        .collect())
+}
+
+/// Ask to rejoin a vault that revoked this device: the old identity can never be re-enrolled, so
+/// the store mints a fresh one and publishes a new request under it.
+pub fn request_reenrollment(
+    store: &Arc<AgeDirStore>,
+    device_name: Option<String>,
+    requested_at: &str,
+) -> ReplicationResult<()> {
+    store.rotate_device_identity()?;
+    publish_enrollment_request(store, device_name, requested_at)
 }
 
 fn load_package_metadata(
-    root: &Path,
+    layout: &SharedLayout,
     vault: &VaultDocument,
     device: &DeviceKeyMaterial,
 ) -> ReplicationResult<PackageMetadata> {
-    let mut trusted_devices = load_trusted_devices(root, vault)?;
-    let generations = load_key_generations(root, vault)?;
+    let mut trusted_devices = load_trusted_devices(layout, vault)?;
+    let generations = vault::load_key_generations(layout, vault)?;
     apply_generation_membership(&mut trusted_devices, &generations, vault)?;
-    let expected = trusted_devices.get(&device.device_id).ok_or_else(|| {
-        ReplicationError::EnrollmentRequired { device_id: device.device_id.clone() }
+    let expected = trusted_devices.get(device.device_id()).ok_or_else(|| {
+        ReplicationError::EnrollmentRequired { device_id: device.device_id().to_string() }
     })?;
     if expected.verifying_key != device.verifying_key()
-        || expected.wrapping_recipient != device.wrapping_identity.to_public()
+        || expected.wrapping_recipient != device.wrapping_identity().to_public()
     {
         return Err(ReplicationError::Invalid(
             "Device private keys do not match its enrolled identity".to_string(),
@@ -3376,7 +2754,7 @@ fn load_package_metadata(
     }
     if let Some(generation) = expected.revoked_generation {
         return Err(ReplicationError::DeviceRevoked {
-            device_id: device.device_id.clone(),
+            device_id: device.device_id().to_string(),
             generation,
         });
     }
@@ -3384,19 +2762,11 @@ fn load_package_metadata(
         .keys()
         .next_back()
         .expect("key generations were validated as non-empty");
-    let vault_identities = load_vault_identities(root, device, &generations)?;
     let generation_fingerprints = key_generation_fingerprints(&generations)?;
-    let recovery_public = generations
-        .values()
-        .next_back()
-        .map(|document| document.recovery_public.clone())
-        .expect("key generations were validated as non-empty");
     Ok(PackageMetadata {
-        vault_identities,
         current_generation,
         generation_fingerprints,
         trusted_devices,
-        recovery_public,
     })
 }
 
@@ -3411,52 +2781,12 @@ fn key_generation_fingerprints(
         .collect()
 }
 
-fn validate_key_generation(
-    document: &KeyGenerationDocument,
-    vault: &VaultDocument,
-) -> ReplicationResult<()> {
-    if document.format_version != FORMAT_VERSION
-        || document.vault_id != vault.vault_id
-        || document.authorized_by != vault.genesis_device_id
-        || document.generation == 0
-    {
-        return Err(ReplicationError::Invalid(
-            "key generation does not match vault.json".to_string(),
-        ));
-    }
-    for (device_id, envelope) in &document.envelopes {
-        require_uuid("envelope Device id", device_id)?;
-        let bytes = decode("Vault key envelope", envelope)?;
-        if bytes.len() as u64 > MAX_DESCRIPTOR_BYTES {
-            return Err(ReplicationError::Invalid(
-                "Vault key envelope exceeds the format limit".to_string(),
-            ));
-        }
-    }
-    for device_id in document.revoked_devices.keys() {
-        require_uuid("revoked Device id", device_id)?;
-        if document.envelopes.contains_key(device_id) {
-            return Err(ReplicationError::Invalid(format!(
-                "revoked Device {device_id} still has an envelope in generation {}",
-                document.generation
-            )));
-        }
-    }
-    let genesis_key = verifying_key("genesis public key", &vault.genesis_public_key)?;
-    verify_struct(
-        KEY_GENERATION_SIGNATURE_CONTEXT,
-        &document.unsigned(),
-        &document.signature,
-        &genesis_key,
-    )
-}
-
 fn load_trusted_devices(
-    root: &Path,
+    layout: &SharedLayout,
     vault: &VaultDocument,
 ) -> ReplicationResult<HashMap<String, TrustedDevice>> {
     let mut trusted: HashMap<String, TrustedDevice> = HashMap::new();
-    let devices_root = root.join("devices");
+    let devices_root = layout.devices_dir();
     for entry in fs::read_dir(&devices_root).map_err(|source| io_error(&devices_root, source))? {
         let entry = entry.map_err(|source| io_error(&devices_root, source))?;
         let path = entry.path();
@@ -3471,14 +2801,13 @@ fn load_trusted_devices(
             continue;
         }
         let identity_path = path.join("identity.json");
-        let identity = match read_device_identity(&identity_path, vault) {
+        let identity = match vault::read_device_identity(&identity_path, vault) {
             Ok(identity) => identity,
-            Err(ReplicationError::Io { source, .. })
-                if source.kind() == io::ErrorKind::NotFound =>
-            {
+            // A device namespace with no signed identity is a pending join request, not damage.
+            Err(StoreError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
                 continue;
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         };
         if identity.device_id != directory_device_id {
             return Err(ReplicationError::Invalid(format!(
@@ -3487,7 +2816,10 @@ fn load_trusted_devices(
             )));
         }
         let device = TrustedDevice {
-            verifying_key: verifying_key("Device public key", &identity.signing_public_key)?,
+            verifying_key: vault::verifying_key(
+                "Device public key",
+                &identity.signing_public_key,
+            )?,
             wrapping_recipient: identity
                 .wrapping_recipient
                 .parse::<x25519::Recipient>()
@@ -3564,160 +2896,12 @@ fn apply_generation_membership(
     Ok(())
 }
 
-fn load_vault_identities(
-    root: &Path,
-    device: &DeviceKeyMaterial,
-    generations: &BTreeMap<u32, KeyGenerationDocument>,
-) -> ReplicationResult<BTreeMap<u32, Arc<x25519::Identity>>> {
-    let mut identities = BTreeMap::new();
-    for (generation, document) in generations {
-        let envelope = match document.envelopes.get(&device.device_id) {
-            Some(envelope) => decode("Vault key envelope", envelope)?,
-            None => read_untrusted_file(
-                &root
-                    .join("devices")
-                    .join(&device.device_id)
-                    .join("envelopes")
-                    .join(envelope_filename(*generation)),
-                MAX_DESCRIPTOR_BYTES,
-            )?,
-        };
-        let identity_text = decrypt(&device.wrapping_identity, &envelope)?;
-        let identity_text = std::str::from_utf8(&identity_text).map_err(|_| {
-            ReplicationError::Encryption("Vault envelope is not UTF-8".to_string())
-        })?;
-        let identity = identity_text.parse::<x25519::Identity>().map_err(|error| {
-            ReplicationError::Encryption(format!("Vault envelope identity is invalid: {error}"))
-        })?;
-        identities.insert(*generation, Arc::new(identity));
-    }
-    Ok(identities)
-}
-
-fn read_device_identity(
-    path: &Path,
-    vault: &VaultDocument,
-) -> ReplicationResult<DeviceDocument> {
-    let bytes = read_untrusted_file(path, MAX_DESCRIPTOR_BYTES)?;
-    let identity: DeviceDocument = serde_json::from_slice(&bytes)?;
-    validate_device_identity(&identity, vault)?;
-    Ok(identity)
-}
-
-fn validate_enrollment(enrollment: &DeviceEnrollment) -> ReplicationResult<()> {
-    require_uuid("device id", &enrollment.device_id)?;
-    if let Some(device_name) = &enrollment.device_name {
-        if device_name.is_empty()
-            || device_name.trim() != device_name
-            || device_name.chars().count() > 80
-            || device_name.chars().any(char::is_control)
-        {
-            return Err(ReplicationError::Invalid(
-                "Device name must be 1-80 printable characters without surrounding whitespace"
-                    .to_string(),
-            ));
-        }
-    }
-    verifying_key("Device public key", &enrollment.signing_public_key)?;
-    enrollment
-        .wrapping_recipient
-        .parse::<x25519::Recipient>()
-        .map_err(|error| {
-            ReplicationError::Invalid(format!("invalid Device wrapping recipient: {error}"))
-        })?;
-    Ok(())
-}
-
-fn validate_vault(vault: &VaultDocument) -> ReplicationResult<()> {
-    if vault.format_version != FORMAT_VERSION {
-        return Err(ReplicationError::Invalid(format!(
-            "unsupported Vault format {}",
-            vault.format_version
-        )));
-    }
-    require_uuid("vault id", &vault.vault_id)?;
-    require_uuid("genesis device id", &vault.genesis_device_id)?;
-    let key = verifying_key("genesis public key", &vault.genesis_public_key)?;
-    verify_struct(VAULT_SIGNATURE_CONTEXT, &vault.unsigned(), &vault.signature, &key)
-}
-
-fn validate_device_identity(
-    identity: &DeviceDocument,
-    vault: &VaultDocument,
-) -> ReplicationResult<()> {
-    if identity.format_version != FORMAT_VERSION
-        || identity.vault_id != vault.vault_id
-        || identity.authorized_by != vault.genesis_device_id
-        || identity.enrolled_generation == 0
-    {
-        return Err(ReplicationError::Invalid(
-            "Device identity does not match vault.json".to_string(),
-        ));
-    }
-    validate_enrollment(&DeviceEnrollment {
-        device_id: identity.device_id.clone(),
-        signing_public_key: identity.signing_public_key.clone(),
-        wrapping_recipient: identity.wrapping_recipient.clone(),
-        device_name: identity.device_name.clone(),
-    })?;
-    if identity.device_id == vault.genesis_device_id
-        && identity.signing_public_key != vault.genesis_public_key
-    {
-        return Err(ReplicationError::Invalid(
-            "genesis Device identity does not match vault.json".to_string(),
-        ));
-    }
-    let key = verifying_key("genesis public key", &vault.genesis_public_key)?;
-    verify_struct(
-        DEVICE_SIGNATURE_CONTEXT,
-        &identity.unsigned(),
-        &identity.signature,
-        &key,
-    )
-}
-
-fn sign_struct<T: Serialize>(
-    context: &[u8],
-    value: &T,
-    key: &SigningKey,
-) -> ReplicationResult<String> {
-    let message = signing_bytes(context, value)?;
-    Ok(encode(&key.sign(&message).to_bytes()))
-}
-
-fn verify_struct<T: Serialize>(
-    context: &[u8],
-    value: &T,
-    encoded_signature: &str,
-    key: &VerifyingKey,
-) -> ReplicationResult<()> {
-    let bytes = decode("signature", encoded_signature)?;
-    let bytes: [u8; 64] = bytes.try_into().map_err(|_| {
-        ReplicationError::Signature("Ed25519 signature must be 64 bytes".to_string())
-    })?;
-    key.verify(&signing_bytes(context, value)?, &Signature::from_bytes(&bytes))
-        .map_err(|error| ReplicationError::Signature(error.to_string()))
-}
-
-fn signing_bytes<T: Serialize>(context: &[u8], value: &T) -> ReplicationResult<Vec<u8>> {
-    let encoded = serde_json::to_vec(value)?;
-    let mut message = Vec::with_capacity(context.len() + encoded.len());
-    message.extend_from_slice(context);
-    message.extend_from_slice(&encoded);
-    Ok(message)
-}
-
-fn verifying_key(label: &str, encoded: &str) -> ReplicationResult<VerifyingKey> {
-    let bytes = decode(label, encoded)?;
-    let bytes: [u8; 32] = bytes.try_into().map_err(|_| {
-        ReplicationError::Invalid(format!("{label} must be 32 bytes"))
-    })?;
-    VerifyingKey::from_bytes(&bytes)
-        .map_err(|error| ReplicationError::Invalid(format!("invalid {label}: {error}")))
-}
-
-fn encrypt(recipient: &x25519::Recipient, plaintext: &[u8]) -> ReplicationResult<Vec<u8>> {
-    let encryptor = age::Encryptor::with_recipients(vec![Box::new(recipient.clone())])
+/// age-encrypt an operation payload to the store's current recipients (generation + recovery).
+fn encrypt(
+    recipients: Vec<Box<dyn age::Recipient + Send>>,
+    plaintext: &[u8],
+) -> ReplicationResult<Vec<u8>> {
+    let encryptor = age::Encryptor::with_recipients(recipients)
         .ok_or_else(|| ReplicationError::Encryption("Vault has no recipient".to_string()))?;
     let mut ciphertext = Vec::new();
     let mut writer = encryptor
@@ -3730,50 +2914,6 @@ fn encrypt(recipient: &x25519::Recipient, plaintext: &[u8]) -> ReplicationResult
         .finish()
         .map_err(|error| ReplicationError::Encryption(error.to_string()))?;
     Ok(ciphertext)
-}
-
-fn encrypt_with_provider(
-    keys: &dyn floria_store::KeyProvider,
-    plaintext: &[u8],
-) -> ReplicationResult<Vec<u8>> {
-    let encryptor = age::Encryptor::with_recipients(keys.recipients()?)
-        .ok_or_else(|| ReplicationError::Encryption("Device key has no recipient".to_string()))?;
-    let mut ciphertext = Vec::new();
-    let mut writer = encryptor
-        .wrap_output(&mut ciphertext)
-        .map_err(|error| ReplicationError::Encryption(error.to_string()))?;
-    writer
-        .write_all(plaintext)
-        .map_err(|error| ReplicationError::Encryption(error.to_string()))?;
-    writer
-        .finish()
-        .map_err(|error| ReplicationError::Encryption(error.to_string()))?;
-    Ok(ciphertext)
-}
-
-fn decrypt_with_provider(
-    keys: &dyn floria_store::KeyProvider,
-    ciphertext: &[u8],
-) -> ReplicationResult<Zeroizing<Vec<u8>>> {
-    let decryptor = match age::Decryptor::new(ciphertext)
-        .map_err(|error| ReplicationError::Encryption(error.to_string()))?
-    {
-        age::Decryptor::Recipients(decryptor) => decryptor,
-        age::Decryptor::Passphrase(_) => {
-            return Err(ReplicationError::Encryption(
-                "Device key is passphrase-encrypted".to_string(),
-            ));
-        }
-    };
-    let identity = keys.identity()?;
-    let mut reader = decryptor
-        .decrypt(std::iter::once(identity.as_ref()))
-        .map_err(|error| ReplicationError::Encryption(error.to_string()))?;
-    let mut plaintext = Zeroizing::new(Vec::new());
-    reader
-        .read_to_end(&mut plaintext)
-        .map_err(|error| ReplicationError::Encryption(error.to_string()))?;
-    Ok(plaintext)
 }
 
 fn decrypt(identity: &x25519::Identity, ciphertext: &[u8]) -> ReplicationResult<Zeroizing<Vec<u8>>> {
@@ -4038,46 +3178,6 @@ fn path_exists(path: &Path) -> ReplicationResult<bool> {
     }
 }
 
-fn sync_directory(path: &Path) -> ReplicationResult<()> {
-    File::open(path)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|source| io_error(path, source))
-}
-
-#[cfg(target_os = "macos")]
-fn rename_directory_exclusive(source: &Path, target: &Path) -> ReplicationResult<()> {
-    let source_bytes = CString::new(source.as_os_str().as_bytes()).map_err(|_| {
-        ReplicationError::Invalid(format!("{} contains a NUL byte", source.display()))
-    })?;
-    let target_bytes = CString::new(target.as_os_str().as_bytes()).map_err(|_| {
-        ReplicationError::Invalid(format!("{} contains a NUL byte", target.display()))
-    })?;
-    // SAFETY: both pointers are valid NUL-terminated paths for the duration of the call.
-    let result = unsafe {
-        libc::renamex_np(
-            source_bytes.as_ptr(),
-            target_bytes.as_ptr(),
-            libc::RENAME_EXCL,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io_error(target, io::Error::last_os_error()))
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn rename_directory_exclusive(source: &Path, target: &Path) -> ReplicationResult<()> {
-    if path_exists(target)? {
-        return Err(ReplicationError::Invalid(format!(
-            "replication package already exists at {}",
-            target.display()
-        )));
-    }
-    fs::rename(source, target).map_err(|error| io_error(target, error))
-}
-
 fn digest(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
 }
@@ -4216,76 +3316,60 @@ mod tests {
         EntrySpec, ReplicatedCatalog, ReplicatedProject, ReplicationStoreVersionRef, Resource,
         ResourceCodec, ResourceKind, ResourceSource, ValueShape,
     };
+    use ed25519_dalek::SigningKey;
     use floria_store::{KeyProvider, NewSecret, StoreResult};
     use std::os::unix::fs::PermissionsExt;
 
     const VAULT_ID: &str = "11111111-1111-4111-8111-111111111111";
-    const DEVICE_ID: &str = "22222222-2222-4222-8222-222222222222";
     const OPERATION_ID: &str = "33333333-3333-4333-8333-333333333333";
-    const SECOND_DEVICE_ID: &str = "44444444-4444-4444-8444-444444444444";
     const SECOND_OPERATION_ID: &str = "77777777-7777-4777-8777-777777777777";
     const GENESIS_CHILD_OPERATION_ID: &str = "99999999-9999-4999-8999-999999999999";
     const MERGE_OPERATION_ID: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
     const THIRD_OPERATION_ID: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    const REQUESTED_AT: &str = "2026-08-06T00:00:00Z";
 
-    fn keys(seed: u8, vault_identity: x25519::Identity) -> DeviceKeyMaterial {
-        DeviceKeyMaterial::new(DEVICE_ID, [seed; 32], vault_identity).unwrap()
+    fn store_keys() -> Arc<dyn KeyProvider> {
+        Arc::new(LocalStoreKeys(x25519::Identity::generate()))
     }
 
-    fn second_device_keys(seed: u8, wrapping_identity: x25519::Identity) -> DeviceKeyMaterial {
-        DeviceKeyMaterial::new(SECOND_DEVICE_ID, [seed; 32], wrapping_identity).unwrap()
+    fn open_store_at(root: PathBuf, keys: Arc<dyn KeyProvider>) -> Arc<AgeDirStore> {
+        Arc::new(AgeDirStore::open(root, keys).unwrap())
     }
 
-    fn third_device_keys(wrapping_identity: x25519::Identity) -> DeviceKeyMaterial {
-        DeviceKeyMaterial::new(
-            "88888888-8888-4888-8888-888888888888",
-            [9; 32],
-            wrapping_identity,
-        )
-        .unwrap()
+    /// One machine: its own data root, its own device identity, its own single-device vault.
+    fn open_store(directory: &Path, label: &str) -> Arc<AgeDirStore> {
+        open_store_at(directory.join(format!("{label}-store")), store_keys())
+    }
+
+    /// A genesis package: the store opened its own vault, replication just logs on top of it.
+    fn package_for_store(store: &Arc<AgeDirStore>) -> ReplicationPackage {
+        ReplicationPackage::for_store(Arc::clone(store)).unwrap()
     }
 
     fn package() -> (tempfile::TempDir, ReplicationPackage) {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("Personal.floriavault");
-        let package = ReplicationPackage::create(
-            &root,
-            VAULT_ID,
-            "2026-08-06T00:00:00Z",
-            keys(7, x25519::Identity::generate()),
-            x25519::Identity::generate(),
-            x25519::Identity::generate().to_public().to_string(),
-        )
-        .unwrap();
+        let store = open_store(directory.path(), "genesis");
+        let package = package_for_store(&store);
         (directory, package)
     }
 
-    fn open_store(directory: &Path, label: &str) -> Arc<AgeDirStore> {
-        Arc::new(
-            AgeDirStore::open(
-                directory.join(format!("{label}-store")),
-                Arc::new(LocalStoreKeys(x25519::Identity::generate())),
-            )
-            .unwrap(),
-        )
-    }
-
-    /// Create a Vault whose generation 1 IS the local store's, so the version files that store
-    /// already wrote stay decryptable for every enrolled Device (zero transcoding).
-    fn package_for_store(
-        root: &Path,
-        store: &AgeDirStore,
-        device: DeviceKeyMaterial,
+    /// Join `store` to the genesis vault the way a second Mac does: adopt the shared half, drop a
+    /// self-signed request in, and have the genesis Device approve it after checking the
+    /// fingerprint.
+    fn join_vault(
+        genesis: &mut ReplicationPackage,
+        store: &Arc<AgeDirStore>,
+        device_name: Option<&str>,
     ) -> ReplicationPackage {
-        ReplicationPackage::create(
-            root,
-            VAULT_ID,
-            "2026-08-06T00:00:00Z",
-            device,
-            store.generation_identity(1).unwrap(),
-            store.recovery_recipient().unwrap(),
+        ReplicationEngine::join_vault_at(
+            store,
+            &genesis.root(),
+            device_name.map(ToOwned::to_owned),
+            REQUESTED_AT,
         )
-        .unwrap()
+        .unwrap();
+        genesis.enroll_requested(store.device().device_id()).unwrap();
+        package_for_store(store)
     }
 
     fn catalog_entity(projection: &ReplicatedCatalog, parents: Vec<String>) -> EntityPayload {
@@ -4301,18 +3385,25 @@ mod tests {
     fn decoded_catalog(entity: &EntityPayload) -> ReplicatedCatalog {
         match &entity.delta {
             EntityDelta::Catalog { payload } => serde_json::from_slice(payload).unwrap(),
-            EntityDelta::Secret(_) => panic!("expected a catalog entity"),
+            EntityDelta::Secret(_) | EntityDelta::Tombstone => {
+                panic!("expected a catalog entity")
+            }
         }
     }
 
-    /// One secret entity plus the verbatim version file it references, taken from a local store.
+    /// One secret entity naming the version object the store already wrote.
     fn secret_entity(
         store: &AgeDirStore,
         id: &SecretId,
         ordinal: u32,
         parents: Vec<String>,
     ) -> (EntityPayload, PreparedObject) {
-        let export = store.export_version(id, ordinal).unwrap();
+        let reference = store
+            .version_refs(id)
+            .unwrap()
+            .into_iter()
+            .find(|reference| reference.ordinal == ordinal)
+            .unwrap();
         let descriptor = descriptor_from_record(&store.record(id).unwrap().unwrap());
         let entity = EntityPayload {
             logical_id: id.to_string(),
@@ -4320,23 +3411,33 @@ mod tests {
             delta: EntityDelta::Secret(SecretDelta {
                 descriptor,
                 versions: vec![SecretVersionRef {
-                    version_uuid: export.version_uuid.clone(),
-                    generation: export.generation,
-                    size: export.size,
+                    version_uuid: reference.version_uuid.clone(),
+                    generation: reference.generation,
+                    size: reference.size,
                     object: ObjectReference {
-                        id: export.digest.clone(),
-                        ciphertext_size: export.ciphertext.len() as u64,
+                        id: reference.digest.clone(),
+                        ciphertext_size: reference.ciphertext_size,
                     },
                 }],
-                head_uuid: export.version_uuid,
+                head_uuid: reference.version_uuid,
             }),
         };
-        (entity, PreparedObject { id: export.digest, bytes: export.ciphertext })
+        (
+            entity,
+            PreparedObject {
+                id: reference.digest,
+                ciphertext_size: reference.ciphertext_size,
+            },
+        )
     }
 
-    fn version_blob(store: &AgeDirStore, id: &SecretId, digest: &str) -> Vec<u8> {
-        fs::read(store.root().join(id.to_string()).join("v").join(format!("{digest}.age")))
+    /// Every object file in the shared half, by digest. There is exactly one copy of each.
+    fn shared_objects(store: &AgeDirStore) -> BTreeSet<String> {
+        regular_files_recursively(&store.shared_layout().objects_dir())
             .unwrap()
+            .iter()
+            .filter_map(|path| canonical_object_id(path))
+            .collect()
     }
 
     fn intent(intent_id: &str) -> ReplicationIntent {
@@ -4395,6 +3496,22 @@ mod tests {
         projection
     }
 
+    fn journal(
+        directory: &Path,
+        label: &str,
+        vault_id: &str,
+        key: [u8; 32],
+    ) -> Arc<ReplicationIntentJournal> {
+        Arc::new(
+            ReplicationIntentJournal::open(
+                directory.join(format!("{label}-intents.json")),
+                vault_id,
+                Arc::new(StateAuthenticator::for_tests(key)),
+            )
+            .unwrap(),
+        )
+    }
+
     fn engine_for_package(
         directory: &Path,
         label: &str,
@@ -4405,19 +3522,9 @@ mod tests {
         let catalog = Arc::new(
             Catalog::open(directory.join(format!("{label}-catalog.sqlite"))).unwrap(),
         );
-        let engine = ReplicationEngine::from_parts(
-            package,
-            Arc::new(
-                ReplicationIntentJournal::open(
-                    directory.join(format!("{label}-intents.json")),
-                    VAULT_ID,
-                    Arc::new(StateAuthenticator::for_tests(authentication_key)),
-                )
-                .unwrap(),
-            ),
-            Arc::clone(&catalog),
-            store,
-        );
+        let intents = journal(directory, label, package.vault_id(), authentication_key);
+        let engine =
+            ReplicationEngine::from_parts(package, intents, Arc::clone(&catalog), store);
         (engine, catalog)
     }
 
@@ -4434,9 +3541,12 @@ mod tests {
     }
 
     #[test]
-    fn create_open_and_single_device_round_trip() {
-        let (directory, package) = package();
-        let identity = package.device.wrapping_identity.clone();
+    fn single_device_store_round_trips_one_operation() {
+        let directory = tempfile::tempdir().unwrap();
+        let keys = store_keys();
+        let root = directory.path().join("genesis-store");
+        let store = open_store_at(root.clone(), Arc::clone(&keys));
+        let package = package_for_store(&store);
         let projection = project_projection("Fixture project");
         let prepared = package
             .prepare(PackageMutation {
@@ -4447,12 +3557,10 @@ mod tests {
             })
             .unwrap();
         package.publish(&prepared).unwrap();
+        drop(package);
+        drop(store);
 
-        let reopened = ReplicationPackage::open(
-            directory.path().join("Personal.floriavault"),
-            keys(7, identity),
-        )
-        .unwrap();
+        let reopened = package_for_store(&open_store_at(root, keys));
         let scan = reopened.scan().unwrap();
 
         assert!(scan.pending.is_empty());
@@ -4467,19 +3575,10 @@ mod tests {
     #[test]
     fn enrolled_device_can_decrypt_and_publish_its_own_operations() {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("Personal.floriavault");
-        let mut genesis = ReplicationPackage::create(
-            &root,
-            VAULT_ID,
-            "2026-08-06T00:00:00Z",
-            keys(7, x25519::Identity::generate()),
-            x25519::Identity::generate(),
-            x25519::Identity::generate().to_public().to_string(),
-        )
-        .unwrap();
-        let second_wrapping_identity = x25519::Identity::generate();
-        let second = second_device_keys(8, second_wrapping_identity.clone());
-        genesis.enroll_device(second.enrollment()).unwrap();
+        let genesis_store = open_store(directory.path(), "genesis");
+        let second_store = open_store(directory.path(), "second");
+        let mut genesis = package_for_store(&genesis_store);
+        let second = join_vault(&mut genesis, &second_store, Some("Second Mac"));
 
         let from_genesis = project_projection("From genesis");
         let genesis_publication = genesis
@@ -4492,11 +3591,6 @@ mod tests {
             .unwrap();
         genesis.publish(&genesis_publication).unwrap();
 
-        let second = ReplicationPackage::open(
-            &root,
-            second_device_keys(8, second_wrapping_identity),
-        )
-        .unwrap();
         let initial_scan = second.scan().unwrap();
         assert!(initial_scan.damaged.is_empty());
         assert_eq!(initial_scan.verified.len(), 1);
@@ -4520,23 +3614,91 @@ mod tests {
         assert!(final_scan.damaged.is_empty());
         assert_eq!(final_scan.verified.len(), 2);
         assert!(final_scan.verified.iter().any(|mutation| {
-            mutation.device_id == SECOND_DEVICE_ID
+            mutation.device_id == second_store.device().device_id()
                 && mutation.operation_id == SECOND_OPERATION_ID
                 && decoded_catalog(&mutation.payload.entities[0]) == from_second
         }));
+        // Approval is what makes the request go away; nothing stays pending afterwards.
+        assert!(final_scan.pending_enrollments.is_empty());
     }
 
     #[test]
-    fn enrolled_device_requires_its_private_wrapping_identity() {
-        let (directory, mut package) = package();
-        let second = second_device_keys(8, x25519::Identity::generate());
-        package.enroll_device(second.enrollment()).unwrap();
+    fn pending_enrollment_is_reported_with_a_fingerprint_until_it_is_approved() {
+        let directory = tempfile::tempdir().unwrap();
+        let genesis_store = open_store(directory.path(), "genesis");
+        let second_store = open_store(directory.path(), "second");
+        let mut genesis = package_for_store(&genesis_store);
+        let secret_id: SecretId = "55555555-5555-4555-8555-555555555555".parse().unwrap();
+        genesis_store
+            .put_identified(
+                secret_id.clone(),
+                NewSecret::managed("Fixture value"),
+                b"fixture payload, not a credential",
+                "66666666-6666-4666-8666-666666666666",
+            )
+            .unwrap();
 
-        let error = match ReplicationPackage::open(
-            directory.path().join("Personal.floriavault"),
-            second_device_keys(8, x25519::Identity::generate()),
-        ) {
-            Ok(_) => panic!("wrong wrapping identity unexpectedly opened the Vault"),
+        ReplicationEngine::join_vault_at(
+            &second_store,
+            &genesis.root(),
+            Some("Second Mac".to_string()),
+            REQUESTED_AT,
+        )
+        .unwrap();
+        // Republishing the same request is idempotent, not a second pending device.
+        publish_enrollment_request(
+            &second_store,
+            Some("Second Mac".to_string()),
+            REQUESTED_AT,
+        )
+        .unwrap();
+
+        let waiting = genesis.scan().unwrap();
+        assert!(waiting.damaged.is_empty());
+        assert_eq!(waiting.pending_enrollments.len(), 1);
+        let request = &waiting.pending_enrollments[0];
+        assert_eq!(request.device_id, second_store.device().device_id());
+        assert_eq!(request.device_name.as_deref(), Some("Second Mac"));
+        assert_eq!(request.requested_at, REQUESTED_AT);
+        assert!(!request.fingerprint.is_empty());
+        // Until it is approved the joining Device cannot even build a package.
+        assert!(matches!(
+            ReplicationPackage::for_store(Arc::clone(&second_store)),
+            Err(ReplicationError::EnrollmentRequired { .. })
+        ));
+
+        genesis.enroll_requested(&request.device_id.clone()).unwrap();
+
+        assert!(genesis.scan().unwrap().pending_enrollments.is_empty());
+        assert!(!genesis
+            .layout()
+            .enrollment_request(second_store.device().device_id())
+            .exists());
+        // Approval hands over the generation envelope, so the joining store can read the vault.
+        package_for_store(&second_store);
+        assert_eq!(
+            second_store.generation_identity(1).unwrap().to_public().to_string(),
+            genesis_store.generation_identity(1).unwrap().to_public().to_string()
+        );
+    }
+
+    #[test]
+    fn enrolled_identity_must_match_the_local_device_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let genesis_store = open_store(directory.path(), "genesis");
+        let second_store = open_store(directory.path(), "second");
+        let mut genesis = package_for_store(&genesis_store);
+        second_store
+            .adopt_shared_location(&genesis.root())
+            .unwrap();
+        // Enroll the joining Device's id, but bound to keys it does not hold.
+        let impostor = DeviceKeyMaterial::generate().unwrap();
+        let mut enrollment = impostor.enrollment();
+        enrollment.device_id = second_store.device().device_id().to_string();
+        genesis.enroll_device(enrollment).unwrap();
+
+        let error = match ReplicationPackage::for_store(Arc::clone(&second_store)) {
+            Ok(_) => panic!("foreign enrolled keys unexpectedly opened the Vault"),
             Err(error) => error,
         };
 
@@ -4545,51 +3707,36 @@ mod tests {
 
     #[test]
     fn tampered_enrollment_is_rejected_before_vault_key_unwrap() {
-        let (directory, mut package) = package();
-        let wrapping_identity = x25519::Identity::generate();
-        let second = second_device_keys(8, wrapping_identity.clone());
-        package.enroll_device(second.enrollment()).unwrap();
-        let identity_path = directory
-            .path()
-            .join("Personal.floriavault/devices")
-            .join(SECOND_DEVICE_ID)
-            .join("identity.json");
-        let mut document: DeviceDocument =
+        let directory = tempfile::tempdir().unwrap();
+        let genesis_store = open_store(directory.path(), "genesis");
+        let second_store = open_store(directory.path(), "second");
+        let mut genesis = package_for_store(&genesis_store);
+        join_vault(&mut genesis, &second_store, None);
+        let identity_path = genesis
+            .layout()
+            .device_identity(second_store.device().device_id());
+        let mut document: serde_json::Value =
             serde_json::from_slice(&fs::read(&identity_path).unwrap()).unwrap();
-        document.wrapping_recipient = x25519::Identity::generate().to_public().to_string();
+        document["wrapping_recipient"] =
+            serde_json::Value::String(x25519::Identity::generate().to_public().to_string());
         fs::write(&identity_path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
 
-        let error = match ReplicationPackage::open(
-            directory.path().join("Personal.floriavault"),
-            second_device_keys(8, wrapping_identity),
-        ) {
+        let error = match ReplicationPackage::for_store(Arc::clone(&second_store)) {
             Ok(_) => panic!("tampered enrollment unexpectedly opened the Vault"),
             Err(error) => error,
         };
 
-        assert!(error.to_string().contains("replication signature failed"));
+        assert!(error.to_string().contains("signature verification failed"));
     }
 
     #[test]
     fn non_genesis_device_cannot_enroll_another_device() {
-        let (directory, mut genesis) = package();
-        let second_wrapping_identity = x25519::Identity::generate();
-        genesis
-            .enroll_device(
-                second_device_keys(8, second_wrapping_identity.clone()).enrollment(),
-            )
-            .unwrap();
-        let mut second = ReplicationPackage::open(
-            directory.path().join("Personal.floriavault"),
-            second_device_keys(8, second_wrapping_identity),
-        )
-        .unwrap();
-        let third = DeviceKeyMaterial::new(
-            "88888888-8888-4888-8888-888888888888",
-            [9; 32],
-            x25519::Identity::generate(),
-        )
-        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let genesis_store = open_store(directory.path(), "genesis");
+        let second_store = open_store(directory.path(), "second");
+        let mut genesis = package_for_store(&genesis_store);
+        let mut second = join_vault(&mut genesis, &second_store, None);
+        let third = DeviceKeyMaterial::generate().unwrap();
 
         let error = second.enroll_device(third.enrollment()).unwrap_err();
 
@@ -4599,27 +3746,10 @@ mod tests {
     #[test]
     fn concurrent_heads_require_an_explicit_signed_merge() {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("Personal.floriavault");
-        let mut genesis = ReplicationPackage::create(
-            &root,
-            VAULT_ID,
-            "2026-08-06T00:00:00Z",
-            keys(7, x25519::Identity::generate()),
-            x25519::Identity::generate(),
-            x25519::Identity::generate().to_public().to_string(),
-        )
-        .unwrap();
-        let second_wrapping_identity = x25519::Identity::generate();
-        genesis
-            .enroll_device(
-                second_device_keys(8, second_wrapping_identity.clone()).enrollment(),
-            )
-            .unwrap();
-        let second = ReplicationPackage::open(
-            &root,
-            second_device_keys(8, second_wrapping_identity),
-        )
-        .unwrap();
+        let genesis_store = open_store(directory.path(), "genesis");
+        let second_store = open_store(directory.path(), "second");
+        let mut genesis = package_for_store(&genesis_store);
+        let second = join_vault(&mut genesis, &second_store, None);
 
         let base = genesis
             .prepare(PackageMutation {
@@ -4689,25 +3819,10 @@ mod tests {
     #[test]
     fn concurrent_local_snapshots_keep_each_devices_projection_and_report_the_conflict() {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("Personal.floriavault");
         let genesis_store = open_store(directory.path(), "genesis");
         let second_store = open_store(directory.path(), "second");
-        let mut genesis = package_for_store(
-            &root,
-            &genesis_store,
-            keys(7, x25519::Identity::generate()),
-        );
-        let second_wrapping_identity = x25519::Identity::generate();
-        genesis
-            .enroll_device(
-                second_device_keys(8, second_wrapping_identity.clone()).enrollment(),
-            )
-            .unwrap();
-        let second = ReplicationPackage::open(
-            &root,
-            second_device_keys(8, second_wrapping_identity),
-        )
-        .unwrap();
+        let mut genesis = package_for_store(&genesis_store);
+        let second = join_vault(&mut genesis, &second_store, None);
         let (genesis, genesis_catalog) = engine_for_package(
             directory.path(),
             "genesis",
@@ -4817,31 +3932,15 @@ mod tests {
     #[test]
     fn revocation_rotates_the_vault_key_and_fences_late_operations() {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("Personal.floriavault");
-        let genesis_wrapping_identity = x25519::Identity::generate();
-        let genesis_store = open_store(directory.path(), "genesis");
-        let mut genesis = ReplicationPackage::create_named(
-            &root,
-            VAULT_ID,
-            "2026-08-06T00:00:00Z",
-            keys(7, genesis_wrapping_identity.clone()),
-            Some("Owner Mac".to_string()),
-            genesis_store.generation_identity(1).unwrap(),
-            genesis_store.recovery_recipient().unwrap(),
-        )
-        .unwrap();
-        let second_wrapping_identity = x25519::Identity::generate();
-        genesis
-            .enroll_device(
-                second_device_keys(8, second_wrapping_identity.clone())
-                    .enrollment_named(Some("Second Mac".to_string())),
-            )
-            .unwrap();
-        let second = ReplicationPackage::open(
-            &root,
-            second_device_keys(8, second_wrapping_identity.clone()),
-        )
-        .unwrap();
+        let genesis_keys = store_keys();
+        let genesis_root = directory.path().join("genesis-store");
+        let genesis_store = open_store_at(genesis_root.clone(), Arc::clone(&genesis_keys));
+        let second_keys = store_keys();
+        let second_root = directory.path().join("second-store");
+        let second_store = open_store_at(second_root.clone(), Arc::clone(&second_keys));
+        let mut genesis = package_for_store(&genesis_store);
+        let second_device_id = second_store.device().device_id().to_string();
+        let second = join_vault(&mut genesis, &second_store, Some("Second Mac"));
         let before_revocation = second
             .prepare(PackageMutation {
                 sequence: 1,
@@ -4875,35 +3974,31 @@ mod tests {
         );
         let devices = genesis.devices();
         assert_eq!(devices.len(), 2);
-        assert_eq!(devices[0].device_name.as_deref(), Some("Owner Mac"));
+        assert!(devices[0].is_genesis);
         assert!(devices[0].is_current);
         assert_eq!(devices[1].device_name.as_deref(), Some("Second Mac"));
         assert!(!devices[1].is_current);
 
-        // Revocation rotates the store first, then publishes the matching Vault generation, so
-        // the two key domains stay in lockstep.
-        assert!(!genesis.revoke_device(SECOND_DEVICE_ID).unwrap().local_device_fenced);
+        // One signed step: the store writes the new generation document, so the vault and the
+        // bytes it encrypts can never name different key domains.
+        assert!(!genesis.revoke_device(&second_device_id).unwrap().local_device_fenced);
         assert_eq!(genesis.current_generation(), 2);
         assert_eq!(genesis_store.current_generation().unwrap(), 2);
+        let rotated: KeyGenerationDocument = serde_json::from_slice(
+            &fs::read(genesis.package.layout().generation_document(2)).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
-            genesis_store.generation_public(2).unwrap(),
-            Some(
-                genesis
-                    .package
-                    .generation_identity_secrets()
-                    .into_iter()
-                    .find(|(generation, _)| *generation == 2)
-                    .map(|(_, secret)| secret.trim().parse::<x25519::Identity>().unwrap())
-                    .unwrap()
-                    .to_public()
-                    .to_string()
-            )
+            rotated.envelopes.keys().cloned().collect::<Vec<_>>(),
+            vec![genesis_store.device().device_id().to_string()]
+        );
+        assert_eq!(
+            rotated.revoked_devices,
+            BTreeMap::from([(second_device_id.clone(), 1)])
         );
         assert_eq!(genesis.devices()[1].revoked_generation, Some(2));
         let re_enrollment = genesis
-            .enroll_device(
-                second_device_keys(8, second_wrapping_identity.clone()).enrollment(),
-            )
+            .enroll_device(second_store.device().enrollment())
             .unwrap_err();
         assert!(re_enrollment.to_string().contains("new Device id"));
         let after_rotation = genesis
@@ -4930,30 +4025,17 @@ mod tests {
             damaged.reason.contains("not authorized for key generation")
         }));
 
-        let reopened = ReplicationPackage::open(
-            &root,
-            keys(7, genesis_wrapping_identity),
-        )
-        .unwrap();
+        let reopened = package_for_store(&open_store_at(genesis_root, genesis_keys));
         assert_eq!(reopened.current_generation(), 2);
-        let revoked_error = match ReplicationPackage::open(
-            &root,
-            second_device_keys(8, second_wrapping_identity),
-        ) {
-            Ok(_) => panic!("revoked Device unexpectedly reopened the Vault"),
-            Err(error) => error,
-        };
+        let revoked_error =
+            match ReplicationPackage::for_store(open_store_at(second_root, second_keys)) {
+                Ok(_) => panic!("revoked Device unexpectedly reopened the Vault"),
+                Err(error) => error,
+            };
         assert!(revoked_error.to_string().contains("was revoked at key generation 2"));
 
-        let third_wrapping_identity = x25519::Identity::generate();
-        genesis
-            .enroll_device(third_device_keys(third_wrapping_identity.clone()).enrollment())
-            .unwrap();
-        let third = ReplicationPackage::open(
-            &root,
-            third_device_keys(third_wrapping_identity),
-        )
-        .unwrap();
+        let third_store = open_store(directory.path(), "third");
+        let third = join_vault(&mut genesis.package, &third_store, Some("Third Mac"));
         assert_eq!(third.current_generation(), 2);
         let third_publication = third
             .prepare(PackageMutation {
@@ -4975,10 +4057,9 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn operation_waits_when_object_has_not_arrived() {
-        let (directory, package) = package();
-        let store = open_store(directory.path(), "source");
+    /// Put one secret into the package's own store and describe it as an entity.
+    fn fixture_secret(package: &ReplicationPackage) -> (SecretId, EntityPayload, PreparedObject) {
+        let store = Arc::clone(&package.store);
         let secret_id: SecretId = "55555555-5555-4555-8555-555555555555".parse().unwrap();
         store
             .put_identified(
@@ -4989,6 +4070,13 @@ mod tests {
             )
             .unwrap();
         let (entity, object) = secret_entity(&store, &secret_id, 1, Vec::new());
+        (secret_id, entity, object)
+    }
+
+    #[test]
+    fn operation_waits_when_its_object_is_missing_from_the_shared_half() {
+        let (_directory, package) = package();
+        let (_secret_id, entity, object) = fixture_secret(&package);
         let prepared = package
             .prepare(PackageMutation {
                 sequence: 1,
@@ -4999,15 +4087,15 @@ mod tests {
             .unwrap();
         publish_immutable(&package.operation_path(&prepared), &prepared.operation).unwrap();
 
+        // The operation file synced ahead of the object it names.
+        let object_path = package.layout().object(&object.id);
+        let bytes = fs::read(&object_path).unwrap();
+        fs::remove_file(&object_path).unwrap();
         let pending = package.scan().unwrap();
         assert_eq!(pending.pending.len(), 1);
         assert!(pending.pending[0].reason.contains("has not arrived"));
 
-        publish_immutable(
-            &package.root.join("objects").join(format!("{}.age", object.id)),
-            &object.bytes,
-        )
-        .unwrap();
+        publish_immutable(&object_path, &bytes).unwrap();
         let complete = package.scan().unwrap();
         assert_eq!(complete.verified.len(), 1);
         assert!(complete.pending.is_empty());
@@ -5015,18 +4103,8 @@ mod tests {
 
     #[test]
     fn object_conflict_copy_is_validated_and_normalized_by_digest() {
-        let (directory, package) = package();
-        let store = open_store(directory.path(), "source");
-        let secret_id: SecretId = "55555555-5555-4555-8555-555555555555".parse().unwrap();
-        store
-            .put_identified(
-                secret_id.clone(),
-                NewSecret::managed("Fixture value"),
-                b"fixture payload, not a credential",
-                "66666666-6666-4666-8666-666666666666",
-            )
-            .unwrap();
-        let (entity, object) = secret_entity(&store, &secret_id, 1, Vec::new());
+        let (_directory, package) = package();
+        let (secret_id, entity, object) = fixture_secret(&package);
         let prepared = package
             .prepare(PackageMutation {
                 sequence: 1,
@@ -5035,17 +4113,29 @@ mod tests {
                 objects: std::slice::from_ref(&object),
             })
             .unwrap();
-        let conflict_copy = package.root.join("objects/object (conflicted copy).age");
-        fs::write(&conflict_copy, &object.bytes).unwrap();
         publish_immutable(&package.operation_path(&prepared), &prepared.operation).unwrap();
+        // A sync provider renamed the object aside; only the conflict copy is left.
+        let object_path = package.layout().object(&object.id);
+        let bytes = fs::read(&object_path).unwrap();
+        fs::remove_file(&object_path).unwrap();
+        fs::write(
+            package
+                .layout()
+                .objects_dir()
+                .join("object (conflicted copy).age"),
+            &bytes,
+        )
+        .unwrap();
 
         let scan = package.scan().unwrap();
+
         assert_eq!(scan.verified.len(), 1);
-        assert!(package
-            .root
-            .join("objects")
-            .join(format!("{}.age", object.id))
-            .is_file());
+        assert!(object_path.is_file());
+        // Restoring the canonical name restores the store's own read path.
+        assert_eq!(
+            package.store.get(&secret_id).unwrap().as_slice(),
+            b"fixture payload, not a credential"
+        );
     }
 
     #[test]
@@ -5125,7 +4215,7 @@ mod tests {
     #[test]
     fn immutable_publication_never_overwrites_existing_bytes() {
         let (_directory, package) = package();
-        let path = package.root.join("objects/collision.age");
+        let path = package.layout().objects_dir().join("collision.age");
         publish_immutable(&path, b"first").unwrap();
 
         let error = publish_immutable(&path, b"second").unwrap_err();
@@ -5135,34 +4225,29 @@ mod tests {
     }
 
     #[test]
-    fn package_creation_never_replaces_an_existing_directory() {
+    fn enabling_sync_never_replaces_an_existing_directory() {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("Personal.floriavault");
-        fs::create_dir(&root).unwrap();
-        fs::write(root.join("keep"), b"existing package marker").unwrap();
+        let store = open_store(directory.path(), "genesis");
+        let target = directory.path().join("Sync/Personal.floriavault");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("keep"), b"existing package marker").unwrap();
 
-        let error = ReplicationPackage::create(
-            &root,
-            VAULT_ID,
-            "2026-08-06T00:00:00Z",
-            keys(7, x25519::Identity::generate()),
-            x25519::Identity::generate(),
-            x25519::Identity::generate().to_public().to_string(),
-        )
-        .err()
-        .unwrap();
+        let error = ReplicationEngine::enable_sync_at(&store, &target).err().unwrap();
 
         assert!(error.to_string().contains("already exists"));
-        assert_eq!(fs::read(root.join("keep")).unwrap(), b"existing package marker");
+        assert_eq!(
+            fs::read(target.join("keep")).unwrap(),
+            b"existing package marker"
+        );
+        // The authoritative shared half never left its original location.
+        assert_eq!(store.shared_root(), directory.path().join("genesis-store/shared"));
+        assert!(store.shared_layout().vault_json().is_file());
     }
 
     #[test]
     fn canonical_object_name_with_wrong_digest_is_damaged() {
         let (_directory, package) = package();
-        let path = package
-            .root
-            .join("objects")
-            .join(format!("{}.age", "0".repeat(64)));
+        let path = package.layout().object(&"0".repeat(64));
         fs::write(path, b"not an age ciphertext").unwrap();
 
         let scan = package.scan().unwrap();
@@ -5174,8 +4259,8 @@ mod tests {
     #[test]
     fn engine_reports_damaged_files_relative_to_the_replication_package() {
         let (directory, package) = package();
-        let root = package.root.clone();
-        let store = open_store(directory.path(), "damaged");
+        let root = package.root();
+        let store = Arc::clone(&package.store);
         let (engine, _) =
             engine_for_package(directory.path(), "damaged", package, [43; 32], store);
         let relative = PathBuf::from("objects").join(format!("{}.age", "0".repeat(64)));
@@ -5189,20 +4274,28 @@ mod tests {
 
     #[test]
     fn vault_descriptor_has_stable_signing_vector() {
-        let unsigned = VaultUnsigned {
+        let unsigned = vault::VaultUnsigned {
             format_version: 1,
             vault_id: VAULT_ID.to_string(),
-            genesis_device_id: DEVICE_ID.to_string(),
-            genesis_public_key: encode(SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes()),
+            genesis_device_id: "22222222-2222-4222-8222-222222222222".to_string(),
+            genesis_public_key: encode(
+                SigningKey::from_bytes(&[7; 32]).verifying_key().as_bytes(),
+            ),
             created_at: "2026-08-06T00:00:00Z".to_string(),
         };
+        // The signed bytes are the context followed by this exact JSON; the signature below
+        // pins both halves.
         assert_eq!(
-            String::from_utf8(signing_bytes(VAULT_SIGNATURE_CONTEXT, &unsigned).unwrap()).unwrap(),
-            "floria-vault-v1\0{\"format_version\":1,\"vault_id\":\"11111111-1111-4111-8111-111111111111\",\"genesis_device_id\":\"22222222-2222-4222-8222-222222222222\",\"genesis_public_key\":\"6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw\",\"created_at\":\"2026-08-06T00:00:00Z\"}"
+            String::from_utf8(serde_json::to_vec(&unsigned).unwrap()).unwrap(),
+            "{\"format_version\":1,\"vault_id\":\"11111111-1111-4111-8111-111111111111\",\"genesis_device_id\":\"22222222-2222-4222-8222-222222222222\",\"genesis_public_key\":\"6kpsY-KcUgq-9VB7Ey7F-ZVHdq6-vnuSQh7qaRRG0iw\",\"created_at\":\"2026-08-06T00:00:00Z\"}"
         );
         assert_eq!(
-            sign_struct(VAULT_SIGNATURE_CONTEXT, &unsigned, &SigningKey::from_bytes(&[7; 32]))
-                .unwrap(),
+            vault::sign_struct(
+                vault::VAULT_SIGNATURE_CONTEXT,
+                &unsigned,
+                &SigningKey::from_bytes(&[7; 32])
+            )
+            .unwrap(),
             "iGeZuPC-ulM5c5tLijmtXWaKPNQsaQX7djOuLPjM1o0hmI91TNixOcqsMBTnLA9GOIexEoS6-ydW4G5PJsx6BA"
         );
     }
@@ -5280,7 +4373,7 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(error.to_string().contains("replication encryption failed"));
+        assert!(error.to_string().contains("crypto error"));
     }
 
     #[test]
@@ -5309,15 +4402,7 @@ mod tests {
         let authenticator = Arc::new(StateAuthenticator::for_tests([72; 32]));
         let journal = ReplicationIntentJournal::open(&path, VAULT_ID, authenticator).unwrap();
         journal.enqueue(intent(OPERATION_ID)).unwrap();
-        let package = ReplicationPackage::create(
-            directory.path().join("Personal.floriavault"),
-            VAULT_ID,
-            "2026-08-06T00:00:00Z",
-            keys(7, x25519::Identity::generate()),
-            x25519::Identity::generate(),
-            x25519::Identity::generate().to_public().to_string(),
-        )
-        .unwrap();
+        let package = package_for_store(&open_store(directory.path(), "genesis"));
         let prepared = package
             .prepare(PackageMutation {
                 sequence: 1,
@@ -5372,7 +4457,7 @@ mod tests {
     }
 
     #[test]
-    fn engine_publishes_committed_outbox_from_the_exact_store_version() {
+    fn engine_publishes_committed_outbox_without_copying_the_object() {
         let directory = tempfile::tempdir().unwrap();
         let store = open_store(directory.path(), "local");
         let secret_id: SecretId = "55555555-5555-4555-8555-555555555555".parse().unwrap();
@@ -5385,20 +4470,8 @@ mod tests {
                 mutation_id,
             )
             .unwrap();
-        let package = package_for_store(
-            &directory.path().join("Personal.floriavault"),
-            &store,
-            keys(7, x25519::Identity::generate()),
-        );
-        let authenticator = Arc::new(StateAuthenticator::for_tests([74; 32]));
-        let intents = Arc::new(
-            ReplicationIntentJournal::open(
-                directory.path().join("replication-intents.json"),
-                VAULT_ID,
-                authenticator,
-            )
-            .unwrap(),
-        );
+        let package = package_for_store(&store);
+        let intents = journal(directory.path(), "local", package.vault_id(), [74; 32]);
         let catalog = Arc::new(Catalog::open(directory.path().join("catalog.sqlite")).unwrap());
         let (entity, object) = secret_entity(&store, &secret_id, 1, Vec::new());
         let catalog_payload = serde_json::to_vec(&TransactionDelta {
@@ -5448,37 +4521,25 @@ mod tests {
         assert!(!report.local_device_fenced);
         assert!(catalog.replication_outbox().unwrap().is_empty());
         assert!(intents.entries().is_empty());
-        assert_eq!(intents.device_sequence(DEVICE_ID), 1);
+        assert_eq!(intents.device_sequence(store.device().device_id()), 1);
         let scan = engine.package.scan().unwrap();
         assert_eq!(scan.verified.len(), 1);
-        // Zero transcoding: the published Object is byte-for-byte the store's version file.
+        // Publishing moved no bytes: the object the operation names is the one file the store
+        // wrote, at the path the store reads it from.
+        assert_eq!(shared_objects(&store), BTreeSet::from([object.id.clone()]));
+        assert!(store.shared_layout().object(&object.id).is_file());
         assert_eq!(
-            fs::read(
-                engine
-                    .package
-                    .root
-                    .join("objects")
-                    .join(format!("{}.age", object.id))
-            )
-            .unwrap(),
-            version_blob(&store, &secret_id, &object.id)
+            store.get(&secret_id).unwrap().as_slice(),
+            b"fixture payload, not a credential"
         );
     }
 
     #[test]
     fn engine_self_fences_when_an_accepted_local_operation_disappears() {
         let (directory, package) = package();
-        let authenticator = Arc::new(StateAuthenticator::for_tests([75; 32]));
-        let intents = Arc::new(
-            ReplicationIntentJournal::open(
-                directory.path().join("replication-intents.json"),
-                VAULT_ID,
-                authenticator,
-            )
-            .unwrap(),
-        );
+        let store = Arc::clone(&package.store);
+        let intents = journal(directory.path(), "local", package.vault_id(), [75; 32]);
         let catalog = Arc::new(Catalog::open(directory.path().join("catalog.sqlite")).unwrap());
-        let store = open_store(directory.path(), "local");
         let prepared = package
             .prepare(PackageMutation {
                 sequence: 1,
@@ -5490,7 +4551,9 @@ mod tests {
         package.publish(&prepared).unwrap();
         intents.enqueue(intent(OPERATION_ID)).unwrap();
         intents.save_prepared(OPERATION_ID, prepared.clone()).unwrap();
-        intents.accept_device_operation(DEVICE_ID, 1, OPERATION_ID).unwrap();
+        intents
+            .accept_device_operation(store.device().device_id(), 1, OPERATION_ID)
+            .unwrap();
         intents.complete(OPERATION_ID).unwrap();
         fs::remove_file(package.operation_path(&prepared)).unwrap();
         let engine = ReplicationEngine::from_parts(package, intents, catalog, store);
@@ -5504,51 +4567,26 @@ mod tests {
     #[test]
     fn engine_refreshes_metadata_and_fences_a_key_generation_rollback() {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("Personal.floriavault");
-        let genesis_wrapping_identity = x25519::Identity::generate();
         let administrator_store = open_store(directory.path(), "administrator");
-        let mut administrator = package_for_store(
-            &root,
-            &administrator_store,
-            keys(7, genesis_wrapping_identity.clone()),
-        );
-        administrator
-            .enroll_device(
-                second_device_keys(8, x25519::Identity::generate()).enrollment(),
-            )
-            .unwrap();
-        let intents = Arc::new(
-            ReplicationIntentJournal::open(
-                directory.path().join("replication-intents.json"),
-                VAULT_ID,
-                Arc::new(StateAuthenticator::for_tests([79; 32])),
-            )
-            .unwrap(),
-        );
-        let engine = ReplicationEngine::from_parts(
-            ReplicationPackage::open(
-                &root,
-                keys(7, genesis_wrapping_identity),
-            )
-            .unwrap(),
-            intents,
-            Arc::new(Catalog::open(directory.path().join("catalog.sqlite")).unwrap()),
-            open_store(directory.path(), "local"),
+        let second_store = open_store(directory.path(), "second");
+        let mut administrator = package_for_store(&administrator_store);
+        let second_device_id = second_store.device().device_id().to_string();
+        join_vault(&mut administrator, &second_store, None);
+        let layout = administrator.layout();
+        let (engine, _catalog) = engine_for_package(
+            directory.path(),
+            "administrator",
+            administrator,
+            [79; 32],
+            Arc::clone(&administrator_store),
         );
 
         assert!(!engine.sync().unwrap().local_device_fenced);
-        let rotated = administrator_store.rotate_generation().unwrap();
-        administrator
-            .revoke_device(
-                SECOND_DEVICE_ID,
-                administrator_store.generation_identity(rotated).unwrap(),
-                &administrator_store.recovery_recipient().unwrap(),
-            )
-            .unwrap();
-        assert!(!engine.sync().unwrap().local_device_fenced);
+        assert!(!engine.revoke_device(&second_device_id).unwrap().local_device_fenced);
         assert_eq!(engine.package.current_generation(), 2);
 
-        fs::remove_file(root.join("generations").join(generation_filename(2))).unwrap();
+        // A rollback of the shared half drops a generation this Device already checkpointed.
+        fs::remove_file(layout.generation_document(2)).unwrap();
         let rollback = engine.sync().unwrap();
 
         assert!(rollback.local_device_fenced);
@@ -5558,27 +4596,14 @@ mod tests {
     #[test]
     fn verified_commit_replays_into_an_empty_catalog_and_store() {
         let directory = tempfile::tempdir().unwrap();
-        let genesis_wrapping_identity = x25519::Identity::generate();
-        let source_store = open_store(directory.path(), "source");
-        let mut package = package_for_store(
-            &directory.path().join("Personal.floriavault"),
-            &source_store,
-            keys(7, genesis_wrapping_identity.clone()),
-        );
-        let target_wrapping_identity = x25519::Identity::generate();
-        package
-            .enroll_device(
-                second_device_keys(8, target_wrapping_identity.clone()).enrollment(),
-            )
-            .unwrap();
-        let source_intents = Arc::new(
-            ReplicationIntentJournal::open(
-                directory.path().join("source-intents.json"),
-                VAULT_ID,
-                Arc::new(StateAuthenticator::for_tests([76; 32])),
-            )
-            .unwrap(),
-        );
+        let source_keys = store_keys();
+        let source_root = directory.path().join("source-store");
+        let source_store = open_store_at(source_root.clone(), Arc::clone(&source_keys));
+        let target_store = open_store(directory.path(), "target");
+        let mut package = package_for_store(&source_store);
+        let target_package = join_vault(&mut package, &target_store, None);
+        let source_intents =
+            journal(directory.path(), "source", package.vault_id(), [76; 32]);
         let source_catalog = Arc::new(
             Catalog::open(directory.path().join("source-catalog.sqlite")).unwrap(),
         );
@@ -5618,24 +4643,29 @@ mod tests {
         assert_eq!(source.sync().unwrap().published, 3);
         assert!(!source.stage_current_snapshot("2026-08-06T00:00:03Z").unwrap());
 
+        // A restored Mac: same Device identity and same shared half, but its local library,
+        // catalog, and journal are empty. Its own signed operations must replay back into it.
+        let digests = source_store
+            .version_refs(&secret_id)
+            .unwrap()
+            .into_iter()
+            .map(|reference| reference.digest)
+            .collect::<BTreeSet<_>>();
+        drop(source);
+        drop(source_store);
+        for path in regular_files_recursively(&source_root.join("local/heads")).unwrap() {
+            fs::remove_file(path).unwrap();
+        }
         let restored_catalog = Arc::new(
             Catalog::open(directory.path().join("restored-catalog.sqlite")).unwrap(),
         );
-        let restored_store = open_store(directory.path(), "restored");
+        let restored_store = open_store_at(source_root, source_keys);
+        let restored_package = package_for_store(&restored_store);
+        let restored_intents =
+            journal(directory.path(), "restored", restored_package.vault_id(), [78; 32]);
         let restored = ReplicationEngine::from_parts(
-            ReplicationPackage::open(
-                directory.path().join("Personal.floriavault"),
-                keys(7, genesis_wrapping_identity),
-            )
-            .unwrap(),
-            Arc::new(
-                ReplicationIntentJournal::open(
-                    directory.path().join("restored-intents.json"),
-                    VAULT_ID,
-                    Arc::new(StateAuthenticator::for_tests([78; 32])),
-                )
-                .unwrap(),
-            ),
+            restored_package,
+            restored_intents,
             Arc::clone(&restored_catalog),
             Arc::clone(&restored_store),
         );
@@ -5651,21 +4681,11 @@ mod tests {
         let target_catalog = Arc::new(
             Catalog::open(directory.path().join("target-catalog.sqlite")).unwrap(),
         );
-        let target_store = open_store(directory.path(), "target");
+        let target_intents =
+            journal(directory.path(), "target", target_package.vault_id(), [77; 32]);
         let target = ReplicationEngine::from_parts(
-            ReplicationPackage::open(
-                directory.path().join("Personal.floriavault"),
-                second_device_keys(8, target_wrapping_identity),
-            )
-            .unwrap(),
-            Arc::new(
-                ReplicationIntentJournal::open(
-                    directory.path().join("target-intents.json"),
-                    VAULT_ID,
-                    Arc::new(StateAuthenticator::for_tests([77; 32])),
-                )
-                .unwrap(),
-            ),
+            target_package,
+            target_intents,
             Arc::clone(&target_catalog),
             Arc::clone(&target_store),
         );
@@ -5682,22 +4702,19 @@ mod tests {
         );
         assert_eq!(target_catalog.replicated_catalog().unwrap(), projection(&secret_id));
 
-        // Zero transcoding end to end: source version file == published Object == imported file.
-        for reference in source_store.version_refs(&secret_id).unwrap() {
-            let source_bytes = version_blob(&source_store, &secret_id, &reference.digest);
+        // One physical copy end to end: writer, restored reader, and importer all read the same
+        // three files, and importing created none of its own.
+        assert_eq!(shared_objects(&restored_store), digests);
+        assert_eq!(shared_objects(&target_store), digests);
+        assert_eq!(
+            target_store.shared_root(),
+            restored_store.shared_root(),
+            "both Devices read the same shared half"
+        );
+        for reference in target_store.version_refs(&secret_id).unwrap() {
             assert_eq!(
-                fs::read(
-                    directory
-                        .path()
-                        .join("Personal.floriavault/objects")
-                        .join(format!("{}.age", reference.digest))
-                )
-                .unwrap(),
-                source_bytes
-            );
-            assert_eq!(
-                version_blob(&target_store, &secret_id, &reference.digest),
-                source_bytes
+                target_store.shared_layout().object(&reference.digest),
+                restored_store.shared_layout().object(&reference.digest)
             );
         }
     }
@@ -5705,25 +4722,10 @@ mod tests {
     #[test]
     fn disjoint_entity_edits_from_two_devices_do_not_conflict() {
         let directory = tempfile::tempdir().unwrap();
-        let root = directory.path().join("Personal.floriavault");
         let genesis_store = open_store(directory.path(), "genesis");
         let second_store = open_store(directory.path(), "second");
-        let mut genesis_package = package_for_store(
-            &root,
-            &genesis_store,
-            keys(7, x25519::Identity::generate()),
-        );
-        let second_wrapping_identity = x25519::Identity::generate();
-        genesis_package
-            .enroll_device(
-                second_device_keys(8, second_wrapping_identity.clone()).enrollment(),
-            )
-            .unwrap();
-        let second_package = ReplicationPackage::open(
-            &root,
-            second_device_keys(8, second_wrapping_identity),
-        )
-        .unwrap();
+        let mut genesis_package = package_for_store(&genesis_store);
+        let second_package = join_vault(&mut genesis_package, &second_store, None);
         let (genesis, genesis_catalog) = engine_for_package(
             directory.path(),
             "genesis",
@@ -5783,5 +4785,70 @@ mod tests {
         );
         assert!(!genesis.stage_current_snapshot("converged").unwrap());
         assert!(!second.stage_current_snapshot("converged").unwrap());
+    }
+
+    #[test]
+    fn deleting_a_secret_publishes_a_tombstone_and_keeps_the_shared_object() {
+        let directory = tempfile::tempdir().unwrap();
+        let genesis_store = open_store(directory.path(), "genesis");
+        let second_store = open_store(directory.path(), "second");
+        let mut genesis_package = package_for_store(&genesis_store);
+        let second_package = join_vault(&mut genesis_package, &second_store, None);
+        let (genesis, genesis_catalog) = engine_for_package(
+            directory.path(),
+            "genesis",
+            genesis_package,
+            [86; 32],
+            Arc::clone(&genesis_store),
+        );
+        let (second, second_catalog) = engine_for_package(
+            directory.path(),
+            "second",
+            second_package,
+            [87; 32],
+            Arc::clone(&second_store),
+        );
+
+        let secret_id: SecretId = "55555555-5555-4555-8555-555555555555".parse().unwrap();
+        genesis_store
+            .put_identified(
+                secret_id.clone(),
+                NewSecret::managed("Deleted fixture"),
+                b"base fixture payload",
+                "66666666-6666-4666-8666-666666666666",
+            )
+            .unwrap();
+        genesis_catalog
+            .apply_replicated_catalog(&project_with_secret_projection(&secret_id, "Base"))
+            .unwrap();
+        assert!(genesis.stage_current_snapshot("base").unwrap());
+        assert_eq!(genesis.sync().unwrap().published, 1);
+        assert_eq!(second.sync().unwrap().imported, 1);
+        assert!(second_store.record(&secret_id).unwrap().is_some());
+        let objects = shared_objects(&genesis_store);
+        assert_eq!(objects.len(), 1);
+
+        // Another Device is enrolled, so deleting drops this Mac's head document and leaves the
+        // immutable object behind; the cross-device meaning is a signed tombstone.
+        genesis_store.delete(&secret_id).unwrap();
+        genesis_catalog
+            .apply_replicated_catalog(&project_projection("Base"))
+            .unwrap();
+        assert!(genesis.stage_current_snapshot("delete").unwrap());
+        assert_eq!(genesis.sync().unwrap().published, 1);
+
+        let imported = second.sync().unwrap();
+
+        assert_eq!(imported.imported, 1);
+        assert_eq!(imported.conflicts, 0);
+        assert!(second_store.record(&secret_id).unwrap().is_none());
+        assert_eq!(shared_objects(&second_store), objects);
+        assert_eq!(
+            second_catalog.replicated_catalog().unwrap(),
+            project_projection("Base")
+        );
+        // A tombstoned entity is not rediscovered as a missing secret on the next pass.
+        assert!(!genesis.stage_current_snapshot("settled").unwrap());
+        assert!(!second.stage_current_snapshot("settled").unwrap());
     }
 }

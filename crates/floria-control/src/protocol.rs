@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 const MAX_MSG: usize = 8 << 20;
-pub const CONTROL_PROTOCOL_VERSION: u32 = 9;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 10;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRequest {
@@ -78,6 +78,9 @@ pub enum ControlCommand {
     ReplicationDisable,
     ReplicationEnrollment,
     ReplicationEnroll { enrollment: ReplicationEnrollment },
+    /// Approve a pending enrollment request that arrived through the sync directory. The GUI
+    /// must have shown the request's key fingerprint for out-of-band comparison first.
+    ReplicationApprove { device_id: String },
     Snapshot,
     Discover { paths: Vec<PathBuf> },
     DiscoverStart { paths: Vec<PathBuf> },
@@ -274,6 +277,22 @@ pub struct ReplicationStatus {
     pub damaged_files: Vec<PathBuf>,
     pub devices: Vec<ReplicationDevice>,
     pub message: Option<String>,
+    /// This Mac's signing-key fingerprint, displayed while waiting for approval so the user can
+    /// compare it on the genesis Mac (number matching).
+    #[serde(default)]
+    pub device_fingerprint: Option<String>,
+    /// Enrollment requests found in the sync directory that await genesis approval.
+    #[serde(default)]
+    pub pending_enrollments: Vec<ReplicationPendingEnrollment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicationPendingEnrollment {
+    pub device_id: String,
+    pub device_name: Option<String>,
+    /// Short signing-key fingerprint the approver must compare with the requesting Mac's screen.
+    pub fingerprint: String,
+    pub requested_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1029,6 +1048,13 @@ mod tests {
                 device_id: Some("fixture-device".to_string()),
                 vault_id: Some("fixture-vault".to_string()),
                 key_generation: Some(2),
+                device_fingerprint: Some("3F09-A2C4-88D1".to_string()),
+                pending_enrollments: vec![ReplicationPendingEnrollment {
+                    device_id: "fixture-joining".to_string(),
+                    device_name: Some("Fixture Laptop".to_string()),
+                    fingerprint: "AB12-CD34-EF56".to_string(),
+                    requested_at: "2026-08-06T00:00:00Z".to_string(),
+                }],
                 published: 3,
                 imported: 4,
                 pending: 1,

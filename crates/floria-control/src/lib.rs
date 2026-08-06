@@ -16,7 +16,7 @@ pub use protocol::{
     DiscoveryJobStatus, HealthCheck, HealthReport, HealthStatus, ProjectCheckoutCandidate,
     ProjectCheckoutDiscovery, ProjectCheckoutInventory, ProtectedFile, ProtectedFileVersion,
     RecoveryKeyReport, ReplicationDevice, ReplicationEnrollment, ReplicationMode,
-    ReplicationStatus, SecretValue,
+    ReplicationPendingEnrollment, ReplicationStatus, SecretValue,
     SshConfigState, SshConfigStatus, SshIdentity,
     CONTROL_PROTOCOL_VERSION,
 };

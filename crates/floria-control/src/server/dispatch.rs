@@ -26,6 +26,7 @@ pub(super) fn dispatch_observed(
             | ControlCommand::ReplicationRequestReenrollment
             | ControlCommand::ReplicationDisable
             | ControlCommand::ReplicationEnroll { .. }
+            | ControlCommand::ReplicationApprove { .. }
     );
     let operation = || {
         let result = dispatch_uncoordinated(catalog, services, command);
@@ -196,6 +197,15 @@ fn dispatch_uncoordinated(
                 )
             })?
             .enroll(enrollment)
+            .map(ControlResult::ReplicationStatus)
+            .map_err(DispatchError::Replication),
+        ControlCommand::ReplicationApprove { device_id } => replication
+            .ok_or_else(|| {
+                DispatchError::Validation(
+                    "replication is unavailable on this control server".to_string(),
+                )
+            })?
+            .approve(&device_id)
             .map(ControlResult::ReplicationStatus)
             .map_err(DispatchError::Replication),
         ControlCommand::PolicyModeGet => policy

@@ -92,8 +92,9 @@ pub fn activate_restored_data(
         &expected.path.join(STORE_DIRECTORY),
         staged.store_path(),
     )?;
-    let active_store_lock = staged.active_store().join(".lock");
-    let staged_store_lock = staged.store_path().join(".lock");
+    // Format 5: the store's cross-process lock lives in the local half.
+    let active_store_lock = staged.active_store().join("local/.lock");
+    let staged_store_lock = staged.store_path().join("local/.lock");
     std::fs::hard_link(&active_store_lock, &staged_store_lock)
         .map_err(|source| BackupError::io(&staged_store_lock, source))?;
     let staged_report = verify_components(staged.catalog_path(), staged.store_path(), store)?;
@@ -781,7 +782,8 @@ mod tests {
             &staged_store,
         )
         .unwrap();
-        std::fs::hard_link(active_store.join(".lock"), staged_store.join(".lock")).unwrap();
+        std::fs::hard_link(active_store.join("local/.lock"), staged_store.join("local/.lock"))
+            .unwrap();
         let journal = ActivationJournal {
             format: ACTIVATION_FORMAT,
             active_catalog: active_catalog.clone(),

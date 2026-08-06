@@ -600,15 +600,16 @@ mod tests {
         .unwrap()
     }
 
-    /// The single digest-named version blob of a backup entry.
-    fn version_blob_in(entry_dir: &Path) -> PathBuf {
-        let vdir = entry_dir.join("v");
-        std::fs::read_dir(&vdir)
+    /// The single digest-named version object of a backed-up store (format 5: objects live in
+    /// the shared half, flat and content-addressed).
+    fn version_blob_in(store_backup: &Path) -> PathBuf {
+        let objects = store_backup.join("shared/objects");
+        std::fs::read_dir(&objects)
             .unwrap()
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path())
             .find(|path| path.extension().is_some_and(|ext| ext == "age"))
-            .expect("backup entry has a version blob")
+            .expect("backup store has a version object")
     }
 
     fn fixture_resource(secret_id: String) -> Resource {
@@ -677,10 +678,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let catalog = Catalog::open(directory.path().join("catalog.sqlite")).unwrap();
         let store = fixture_store(&directory.path().join("store"));
-        let id = store.put(NewSecret::managed("Fixture"), b"fixture-value").unwrap();
+        store.put(NewSecret::managed("Fixture"), b"fixture-value").unwrap();
         let destination = directory.path().join("backup");
         create(&catalog, &store, &destination).unwrap();
-        let blob = version_blob_in(&destination.join(STORE_DIRECTORY).join(id.to_string()));
+        let blob = version_blob_in(&destination.join(STORE_DIRECTORY));
         std::fs::write(&blob, b"tampered-ciphertext").unwrap();
 
         let error = verify(&destination, &store).unwrap_err();
@@ -874,10 +875,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let catalog = Catalog::open(directory.path().join("catalog.sqlite")).unwrap();
         let store = fixture_store(&directory.path().join("store"));
-        let id = store.put(NewSecret::managed("Fixture"), b"fixture-value").unwrap();
+        store.put(NewSecret::managed("Fixture"), b"fixture-value").unwrap();
         let backup = directory.path().join("backup");
         create(&catalog, &store, &backup).unwrap();
-        let blob = version_blob_in(&backup.join(STORE_DIRECTORY).join(id.to_string()));
+        let blob = version_blob_in(&backup.join(STORE_DIRECTORY));
         std::fs::write(blob, b"tampered").unwrap();
         let destination = directory.path().join("restored");
 

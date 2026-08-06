@@ -26,7 +26,7 @@ use floria_core::config::{Config, ResolvedConfig, StoreKeySource};
 use floria_discover::{GitCheckoutMonitor, MonitoredGitProject};
 use floria_platform::{CodeSignedPeerVerifier, PeerAccess, SocketPeerVerifier};
 use floria_replication::{
-    DeviceEnrollment, DeviceKeyStore, ReplicationEngine, ReplicationError, ReplicationReport,
+    DeviceEnrollment, ReplicationEngine, ReplicationError, ReplicationReport,
     ReplicationRuntime,
 };
 use floria_store::{
@@ -992,7 +992,6 @@ fn cmd_mount(config: &Path) -> Result<()> {
     let replication = Arc::new(
         DaemonReplicationService::start(
             support_dir.join("replication"),
-            Arc::clone(&key_provider),
             Arc::clone(&state_authenticator),
             Arc::new(catalog.clone()),
             Arc::clone(&concrete_store),
@@ -1403,7 +1402,6 @@ struct ReplicationRuntimeState {
 struct DaemonReplicationService {
     local_directory: PathBuf,
     settings_path: PathBuf,
-    keys: Arc<dyn floria_store::KeyProvider>,
     authenticator: Arc<floria_integrity::StateAuthenticator>,
     catalog: Arc<Catalog>,
     store: Arc<AgeDirStore>,
@@ -1414,7 +1412,6 @@ struct DaemonReplicationService {
 impl DaemonReplicationService {
     fn start(
         local_directory: PathBuf,
-        keys: Arc<dyn floria_store::KeyProvider>,
         authenticator: Arc<floria_integrity::StateAuthenticator>,
         catalog: Arc<Catalog>,
         store: Arc<AgeDirStore>,
@@ -1459,7 +1456,6 @@ impl DaemonReplicationService {
         let service = Self {
             local_directory,
             settings_path,
-            keys,
             authenticator,
             catalog,
             store,
@@ -1477,19 +1473,6 @@ impl DaemonReplicationService {
         };
         service.restore_configured_engine();
         Ok(service)
-    }
-
-    fn device_key_store(&self) -> DeviceKeyStore {
-        DeviceKeyStore::new(
-            self.local_directory.join("device.age"),
-            Arc::clone(&self.keys),
-        )
-    }
-
-    fn device_keys(
-        &self,
-    ) -> floria_replication::ReplicationResult<floria_replication::DeviceKeyMaterial> {
-        self.device_key_store().load_or_create()
     }
 
     fn replication_runtime(&self) -> ReplicationRuntime {
@@ -1510,8 +1493,8 @@ impl DaemonReplicationService {
             .settings
             .directory
             .clone();
-        let Some(directory) = directory else { return };
-        let result = self.open_engine(&directory);
+        let Some(_directory) = directory else { return };
+        let result = self.open_engine();
         let mut state = self.state.lock().expect("replication runtime state poisoned");
         match result {
             Ok(engine) => {
@@ -1543,15 +1526,10 @@ impl DaemonReplicationService {
         }
     }
 
-    fn open_engine(
-        &self,
-        directory: &Path,
-    ) -> floria_replication::ReplicationResult<ReplicationEngine> {
-        ReplicationEngine::open(
-            directory,
-            self.device_keys()?,
-            self.replication_runtime(),
-        )
+    /// The store already is the vault; the engine only needs the runtime. The configured sync
+    /// directory is the store's shared-location pointer, resolved at store open.
+    fn open_engine(&self) -> floria_replication::ReplicationResult<ReplicationEngine> {
+        ReplicationEngine::for_runtime(self.replication_runtime())
     }
 
     fn persist_directory(
@@ -1597,12 +1575,26 @@ impl DaemonReplicationService {
         Ok(report)
     }
 
-    fn status_from(state: &ReplicationRuntimeState) -> ReplicationStatus {
+    fn status_from(&self, state: &ReplicationRuntimeState) -> ReplicationStatus {
         ReplicationStatus {
             mode: state.mode,
             directory: state.settings.directory.clone(),
             device_id: state.device_id.clone(),
             vault_id: state.vault_id.clone(),
+            device_fingerprint: Some(floria_store::vault::signing_key_fingerprint(
+                &self.store.device().enrollment().signing_public_key,
+            )),
+            pending_enrollments: state
+                .last_report
+                .pending_enrollments
+                .iter()
+                .map(|pending| floria_control::ReplicationPendingEnrollment {
+                    device_id: pending.device_id.clone(),
+                    device_name: pending.device_name.clone(),
+                    fingerprint: pending.fingerprint.clone(),
+                    requested_at: pending.requested_at.clone(),
+                })
+                .collect(),
             key_generation: state.engine.as_ref().map(ReplicationEngine::current_generation),
             published: state.last_report.published,
             imported: state.last_report.imported,
@@ -1633,6 +1625,7 @@ impl DaemonReplicationService {
     }
 
     fn update_after_sync(
+        &self,
         state: &mut ReplicationRuntimeState,
         report: ReplicationReport,
     ) -> ReplicationStatus {
@@ -1643,39 +1636,45 @@ impl DaemonReplicationService {
         };
         state.message = report.messages.first().cloned();
         state.last_report = report;
-        Self::status_from(state)
+        self.status_from(state)
     }
 }
 
 impl RuntimeReplicationService for DaemonReplicationService {
     fn status(&self) -> ReplicationStatus {
-        Self::status_from(
+        self.status_from(
             &self.state.lock().expect("replication runtime state poisoned"),
         )
     }
 
     fn create(&self, directory: &Path) -> Result<ReplicationStatus, String> {
-        let device = self.device_keys().map_err(|error| error.to_string())?;
-        let engine = ReplicationEngine::create_named(
-            directory,
-            uuid::Uuid::new_v4().to_string(),
-            replication_timestamp(),
-            device,
-            local_device_name(),
-            self.replication_runtime(),
-        )
-        .map_err(|error| error.to_string())?;
+        // Enabling sync moves the authoritative shared half into the chosen synced location;
+        // this Mac was the (single-device) vault's genesis all along.
+        ReplicationEngine::enable_sync_at(&self.store, directory)
+            .map_err(|error| error.to_string())?;
+        let engine = self.open_engine().map_err(|error| error.to_string())?;
         let report = Self::run_sync(&engine).map_err(|error| error.to_string())?;
         let mut state = self.state.lock().expect("replication runtime state poisoned");
         self.persist_directory(&mut state, Some(directory.to_path_buf()))?;
         state.device_id = Some(engine.device_id().to_string());
         state.vault_id = Some(engine.vault_id().to_string());
         state.engine = Some(engine);
-        Ok(Self::update_after_sync(&mut state, report))
+        Ok(self.update_after_sync(&mut state, report))
     }
 
     fn open(&self, directory: &Path) -> Result<ReplicationStatus, String> {
-        match self.open_engine(directory) {
+        // First-time join: adopt the vault and drop the self-signed request into this device's
+        // namespace. Re-opening the already-adopted folder (e.g. after a restart) skips both.
+        if self.store.shared_root() != directory {
+            ReplicationEngine::join_vault_at(
+                &self.store,
+                directory,
+                local_device_name(),
+                &replication_timestamp(),
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        match self.open_engine() {
             Ok(engine) => {
                 let report = Self::run_sync(&engine).map_err(|error| error.to_string())?;
                 let mut state = self.state.lock().expect("replication runtime state poisoned");
@@ -1683,7 +1682,7 @@ impl RuntimeReplicationService for DaemonReplicationService {
                 state.device_id = Some(engine.device_id().to_string());
                 state.vault_id = Some(engine.vault_id().to_string());
                 state.engine = Some(engine);
-                Ok(Self::update_after_sync(&mut state, report))
+                Ok(self.update_after_sync(&mut state, report))
             }
             Err(ReplicationError::EnrollmentRequired { device_id }) => {
                 let mut state = self.state.lock().expect("replication runtime state poisoned");
@@ -1696,7 +1695,7 @@ impl RuntimeReplicationService for DaemonReplicationService {
                     "This Mac is waiting for the Mac that created this sync folder to approve it"
                         .to_string(),
                 );
-                Ok(Self::status_from(&state))
+                Ok(self.status_from(&state))
             }
             Err(ReplicationError::DeviceRevoked { device_id, .. }) => {
                 let mut state = self.state.lock().expect("replication runtime state poisoned");
@@ -1706,7 +1705,7 @@ impl RuntimeReplicationService for DaemonReplicationService {
                 state.vault_id = None;
                 state.mode = ReplicationMode::Removed;
                 state.message = Some("This Mac was removed from this sync folder".to_string());
-                Ok(Self::status_from(&state))
+                Ok(self.status_from(&state))
             }
             Err(error) => Err(error.to_string()),
         }
@@ -1741,7 +1740,7 @@ impl RuntimeReplicationService for DaemonReplicationService {
                 state.vault_id = None;
                 state.mode = ReplicationMode::Removed;
                 state.message = Some("This Mac was removed from this sync folder".to_string());
-                return Ok(Self::status_from(&state));
+                return Ok(self.status_from(&state));
             }
             Err(error) => {
                 state.mode = ReplicationMode::Error;
@@ -1749,7 +1748,7 @@ impl RuntimeReplicationService for DaemonReplicationService {
                 return Err(error.to_string());
             }
         };
-        Ok(Self::update_after_sync(&mut state, report))
+        Ok(self.update_after_sync(&mut state, report))
     }
 
     fn resolve_with_current(&self) -> Result<ReplicationStatus, String> {
@@ -1773,7 +1772,7 @@ impl RuntimeReplicationService for DaemonReplicationService {
                 return Err(error);
             }
         };
-        Ok(Self::update_after_sync(&mut state, report))
+        Ok(self.update_after_sync(&mut state, report))
     }
 
     fn revoke_device(&self, device_id: &str) -> Result<ReplicationStatus, String> {
@@ -1784,7 +1783,7 @@ impl RuntimeReplicationService for DaemonReplicationService {
             .ok_or_else(|| "replication is not active on this Mac".to_string())?
             .revoke_device(device_id)
             .map_err(|error| error.to_string())?;
-        Ok(Self::update_after_sync(&mut state, report))
+        Ok(self.update_after_sync(&mut state, report))
     }
 
     fn request_reenrollment(&self) -> Result<ReplicationStatus, String> {
@@ -1792,14 +1791,19 @@ impl RuntimeReplicationService for DaemonReplicationService {
         if state.mode != ReplicationMode::Removed || state.engine.is_some() {
             return Err("this Mac does not have a revoked sync identity".to_string());
         }
-        let replacement = self.device_key_store().rotate().map_err(|error| error.to_string())?;
-        state.device_id = Some(replacement.device_id().to_string());
+        floria_replication::request_reenrollment(
+            &self.store,
+            local_device_name(),
+            &replication_timestamp(),
+        )
+        .map_err(|error| error.to_string())?;
+        state.device_id = Some(self.store.device().device_id().to_string());
         state.mode = ReplicationMode::WaitingForEnrollment;
         state.message = Some(
             "This Mac has a new identity and is waiting for the Mac that created this sync folder to approve it"
                 .to_string(),
         );
-        Ok(Self::status_from(&state))
+        Ok(self.status_from(&state))
     }
 
     fn disable(&self) -> Result<ReplicationStatus, String> {
@@ -1810,15 +1814,23 @@ impl RuntimeReplicationService for DaemonReplicationService {
         state.vault_id = None;
         state.last_report = ReplicationReport::default();
         state.message = None;
-        Ok(Self::status_from(&state))
+        Ok(self.status_from(&state))
     }
 
     fn enrollment(&self) -> Result<ControlReplicationEnrollment, String> {
-        let enrollment = self
-            .device_keys()
-            .map_err(|error| error.to_string())?
-            .enrollment_named(local_device_name());
+        let enrollment = self.store.device().enrollment_named(local_device_name());
         Ok(control_replication_enrollment(enrollment))
+    }
+
+    fn approve(&self, device_id: &str) -> Result<ReplicationStatus, String> {
+        let mut state = self.state.lock().expect("replication runtime state poisoned");
+        let engine = state
+            .engine
+            .as_mut()
+            .ok_or_else(|| "replication is not active on this Mac".to_string())?;
+        engine.enroll_requested(device_id).map_err(|error| error.to_string())?;
+        let report = Self::run_sync(engine).map_err(|error| error.to_string())?;
+        Ok(self.update_after_sync(&mut state, report))
     }
 
     fn enroll(
@@ -1838,7 +1850,7 @@ impl RuntimeReplicationService for DaemonReplicationService {
                 device_name: enrollment.device_name,
             })
             .map_err(|error| error.to_string())?;
-        Ok(Self::status_from(&state))
+        Ok(self.status_from(&state))
     }
 }
 
@@ -3003,7 +3015,6 @@ mod tests {
         let catalog = Arc::new(Catalog::open(directory.path().join("catalog.sqlite")).unwrap());
         let service = DaemonReplicationService::start(
             directory.path().join("local-replication"),
-            keys,
             Arc::new(floria_integrity::StateAuthenticator::for_tests([91; 32])),
             catalog,
             store,
@@ -3059,7 +3070,6 @@ mod tests {
             Arc::new(Catalog::open(genesis_root.join("catalog.sqlite")).unwrap());
         let genesis = DaemonReplicationService::start(
             genesis_root.join("replication"),
-            genesis_keys,
             Arc::new(floria_integrity::StateAuthenticator::for_tests([92; 32])),
             genesis_catalog,
             genesis_store,
@@ -3075,7 +3085,6 @@ mod tests {
             Arc::new(Catalog::open(joining_root.join("catalog.sqlite")).unwrap());
         let joining = DaemonReplicationService::start(
             joining_root.join("replication"),
-            joining_keys,
             Arc::new(floria_integrity::StateAuthenticator::for_tests([93; 32])),
             Arc::clone(&joining_catalog),
             Arc::clone(&joining_store),
@@ -3117,7 +3126,7 @@ mod tests {
         assert_eq!(rejoined.mode, ReplicationMode::Active);
         assert_eq!(joining_catalog.snapshot().unwrap(), catalog_before);
         assert_eq!(joining_store.get(&local_secret).unwrap().as_slice(), b"still here");
-        assert!(joining_store.generation_public(2).unwrap().is_some());
+        assert!(joining_store.generation_identity(2).is_ok());
     }
 
     #[test]

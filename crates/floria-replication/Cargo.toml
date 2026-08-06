@@ -13,12 +13,10 @@ floria-core = { workspace = true }
 floria-integrity = { workspace = true }
 floria-store = { workspace = true }
 floria-surface = { workspace = true }
-getrandom = { workspace = true }
 libc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
-signature = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 zeroize = { workspace = true }

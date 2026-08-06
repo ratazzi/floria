@@ -1,45 +1,51 @@
 //! `SecretStore`: keep a secret blob confidential at rest, addressed by a stable id.
 //!
-//! [`AgeDirStore`] is the portable, sync/backup-friendly implementation: each secret version is
-//! an immutable age-encrypted blob under `<root>/<id>/v/<ciphertext-sha256>.age` with plaintext
-//! toml sidecars. The id (a v4 UUID) is the identity; the original path is mutable metadata, not
-//! the key, so renaming/moving the source never desyncs the store. Plaintext exists only as
-//! [`Zeroizing`] in memory and never touches disk here.
+//! Format 5 — the store IS the vault ("一份字节"): the data root splits into a **shared half**
+//! (`shared/` — content-addressed immutable version objects, signed vault/device/generation
+//! documents; the exact directory a sync tool moves) and a **local half** (`local/` — mutable
+//! head documents, the lock, the integrity sidecar; never synced). There is no export, no
+//! import copy, and no second key location: the software never synchronizes with itself.
 //!
-//! Format 4 (see `docs/design/storage.md`): version files are named by their ciphertext digest
-//! (self-verifying, sync-conflict-free) and encrypted to a per-generation data key plus the
-//! recovery recipient — never to the device key directly. Device keys only unwrap the small
-//! envelopes under `<root>/keys/` ([`crate::generation`]), so version bytes are independent of
-//! the device set and can be replicated verbatim.
+//! A machine that never enables sync is simply a single-device vault; the shared half then
+//! lives at `<root>/shared`. Enabling sync relocates the shared half to a user-chosen synced
+//! location (recorded in the `shared-location` pointer) — a move, not a copy.
+//!
+//! Plaintext exists only as [`Zeroizing`] in memory and never touches disk here.
 
-use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
-use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
+
+use age::secrecy::ExposeSecret;
+use age::x25519;
 
 use floria_core::authz::Enforcement;
 use floria_core::metadata::ItemMetadata;
 use floria_integrity::StateAuthenticator;
 
+use crate::device::{DeviceKeyMaterial, DeviceKeyStore};
 use crate::error::{StoreError, StoreResult};
-use crate::generation::GenerationKeys;
+use crate::generations::GenerationAccess;
 use crate::keys::KeyProvider;
+use crate::vault::{
+    self, ensure_private_directory, publish_immutable, read_untrusted_file, write_key_generation,
+    write_new_atomic, SharedLayout, VaultDocument,
+};
 
-/// Current on-disk layout. Format 4 names version files by ciphertext digest, encrypts them to
-/// the generation data key (+ recovery recipient), and binds every payload to its secret id and
-/// a transport-stable version UUID. Older formats are rejected with a migrate-or-delete error;
-/// migration is a manual, one-time step during development.
-pub const STORE_FORMAT_VERSION: u32 = 4;
-pub const MIN_SUPPORTED_STORE_FORMAT_VERSION: u32 = 4;
+/// Current on-disk layout. Format 5 stores version objects directly in the shared half and
+/// keeps only mutable head documents locally. Older formats are rejected with a
+/// migrate-or-delete error; migration is a manual, one-time step during development.
+pub const STORE_FORMAT_VERSION: u32 = 5;
+pub const MIN_SUPPORTED_STORE_FORMAT_VERSION: u32 = 5;
 
-const PAYLOAD_MAGIC: &[u8; 8] = b"FLORIA\0\x04";
+const PAYLOAD_MAGIC: &[u8; 8] = b"FLORIA\0\x05";
 const INTEGRITY_DOMAIN: &str = "encrypted-store-security-state";
+const SHARED_LOCATION_FILE: &str = "shared-location";
 
 /// Stable secret identifier (a v4 UUID string). Immutable for the life of an entry.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -124,9 +130,6 @@ pub struct SecretRecord {
     /// Default authorization behavior when no explicit process rule matches this secret.
     pub enforcement: Enforcement,
     /// Project Environments where this file-backed item is exposed to managed worktrees.
-    ///
-    /// `None` preserves legacy behavior: expose the file in every Environment of its owning
-    /// Project. Managed value secrets do not use this field.
     pub environment_ids: Option<Vec<String>>,
     /// Plaintext, non-secret context for display and navigation.
     pub metadata: ItemMetadata,
@@ -156,7 +159,6 @@ pub struct VersionRecord {
     pub created: String,
     pub note: Option<String>,
     /// Stable identity of the cross-backend mutation that created this version.
-    /// Ordinary local and legacy versions do not have one.
     pub mutation_id: Option<String>,
 }
 
@@ -166,23 +168,11 @@ pub struct StoreVersionRef {
     pub ordinal: u32,
     pub version_uuid: String,
     pub generation: u32,
-    /// Plaintext size as declared by the version sidecar.
+    /// Plaintext size as declared by the head document.
     pub size: u64,
-    /// On-disk ciphertext size of the blob file.
+    /// On-disk ciphertext size of the object.
     pub ciphertext_size: u64,
     pub digest: String,
-}
-
-/// One immutable version exported verbatim for replication (`ciphertext` = the on-disk file).
-#[derive(Clone)]
-pub struct VersionExport {
-    pub ordinal: u32,
-    pub version_uuid: String,
-    pub generation: u32,
-    pub size: u64,
-    /// Lowercase hex sha256 of `ciphertext` — the blob's filename and its replication Object ID.
-    pub digest: String,
-    pub ciphertext: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,14 +217,16 @@ pub trait SecretStore: Send + Sync {
         enforcement: Enforcement,
         environment_ids: Option<Vec<String>>,
     ) -> StoreResult<()>;
-    /// Delete a secret and all its versions.
+    /// Delete a secret. On a solo vault this destroys the objects too; once other devices are
+    /// enrolled it only removes the local head document (shared objects stay immutable).
     fn delete(&self, id: &SecretId) -> StoreResult<()>;
 }
 
-/// On-disk `<id>/meta.toml`: entry-level metadata plus the head pointer.
+/// On-disk `local/heads/<id>.toml`: entry metadata, the ordered version table, and the head
+/// pointer. The single mutable document per secret; everything it references is immutable.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct MetaFile {
-    /// See [`STORE_FORMAT_VERSION`]. `default` so a pre-format entry reads as 0 and fails the check.
+struct HeadsDocument {
+    /// See [`STORE_FORMAT_VERSION`]. `default` so a pre-format entry reads as 0 and fails.
     #[serde(default)]
     format: u32,
     id: String,
@@ -251,36 +243,25 @@ struct MetaFile {
     environment_ids: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "ItemMetadata::is_empty")]
     metadata: ItemMetadata,
+    versions: Vec<HeadsVersion>,
 }
 
-fn default_secret_enforcement() -> Enforcement {
-    Enforcement::Prompt
-}
-
-/// On-disk `<id>/v/<digest>.toml`: immutable per-version metadata. The blob filename (the
-/// ciphertext sha256) is the content identity; `version` is the machine-local ordinal exposed
-/// through the public API, and `version_uuid` is the transport-stable identity bound into the
-/// encrypted payload (a local ordinal cannot travel between machines).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct VersionMetaFile {
+struct HeadsVersion {
     version: u32,
     version_uuid: String,
-    /// Key generation the blob is encrypted under.
     generation: u32,
     size: u64,
+    digest: String,
     created: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     mutation_id: Option<String>,
 }
 
-/// Portable age-encrypted directory store.
-pub struct AgeDirStore {
-    root: PathBuf,
-    keys: Arc<dyn KeyProvider>,
-    generations: GenerationKeys,
-    integrity: Option<StoreIntegrity>,
+fn default_secret_enforcement() -> Enforcement {
+    Enforcement::Prompt
 }
 
 #[derive(Clone)]
@@ -292,62 +273,107 @@ struct StoreIntegrity {
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoreSecuritySnapshot {
-    entries: Vec<StoreSecurityEntry>,
-    /// `keys/` listing (name, sha256). Swapping a generation public key would silently redirect
-    /// future encryption, so key material files are part of the authenticated state.
-    #[serde(default)]
-    keys: Vec<(String, String)>,
+    entries: Vec<HeadsDocument>,
 }
 
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct StoreSecurityEntry {
-    meta: MetaFile,
-    versions: Vec<StoreSecurityVersion>,
-}
-
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct StoreSecurityVersion {
-    meta: VersionMetaFile,
-    ciphertext_sha256: String,
+/// The mutable shared-half binding: swapped atomically when sync is enabled (relocate) or an
+/// existing vault is adopted.
+struct SharedState {
+    layout: SharedLayout,
+    vault: VaultDocument,
 }
 
 /// Holds the store's cross-process mutation lock for a maintenance operation.
-///
-/// The guard intentionally exposes no mutation methods. While it is alive, normal store writes
-/// block, allowing a caller to verify and atomically replace the store directory as one
-/// maintenance transaction.
 pub struct StoreMaintenanceGuard {
     _lock: std::fs::File,
-    root: PathBuf,
+    shared_root: PathBuf,
+    local_root: PathBuf,
+    device_key_path: PathBuf,
 }
 
 impl StoreMaintenanceGuard {
-    /// Copy the locked store without trying to acquire the same lock again.
+    /// Copy the locked store (both halves + the device key file) without re-locking.
     pub fn backup_to(&self, destination: &Path) -> StoreResult<()> {
-        copy_store_directory(&self.root, destination)
+        if destination.exists() {
+            return Err(StoreError::Invalid(format!(
+                "backup store destination already exists: {}",
+                destination.display()
+            )));
+        }
+        std::fs::DirBuilder::new()
+            .recursive(false)
+            .mode(0o700)
+            .create(destination)
+            .map_err(|source| StoreError::io(destination, source))?;
+        copy_directory(&self.shared_root, &destination.join("shared"))?;
+        copy_directory(&self.local_root, &destination.join("local"))?;
+        if self.device_key_path.is_file() {
+            let bytes = std::fs::read(&self.device_key_path)
+                .map_err(|source| StoreError::io(&self.device_key_path, source))?;
+            let target = destination.join("device.age");
+            std::fs::write(&target, bytes).map_err(|source| StoreError::io(&target, source))?;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))
+                .map_err(|source| StoreError::io(&target, source))?;
+        }
+        Ok(())
     }
 }
 
+/// Portable age-encrypted store over a shared/local split data root.
+pub struct AgeDirStore {
+    root: PathBuf,
+    keys: Arc<dyn KeyProvider>,
+    device: RwLock<Arc<DeviceKeyMaterial>>,
+    state: RwLock<SharedState>,
+    generations: GenerationAccess,
+    integrity: Option<StoreIntegrity>,
+}
+
 impl AgeDirStore {
-    /// Open (creating the root directory, mode 0700, if needed).
-    ///
-    /// A store without generation keys gets generation 1 and the recovery recipient created on
-    /// first open — a solo machine is the degenerate single-device vault.
+    /// Open the data root (creating it, mode 0700, if needed). A root without a vault becomes
+    /// a single-device vault: device identity, genesis vault.json, and generation 1 are created
+    /// on first open.
     pub fn open(root: PathBuf, keys: Arc<dyn KeyProvider>) -> StoreResult<Self> {
-        if !root.exists() {
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&root)
-                .map_err(|e| StoreError::io(&root, e))?;
-        }
-        let generations = GenerationKeys::open(&root);
-        let store = AgeDirStore { root, keys, generations, integrity: None };
-        {
-            let _lock = store.lock_exclusive()?;
-            store.generations.initialize_if_missing(&*store.keys)?;
-        }
-        Ok(store)
+        ensure_private_directory(&root)?;
+        let local = root.join("local");
+        ensure_private_directory(&local.join("heads"))?;
+        let device = Arc::new(
+            DeviceKeyStore::new(root.join("device.age"), Arc::clone(&keys)).load_or_create()?,
+        );
+
+        let (layout, pointer_present) = match read_shared_location(&root)? {
+            Some(target) => (SharedLayout::new(target), true),
+            None => (SharedLayout::new(root.join("shared")), false),
+        };
+        let vault = match vault::read_vault(&layout) {
+            Ok(vault) => vault,
+            Err(StoreError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound && !pointer_present =>
+            {
+                genesis_initialize(&layout, &device, &local.join("recovery.age"))?
+            }
+            Err(StoreError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                return Err(StoreError::Invalid(format!(
+                    "shared-location points at {} but there is no vault there",
+                    layout.root().display()
+                )));
+            }
+            Err(error) => return Err(error),
+        };
+        ensure_private_directory(&layout.envelopes_dir(device.device_id()))?;
+        ensure_private_directory(&layout.device_operations_dir(device.device_id()))?;
+        ensure_private_directory(&layout.device_checkpoints_dir(device.device_id()))?;
+
+        Ok(AgeDirStore {
+            root,
+            keys,
+            device: RwLock::new(device),
+            state: RwLock::new(SharedState { layout, vault }),
+            generations: GenerationAccess::new(),
+            integrity: None,
+        })
     }
 
     pub fn open_authenticated(
@@ -359,7 +385,7 @@ impl AgeDirStore {
     }
 
     pub fn authenticate(mut self, authenticator: Arc<StateAuthenticator>) -> StoreResult<Self> {
-        let sidecar = self.root.join(".integrity.json");
+        let sidecar = self.root.join("local/.integrity.json");
         let loaded = authenticator.load::<StoreSecuritySnapshot>(&sidecar, INTEGRITY_DOMAIN)?;
         let current = self.security_snapshot()?;
         let generation = match loaded.value {
@@ -407,29 +433,18 @@ impl AgeDirStore {
 
     /// Adopt the currently mounted root after an explicit, verified restore activation.
     ///
-    /// Normal startup never calls this: it compares the live store with the existing checkpoint
-    /// and rejects rollback. The restore transaction calls it only after decrypting every staged
-    /// version and atomically switching both catalog and store paths.
+    /// The restored directory has no integrity sidecar yet, so verification runs on an
+    /// unauthenticated twin before the fresh snapshot is persisted.
     pub fn authenticate_restored_state(
         &self,
         authenticator: Arc<StateAuthenticator>,
     ) -> StoreResult<()> {
-        let restored = AgeDirStore {
-            root: self.root.clone(),
-            keys: Arc::clone(&self.keys),
-            generations: GenerationKeys::open(&self.root),
-            integrity: None,
-        };
+        let restored = AgeDirStore::open(self.root.clone(), Arc::clone(&self.keys))?;
         restored.verify_all()?;
         let snapshot = restored.security_snapshot()?;
-        let sidecar = self.root.join(".integrity.json");
+        let sidecar = self.root.join("local/.integrity.json");
         let generation = authenticator.checkpoint_generation(INTEGRITY_DOMAIN)?;
-        let next = authenticator.persist(
-            &sidecar,
-            INTEGRITY_DOMAIN,
-            generation,
-            &snapshot,
-        )?;
+        let next = authenticator.persist(&sidecar, INTEGRITY_DOMAIN, generation, &snapshot)?;
         if let Some(integrity) = &self.integrity {
             *integrity
                 .generation
@@ -439,78 +454,141 @@ impl AgeDirStore {
         Ok(())
     }
 
-    fn security_snapshot(&self) -> StoreResult<StoreSecuritySnapshot> {
-        let mut ids = std::fs::read_dir(&self.root)
-            .map_err(|error| StoreError::io(&self.root, error))?
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.path().is_dir())
-            .filter_map(|entry| entry.file_name().to_string_lossy().parse::<SecretId>().ok())
-            .collect::<Vec<_>>();
-        ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
-        let mut entries = Vec::with_capacity(ids.len());
-        for id in ids {
-            let meta = self.read_meta(&id)?;
-            let mut files = self.version_files(&id)?;
-            files.sort_by_key(|(_, vmeta)| vmeta.version);
-            let mut versions = Vec::new();
-            for (digest, vmeta) in files {
-                let ciphertext = self.read_ciphertext_by_digest(&id, &digest)?;
-                versions.push(StoreSecurityVersion {
-                    meta: vmeta,
-                    ciphertext_sha256: base64::engine::general_purpose::URL_SAFE_NO_PAD
-                        .encode(Sha256::digest(ciphertext)),
-                });
-            }
-            entries.push(StoreSecurityEntry { meta, versions });
-        }
-        Ok(StoreSecuritySnapshot { entries, keys: self.generations.snapshot_entries()? })
-    }
-
-    fn verify_security_state(&self) -> StoreResult<()> {
-        let Some(integrity) = &self.integrity else { return Ok(()) };
-        let loaded = integrity
-            .authenticator
-            .load::<StoreSecuritySnapshot>(&integrity.sidecar, INTEGRITY_DOMAIN)?;
-        let authenticated = loaded.value.ok_or_else(|| StoreError::Corrupt {
-            id: "store".to_string(),
-            reason: "authenticated store snapshot is missing".to_string(),
-        })?;
-        if authenticated != self.security_snapshot()? {
-            return Err(StoreError::Corrupt {
-                id: "store".to_string(),
-                reason: "store contents changed outside the authenticated daemon transaction boundary"
-                    .to_string(),
-            });
-        }
-        *integrity
-            .generation
-            .lock()
-            .expect("store integrity generation poisoned") = loaded.generation;
-        Ok(())
-    }
-
-    fn seal_security_state(&self) -> StoreResult<()> {
-        let Some(integrity) = &self.integrity else { return Ok(()) };
-        let snapshot = self.security_snapshot()?;
-        let mut generation = integrity
-            .generation
-            .lock()
-            .expect("store integrity generation poisoned");
-        *generation = integrity.authenticator.persist(
-            &integrity.sidecar,
-            INTEGRITY_DOMAIN,
-            *generation,
-            &snapshot,
-        )?;
-        Ok(())
-    }
-
     pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// Create version 1 at a caller-selected stable Secret id and bind it to a durable mutation.
-    /// Retrying the same mutation is idempotent; reusing the id for different bytes is rejected.
+    /// The shared half's current location (the directory a sync tool moves).
+    pub fn shared_root(&self) -> PathBuf {
+        self.state.read().expect("shared state poisoned").layout.root().to_path_buf()
+    }
+
+    pub fn shared_layout(&self) -> SharedLayout {
+        self.state.read().expect("shared state poisoned").layout.clone()
+    }
+
+    pub fn vault_document(&self) -> VaultDocument {
+        self.state.read().expect("shared state poisoned").vault.clone()
+    }
+
+    pub fn device(&self) -> Arc<DeviceKeyMaterial> {
+        Arc::clone(&self.device.read().expect("device identity poisoned"))
+    }
+
+    pub fn device_key_provider(&self) -> Arc<dyn KeyProvider> {
+        Arc::clone(&self.keys)
+    }
+
+    /// Encryption recipients for new payloads (current generation + recovery), straight from
+    /// the signed generation document — no private key involved.
+    pub fn generation_recipients(&self) -> StoreResult<Vec<Box<dyn age::Recipient + Send>>> {
+        let state = self.state.read().expect("shared state poisoned");
+        self.generations.recipients(&state.layout, &state.vault)
+    }
+
+    /// Replace a revoked device identity with a fresh keypair and id. Callers must only expose
+    /// this after a signed Vault generation identifies the current identity as revoked.
+    ///
+    /// The local library must stay readable while the new identity waits for approval, so every
+    /// generation the OLD identity could unwrap is re-wrapped to the new one first. This grants
+    /// no new capability — the machine already held these plaintexts, and a removed device's
+    /// historical access is explicitly non-revocable (see portable-replication.md).
+    pub fn rotate_device_identity(&self) -> StoreResult<Arc<DeviceKeyMaterial>> {
+        let _lock = self.lock_exclusive()?;
+        let state = self.state.read().expect("shared state poisoned");
+        let old_device = self.device();
+        let current = self.generations.current(&state.layout, &state.vault)?;
+        let mut reachable = Vec::new();
+        for generation in 1..=current {
+            if let Ok(identity) =
+                self.generations
+                    .identity(&state.layout, &state.vault, &old_device, generation)
+            {
+                reachable.push((generation, identity));
+            }
+        }
+        let rotated = Arc::new(
+            DeviceKeyStore::new(self.root.join("device.age"), Arc::clone(&self.keys)).rotate()?,
+        );
+        ensure_private_directory(&state.layout.envelopes_dir(rotated.device_id()))?;
+        ensure_private_directory(&state.layout.device_operations_dir(rotated.device_id()))?;
+        ensure_private_directory(&state.layout.device_checkpoints_dir(rotated.device_id()))?;
+        for (generation, identity) in reachable {
+            let envelope = vault::encrypt_to_recipient(
+                &rotated.wrapping_identity().to_public(),
+                identity.to_string().expose_secret().as_bytes(),
+            )?;
+            write_new_atomic(
+                &state.layout.envelope(rotated.device_id(), generation),
+                &envelope,
+            )?;
+        }
+        drop(state);
+        *self.device.write().expect("device identity poisoned") = Arc::clone(&rotated);
+        // The old identity's cached unwraps are stale for cache-keying purposes.
+        self.generations.clear_identity_cache();
+        Ok(rotated)
+    }
+
+    /// Move the shared half to a user-chosen (synced) location and record the pointer.
+    /// This is enabling sync: a move of the authoritative bytes, never a copy.
+    pub fn relocate_shared(&self, target: &Path) -> StoreResult<()> {
+        let _lock = self.lock_exclusive()?;
+        self.verify_security_state()?;
+        if target.exists() {
+            return Err(StoreError::Invalid(format!(
+                "sync location already exists: {}",
+                target.display()
+            )));
+        }
+        let mut state = self.state.write().expect("shared state poisoned");
+        let source = state.layout.root().to_path_buf();
+        if let Some(parent) = target.parent() {
+            ensure_private_directory(parent)?;
+        }
+        std::fs::rename(&source, target).map_err(|source_error| {
+            StoreError::io(&source, source_error)
+        })?;
+        write_new_atomic(
+            &self.root.join(SHARED_LOCATION_FILE),
+            target.to_string_lossy().as_bytes(),
+        )?;
+        state.layout = SharedLayout::new(target);
+        Ok(())
+    }
+
+    /// Point this store at an existing vault (joining as a new device). Legal only while this
+    /// store's own vault is unused (no secrets): the local genesis is discarded.
+    pub fn adopt_shared_location(&self, target: &Path) -> StoreResult<()> {
+        let _lock = self.lock_exclusive()?;
+        self.verify_security_state()?;
+        if !self.heads_ids()?.is_empty() {
+            return Err(StoreError::Invalid(
+                "cannot join another vault: this store already holds secrets".to_string(),
+            ));
+        }
+        let layout = SharedLayout::new(target);
+        let vault = vault::read_vault(&layout)?;
+        let mut state = self.state.write().expect("shared state poisoned");
+        let old_default = self.root.join("shared");
+        write_new_atomic(
+            &self.root.join(SHARED_LOCATION_FILE),
+            target.to_string_lossy().as_bytes(),
+        )?;
+        let device = self.device();
+        ensure_private_directory(&layout.envelopes_dir(device.device_id()))?;
+        ensure_private_directory(&layout.device_operations_dir(device.device_id()))?;
+        ensure_private_directory(&layout.device_checkpoints_dir(device.device_id()))?;
+        state.layout = layout;
+        state.vault = vault;
+        self.generations.refresh(&state.layout, &state.vault).ok();
+        if old_default.exists() {
+            let _ = std::fs::remove_dir_all(&old_default);
+        }
+        Ok(())
+    }
+
+    /// Create version 1 at a caller-selected stable Secret id bound to a durable mutation.
     pub fn put_identified(
         &self,
         id: SecretId,
@@ -523,7 +601,6 @@ impl AgeDirStore {
     }
 
     /// Append one immutable version associated with a durable cross-backend mutation.
-    /// A retry returns the original version and never creates a second version.
     pub fn append_version_identified(
         &self,
         id: &SecretId,
@@ -532,270 +609,6 @@ impl AgeDirStore {
     ) -> StoreResult<u32> {
         validate_mutation_id(mutation_id)?;
         self.append_version_internal(id, plaintext, Some(mutation_id.to_string()))
-    }
-
-    /// All versions of a secret as lightweight replication references (no ciphertext), oldest
-    /// first.
-    pub fn version_refs(&self, id: &SecretId) -> StoreResult<Vec<StoreVersionRef>> {
-        self.verify_security_state()?;
-        self.read_meta(id)?;
-        let mut refs = self
-            .version_files(id)?
-            .into_iter()
-            .map(|(digest, vmeta)| {
-                let blob = self.version_blob_path(id, &digest);
-                let ciphertext_size = std::fs::metadata(&blob)
-                    .map_err(|e| StoreError::io(&blob, e))?
-                    .len();
-                Ok(StoreVersionRef {
-                    ordinal: vmeta.version,
-                    version_uuid: vmeta.version_uuid,
-                    generation: vmeta.generation,
-                    size: vmeta.size,
-                    ciphertext_size,
-                    digest,
-                })
-            })
-            .collect::<StoreResult<Vec<_>>>()?;
-        refs.sort_by_key(|reference| reference.ordinal);
-        Ok(refs)
-    }
-
-    /// Export one immutable version verbatim for replication: `ciphertext` is the exact on-disk
-    /// file, `digest` its filename. Zero transcoding — the same bytes land in the vault's
-    /// `objects/` and in the importing machine's store.
-    pub fn export_version(&self, id: &SecretId, ordinal: u32) -> StoreResult<VersionExport> {
-        self.verify_security_state()?;
-        let (digest, vmeta) = self.find_version(id, ordinal)?;
-        let ciphertext = self.read_ciphertext_by_digest(id, &digest)?;
-        Ok(VersionExport {
-            ordinal,
-            version_uuid: vmeta.version_uuid,
-            generation: vmeta.generation,
-            size: vmeta.size,
-            digest,
-            ciphertext,
-        })
-    }
-
-    /// The transport-stable identity of the head version.
-    pub fn head_version_uuid(&self, id: &SecretId) -> StoreResult<String> {
-        self.verify_security_state()?;
-        let meta = self.read_meta(id)?;
-        let (_, vmeta) = self.find_version(id, meta.current_version)?;
-        Ok(vmeta.version_uuid)
-    }
-
-    /// Point the head at the version carrying `version_uuid` (the replicated head reference);
-    /// returns its machine-local ordinal. Idempotent.
-    pub fn set_head_to_uuid(&self, id: &SecretId, version_uuid: &str) -> StoreResult<u32> {
-        let _lock = self.lock_exclusive()?;
-        self.verify_security_state()?;
-        let mut meta = self.read_meta(id)?;
-        let mut matches = self
-            .version_files(id)?
-            .into_iter()
-            .filter(|(_, vmeta)| vmeta.version_uuid == version_uuid)
-            .collect::<Vec<_>>();
-        let ordinal = match matches.len() {
-            0 => return Err(StoreError::NotFound(format!("{id} version {version_uuid}"))),
-            1 => matches.remove(0).1.version,
-            _ => {
-                return Err(StoreError::Corrupt {
-                    id: id.to_string(),
-                    reason: format!("multiple version files claim uuid {version_uuid}"),
-                })
-            }
-        };
-        if meta.current_version != ordinal {
-            meta.current_version = ordinal;
-            self.write_meta(id, &meta)?;
-            self.seal_security_state()?;
-        }
-        Ok(ordinal)
-    }
-
-    /// Import a verbatim version blob replicated from another machine's store.
-    ///
-    /// The bytes are verified (digest, decrypt, payload binding, declared size) before anything
-    /// is written, then land on disk unchanged. `create` supplies entry metadata when the secret
-    /// does not exist locally yet. Idempotent by `version_uuid`: a blob that already arrived
-    /// returns its existing ordinal, and the same uuid with different bytes is corruption.
-    #[allow(clippy::too_many_arguments)]
-    pub fn import_version(
-        &self,
-        id: &SecretId,
-        create: Option<NewSecret>,
-        ciphertext: &[u8],
-        version_uuid: &str,
-        generation: u32,
-        expected_size: u64,
-        mutation_id: &str,
-    ) -> StoreResult<u32> {
-        validate_mutation_id(mutation_id)?;
-        let _lock = self.lock_exclusive()?;
-        self.verify_security_state()?;
-        let digest = hex_sha256(ciphertext);
-        let exists = match self.read_meta(id) {
-            Ok(_) => true,
-            Err(StoreError::NotFound(_)) => false,
-            Err(error) => return Err(error),
-        };
-        if exists {
-            if let Some((have_digest, vmeta)) = self
-                .version_files(id)?
-                .into_iter()
-                .find(|(_, vmeta)| vmeta.version_uuid == version_uuid)
-            {
-                if have_digest != digest {
-                    return Err(StoreError::Corrupt {
-                        id: id.to_string(),
-                        reason: format!(
-                            "version {version_uuid} already exists with different bytes"
-                        ),
-                    });
-                }
-                return Ok(vmeta.version);
-            }
-        }
-        let identity = self.generations.identity(generation, &*self.keys)?;
-        let decrypted = self.decrypt_with_identity(ciphertext, &identity)?;
-        let plaintext = decode_bound_payload(id, version_uuid, decrypted)?;
-        if plaintext.len() as u64 != expected_size {
-            return Err(StoreError::Invalid(format!(
-                "imported version {version_uuid} declares {expected_size} bytes but decrypts to {}",
-                plaintext.len()
-            )));
-        }
-        let ordinal = if exists {
-            self.max_version(id)?.checked_add(1).ok_or_else(|| {
-                StoreError::Invalid(format!("secret {id} version overflow"))
-            })?
-        } else {
-            1
-        };
-        if !exists {
-            let Some(create) = create else {
-                return Err(StoreError::Invalid(format!(
-                    "secret {id} does not exist locally and no descriptor was provided"
-                )));
-            };
-            let mode = create.mode;
-            let enforcement = create.enforcement;
-            let (source_path, managed_label) = validate_new_secret_origin(create.origin)?;
-            let vdir = self.versions_dir(id);
-            std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(&vdir)
-                .map_err(|error| StoreError::io(&vdir, error))?;
-            self.write_meta(
-                id,
-                &MetaFile {
-                    format: STORE_FORMAT_VERSION,
-                    id: id.to_string(),
-                    source_path,
-                    managed_label,
-                    mode,
-                    created: now_rfc3339(),
-                    current_version: ordinal,
-                    enforcement,
-                    environment_ids: None,
-                    metadata: ItemMetadata::default(),
-                },
-            )?;
-        }
-        write_private(&self.version_blob_path(id, &digest), ciphertext)?;
-        let vmeta = VersionMetaFile {
-            version: ordinal,
-            version_uuid: version_uuid.to_string(),
-            generation,
-            size: expected_size,
-            created: now_rfc3339(),
-            note: None,
-            mutation_id: Some(mutation_id.to_string()),
-        };
-        let text = toml::to_string_pretty(&vmeta)
-            .map_err(|e| StoreError::Crypto(format!("serialize version meta: {e}")))?;
-        write_private(&self.version_meta_path(id, &digest), text.as_bytes())?;
-        self.seal_security_state()?;
-        Ok(ordinal)
-    }
-
-    /// The generation new versions are encrypted under right now.
-    pub fn current_generation(&self) -> StoreResult<u32> {
-        self.generations.encryption_generation()
-    }
-
-    /// Unwrap the identity for `generation` with the device key (cached per store instance).
-    pub fn generation_identity(&self, generation: u32) -> StoreResult<age::x25519::Identity> {
-        self.generations.identity(generation, &*self.keys)
-    }
-
-    /// The secret string of a generation identity, for wrapping into device envelopes.
-    pub fn generation_identity_secret(&self, generation: u32) -> StoreResult<Zeroizing<String>> {
-        self.generations.identity_secret(generation, &*self.keys)
-    }
-
-    /// Encryption recipients (current generation + recovery), usable without unlocking keys.
-    pub fn generation_recipients(&self) -> StoreResult<Vec<Box<dyn age::Recipient + Send>>> {
-        self.generations.recipients()
-    }
-
-    /// The plaintext recovery recipient string.
-    pub fn recovery_recipient(&self) -> StoreResult<String> {
-        self.generations.recovery_public()
-    }
-
-    /// The public key of a generation, or `None` if this store doesn't know it.
-    pub fn generation_public(&self, generation: u32) -> StoreResult<Option<String>> {
-        self.generations.generation_public(generation)
-    }
-
-    /// Start a new generation (device revocation). Existing version files keep their bytes.
-    pub fn rotate_generation(&self) -> StoreResult<u32> {
-        let _lock = self.lock_exclusive()?;
-        self.verify_security_state()?;
-        let generation = self.generations.rotate(&*self.keys)?;
-        self.seal_security_state()?;
-        Ok(generation)
-    }
-
-    /// Install one missing generation without touching existing keys (an already-aligned store
-    /// learning a newer vault generation, e.g. after re-enrollment). Idempotent for the same
-    /// key; a different key for an existing generation fails.
-    pub fn install_generation(&self, generation: u32, secret: &str) -> StoreResult<()> {
-        let _lock = self.lock_exclusive()?;
-        self.verify_security_state()?;
-        self.generations.install(generation, secret, &*self.keys)?;
-        self.seal_security_state()
-    }
-
-    /// Adopt a vault's generation set (joining as a new device). Fails if this store already
-    /// holds secret entries — their versions are bound to the local generations.
-    pub fn adopt_generations(
-        &self,
-        generations: &[(u32, Zeroizing<String>)],
-        recovery_public: &str,
-    ) -> StoreResult<()> {
-        let _lock = self.lock_exclusive()?;
-        self.verify_security_state()?;
-        let has_entries = std::fs::read_dir(&self.root)
-            .map_err(|e| StoreError::io(&self.root, e))?
-            .filter_map(|entry| entry.ok())
-            .any(|entry| {
-                entry.path().is_dir()
-                    && entry.file_name().to_string_lossy().parse::<SecretId>().is_ok()
-            });
-        if has_entries {
-            return Err(StoreError::Invalid(
-                "cannot adopt vault generations: this store already holds secrets \
-                 (joining a vault with an existing local library is not supported yet)"
-                    .to_string(),
-            ));
-        }
-        self.generations.adopt(&*self.keys, generations, recovery_public)?;
-        self.seal_security_state()
     }
 
     /// Find the immutable version produced by a durable mutation without reading mutable head.
@@ -807,120 +620,261 @@ impl AgeDirStore {
         validate_mutation_id(mutation_id)?;
         self.verify_security_state()?;
         Ok(self
-            .history_unverified(id)?
-            .into_iter()
+            .read_heads(id)?
+            .versions
+            .iter()
             .find(|version| version.mutation_id.as_deref() == Some(mutation_id))
             .map(|version| version.version))
     }
 
-    fn put_internal(
-        &self,
-        id: SecretId,
-        meta: NewSecret,
-        plaintext: &[u8],
-        mutation_id: Option<String>,
-    ) -> StoreResult<SecretId> {
-        let mode = meta.mode;
-        let enforcement = meta.enforcement;
-        let (source_path, managed_label) = validate_new_secret_origin(meta.origin)?;
-        let _lock = self.lock_exclusive()?;
+    /// All versions of a secret as lightweight replication references, oldest first.
+    pub fn version_refs(&self, id: &SecretId) -> StoreResult<Vec<StoreVersionRef>> {
         self.verify_security_state()?;
-        if self.entry_dir(&id).exists() {
-            if let Some(expected) = mutation_id.as_deref() {
-                if let Some(version) = self
-                    .history_unverified(&id)?
-                    .into_iter()
-                    .find(|version| version.mutation_id.as_deref() == Some(expected))
-                {
-                    let existing = self.get_version(&id, version.version)?;
-                    if existing.as_slice() != plaintext {
-                        return Err(StoreError::Invalid(format!(
-                            "mutation {expected} was already used for different secret bytes"
-                        )));
-                    }
-                    return Ok(id);
-                }
-            }
-            return Err(StoreError::Invalid(format!(
-                "secret id {id} already exists for a different mutation"
-            )));
-        }
-        let vdir = self.versions_dir(&id);
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&vdir)
-            .map_err(|error| StoreError::io(&vdir, error))?;
-        self.write_version(&id, 1, plaintext, None, mutation_id)?;
-        self.write_meta(
-            &id,
-            &MetaFile {
-                format: STORE_FORMAT_VERSION,
-                id: id.to_string(),
-                source_path,
-                managed_label,
-                mode,
-                created: now_rfc3339(),
-                current_version: 1,
-                enforcement,
-                environment_ids: None,
-                metadata: ItemMetadata::default(),
-            },
-        )?;
-        self.seal_security_state()?;
-        Ok(id)
+        let heads = self.read_heads(id)?;
+        let state = self.state.read().expect("shared state poisoned");
+        heads
+            .versions
+            .iter()
+            .map(|version| {
+                let object = state.layout.object(&version.digest);
+                let ciphertext_size = std::fs::metadata(&object)
+                    .map_err(|e| StoreError::io(&object, e))?
+                    .len();
+                Ok(StoreVersionRef {
+                    ordinal: version.version,
+                    version_uuid: version.version_uuid.clone(),
+                    generation: version.generation,
+                    size: version.size,
+                    ciphertext_size,
+                    digest: version.digest.clone(),
+                })
+            })
+            .collect()
     }
 
-    fn append_version_internal(
-        &self,
-        id: &SecretId,
-        plaintext: &[u8],
-        mutation_id: Option<String>,
-    ) -> StoreResult<u32> {
-        // The immutable version is published before the mutable head. A retry carrying a stable
-        // mutation id finds that exact version and completes only the missing head transition.
+    /// The transport-stable identity of the head version.
+    pub fn head_version_uuid(&self, id: &SecretId) -> StoreResult<String> {
+        self.verify_security_state()?;
+        let heads = self.read_heads(id)?;
+        heads
+            .versions
+            .iter()
+            .find(|version| version.version == heads.current_version)
+            .map(|version| version.version_uuid.clone())
+            .ok_or_else(|| StoreError::Corrupt {
+                id: id.to_string(),
+                reason: format!(
+                    "head version {} is missing from the version table",
+                    heads.current_version
+                ),
+            })
+    }
+
+    /// Point the head at the version carrying `version_uuid`; returns its local ordinal.
+    pub fn set_head_to_uuid(&self, id: &SecretId, version_uuid: &str) -> StoreResult<u32> {
         let _lock = self.lock_exclusive()?;
         self.verify_security_state()?;
-        let mut meta = self.read_meta(id)?;
-        if let Some(expected) = mutation_id.as_deref() {
-            if let Some(version) = self
-                .history_unverified(id)?
-                .into_iter()
-                .find(|version| version.mutation_id.as_deref() == Some(expected))
+        let mut heads = self.read_heads(id)?;
+        let ordinal = heads
+            .versions
+            .iter()
+            .find(|version| version.version_uuid == version_uuid)
+            .map(|version| version.version)
+            .ok_or_else(|| StoreError::NotFound(format!("{id} version {version_uuid}")))?;
+        if heads.current_version != ordinal {
+            heads.current_version = ordinal;
+            self.write_heads(id, &heads)?;
+            self.seal_security_state()?;
+        }
+        Ok(ordinal)
+    }
+
+    /// Register a version that arrived through replication. The object already sits in the
+    /// shared half; this verifies it end to end (digest, decrypt, payload binding, declared
+    /// size) and appends a row to the local head document. No bytes are copied.
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_replicated_version(
+        &self,
+        id: &SecretId,
+        create: Option<NewSecret>,
+        version_uuid: &str,
+        generation: u32,
+        expected_size: u64,
+        digest: &str,
+        mutation_id: &str,
+    ) -> StoreResult<u32> {
+        validate_mutation_id(mutation_id)?;
+        let _lock = self.lock_exclusive()?;
+        self.verify_security_state()?;
+        let existing = match self.read_heads(id) {
+            Ok(heads) => Some(heads),
+            Err(StoreError::NotFound(_)) => None,
+            Err(error) => return Err(error),
+        };
+        if let Some(heads) = &existing {
+            if let Some(version) = heads
+                .versions
+                .iter()
+                .find(|version| version.version_uuid == version_uuid)
             {
-                let existing = self.get_version(id, version.version)?;
-                if existing.as_slice() != plaintext {
-                    return Err(StoreError::Invalid(format!(
-                        "mutation {expected} was already used for different secret bytes"
-                    )));
-                }
-                if meta.current_version != version.version {
-                    meta.current_version = version.version;
-                    self.write_meta(id, &meta)?;
-                    self.seal_security_state()?;
+                if version.digest != digest {
+                    return Err(StoreError::Corrupt {
+                        id: id.to_string(),
+                        reason: format!(
+                            "version {version_uuid} already exists with a different digest"
+                        ),
+                    });
                 }
                 return Ok(version.version);
             }
         }
-        let next = self
-            .max_version(id)?
-            .checked_add(1)
-            .ok_or_else(|| StoreError::Invalid(format!("secret {id} version overflow")))?;
-        self.write_version(id, next, plaintext, None, mutation_id)?;
-        meta.current_version = next;
-        self.write_meta(id, &meta)?;
+        // Verify the shared object before trusting it into the head table.
+        let ciphertext = self.read_object_verified(digest, id)?;
+        let plaintext = {
+            let state = self.state.read().expect("shared state poisoned");
+            let identity = self.generations.identity(
+                &state.layout,
+                &state.vault,
+                &self.device(),
+                generation,
+            )?;
+            let decrypted = vault::decrypt_with_identity(&identity, &ciphertext)?;
+            decode_bound_payload(id, version_uuid, decrypted)?
+        };
+        if plaintext.len() as u64 != expected_size {
+            return Err(StoreError::Invalid(format!(
+                "replicated version {version_uuid} declares {expected_size} bytes but decrypts to {}",
+                plaintext.len()
+            )));
+        }
+        let mut heads = match existing {
+            Some(heads) => heads,
+            None => {
+                let Some(create) = create else {
+                    return Err(StoreError::Invalid(format!(
+                        "secret {id} does not exist locally and no descriptor was provided"
+                    )));
+                };
+                new_heads_document(id, create)?
+            }
+        };
+        let ordinal = next_ordinal(&heads)?;
+        heads.versions.push(HeadsVersion {
+            version: ordinal,
+            version_uuid: version_uuid.to_string(),
+            generation,
+            size: expected_size,
+            digest: digest.to_string(),
+            created: now_rfc3339(),
+            note: None,
+            mutation_id: Some(mutation_id.to_string()),
+        });
+        if heads.versions.len() == 1 {
+            heads.current_version = ordinal;
+        }
+        self.write_heads(id, &heads)?;
         self.seal_security_state()?;
-        Ok(next)
+        Ok(ordinal)
     }
 
-    /// Copy one immutable, internally consistent encrypted-store snapshot.
-    ///
-    /// Store mutations take the same exclusive lock. The destination must not exist and no
-    /// plaintext or key material is written there.
-    pub fn backup_to(&self, destination: &Path) -> StoreResult<()> {
+    /// Remove the local head document for a replicated tombstone. Shared objects stay.
+    pub fn remove_replicated_heads(&self, id: &SecretId) -> StoreResult<bool> {
         let _lock = self.lock_exclusive()?;
         self.verify_security_state()?;
-        copy_store_directory(&self.root, destination)
+        let path = self.heads_path(id);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                self.seal_security_state()?;
+                Ok(true)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(StoreError::io(&path, error)),
+        }
+    }
+
+    /// The generation new versions are encrypted under right now.
+    pub fn current_generation(&self) -> StoreResult<u32> {
+        let state = self.state.read().expect("shared state poisoned");
+        self.generations.current(&state.layout, &state.vault)
+    }
+
+    /// Unwrap the identity for `generation` with this device's wrapping key (cached).
+    pub fn generation_identity(&self, generation: u32) -> StoreResult<x25519::Identity> {
+        let state = self.state.read().expect("shared state poisoned");
+        self.generations.identity(&state.layout, &state.vault, &self.device(), generation)
+    }
+
+    /// The plaintext recovery recipient string.
+    pub fn recovery_recipient(&self) -> StoreResult<String> {
+        let state = self.state.read().expect("shared state poisoned");
+        self.generations.recovery_public(&state.layout, &state.vault)
+    }
+
+    /// Whether any other, unrevoked device is enrolled in this vault.
+    pub fn has_other_enrolled_devices(&self) -> StoreResult<bool> {
+        let state = self.state.read().expect("shared state poisoned");
+        let generations = vault::load_key_generations(&state.layout, &state.vault)?;
+        let revoked = generations
+            .values()
+            .flat_map(|document| document.revoked_devices.keys().cloned())
+            .collect::<std::collections::HashSet<_>>();
+        let devices_dir = state.layout.devices_dir();
+        let entries = match std::fs::read_dir(&devices_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(StoreError::io(&devices_dir, error)),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| StoreError::io(&devices_dir, error))?;
+            let Some(device_id) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if device_id == self.device().device_id() || revoked.contains(&device_id) {
+                continue;
+            }
+            if uuid::Uuid::parse_str(&device_id).is_err() {
+                continue;
+            }
+            let identity_path = state.layout.device_identity(&device_id);
+            if identity_path.is_file()
+                && vault::read_device_identity(&identity_path, &state.vault).is_ok()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Rotate to a new key generation (device revocation support). Writes the signed
+    /// generation document with envelopes for `recipients` and returns the new generation.
+    /// Only the genesis device can sign generation documents.
+    pub fn rotate_generation(
+        &self,
+        recipients: &std::collections::BTreeMap<String, x25519::Recipient>,
+        revoked_devices: std::collections::BTreeMap<String, u64>,
+    ) -> StoreResult<u32> {
+        let _lock = self.lock_exclusive()?;
+        self.verify_security_state()?;
+        let state = self.state.read().expect("shared state poisoned");
+        let current = self.generations.current(&state.layout, &state.vault)?;
+        let recovery = self.generations.recovery_public(&state.layout, &state.vault)?;
+        let next = current
+            .checked_add(1)
+            .ok_or_else(|| StoreError::Invalid("key generation overflow".to_string()))?;
+        let identity = x25519::Identity::generate();
+        write_key_generation(
+            &state.layout.generation_document(next),
+            &state.vault,
+            next,
+            Some(current),
+            &identity,
+            recipients,
+            revoked_devices,
+            &recovery,
+            self.device().signing_key(),
+        )?;
+        self.generations.refresh(&state.layout, &state.vault)?;
+        Ok(next)
     }
 
     /// Verify every version in this store by decrypting it and comparing its declared size.
@@ -966,7 +920,7 @@ impl AgeDirStore {
         })
     }
 
-    /// Verify a copied store with the same key provider as this live store.
+    /// Verify a copied store backup with the same key provider as this live store.
     pub fn verify_backup(&self, root: &Path) -> StoreResult<StoreVerification> {
         if !root.is_dir() {
             return Err(StoreError::Invalid(format!(
@@ -974,13 +928,7 @@ impl AgeDirStore {
                 root.display()
             )));
         }
-        AgeDirStore {
-            root: root.to_path_buf(),
-            keys: Arc::clone(&self.keys),
-            generations: GenerationKeys::open(root),
-            integrity: None,
-        }
-        .verify_all()
+        AgeDirStore::open(root.to_path_buf(), Arc::clone(&self.keys))?.verify_all()
     }
 
     pub fn lock_for_maintenance(&self) -> StoreResult<StoreMaintenanceGuard> {
@@ -988,19 +936,23 @@ impl AgeDirStore {
         self.verify_security_state()?;
         Ok(StoreMaintenanceGuard {
             _lock: lock,
-            root: self.root.clone(),
+            shared_root: self.shared_root(),
+            local_root: self.root.join("local"),
+            device_key_path: self.root.join("device.age"),
         })
     }
 
-    /// Take the store-wide exclusive lock (blocking), serializing mutations across processes —
-    /// the CLI and the mounted daemon share this store. Released when the returned handle drops.
-    /// Reads don't lock: version blobs are immutable and the head pointer is renamed atomically.
+    /// Copy one immutable, internally consistent encrypted-store snapshot.
+    pub fn backup_to(&self, destination: &Path) -> StoreResult<()> {
+        self.lock_for_maintenance()?.backup_to(destination)
+    }
+
     fn lock_exclusive(&self) -> StoreResult<std::fs::File> {
-        let path = self.root.join(".lock");
+        let path = self.root.join("local/.lock");
         let f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
-            .truncate(false) // the file is only ever locked, never written
+            .truncate(false)
             .mode(0o600)
             .open(&path)
             .map_err(|e| StoreError::io(&path, e))?;
@@ -1008,89 +960,37 @@ impl AgeDirStore {
         Ok(f)
     }
 
-    fn entry_dir(&self, id: &SecretId) -> PathBuf {
-        self.root.join(id.as_str())
+    fn heads_dir(&self) -> PathBuf {
+        self.root.join("local/heads")
     }
 
-    fn versions_dir(&self, id: &SecretId) -> PathBuf {
-        self.entry_dir(id).join("v")
+    fn heads_path(&self, id: &SecretId) -> PathBuf {
+        self.heads_dir().join(format!("{id}.toml"))
     }
 
-    fn version_blob_path(&self, id: &SecretId, digest: &str) -> PathBuf {
-        self.versions_dir(id).join(format!("{digest}.age"))
-    }
-
-    fn version_meta_path(&self, id: &SecretId, digest: &str) -> PathBuf {
-        self.versions_dir(id).join(format!("{digest}.toml"))
-    }
-
-    /// All version sidecars of an entry as (ciphertext digest, metadata), unsorted.
-    fn version_files(&self, id: &SecretId) -> StoreResult<Vec<(String, VersionMetaFile)>> {
-        let vdir = self.versions_dir(id);
-        let rd = match std::fs::read_dir(&vdir) {
-            Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(e) => return Err(StoreError::io(&vdir, e)),
+    fn heads_ids(&self) -> StoreResult<Vec<SecretId>> {
+        let dir = self.heads_dir();
+        let mut ids = Vec::new();
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ids),
+            Err(error) => return Err(StoreError::io(&dir, error)),
         };
-        let mut out = Vec::new();
-        for entry in rd {
-            let entry = entry.map_err(|e| StoreError::io(&vdir, e))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| StoreError::io(&dir, error))?;
             let name = entry.file_name();
-            let Some(digest) = name.to_string_lossy().strip_suffix(".toml").map(str::to_owned)
-            else {
-                continue;
-            };
-            let path = entry.path();
-            let text = std::fs::read_to_string(&path).map_err(|e| StoreError::io(&path, e))?;
-            let vmeta: VersionMetaFile = toml::from_str(&text).map_err(|e| StoreError::Corrupt {
-                id: id.to_string(),
-                reason: format!("v/{digest}.toml: {e}"),
-            })?;
-            out.push((digest, vmeta));
-        }
-        Ok(out)
-    }
-
-    /// Resolve a machine-local ordinal to its blob digest and metadata. Two sidecars claiming
-    /// the same ordinal (e.g. a transplanted file) are corruption, not a silent pick.
-    fn find_version(&self, id: &SecretId, version: u32) -> StoreResult<(String, VersionMetaFile)> {
-        self.read_meta(id)?;
-        let mut matches = self
-            .version_files(id)?
-            .into_iter()
-            .filter(|(_, vmeta)| vmeta.version == version)
-            .collect::<Vec<_>>();
-        match matches.len() {
-            0 => Err(StoreError::NotFound(format!("{id}@v{version}"))),
-            1 => Ok(matches.remove(0)),
-            _ => Err(StoreError::Corrupt {
-                id: id.to_string(),
-                reason: format!("multiple version files claim ordinal v{version}"),
-            }),
-        }
-    }
-
-    /// Read a version blob and require its bytes to match the digest in its filename.
-    fn read_ciphertext_by_digest(&self, id: &SecretId, digest: &str) -> StoreResult<Vec<u8>> {
-        let path = self.version_blob_path(id, digest);
-        let ciphertext = std::fs::read(&path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                StoreError::NotFound(format!("{id} blob {digest}"))
-            } else {
-                StoreError::io(&path, e)
+            if let Some(stem) = name.to_string_lossy().strip_suffix(".toml") {
+                if let Ok(id) = stem.parse::<SecretId>() {
+                    ids.push(id);
+                }
             }
-        })?;
-        if hex_sha256(&ciphertext) != digest {
-            return Err(StoreError::Corrupt {
-                id: id.to_string(),
-                reason: format!("v/{digest}.age does not match its declared digest"),
-            });
         }
-        Ok(ciphertext)
+        ids.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+        Ok(ids)
     }
 
-    fn read_meta(&self, id: &SecretId) -> StoreResult<MetaFile> {
-        let path = self.entry_dir(id).join("meta.toml");
+    fn read_heads(&self, id: &SecretId) -> StoreResult<HeadsDocument> {
+        let path = self.heads_path(id);
         let text = std::fs::read_to_string(&path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 StoreError::NotFound(id.to_string())
@@ -1098,164 +998,634 @@ impl AgeDirStore {
                 StoreError::io(&path, e)
             }
         })?;
-        let meta: MetaFile = toml::from_str(&text).map_err(|e| StoreError::Corrupt {
+        let heads: HeadsDocument = toml::from_str(&text).map_err(|e| StoreError::Corrupt {
             id: id.to_string(),
-            reason: format!("meta.toml: {e}"),
+            reason: format!("head document: {e}"),
         })?;
-        if meta.id != id.as_str() {
+        if heads.id != id.as_str() {
             return Err(StoreError::Corrupt {
                 id: id.to_string(),
-                reason: format!("meta.toml id {:?} does not match its directory", meta.id),
+                reason: format!("head document id {:?} does not match its filename", heads.id),
             });
         }
-        if !(MIN_SUPPORTED_STORE_FORMAT_VERSION..=STORE_FORMAT_VERSION).contains(&meta.format) {
+        if !(MIN_SUPPORTED_STORE_FORMAT_VERSION..=STORE_FORMAT_VERSION).contains(&heads.format) {
             return Err(StoreError::Corrupt {
                 id: id.to_string(),
                 reason: format!(
                     "store format {} but this build supports {} through {}; migrate or delete the entry",
-                    meta.format, MIN_SUPPORTED_STORE_FORMAT_VERSION, STORE_FORMAT_VERSION
+                    heads.format, MIN_SUPPORTED_STORE_FORMAT_VERSION, STORE_FORMAT_VERSION
                 ),
             });
         }
-        match (&meta.source_path, &meta.managed_label) {
+        match (&heads.source_path, &heads.managed_label) {
             (Some(_), None) => {}
-            (None, Some(label)) if !label.trim().is_empty() && meta.format >= 2 => {}
+            (None, Some(label)) if !label.trim().is_empty() => {}
             _ => {
                 return Err(StoreError::Corrupt {
                     id: id.to_string(),
-                    reason: "meta.toml must contain exactly one valid secret origin".to_string(),
+                    reason: "head document must contain exactly one valid secret origin"
+                        .to_string(),
                 })
             }
         }
-        Ok(meta)
+        let mut seen = std::collections::HashSet::new();
+        for version in &heads.versions {
+            if version.version == 0
+                || !seen.insert(version.version)
+                || version.version_uuid.is_empty()
+                || version.digest.is_empty()
+            {
+                return Err(StoreError::Corrupt {
+                    id: id.to_string(),
+                    reason: "head document version table is invalid".to_string(),
+                });
+            }
+        }
+        Ok(heads)
     }
 
-    fn write_meta(&self, id: &SecretId, meta: &MetaFile) -> StoreResult<()> {
-        let text = toml::to_string_pretty(meta)
-            .map_err(|e| StoreError::Crypto(format!("serialize meta: {e}")))?;
-        write_private(&self.entry_dir(id).join("meta.toml"), text.as_bytes())
+    fn write_heads(&self, id: &SecretId, heads: &HeadsDocument) -> StoreResult<()> {
+        let text = toml::to_string_pretty(heads)
+            .map_err(|e| StoreError::Crypto(format!("serialize head document: {e}")))?;
+        write_private(&self.heads_path(id), text.as_bytes())
     }
 
-    fn history_unverified(&self, id: &SecretId) -> StoreResult<Vec<VersionRecord>> {
-        self.read_meta(id)?;
-        let mut out = self
-            .version_files(id)?
-            .into_iter()
-            .map(|(_, vmeta)| VersionRecord {
-                version: vmeta.version,
-                size: vmeta.size,
-                created: vmeta.created,
-                note: vmeta.note,
-                mutation_id: vmeta.mutation_id,
-            })
-            .collect::<Vec<_>>();
-        out.sort_by_key(|record| record.version);
-        Ok(out)
+    fn find_version(&self, heads: &HeadsDocument, ordinal: u32) -> StoreResult<HeadsVersion> {
+        heads
+            .versions
+            .iter()
+            .find(|version| version.version == ordinal)
+            .cloned()
+            .ok_or_else(|| StoreError::NotFound(format!("{}@v{ordinal}", heads.id)))
     }
 
-    /// Highest existing version ordinal for an entry (0 if none), used to pick the next on append.
-    fn max_version(&self, id: &SecretId) -> StoreResult<u32> {
-        Ok(self
-            .version_files(id)?
-            .into_iter()
-            .map(|(_, vmeta)| vmeta.version)
-            .max()
-            .unwrap_or(0))
+    /// Read an object from the shared half and require its bytes to match the digest. The
+    /// shared half is untrusted input; content addressing makes this check self-contained.
+    fn read_object_verified(&self, digest: &str, id: &SecretId) -> StoreResult<Vec<u8>> {
+        let path = {
+            let state = self.state.read().expect("shared state poisoned");
+            state.layout.object(digest)
+        };
+        let ciphertext = read_untrusted_file(&path, MAX_OBJECT_BYTES).map_err(|error| {
+            match error {
+                StoreError::Io { source, .. }
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    StoreError::NotFound(format!("{id} object {digest}"))
+                }
+                error => error,
+            }
+        })?;
+        if hex_sha256(&ciphertext) != digest {
+            return Err(StoreError::Corrupt {
+                id: id.to_string(),
+                reason: format!("object {digest} does not match its declared digest"),
+            });
+        }
+        Ok(ciphertext)
     }
 
-    /// Write one immutable version (ciphertext + metadata sidecar). Does not touch the head
-    /// pointer. The blob is published before its sidecar: a crash in between leaves an orphan
-    /// digest file that no metadata references — harmless, reported by GC later.
-    fn write_version(
+    fn decrypt_version(&self, id: &SecretId, ordinal: u32) -> StoreResult<Zeroizing<Vec<u8>>> {
+        let heads = self.read_heads(id)?;
+        let version = self.find_version(&heads, ordinal)?;
+        let ciphertext = self.read_object_verified(&version.digest, id)?;
+        let identity = {
+            let state = self.state.read().expect("shared state poisoned");
+            self.generations.identity(
+                &state.layout,
+                &state.vault,
+                &self.device(),
+                version.generation,
+            )?
+        };
+        let decrypted = vault::decrypt_with_identity(&identity, &ciphertext)?;
+        decode_bound_payload(id, &version.version_uuid, decrypted)
+    }
+
+    /// Write one immutable version object and return its table row. The object is published
+    /// before the head document changes; a crash in between leaves a harmless orphan object.
+    fn write_version_object(
         &self,
         id: &SecretId,
-        version: u32,
+        ordinal: u32,
         plaintext: &[u8],
         note: Option<String>,
         mutation_id: Option<String>,
-    ) -> StoreResult<()> {
+    ) -> StoreResult<HeadsVersion> {
+        let state = self.state.read().expect("shared state poisoned");
+        let generation = self.generations.current(&state.layout, &state.vault)?;
+        // A device that cannot decrypt what it writes is not enrolled yet; refuse early.
+        self.generations.identity(&state.layout, &state.vault, &self.device(), generation)?;
         let version_uuid = uuid::Uuid::new_v4().to_string();
-        let generation = self.generations.encryption_generation()?;
         let bound = encode_bound_payload(id, &version_uuid, plaintext)?;
-        let ciphertext = self.encrypt(&bound)?;
-        let digest = hex_sha256(&ciphertext);
-        write_private(&self.version_blob_path(id, &digest), &ciphertext)?;
-        let vmeta = VersionMetaFile {
-            version,
-            version_uuid,
-            generation,
-            size: plaintext.len() as u64,
-            created: now_rfc3339(),
-            note,
-            mutation_id,
-        };
-        let text = toml::to_string_pretty(&vmeta)
-            .map_err(|e| StoreError::Crypto(format!("serialize version meta: {e}")))?;
-        write_private(&self.version_meta_path(id, &digest), text.as_bytes())
-    }
-
-    fn encrypt(&self, plaintext: &[u8]) -> StoreResult<Vec<u8>> {
-        let recipients = self.generations.recipients()?;
+        let recipients = self.generations.recipients(&state.layout, &state.vault)?;
         let encryptor = age::Encryptor::with_recipients(recipients)
             .ok_or_else(|| StoreError::Crypto("no recipients configured".to_string()))?;
-        let mut out = Vec::new();
+        let mut ciphertext = Vec::new();
         let mut writer = encryptor
-            .wrap_output(&mut out)
+            .wrap_output(&mut ciphertext)
             .map_err(|e| StoreError::Crypto(format!("wrap: {e}")))?;
+        use std::io::Write as _;
         writer
-            .write_all(plaintext)
+            .write_all(&bound)
             .map_err(|e| StoreError::Crypto(format!("write: {e}")))?;
         writer
             .finish()
             .map_err(|e| StoreError::Crypto(format!("finish: {e}")))?;
-        Ok(out)
+        let digest = hex_sha256(&ciphertext);
+        ensure_private_directory(&state.layout.objects_dir())?;
+        publish_immutable(&state.layout.object(&digest), &ciphertext)?;
+        Ok(HeadsVersion {
+            version: ordinal,
+            version_uuid,
+            generation,
+            size: plaintext.len() as u64,
+            digest,
+            created: now_rfc3339(),
+            note,
+            mutation_id,
+        })
     }
 
-    fn decrypt_with_identity(
+    fn put_internal(
         &self,
-        ciphertext: &[u8],
-        identity: &dyn age::Identity,
-    ) -> StoreResult<Zeroizing<Vec<u8>>> {
-        let decryptor = match age::Decryptor::new(ciphertext)
-            .map_err(|e| StoreError::Crypto(format!("open: {e}")))?
-        {
-            age::Decryptor::Recipients(d) => d,
-            age::Decryptor::Passphrase(_) => {
-                return Err(StoreError::Crypto(
-                    "blob is passphrase-encrypted, expected recipient-encrypted".to_string(),
-                ))
+        id: SecretId,
+        meta: NewSecret,
+        plaintext: &[u8],
+        mutation_id: Option<String>,
+    ) -> StoreResult<SecretId> {
+        let _lock = self.lock_exclusive()?;
+        self.verify_security_state()?;
+        match self.read_heads(&id) {
+            Ok(heads) => {
+                if let Some(expected) = mutation_id.as_deref() {
+                    if let Some(version) = heads
+                        .versions
+                        .iter()
+                        .find(|version| version.mutation_id.as_deref() == Some(expected))
+                    {
+                        let existing = self.decrypt_version(&id, version.version)?;
+                        if existing.as_slice() != plaintext {
+                            return Err(StoreError::Invalid(format!(
+                                "mutation {expected} was already used for different secret bytes"
+                            )));
+                        }
+                        return Ok(id);
+                    }
+                }
+                return Err(StoreError::Invalid(format!(
+                    "secret id {id} already exists for a different mutation"
+                )));
             }
-        };
-        let mut reader = decryptor
-            .decrypt(std::iter::once(identity))
-            .map_err(|e| StoreError::Crypto(format!("decrypt: {e}")))?;
-        let mut out = Zeroizing::new(Vec::new());
-        reader
-            .read_to_end(&mut out)
-            .map_err(|e| StoreError::Crypto(format!("read: {e}")))?;
-        Ok(out)
+            Err(StoreError::NotFound(_)) => {}
+            Err(error) => return Err(error),
+        }
+        let mut heads = new_heads_document(&id, meta)?;
+        let version = self.write_version_object(&id, 1, plaintext, None, mutation_id)?;
+        heads.versions.push(version);
+        heads.current_version = 1;
+        self.write_heads(&id, &heads)?;
+        self.seal_security_state()?;
+        Ok(id)
     }
 
-    /// Decrypt one version by its machine-local ordinal: resolve the digest, verify the blob
-    /// against its filename, unwrap the right generation key, then check the payload binding.
-    fn decrypt_version(&self, id: &SecretId, version: u32) -> StoreResult<Zeroizing<Vec<u8>>> {
-        let (digest, vmeta) = self.find_version(id, version)?;
-        let ciphertext = self.read_ciphertext_by_digest(id, &digest)?;
-        let identity = self.generations.identity(vmeta.generation, &*self.keys)?;
-        let decrypted = self.decrypt_with_identity(&ciphertext, &identity)?;
-        decode_bound_payload(id, &vmeta.version_uuid, decrypted)
+    fn append_version_internal(
+        &self,
+        id: &SecretId,
+        plaintext: &[u8],
+        mutation_id: Option<String>,
+    ) -> StoreResult<u32> {
+        let _lock = self.lock_exclusive()?;
+        self.verify_security_state()?;
+        let mut heads = self.read_heads(id)?;
+        if let Some(expected) = mutation_id.as_deref() {
+            if let Some(version) = heads
+                .versions
+                .iter()
+                .find(|version| version.mutation_id.as_deref() == Some(expected))
+            {
+                let ordinal = version.version;
+                let existing = self.decrypt_version(id, ordinal)?;
+                if existing.as_slice() != plaintext {
+                    return Err(StoreError::Invalid(format!(
+                        "mutation {expected} was already used for different secret bytes"
+                    )));
+                }
+                if heads.current_version != ordinal {
+                    heads.current_version = ordinal;
+                    self.write_heads(id, &heads)?;
+                    self.seal_security_state()?;
+                }
+                return Ok(ordinal);
+            }
+        }
+        let next = next_ordinal(&heads)?;
+        let version = self.write_version_object(id, next, plaintext, None, mutation_id)?;
+        heads.versions.push(version);
+        heads.current_version = next;
+        self.write_heads(id, &heads)?;
+        self.seal_security_state()?;
+        Ok(next)
+    }
+
+    fn security_snapshot(&self) -> StoreResult<StoreSecuritySnapshot> {
+        let mut entries = Vec::new();
+        for id in self.heads_ids()? {
+            entries.push(self.read_heads(&id)?);
+        }
+        Ok(StoreSecuritySnapshot { entries })
+    }
+
+    fn verify_security_state(&self) -> StoreResult<()> {
+        let Some(integrity) = &self.integrity else { return Ok(()) };
+        let loaded = integrity
+            .authenticator
+            .load::<StoreSecuritySnapshot>(&integrity.sidecar, INTEGRITY_DOMAIN)?;
+        let authenticated = loaded.value.ok_or_else(|| StoreError::Corrupt {
+            id: "store".to_string(),
+            reason: "authenticated store snapshot is missing".to_string(),
+        })?;
+        if authenticated != self.security_snapshot()? {
+            return Err(StoreError::Corrupt {
+                id: "store".to_string(),
+                reason:
+                    "store contents changed outside the authenticated daemon transaction boundary"
+                        .to_string(),
+            });
+        }
+        *integrity
+            .generation
+            .lock()
+            .expect("store integrity generation poisoned") = loaded.generation;
+        Ok(())
+    }
+
+    fn seal_security_state(&self) -> StoreResult<()> {
+        let Some(integrity) = &self.integrity else { return Ok(()) };
+        let snapshot = self.security_snapshot()?;
+        let mut generation = integrity
+            .generation
+            .lock()
+            .expect("store integrity generation poisoned");
+        *generation = integrity.authenticator.persist(
+            &integrity.sidecar,
+            INTEGRITY_DOMAIN,
+            *generation,
+            &snapshot,
+        )?;
+        Ok(())
     }
 }
 
-/// Lowercase hex SHA-256 — the version blob filename and the replication Object ID share this
-/// exact encoding so store files and vault objects are byte- and name-identical.
+const MAX_OBJECT_BYTES: u64 = 1024 * 1024 * 1024;
+
+fn new_heads_document(id: &SecretId, meta: NewSecret) -> StoreResult<HeadsDocument> {
+    let mode = meta.mode;
+    let enforcement = meta.enforcement;
+    let (source_path, managed_label) = validate_new_secret_origin(meta.origin)?;
+    Ok(HeadsDocument {
+        format: STORE_FORMAT_VERSION,
+        id: id.to_string(),
+        source_path,
+        managed_label,
+        mode,
+        created: now_rfc3339(),
+        current_version: 0,
+        enforcement,
+        environment_ids: None,
+        metadata: ItemMetadata::default(),
+        versions: Vec::new(),
+    })
+}
+
+fn next_ordinal(heads: &HeadsDocument) -> StoreResult<u32> {
+    heads
+        .versions
+        .iter()
+        .map(|version| version.version)
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| StoreError::Invalid(format!("secret {} version overflow", heads.id)))
+}
+
+fn read_shared_location(root: &Path) -> StoreResult<Option<PathBuf>> {
+    let path = root.join(SHARED_LOCATION_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => {
+            let target = text.trim();
+            if target.is_empty() {
+                return Err(StoreError::Invalid(format!(
+                    "{} is empty",
+                    path.display()
+                )));
+            }
+            Ok(Some(PathBuf::from(target)))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(StoreError::io(&path, error)),
+    }
+}
+
+/// First open of a data root: become a single-device vault. Generation 1 and the recovery
+/// recipient are born here; the recovery identity is escrowed next to the local half, wrapped
+/// to this device (for later export to offline media).
+fn genesis_initialize(
+    layout: &SharedLayout,
+    device: &DeviceKeyMaterial,
+    recovery_escrow_path: &Path,
+) -> StoreResult<VaultDocument> {
+    ensure_private_directory(layout.root())?;
+    ensure_private_directory(&layout.objects_dir())?;
+    ensure_private_directory(&layout.devices_dir())?;
+    ensure_private_directory(&layout.generations_dir())?;
+    ensure_private_directory(&layout.operations_dir())?;
+    ensure_private_directory(&layout.checkpoints_dir())?;
+
+    let unsigned = vault::VaultUnsigned {
+        format_version: vault::VAULT_FORMAT_VERSION,
+        vault_id: uuid::Uuid::new_v4().to_string(),
+        genesis_device_id: device.device_id().to_string(),
+        genesis_public_key: vault::encode(device.verifying_key().as_bytes()),
+        created_at: now_rfc3339(),
+    };
+    let signature =
+        vault::sign_struct(vault::VAULT_SIGNATURE_CONTEXT, &unsigned, device.signing_key())?;
+    let document = VaultDocument {
+        format_version: unsigned.format_version,
+        vault_id: unsigned.vault_id,
+        genesis_device_id: unsigned.genesis_device_id,
+        genesis_public_key: unsigned.genesis_public_key,
+        created_at: unsigned.created_at,
+        signature,
+    };
+    write_new_atomic(
+        &layout.vault_json(),
+        &serde_json::to_vec_pretty(&document)
+            .map_err(|error| StoreError::Invalid(error.to_string()))?,
+    )?;
+
+    ensure_private_directory(&layout.device_dir(device.device_id()))?;
+    ensure_private_directory(&layout.envelopes_dir(device.device_id()))?;
+    vault::write_device_identity(
+        &layout.device_identity(device.device_id()),
+        &document,
+        &device.enrollment(),
+        1,
+        device.signing_key(),
+    )?;
+
+    let generation_identity = x25519::Identity::generate();
+    let recovery_identity = x25519::Identity::generate();
+    let recipients = std::collections::BTreeMap::from([(
+        device.device_id().to_string(),
+        device.wrapping_identity().to_public(),
+    )]);
+    write_key_generation(
+        &layout.generation_document(1),
+        &document,
+        1,
+        None,
+        &generation_identity,
+        &recipients,
+        std::collections::BTreeMap::new(),
+        &recovery_identity.to_public().to_string(),
+        device.signing_key(),
+    )?;
+    // Escrow the recovery identity wrapped to this device so `keys export-recovery` can later
+    // move it to offline media. Losing this file only loses the escrow, not the data.
+    let escrow = vault::encrypt_to_recipient(
+        &device.wrapping_identity().to_public(),
+        recovery_identity.to_string().expose_secret().as_bytes(),
+    )?;
+    write_new_atomic(recovery_escrow_path, &escrow)?;
+    Ok(document)
+}
+
+impl SecretStore for AgeDirStore {
+    fn put(&self, meta: NewSecret, plaintext: &[u8]) -> StoreResult<SecretId> {
+        self.put_internal(SecretId::generate(), meta, plaintext, None)
+    }
+
+    fn get(&self, id: &SecretId) -> StoreResult<Zeroizing<Vec<u8>>> {
+        self.verify_security_state()?;
+        let head = self.read_heads(id)?.current_version;
+        self.decrypt_version(id, head)
+    }
+
+    fn get_many(&self, ids: &[SecretId]) -> StoreResult<Vec<Zeroizing<Vec<u8>>>> {
+        self.verify_security_state()?;
+        ids.iter()
+            .map(|id| {
+                let head = self.read_heads(id)?.current_version;
+                self.decrypt_version(id, head)
+            })
+            .collect()
+    }
+
+    fn get_version(&self, id: &SecretId, version: u32) -> StoreResult<Zeroizing<Vec<u8>>> {
+        self.verify_security_state()?;
+        self.decrypt_version(id, version)
+    }
+
+    fn append_version(&self, id: &SecretId, plaintext: &[u8]) -> StoreResult<u32> {
+        self.append_version_internal(id, plaintext, None)
+    }
+
+    fn history(&self, id: &SecretId) -> StoreResult<Vec<VersionRecord>> {
+        self.verify_security_state()?;
+        let mut heads = self.read_heads(id)?;
+        heads.versions.sort_by_key(|version| version.version);
+        Ok(heads
+            .versions
+            .into_iter()
+            .map(|version| VersionRecord {
+                version: version.version,
+                size: version.size,
+                created: version.created,
+                note: version.note,
+                mutation_id: version.mutation_id,
+            })
+            .collect())
+    }
+
+    fn set_head(&self, id: &SecretId, version: u32) -> StoreResult<()> {
+        let _lock = self.lock_exclusive()?;
+        self.verify_security_state()?;
+        let mut heads = self.read_heads(id)?;
+        self.find_version(&heads, version)?;
+        heads.current_version = version;
+        self.write_heads(id, &heads)?;
+        self.seal_security_state()
+    }
+
+    fn record(&self, id: &SecretId) -> StoreResult<Option<SecretRecord>> {
+        self.verify_security_state()?;
+        let heads = match self.read_heads(id) {
+            Ok(heads) => heads,
+            Err(StoreError::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let head = self.find_version(&heads, heads.current_version)?;
+        let origin = match (heads.source_path, heads.managed_label) {
+            (Some(source_path), None) => {
+                SecretOrigin::File { source_path: PathBuf::from(source_path) }
+            }
+            (None, Some(label)) => SecretOrigin::Managed { label },
+            _ => unreachable!("read_heads validates exactly one origin"),
+        };
+        Ok(Some(SecretRecord {
+            id: id.clone(),
+            origin,
+            mode: heads.mode,
+            size: head.size,
+            created: heads.created,
+            current_version: heads.current_version,
+            enforcement: heads.enforcement,
+            environment_ids: heads.environment_ids,
+            metadata: heads.metadata,
+        }))
+    }
+
+    fn list(&self) -> StoreResult<Vec<SecretRecord>> {
+        self.verify_security_state()?;
+        let mut out = Vec::new();
+        for id in self.heads_ids()? {
+            if let Some(record) = self.record(&id)? {
+                out.push(record);
+            }
+        }
+        out.sort_by_key(SecretRecord::display_name);
+        Ok(out)
+    }
+
+    fn get_by_path(&self, source_path: &Path) -> StoreResult<Option<SecretRecord>> {
+        self.verify_security_state()?;
+        let target = source_path.to_string_lossy();
+        Ok(self.list()?.into_iter().find(|record| {
+            record
+                .source_path()
+                .is_some_and(|path| path.to_string_lossy() == target)
+        }))
+    }
+
+    fn update_settings(
+        &self,
+        id: &SecretId,
+        metadata: ItemMetadata,
+        enforcement: Enforcement,
+        environment_ids: Option<Vec<String>>,
+    ) -> StoreResult<()> {
+        metadata.validate().map_err(StoreError::Invalid)?;
+        let _lock = self.lock_exclusive()?;
+        self.verify_security_state()?;
+        let mut heads = self.read_heads(id)?;
+        heads.metadata = metadata;
+        heads.enforcement = enforcement;
+        heads.environment_ids = environment_ids;
+        self.write_heads(id, &heads)?;
+        self.seal_security_state()
+    }
+
+    fn delete(&self, id: &SecretId) -> StoreResult<()> {
+        let _lock = self.lock_exclusive()?;
+        self.verify_security_state()?;
+        let heads = self.read_heads(id)?;
+        // Solo vault: nobody else can reference these objects (the payload binding pins them to
+        // this secret id), so a delete is a true destruction. With other enrolled devices the
+        // objects are shared immutable files; only the local head document goes away and the
+        // cross-device meaning is a signed tombstone published by replication.
+        if !self.has_other_enrolled_devices()? {
+            let state = self.state.read().expect("shared state poisoned");
+            for version in &heads.versions {
+                let object = state.layout.object(&version.digest);
+                match std::fs::remove_file(&object) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(StoreError::io(&object, error)),
+                }
+            }
+        }
+        let path = self.heads_path(id);
+        std::fs::remove_file(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StoreError::NotFound(id.to_string())
+            } else {
+                StoreError::io(&path, e)
+            }
+        })?;
+        self.seal_security_state()
+    }
+}
+
+fn copy_directory(source: &Path, destination: &Path) -> StoreResult<()> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(destination)
+        .map_err(|error| StoreError::io(destination, error))?;
+    let entries = std::fs::read_dir(source).map_err(|error| StoreError::io(source, error))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| StoreError::io(source, error))?;
+        if entry.file_name() == ".lock" {
+            continue;
+        }
+        let from = entry.path();
+        let to = destination.join(entry.file_name());
+        let metadata =
+            std::fs::symlink_metadata(&from).map_err(|error| StoreError::io(&from, error))?;
+        if metadata.is_dir() {
+            copy_directory(&from, &to)?;
+        } else if metadata.is_file() {
+            std::fs::copy(&from, &to).map_err(|error| StoreError::io(&to, error))?;
+            std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| StoreError::io(&to, error))?;
+        } else {
+            return Err(StoreError::Invalid(format!(
+                "store contains unsupported filesystem entry: {}",
+                from.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Current time as a second-precision RFC 3339 string (UTC).
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+fn validate_mutation_id(mutation_id: &str) -> StoreResult<()> {
+    uuid::Uuid::parse_str(mutation_id)
+        .map(|_| ())
+        .map_err(|_| StoreError::Invalid(format!("invalid mutation id {mutation_id:?}")))
+}
+
+fn validate_new_secret_origin(
+    origin: SecretOrigin,
+) -> StoreResult<(Option<String>, Option<String>)> {
+    match origin {
+        SecretOrigin::File { source_path } if source_path.is_absolute() => {
+            Ok((Some(source_path.to_string_lossy().into_owned()), None))
+        }
+        SecretOrigin::File { source_path } => Err(StoreError::Invalid(format!(
+            "file secret source path must be absolute: {}",
+            source_path.display()
+        ))),
+        SecretOrigin::Managed { label } if !label.trim().is_empty() => Ok((None, Some(label))),
+        SecretOrigin::Managed { .. } => {
+            Err(StoreError::Invalid("managed secret label cannot be empty".to_string()))
+        }
+    }
+}
+
+/// Lowercase hex SHA-256 — the object filename and the replication Object ID share this exact
+/// encoding: they are the same file.
 pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// Bind the payload to its secret id and transport-stable version UUID. A machine-local ordinal
-/// must not be bound here: the same blob bytes are replicated verbatim to machines that assign
-/// their own ordinals.
+/// Bind the payload to its secret id and transport-stable version UUID.
 fn encode_bound_payload(
     id: &SecretId,
     version_uuid: &str,
@@ -1289,34 +1659,34 @@ fn decode_bound_payload(
         reason,
     };
     if !payload.starts_with(PAYLOAD_MAGIC) {
-        return Err(corrupt("version blob has no authenticated context binding".to_string()));
+        return Err(corrupt("version object has no authenticated context binding".to_string()));
     }
     let mut cursor = PAYLOAD_MAGIC.len();
     let id_len_bytes: [u8; 2] = payload
         .get(cursor..cursor + 2)
         .and_then(|bytes| bytes.try_into().ok())
-        .ok_or_else(|| corrupt("version blob has a truncated context header".to_string()))?;
+        .ok_or_else(|| corrupt("version object has a truncated context header".to_string()))?;
     cursor += 2;
     let id_len = u16::from_be_bytes(id_len_bytes) as usize;
     let actual_id = payload
         .get(cursor..cursor + id_len)
-        .ok_or_else(|| corrupt("version blob has a truncated secret id".to_string()))?
+        .ok_or_else(|| corrupt("version object has a truncated secret id".to_string()))?
         .to_vec();
     cursor += id_len;
     let uuid_len_bytes: [u8; 2] = payload
         .get(cursor..cursor + 2)
         .and_then(|bytes| bytes.try_into().ok())
-        .ok_or_else(|| corrupt("version blob has a truncated context header".to_string()))?;
+        .ok_or_else(|| corrupt("version object has a truncated context header".to_string()))?;
     cursor += 2;
     let uuid_len = u16::from_be_bytes(uuid_len_bytes) as usize;
     let actual_uuid = payload
         .get(cursor..cursor + uuid_len)
-        .ok_or_else(|| corrupt("version blob has a truncated version uuid".to_string()))?
+        .ok_or_else(|| corrupt("version object has a truncated version uuid".to_string()))?
         .to_vec();
     cursor += uuid_len;
     if actual_id != expected_id.as_str().as_bytes() || actual_uuid != expected_uuid.as_bytes() {
         return Err(corrupt(format!(
-            "version blob belongs to {}@{}",
+            "version object belongs to {}@{}",
             String::from_utf8_lossy(&actual_id),
             String::from_utf8_lossy(&actual_uuid)
         )));
@@ -1324,232 +1694,9 @@ fn decode_bound_payload(
     Ok(Zeroizing::new(payload[cursor..].to_vec()))
 }
 
-fn copy_store_directory(source: &Path, destination: &Path) -> StoreResult<()> {
-    if destination.exists() {
-        return Err(StoreError::Invalid(format!(
-            "backup store destination already exists: {}",
-            destination.display()
-        )));
-    }
-    std::fs::DirBuilder::new()
-        .recursive(false)
-        .mode(0o700)
-        .create(destination)
-        .map_err(|source| StoreError::io(destination, source))?;
-    copy_store_contents(source, destination)
-}
-
-fn copy_store_contents(source: &Path, destination: &Path) -> StoreResult<()> {
-    let entries = std::fs::read_dir(source).map_err(|error| StoreError::io(source, error))?;
-    for entry in entries {
-        let entry = entry.map_err(|error| StoreError::io(source, error))?;
-        if entry.file_name() == ".lock" {
-            continue;
-        }
-        let from = entry.path();
-        let to = destination.join(entry.file_name());
-        let metadata =
-            std::fs::symlink_metadata(&from).map_err(|error| StoreError::io(&from, error))?;
-        if metadata.is_dir() {
-            std::fs::DirBuilder::new()
-                .recursive(false)
-                .mode(0o700)
-                .create(&to)
-                .map_err(|error| StoreError::io(&to, error))?;
-            copy_store_contents(&from, &to)?;
-        } else if metadata.is_file() {
-            std::fs::copy(&from, &to).map_err(|error| StoreError::io(&to, error))?;
-            std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o600))
-                .map_err(|error| StoreError::io(&to, error))?;
-        } else {
-            return Err(StoreError::Invalid(format!(
-                "store contains unsupported filesystem entry: {}",
-                from.display()
-            )));
-        }
-    }
-    Ok(())
-}
-
-impl SecretStore for AgeDirStore {
-    fn put(&self, meta: NewSecret, plaintext: &[u8]) -> StoreResult<SecretId> {
-        self.put_internal(SecretId::generate(), meta, plaintext, None)
-    }
-
-    fn get(&self, id: &SecretId) -> StoreResult<Zeroizing<Vec<u8>>> {
-        self.verify_security_state()?;
-        let head = self.read_meta(id)?.current_version;
-        self.get_version(id, head)
-    }
-
-    fn get_many(&self, ids: &[SecretId]) -> StoreResult<Vec<Zeroizing<Vec<u8>>>> {
-        self.verify_security_state()?;
-        // The generation-key cache makes the device identity unwrap happen at most once here.
-        ids.iter()
-            .map(|id| {
-                let head = self.read_meta(id)?.current_version;
-                self.decrypt_version(id, head)
-            })
-            .collect()
-    }
-
-    fn get_version(&self, id: &SecretId, version: u32) -> StoreResult<Zeroizing<Vec<u8>>> {
-        self.verify_security_state()?;
-        self.decrypt_version(id, version)
-    }
-
-    fn append_version(&self, id: &SecretId, plaintext: &[u8]) -> StoreResult<u32> {
-        self.append_version_internal(id, plaintext, None)
-    }
-
-    fn history(&self, id: &SecretId) -> StoreResult<Vec<VersionRecord>> {
-        self.verify_security_state()?;
-        self.history_unverified(id)
-    }
-
-    fn set_head(&self, id: &SecretId, version: u32) -> StoreResult<()> {
-        let _lock = self.lock_exclusive()?;
-        self.verify_security_state()?;
-        let mut meta = self.read_meta(id)?;
-        self.find_version(id, version)?;
-        meta.current_version = version;
-        self.write_meta(id, &meta)?;
-        self.seal_security_state()
-    }
-
-    fn record(&self, id: &SecretId) -> StoreResult<Option<SecretRecord>> {
-        self.verify_security_state()?;
-        let meta = match self.read_meta(id) {
-            Ok(m) => m,
-            Err(StoreError::NotFound(_)) => return Ok(None),
-            Err(e) => return Err(e),
-        };
-        let (_, vm) = self.find_version(id, meta.current_version)?;
-        let origin = match (meta.source_path, meta.managed_label) {
-            (Some(source_path), None) => {
-                SecretOrigin::File { source_path: PathBuf::from(source_path) }
-            }
-            (None, Some(label)) => SecretOrigin::Managed { label },
-            _ => unreachable!("read_meta validates exactly one origin"),
-        };
-        Ok(Some(SecretRecord {
-            id: id.clone(),
-            origin,
-            mode: meta.mode,
-            size: vm.size,
-            created: meta.created,
-            current_version: meta.current_version,
-            enforcement: meta.enforcement,
-            environment_ids: meta.environment_ids,
-            metadata: meta.metadata,
-        }))
-    }
-
-    fn list(&self) -> StoreResult<Vec<SecretRecord>> {
-        self.verify_security_state()?;
-        let mut out = Vec::new();
-        let entries = match std::fs::read_dir(&self.root) {
-            Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-            Err(e) => return Err(StoreError::io(&self.root, e)),
-        };
-        for entry in entries {
-            let entry = entry.map_err(|e| StoreError::io(&self.root, e))?;
-            if !entry.path().is_dir() {
-                continue;
-            }
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            let Ok(id) = name.parse::<SecretId>() else {
-                continue; // ignore non-entry directories
-            };
-            if let Some(rec) = self.record(&id)? {
-                out.push(rec);
-            }
-        }
-        out.sort_by_key(SecretRecord::display_name);
-        Ok(out)
-    }
-
-    fn get_by_path(&self, source_path: &Path) -> StoreResult<Option<SecretRecord>> {
-        self.verify_security_state()?;
-        let target = source_path.to_string_lossy();
-        Ok(self
-            .list()?
-            .into_iter()
-            .find(|record| {
-                record
-                    .source_path()
-                    .is_some_and(|path| path.to_string_lossy() == target)
-            }))
-    }
-
-    fn update_settings(
-        &self,
-        id: &SecretId,
-        metadata: ItemMetadata,
-        enforcement: Enforcement,
-        environment_ids: Option<Vec<String>>,
-    ) -> StoreResult<()> {
-        metadata.validate().map_err(StoreError::Invalid)?;
-        let _lock = self.lock_exclusive()?;
-        self.verify_security_state()?;
-        let mut meta = self.read_meta(id)?;
-        meta.metadata = metadata;
-        meta.enforcement = enforcement;
-        meta.environment_ids = environment_ids;
-        self.write_meta(id, &meta)?;
-        self.seal_security_state()
-    }
-
-    fn delete(&self, id: &SecretId) -> StoreResult<()> {
-        let _lock = self.lock_exclusive()?;
-        self.verify_security_state()?;
-        let dir = self.entry_dir(id);
-        std::fs::remove_dir_all(&dir).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                StoreError::NotFound(id.to_string())
-            } else {
-                StoreError::io(&dir, e)
-            }
-        })?;
-        self.seal_security_state()
-    }
-}
-
-/// Current time as a second-precision RFC 3339 string (UTC).
-fn now_rfc3339() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-}
-
-fn validate_mutation_id(mutation_id: &str) -> StoreResult<()> {
-    uuid::Uuid::parse_str(mutation_id)
-        .map(|_| ())
-        .map_err(|_| StoreError::Invalid(format!("invalid mutation id {mutation_id:?}")))
-}
-
-fn validate_new_secret_origin(
-    origin: SecretOrigin,
-) -> StoreResult<(Option<String>, Option<String>)> {
-    match origin {
-        SecretOrigin::File { source_path } if source_path.is_absolute() => {
-            Ok((Some(source_path.to_string_lossy().into_owned()), None))
-        }
-        SecretOrigin::File { source_path } => Err(StoreError::Invalid(format!(
-            "file secret source path must be absolute: {}",
-            source_path.display()
-        ))),
-        SecretOrigin::Managed { label } if !label.trim().is_empty() => Ok((None, Some(label))),
-        SecretOrigin::Managed { .. } => {
-            Err(StoreError::Invalid("managed secret label cannot be empty".to_string()))
-        }
-    }
-}
-
 /// Write a file with mode 0600, atomically: write+fsync a `.tmp` sibling, then rename over the
-/// target. A crash mid-write leaves the old content intact (this guards the head pointer in
-/// `meta.toml`). Concurrent writers are serialized by the store lock, so the fixed temp name is safe.
+/// target. A crash mid-write leaves the old content intact. Concurrent writers are serialized
+/// by the store lock.
 pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> StoreResult<()> {
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let tmp = {
@@ -1568,6 +1715,7 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> StoreResult<()> {
         .custom_flags(libc::O_NOFOLLOW)
         .open(&tmp)
         .map_err(|e| StoreError::io(&tmp, e))?;
+    use std::io::Write as _;
     f.write_all(bytes).map_err(|e| StoreError::io(&tmp, e))?;
     f.sync_all().map_err(|e| StoreError::io(&tmp, e))?;
     std::fs::rename(&tmp, path).map_err(|e| StoreError::io(path, e))?;
@@ -1583,7 +1731,6 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> StoreResult<()> {
 mod tests {
     use super::*;
     use crate::error::StoreResult;
-    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Test key provider backed by a native age x25519 key (no ssh, no external tools).
     struct X25519Keys(age::x25519::Identity);
@@ -1593,22 +1740,6 @@ mod tests {
         }
         fn identity(&self) -> StoreResult<Box<dyn age::Identity>> {
             Ok(Box::new(self.0.clone()))
-        }
-    }
-
-    struct CountingKeys {
-        identity: age::x25519::Identity,
-        identity_loads: Arc<AtomicUsize>,
-    }
-
-    impl KeyProvider for CountingKeys {
-        fn recipients(&self) -> StoreResult<Vec<Box<dyn age::Recipient + Send>>> {
-            Ok(vec![Box::new(self.identity.to_public())])
-        }
-
-        fn identity(&self) -> StoreResult<Box<dyn age::Identity>> {
-            self.identity_loads.fetch_add(1, Ordering::Relaxed);
-            Ok(Box::new(self.identity.clone()))
         }
     }
 
@@ -1626,360 +1757,68 @@ mod tests {
     }
 
     #[test]
-    fn put_get_roundtrip() {
+    fn opening_a_root_becomes_a_single_device_vault() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path().to_path_buf());
+        assert!(tmp.path().join("shared/vault.json").is_file());
+        assert!(tmp.path().join("device.age").is_file());
+        assert!(tmp.path().join("local/recovery.age").is_file());
+        let vault = s.vault_document();
+        assert_eq!(vault.genesis_device_id, s.device().device_id());
+        assert_eq!(s.current_generation().unwrap(), 1);
+        assert!(!s.has_other_enrolled_devices().unwrap());
+    }
+
+    #[test]
+    fn put_get_roundtrip_stores_the_object_in_the_shared_half() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(tmp.path().to_path_buf());
         let secret = b"EXAMPLE_CONFIG=placeholder-value-one\n";
         let id = s
-            .put(
-                NewSecret::file(PathBuf::from("/Users/me/proj/.env"), 0o600),
-                secret,
-            )
+            .put(NewSecret::file(PathBuf::from("/Users/me/proj/.env"), 0o600), secret)
             .unwrap();
-        let got = s.get(&id).unwrap();
-        assert_eq!(&got[..], secret);
+        assert_eq!(s.get(&id).unwrap().as_slice(), secret);
 
-        // ciphertext on disk must not contain the plaintext, and its filename is its digest
-        let (digest, _) = s.find_version(&id, 1).unwrap();
-        let blob = std::fs::read(s.version_blob_path(&id, &digest)).unwrap();
+        let refs = s.version_refs(&id).unwrap();
+        assert_eq!(refs.len(), 1);
+        let object = tmp.path().join("shared/objects").join(format!("{}.age", refs[0].digest));
+        let blob = std::fs::read(&object).unwrap();
+        assert_eq!(hex_sha256(&blob), refs[0].digest);
         assert!(!blob.windows(secret.len()).any(|w| w == secret));
-        assert_eq!(hex_sha256(&blob), digest);
     }
 
     #[test]
-    fn opening_a_store_creates_generation_and_recovery_keys() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _s = store(tmp.path().to_path_buf());
-        for name in ["1.pub", "1.age", "recovery.pub", "recovery.age"] {
-            let path = tmp.path().join("keys").join(name);
-            assert!(path.is_file(), "missing {name}");
-            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600, "{name} must be private");
-        }
-    }
-
-    #[test]
-    fn reopening_with_the_same_device_key_still_decrypts() {
+    fn reopening_the_same_root_reloads_the_device_identity() {
         let tmp = tempfile::tempdir().unwrap();
         let keys: Arc<dyn KeyProvider> =
             Arc::new(X25519Keys(age::x25519::Identity::generate()));
-        let id = {
+        let (id, device_id) = {
             let s = AgeDirStore::open(tmp.path().to_path_buf(), Arc::clone(&keys)).unwrap();
-            s.put(NewSecret::managed("reopen fixture"), b"survives reopen").unwrap()
+            let id = s.put(NewSecret::managed("reopen fixture"), b"survives reopen").unwrap();
+            (id, s.device().device_id().to_string())
         };
         let reopened = AgeDirStore::open(tmp.path().to_path_buf(), keys).unwrap();
+        assert_eq!(reopened.device().device_id(), device_id);
         assert_eq!(reopened.get(&id).unwrap().as_slice(), b"survives reopen");
-    }
-
-    #[test]
-    fn recovery_identity_alone_decrypts_version_blobs() {
-        use age::secrecy::ExposeSecret as _;
-        use std::str::FromStr as _;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let device = age::x25519::Identity::generate();
-        let keys: Arc<dyn KeyProvider> = Arc::new(X25519Keys(device.clone()));
-        let s = AgeDirStore::open(tmp.path().to_path_buf(), keys).unwrap();
-        let id = s.put(NewSecret::managed("recovery fixture"), b"recoverable").unwrap();
-
-        // Unwrap the escrowed recovery identity with the device key, then decrypt a version
-        // blob using only the recovery identity — the path a total device-key loss would take.
-        let escrow = std::fs::read(tmp.path().join("keys/recovery.age")).unwrap();
-        let secret = s.decrypt_with_identity(&escrow, &device).unwrap();
-        let recovery =
-            age::x25519::Identity::from_str(std::str::from_utf8(&secret).unwrap().trim())
-                .unwrap();
-        assert_eq!(
-            recovery.to_public().to_string(),
-            std::fs::read_to_string(tmp.path().join("keys/recovery.pub")).unwrap().trim()
-        );
-        let _ = recovery.to_string().expose_secret(); // exercise the secrecy API shape
-
-        let (digest, vmeta) = s.find_version(&id, 1).unwrap();
-        let blob = std::fs::read(s.version_blob_path(&id, &digest)).unwrap();
-        let decrypted = s.decrypt_with_identity(&blob, &recovery).unwrap();
-        let plaintext = decode_bound_payload(&id, &vmeta.version_uuid, decrypted).unwrap();
-        assert_eq!(plaintext.as_slice(), b"recoverable");
-    }
-
-    #[test]
-    fn verbatim_export_import_roundtrip_across_stores() {
-        let tmp = tempfile::tempdir().unwrap();
-        let a = store(tmp.path().join("a"));
-        let b_keys: Arc<dyn KeyProvider> =
-            Arc::new(X25519Keys(age::x25519::Identity::generate()));
-        let b = AgeDirStore::open(tmp.path().join("b"), b_keys).unwrap();
-
-        // Machine B joins A's key domain: adopt every generation + the recovery recipient.
-        let generations = vec![(1u32, a.generation_identity_secret(1).unwrap())];
-        b.adopt_generations(&generations, &a.recovery_recipient().unwrap()).unwrap();
-
-        let id = a.put(NewSecret::managed("shared fixture"), b"v1 bytes").unwrap();
-        a.append_version(&id, b"v2 bytes").unwrap();
-        let mutation = "44444444-4444-4444-8444-444444444444";
-
-        for ordinal in [1u32, 2] {
-            let export = a.export_version(&id, ordinal).unwrap();
-            // Zero transcode: the exported bytes are the on-disk file, name = digest.
-            let on_disk = std::fs::read(a.version_blob_path(&id, &export.digest)).unwrap();
-            assert_eq!(on_disk, export.ciphertext);
-            let assigned = b
-                .import_version(
-                    &id,
-                    Some(NewSecret::managed("shared fixture")),
-                    &export.ciphertext,
-                    &export.version_uuid,
-                    export.generation,
-                    export.size,
-                    mutation,
-                )
-                .unwrap();
-            assert_eq!(assigned, ordinal);
-            // Idempotent re-import returns the same ordinal.
-            assert_eq!(
-                b.import_version(
-                    &id,
-                    None,
-                    &export.ciphertext,
-                    &export.version_uuid,
-                    export.generation,
-                    export.size,
-                    mutation,
-                )
-                .unwrap(),
-                ordinal
-            );
-            // Byte-identical on B's disk too.
-            let b_disk = std::fs::read(b.version_blob_path(&id, &export.digest)).unwrap();
-            assert_eq!(b_disk, export.ciphertext);
-        }
-
-        // import_version never moves the head: replicated head moves are explicit deltas.
-        assert_eq!(b.get(&id).unwrap().as_slice(), b"v1 bytes");
-        let v2_uuid = a.export_version(&id, 2).unwrap().version_uuid;
-        assert_eq!(b.set_head_to_uuid(&id, &v2_uuid).unwrap(), 2);
-        assert_eq!(b.get(&id).unwrap().as_slice(), b"v2 bytes");
-        let v1_uuid = a.export_version(&id, 1).unwrap().version_uuid;
-        assert_eq!(b.set_head_to_uuid(&id, &v1_uuid).unwrap(), 1);
-        assert_eq!(b.get(&id).unwrap().as_slice(), b"v1 bytes");
-
-        // A populated store must refuse to adopt foreign generations.
-        assert!(a
-            .adopt_generations(&generations, &a.recovery_recipient().unwrap())
-            .unwrap_err()
-            .to_string()
-            .contains("already holds secrets"));
-    }
-
-    #[test]
-    fn tampered_version_blob_fails_the_digest_check() {
-        let tmp = tempfile::tempdir().unwrap();
-        let s = store(tmp.path().to_path_buf());
-        let id = s.put(NewSecret::managed("tamper fixture"), b"original").unwrap();
-        let (digest, _) = s.find_version(&id, 1).unwrap();
-        let path = s.version_blob_path(&id, &digest);
-        let mut blob = std::fs::read(&path).unwrap();
-        let last = blob.len() - 1;
-        blob[last] ^= 0x01;
-        std::fs::write(&path, &blob).unwrap();
-        assert!(matches!(s.get(&id), Err(StoreError::Corrupt { .. })));
-    }
-
-    #[test]
-    fn identified_put_is_idempotent_at_a_caller_selected_secret_id() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = store(tmp.path().to_path_buf());
-        let id: SecretId = "11111111-1111-4111-8111-111111111111".parse().unwrap();
-        let mutation_id = "22222222-2222-4222-8222-222222222222";
-        let value = b"fixture payload, not a credential";
-
-        let first = store
-            .put_identified(
-                id.clone(),
-                NewSecret::managed("replicated fixture"),
-                value,
-                mutation_id,
-            )
-            .unwrap();
-        let retry = store
-            .put_identified(
-                id.clone(),
-                NewSecret::managed("replicated fixture"),
-                value,
-                mutation_id,
-            )
-            .unwrap();
-
-        assert_eq!(first, id);
-        assert_eq!(retry, id);
-        assert_eq!(store.version_for_mutation(&id, mutation_id).unwrap(), Some(1));
-        assert_eq!(store.history(&id).unwrap().len(), 1);
-        assert!(store
-            .put_identified(
-                id,
-                NewSecret::managed("replicated fixture"),
-                b"different fixture bytes",
-                mutation_id,
-            )
-            .unwrap_err()
-            .to_string()
-            .contains("different secret bytes"));
-    }
-
-    #[test]
-    fn identified_append_reuses_the_original_immutable_version() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = store(tmp.path().to_path_buf());
-        let id = store
-            .put(NewSecret::managed("replicated fixture"), b"version one")
-            .unwrap();
-        let mutation_id = "33333333-3333-4333-8333-333333333333";
-
-        let first = store
-            .append_version_identified(&id, b"version two", mutation_id)
-            .unwrap();
-        let retry = store
-            .append_version_identified(&id, b"version two", mutation_id)
-            .unwrap();
-
-        assert_eq!(first, 2);
-        assert_eq!(retry, 2);
-        assert_eq!(store.version_for_mutation(&id, mutation_id).unwrap(), Some(2));
-        assert_eq!(store.history(&id).unwrap().len(), 2);
-        assert!(store
-            .append_version_identified(&id, b"different version two", mutation_id)
-            .unwrap_err()
-            .to_string()
-            .contains("different secret bytes"));
-    }
-
-    #[test]
-    fn ciphertext_and_metadata_cannot_be_transplanted_between_secret_ids() {
-        let tmp = tempfile::tempdir().unwrap();
-        let s = store(tmp.path().to_path_buf());
-        let first = s
-            .put(NewSecret::file(PathBuf::from("/x/first"), 0o600), b"first")
-            .unwrap();
-        let second = s
-            .put(NewSecret::file(PathBuf::from("/x/second"), 0o600), b"second")
-            .unwrap();
-
-        // Transplant the whole version (blob + sidecar) from first into second: the payload
-        // binding pins the secret id, so decryption fails closed even though the digest matches.
-        let (first_digest, _) = s.find_version(&first, 1).unwrap();
-        let (second_digest, _) = s.find_version(&second, 1).unwrap();
-        std::fs::remove_file(s.version_blob_path(&second, &second_digest)).unwrap();
-        std::fs::remove_file(s.version_meta_path(&second, &second_digest)).unwrap();
-        std::fs::copy(
-            s.version_blob_path(&first, &first_digest),
-            s.version_blob_path(&second, &first_digest),
-        )
-        .unwrap();
-        std::fs::copy(
-            s.version_meta_path(&first, &first_digest),
-            s.version_meta_path(&second, &first_digest),
-        )
-        .unwrap();
-        assert!(matches!(s.get(&second), Err(StoreError::Corrupt { .. })));
-
-        let first_meta = std::fs::read(s.entry_dir(&first).join("meta.toml")).unwrap();
-        std::fs::write(s.entry_dir(&second).join("meta.toml"), first_meta).unwrap();
-        assert!(matches!(s.record(&second), Err(StoreError::Corrupt { .. })));
-    }
-
-    #[test]
-    fn authenticated_store_rejects_external_tampering_and_signed_rollback() {
-        let tmp = tempfile::tempdir().unwrap();
-        let keys: Arc<dyn KeyProvider> =
-            Arc::new(X25519Keys(age::x25519::Identity::generate()));
-        let auth = Arc::new(StateAuthenticator::for_tests([31; 32]));
-        let store = AgeDirStore::open(tmp.path().to_path_buf(), Arc::clone(&keys))
-            .unwrap()
-            .authenticate(Arc::clone(&auth))
-            .unwrap();
-        let id = store
-            .put(NewSecret::managed("authenticated fixture"), b"version-one")
-            .unwrap();
-        let old_sidecar = std::fs::read(tmp.path().join(".integrity.json")).unwrap();
-
-        let meta_path = tmp.path().join(id.as_str()).join("meta.toml");
-        let original_meta = std::fs::read(&meta_path).unwrap();
-        std::fs::write(&meta_path, b"externally modified").unwrap();
-        assert!(store.get(&id).is_err());
-
-        std::fs::write(&meta_path, original_meta).unwrap();
-        store.append_version(&id, b"version-two").unwrap();
-        std::fs::write(tmp.path().join(".integrity.json"), old_sidecar).unwrap();
-        assert!(store.get(&id).is_err());
-    }
-
-    #[test]
-    fn authenticated_store_does_not_silently_adopt_existing_secrets() {
-        let tmp = tempfile::tempdir().unwrap();
-        let keys: Arc<dyn KeyProvider> =
-            Arc::new(X25519Keys(age::x25519::Identity::generate()));
-        let store = AgeDirStore::open(tmp.path().to_path_buf(), Arc::clone(&keys)).unwrap();
-        store
-            .put(NewSecret::managed("legacy fixture"), b"legacy-secret")
-            .unwrap();
-        drop(store);
-
-        let error = match AgeDirStore::open(tmp.path().to_path_buf(), keys)
-            .unwrap()
-            .authenticate(Arc::new(StateAuthenticator::for_tests([32; 32])))
-        {
-            Ok(_) => panic!("existing unauthenticated store was adopted"),
-            Err(error) => error,
-        };
-
-        assert!(error.to_string().contains("refusing to trust"));
-    }
-
-    #[test]
-    fn get_many_loads_the_identity_once() {
-        let tmp = tempfile::tempdir().unwrap();
-        let identity_loads = Arc::new(AtomicUsize::new(0));
-        let keys = Arc::new(CountingKeys {
-            identity: age::x25519::Identity::generate(),
-            identity_loads: Arc::clone(&identity_loads),
-        });
-        let store = AgeDirStore::open(tmp.path().to_path_buf(), keys).unwrap();
-        let first = store
-            .put(NewSecret::managed("fixture-bulk-one"), b"fixture-value-one")
-            .unwrap();
-        let second = store
-            .put(NewSecret::managed("fixture-bulk-two"), b"fixture-value-two")
-            .unwrap();
-
-        let values = store.get_many(&[first, second]).unwrap();
-
-        assert_eq!(identity_loads.load(Ordering::Relaxed), 1);
-        assert_eq!(values[0].as_slice(), b"fixture-value-one");
-        assert_eq!(values[1].as_slice(), b"fixture-value-two");
     }
 
     #[test]
     fn append_version_moves_head_non_destructively() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(tmp.path().to_path_buf());
-        let id = s
-            .put(NewSecret::file(PathBuf::from("/p/.env"), 0o600), b"v1")
-            .unwrap();
+        let id = s.put(NewSecret::file(PathBuf::from("/p/.env"), 0o600), b"v1").unwrap();
 
         assert_eq!(s.append_version(&id, b"v2-longer").unwrap(), 2);
         assert_eq!(s.append_version(&id, b"v3").unwrap(), 3);
 
-        // head is v3; old versions still decrypt
         assert_eq!(s.get(&id).unwrap().as_slice(), b"v3");
         assert_eq!(s.get_version(&id, 1).unwrap().as_slice(), b"v1");
         assert_eq!(s.get_version(&id, 2).unwrap().as_slice(), b"v2-longer");
 
-        // record reflects the head version and its size
         let rec = s.record(&id).unwrap().unwrap();
         assert_eq!(rec.current_version, 3);
         assert_eq!(rec.size, 2);
 
-        // history lists all three, oldest first
         let hist = s.history(&id).unwrap();
         assert_eq!(hist.iter().map(|v| v.version).collect::<Vec<_>>(), vec![1, 2, 3]);
     }
@@ -1988,155 +1827,261 @@ mod tests {
     fn set_head_rolls_back_by_repointing() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(tmp.path().to_path_buf());
-        let id = s
-            .put(NewSecret::file(PathBuf::from("/p/.env"), 0o600), b"first")
-            .unwrap();
+        let id = s.put(NewSecret::file(PathBuf::from("/p/.env"), 0o600), b"first").unwrap();
         s.append_version(&id, b"second").unwrap();
 
-        // rollback head to v1
         s.set_head(&id, 1).unwrap();
         assert_eq!(s.get(&id).unwrap().as_slice(), b"first");
         assert_eq!(s.record(&id).unwrap().unwrap().current_version, 1);
 
-        // a later append goes to max+1 (=3), not head+1, and both older versions survive
         assert_eq!(s.append_version(&id, b"third").unwrap(), 3);
         assert_eq!(s.get_version(&id, 2).unwrap().as_slice(), b"second");
 
-        // rolling back to a nonexistent version fails
         assert!(matches!(s.set_head(&id, 9), Err(StoreError::NotFound(_))));
+
+        // Head moves by transport-stable uuid too.
+        let v2_uuid = s.version_refs(&id).unwrap()[1].version_uuid.clone();
+        assert_eq!(s.set_head_to_uuid(&id, &v2_uuid).unwrap(), 2);
+        assert_eq!(s.head_version_uuid(&id).unwrap(), v2_uuid);
     }
 
     #[test]
-    fn list_and_get_by_path() {
+    fn identified_put_and_append_are_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path().to_path_buf());
+        let id: SecretId = "11111111-1111-4111-8111-111111111111".parse().unwrap();
+        let mutation_id = "22222222-2222-4222-8222-222222222222";
+        let value = b"fixture payload, not a credential";
+
+        store
+            .put_identified(id.clone(), NewSecret::managed("fixture"), value, mutation_id)
+            .unwrap();
+        store
+            .put_identified(id.clone(), NewSecret::managed("fixture"), value, mutation_id)
+            .unwrap();
+        assert_eq!(store.version_for_mutation(&id, mutation_id).unwrap(), Some(1));
+        assert_eq!(store.history(&id).unwrap().len(), 1);
+
+        let append_mutation = "33333333-3333-4333-8333-333333333333";
+        assert_eq!(
+            store.append_version_identified(&id, b"version two", append_mutation).unwrap(),
+            2
+        );
+        assert_eq!(
+            store.append_version_identified(&id, b"version two", append_mutation).unwrap(),
+            2
+        );
+        assert!(store
+            .append_version_identified(&id, b"different", append_mutation)
+            .unwrap_err()
+            .to_string()
+            .contains("different secret bytes"));
+    }
+
+    #[test]
+    fn list_get_by_path_and_settings_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(tmp.path().to_path_buf());
         s.put(NewSecret::file(PathBuf::from("/a/.env"), 0o600), b"A=1").unwrap();
-        s.put(NewSecret::file(PathBuf::from("/b/.env"), 0o600), b"B=2").unwrap();
-
-        let all = s.list().unwrap();
-        assert_eq!(all.len(), 2);
-
+        let id = s.put(NewSecret::file(PathBuf::from("/b/.env"), 0o600), b"B=2").unwrap();
+        assert_eq!(s.list().unwrap().len(), 2);
         let rec = s.get_by_path(Path::new("/b/.env")).unwrap().unwrap();
-        assert_eq!(s.get(&rec.id).unwrap().as_slice(), b"B=2");
-        assert!(s.get_by_path(Path::new("/nope")).unwrap().is_none());
-    }
-
-    #[test]
-    fn managed_secret_has_a_label_without_a_fake_source_path() {
-        let tmp = tempfile::tempdir().unwrap();
-        let s = store(tmp.path().to_path_buf());
-        let id = s
-            .put(NewSecret::managed("Fixture Shared Secret"), b"fixture-managed-value")
-            .unwrap();
-
-        let record = s.record(&id).unwrap().unwrap();
-        assert_eq!(
-            record.origin,
-            SecretOrigin::Managed { label: "Fixture Shared Secret".to_string() }
-        );
-        assert!(record.source_path().is_none());
-        assert_eq!(s.get(&id).unwrap().as_slice(), b"fixture-managed-value");
-        let meta = std::fs::read_to_string(s.entry_dir(&id).join("meta.toml")).unwrap();
-        assert!(meta.contains("managed_label = \"Fixture Shared Secret\""));
-        assert!(!meta.contains("fixture-managed-value"));
-    }
-
-    #[test]
-    fn new_secret_persists_its_initial_enforcement() {
-        let tmp = tempfile::tempdir().unwrap();
-        let s = store(tmp.path().to_path_buf());
-        let id = s
-            .put(
-                NewSecret::file(PathBuf::from("/fixture/.envrc"), 0o600)
-                    .with_enforcement(Enforcement::Allow),
-                b"export FIXTURE=1\n",
-            )
-            .unwrap();
-
-        assert_eq!(s.record(&id).unwrap().unwrap().enforcement, Enforcement::Allow);
-    }
-
-    #[test]
-    fn metadata_roundtrips_without_creating_a_content_version() {
-        use floria_core::metadata::ItemLink;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let s = store(tmp.path().to_path_buf());
-        let id = s
-            .put(NewSecret::file(PathBuf::from("/fixture/.pgpass"), 0o600), b"fixture")
-            .unwrap();
-        let metadata = ItemMetadata {
-            note: Some("Local reporting database".to_string()),
-            links: vec![ItemLink {
-                label: "Database console".to_string(),
-                url: "https://example.invalid/databases/reporting".to_string(),
-            }],
-        };
+        assert_eq!(rec.id, id);
 
         s.update_settings(
             &id,
-            metadata.clone(),
+            ItemMetadata::default(),
             Enforcement::TouchId,
-            Some(vec!["production".to_string(), "staging".to_string()]),
+            Some(vec!["production".to_string()]),
         )
         .unwrap();
-
-        let record = s.record(&id).unwrap().unwrap();
-        assert_eq!(record.metadata, metadata);
-        assert_eq!(record.enforcement, Enforcement::TouchId);
-        assert_eq!(
-            record.environment_ids,
-            Some(vec!["production".to_string(), "staging".to_string()])
-        );
-        assert_eq!(record.current_version, 1);
-        assert_eq!(s.history(&id).unwrap().len(), 1);
-        let sidecar = std::fs::read_to_string(s.entry_dir(&id).join("meta.toml")).unwrap();
-        assert!(sidecar.contains("Local reporting database"));
-        assert!(sidecar.contains("enforcement = \"touchid\""));
-        assert!(!sidecar.contains("fixture\n"));
+        let rec = s.record(&id).unwrap().unwrap();
+        assert_eq!(rec.enforcement, Enforcement::TouchId);
+        assert_eq!(rec.environment_ids, Some(vec!["production".to_string()]));
+        assert_eq!(rec.current_version, 1);
     }
 
     #[test]
-    fn delete_removes_entry() {
+    fn solo_delete_destroys_objects_too() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(tmp.path().to_path_buf());
-        let id = s
-            .put(NewSecret::file(PathBuf::from("/x/.env"), 0o600), b"X=1")
-            .unwrap();
+        let id = s.put(NewSecret::managed("solo delete"), b"gone for real").unwrap();
+        let digest = s.version_refs(&id).unwrap()[0].digest.clone();
+        let object = tmp.path().join("shared/objects").join(format!("{digest}.age"));
+        assert!(object.is_file());
+
         s.delete(&id).unwrap();
         assert!(matches!(s.get(&id), Err(StoreError::NotFound(_))));
-        assert!(s.list().unwrap().is_empty());
+        assert!(!object.exists(), "solo delete must destroy the object");
     }
 
     #[test]
-    fn wrong_format_is_rejected_with_clear_error() {
+    fn delete_with_other_enrolled_devices_keeps_objects() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(tmp.path().to_path_buf());
-        let id = s
-            .put(NewSecret::file(PathBuf::from("/x/.env"), 0o600), b"X=1")
-            .unwrap();
+        let id = s.put(NewSecret::managed("shared delete"), b"kept as history").unwrap();
+        let digest = s.version_refs(&id).unwrap()[0].digest.clone();
+        let object = tmp.path().join("shared/objects").join(format!("{digest}.age"));
 
-        // Simulate an entry written by a different (older/newer) layout.
-        let meta_path = tmp.path().join(id.as_str()).join("meta.toml");
-        let text = std::fs::read_to_string(&meta_path).unwrap();
-        std::fs::write(&meta_path, text.replace("format = 4", "format = 99")).unwrap();
+        // Enroll a second device: genesis-signed identity in its own namespace.
+        let second = DeviceKeyMaterial::generate().unwrap();
+        let layout = s.shared_layout();
+        ensure_private_directory(&layout.device_dir(second.device_id())).unwrap();
+        vault::write_device_identity(
+            &layout.device_identity(second.device_id()),
+            &s.vault_document(),
+            &second.enrollment(),
+            1,
+            s.device().signing_key(),
+        )
+        .unwrap();
+        assert!(s.has_other_enrolled_devices().unwrap());
 
-        match s.get(&id) {
-            Err(StoreError::Corrupt { reason, .. }) => assert!(reason.contains("format 99")),
-            other => panic!("expected Corrupt, got {other:?}"),
+        s.delete(&id).unwrap();
+        assert!(matches!(s.get(&id), Err(StoreError::NotFound(_))));
+        assert!(object.is_file(), "shared objects are immutable once other devices exist");
+    }
+
+    #[test]
+    fn second_device_reads_the_same_object_without_any_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = store(tmp.path().join("a"));
+        let id = a.put(NewSecret::managed("single copy"), b"one byte set").unwrap();
+        a.append_version(&id, b"second version").unwrap();
+
+        // Device B: own root, then adopt A's shared half (fresh install joining a vault).
+        let b_keys: Arc<dyn KeyProvider> =
+            Arc::new(X25519Keys(age::x25519::Identity::generate()));
+        let b = AgeDirStore::open(tmp.path().join("b"), b_keys).unwrap();
+        b.adopt_shared_location(&a.shared_root()).unwrap();
+
+        // Genesis enrolls B: identity + a generation-1 envelope in B's namespace.
+        let layout = a.shared_layout();
+        let b_device = b.device();
+        ensure_private_directory(&layout.device_dir(b_device.device_id())).unwrap();
+        ensure_private_directory(&layout.envelopes_dir(b_device.device_id())).unwrap();
+        vault::write_device_identity(
+            &layout.device_identity(b_device.device_id()),
+            &a.vault_document(),
+            &b_device.enrollment(),
+            1,
+            a.device().signing_key(),
+        )
+        .unwrap();
+        let generation_identity = a.generation_identity(1).unwrap();
+        let envelope = vault::encrypt_to_recipient(
+            &b_device
+                .enrollment()
+                .wrapping_recipient
+                .parse::<x25519::Recipient>()
+                .unwrap(),
+            generation_identity.to_string().expose_secret().as_bytes(),
+        )
+        .unwrap();
+        write_new_atomic(&layout.envelope(b_device.device_id(), 1), &envelope).unwrap();
+
+        // B registers A's versions from references only — no bytes move anywhere.
+        for reference in a.version_refs(&id).unwrap() {
+            let assigned = b
+                .register_replicated_version(
+                    &id,
+                    Some(NewSecret::managed("single copy")),
+                    &reference.version_uuid,
+                    reference.generation,
+                    reference.size,
+                    &reference.digest,
+                    "44444444-4444-4444-8444-444444444444",
+                )
+                .unwrap();
+            assert_eq!(assigned, reference.ordinal);
         }
+        let head_uuid = a.head_version_uuid(&id).unwrap();
+        b.set_head_to_uuid(&id, &head_uuid).unwrap();
+        assert_eq!(b.get(&id).unwrap().as_slice(), b"second version");
+
+        // The single-copy property: both devices resolve the same physical file.
+        let digest = a.version_refs(&id).unwrap()[1].digest.clone();
+        assert_eq!(
+            a.shared_layout().object(&digest),
+            b.shared_layout().object(&digest)
+        );
+
+        // Tombstone import removes only B's head document.
+        assert!(b.remove_replicated_heads(&id).unwrap());
+        assert!(matches!(b.get(&id), Err(StoreError::NotFound(_))));
+        assert_eq!(a.get(&id).unwrap().as_slice(), b"second version");
     }
 
     #[test]
-    fn older_formats_are_rejected_with_a_migrate_hint() {
+    fn unenrolled_device_cannot_write_into_an_adopted_vault() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = store(tmp.path().join("a"));
+        let b = store(tmp.path().join("b"));
+        b.adopt_shared_location(&a.shared_root()).unwrap();
+        let error = b.put(NewSecret::managed("premature"), b"nope").unwrap_err();
+        assert!(
+            error.to_string().contains("no envelope"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn adopting_a_vault_requires_an_unused_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = store(tmp.path().join("a"));
+        let b = store(tmp.path().join("b"));
+        b.put(NewSecret::managed("existing"), b"data").unwrap();
+        assert!(b
+            .adopt_shared_location(&a.shared_root())
+            .unwrap_err()
+            .to_string()
+            .contains("already holds secrets"));
+    }
+
+    #[test]
+    fn relocating_the_shared_half_is_a_move_with_a_pointer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let keys: Arc<dyn KeyProvider> =
+            Arc::new(X25519Keys(age::x25519::Identity::generate()));
+        let s = AgeDirStore::open(tmp.path().join("root"), Arc::clone(&keys)).unwrap();
+        let id = s.put(NewSecret::managed("relocated"), b"still readable").unwrap();
+
+        let target = tmp.path().join("Synced/My Floria.floriavault");
+        s.relocate_shared(&target).unwrap();
+        assert!(target.join("vault.json").is_file());
+        assert!(!tmp.path().join("root/shared").exists());
+        assert_eq!(s.get(&id).unwrap().as_slice(), b"still readable");
+
+        // Reopening resolves the pointer.
+        drop(s);
+        let reopened = AgeDirStore::open(tmp.path().join("root"), keys).unwrap();
+        assert_eq!(reopened.shared_root(), target);
+        assert_eq!(reopened.get(&id).unwrap().as_slice(), b"still readable");
+    }
+
+    #[test]
+    fn tampered_object_fails_the_digest_check() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(tmp.path().to_path_buf());
-        let id = s
-            .put(NewSecret::file(PathBuf::from("/fixture/project/.env"), 0o600), b"fixture-v1")
-            .unwrap();
-        let meta_path = tmp.path().join(id.as_str()).join("meta.toml");
-        let text = std::fs::read_to_string(&meta_path).unwrap();
-        std::fs::write(&meta_path, text.replace("format = 4", "format = 3")).unwrap();
+        let id = s.put(NewSecret::managed("tamper fixture"), b"original").unwrap();
+        let digest = s.version_refs(&id).unwrap()[0].digest.clone();
+        let object = tmp.path().join("shared/objects").join(format!("{digest}.age"));
+        let mut blob = std::fs::read(&object).unwrap();
+        let last = blob.len() - 1;
+        blob[last] ^= 0x01;
+        std::fs::write(&object, &blob).unwrap();
+        assert!(matches!(s.get(&id), Err(StoreError::Corrupt { .. })));
+    }
+
+    #[test]
+    fn wrong_format_is_rejected_with_a_migrate_hint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path().to_path_buf());
+        let id = s.put(NewSecret::file(PathBuf::from("/x/.env"), 0o600), b"X=1").unwrap();
+
+        let heads_path = tmp.path().join("local/heads").join(format!("{id}.toml"));
+        let text = std::fs::read_to_string(&heads_path).unwrap();
+        std::fs::write(&heads_path, text.replace("format = 5", "format = 4")).unwrap();
 
         match s.get(&id) {
             Err(StoreError::Corrupt { reason, .. }) => {
@@ -2147,37 +2092,102 @@ mod tests {
     }
 
     #[test]
-    fn missing_is_not_found() {
+    fn authenticated_store_rejects_tampering_but_tolerates_sync_arrivals() {
         let tmp = tempfile::tempdir().unwrap();
-        let s = store(tmp.path().to_path_buf());
-        let id = SecretId::generate();
-        assert!(matches!(s.get(&id), Err(StoreError::NotFound(_))));
+        let keys: Arc<dyn KeyProvider> =
+            Arc::new(X25519Keys(age::x25519::Identity::generate()));
+        let auth = Arc::new(StateAuthenticator::for_tests([31; 32]));
+        let store = AgeDirStore::open(tmp.path().to_path_buf(), Arc::clone(&keys))
+            .unwrap()
+            .authenticate(Arc::clone(&auth))
+            .unwrap();
+        let id = store.put(NewSecret::managed("authenticated fixture"), b"version-one").unwrap();
+        let sidecar = tmp.path().join("local/.integrity.json");
+        let old_sidecar = std::fs::read(&sidecar).unwrap();
+
+        // A foreign object arriving through the sync tool must NOT trip integrity: the local
+        // snapshot covers only head documents.
+        std::fs::write(
+            tmp.path().join("shared/objects/feedfacefeedface.age"),
+            b"unreferenced arrival",
+        )
+        .unwrap();
+        assert_eq!(store.get(&id).unwrap().as_slice(), b"version-one");
+
+        // Tampering with the local head document fails closed.
+        let heads_path = tmp.path().join("local/heads").join(format!("{id}.toml"));
+        let original = std::fs::read(&heads_path).unwrap();
+        std::fs::write(&heads_path, b"externally modified").unwrap();
+        assert!(store.get(&id).is_err());
+        std::fs::write(&heads_path, original).unwrap();
+
+        // Signed rollback of the sidecar fails closed.
+        store.append_version(&id, b"version-two").unwrap();
+        std::fs::write(&sidecar, old_sidecar).unwrap();
+        assert!(store.get(&id).is_err());
     }
 
-    /// End-to-end with a real (unencrypted) ssh ed25519 key — the dev key path.
     #[test]
-    fn ssh_ed25519_roundtrip() {
+    fn authenticated_store_does_not_silently_adopt_existing_secrets() {
         let tmp = tempfile::tempdir().unwrap();
-        let key = tmp.path().join("id_ed25519");
-        let ok = std::process::Command::new("ssh-keygen")
-            .args(["-t", "ed25519", "-N", "", "-C", "test", "-q", "-f"])
-            .arg(&key)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if !ok {
-            eprintln!("ssh-keygen unavailable; skipping");
-            return;
+        let keys: Arc<dyn KeyProvider> =
+            Arc::new(X25519Keys(age::x25519::Identity::generate()));
+        {
+            let store = AgeDirStore::open(tmp.path().to_path_buf(), Arc::clone(&keys)).unwrap();
+            store.put(NewSecret::managed("legacy fixture"), b"legacy-secret").unwrap();
         }
-        // The key file must be 0600 for the store's perm check.
-        std::fs::set_permissions(&key, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
+        let error = match AgeDirStore::open(tmp.path().to_path_buf(), keys)
+            .unwrap()
+            .authenticate(Arc::new(StateAuthenticator::for_tests([32; 32])))
+        {
+            Ok(_) => panic!("existing unauthenticated store was adopted"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("refusing to trust"));
+    }
 
-        let keys = Arc::new(crate::keys::SshKeyProvider::new(key, None));
-        let s = AgeDirStore::open(tmp.path().join("store"), keys).unwrap();
-        let secret = b"EXAMPLE_CONFIG=placeholder-value-two\n";
-        let id = s
-            .put(NewSecret::file(PathBuf::from("/p/.env"), 0o600), secret)
+    #[test]
+    fn enrollment_request_roundtrip_and_fingerprint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = store(tmp.path().join("a"));
+        let b = DeviceKeyMaterial::generate().unwrap();
+        let request = b
+            .enrollment_request(&a.vault_document(), Some("Laptop".to_string()), "2026-08-06T00:00:00Z")
             .unwrap();
-        assert_eq!(s.get(&id).unwrap().as_slice(), secret);
+        let layout = a.shared_layout();
+        ensure_private_directory(&layout.device_dir(b.device_id())).unwrap();
+        write_new_atomic(
+            &layout.enrollment_request(b.device_id()),
+            &serde_json::to_vec_pretty(&request).unwrap(),
+        )
+        .unwrap();
+
+        let read = vault::read_enrollment_request(
+            &layout.enrollment_request(b.device_id()),
+            &a.vault_document(),
+        )
+        .unwrap();
+        assert_eq!(read.device_id, b.device_id());
+        assert_eq!(read.device_name.as_deref(), Some("Laptop"));
+        let fingerprint = read.fingerprint();
+        assert_eq!(fingerprint.len(), 14); // XXXX-XXXX-XXXX
+        assert_eq!(fingerprint, request.fingerprint());
+
+        // A tampered request fails validation.
+        let mut forged = request.clone();
+        forged.device_name = Some("Evil".to_string());
+        assert!(vault::validate_enrollment_request(&forged, &a.vault_document()).is_err());
+    }
+
+    #[test]
+    fn backup_and_verify_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path().join("live"));
+        s.put(NewSecret::managed("backup fixture"), b"backup me").unwrap();
+        let destination = tmp.path().join("backup");
+        s.backup_to(&destination).unwrap();
+        let verification = s.verify_backup(&destination).unwrap();
+        assert_eq!(verification.secrets, 1);
+        assert_eq!(verification.versions, 1);
     }
 }

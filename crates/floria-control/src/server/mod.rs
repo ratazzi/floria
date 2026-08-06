@@ -135,6 +135,8 @@ pub trait RuntimeReplicationService: Send + Sync + 'static {
     fn disable(&self) -> Result<ReplicationStatus, String>;
     fn enrollment(&self) -> Result<ReplicationEnrollment, String>;
     fn enroll(&self, enrollment: ReplicationEnrollment) -> Result<ReplicationStatus, String>;
+    /// Approve a pending sync-directory enrollment request by device id.
+    fn approve(&self, device_id: &str) -> Result<ReplicationStatus, String>;
 }
 
 pub struct ControlRuntimeServices {
