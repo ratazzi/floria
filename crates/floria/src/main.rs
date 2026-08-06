@@ -3109,7 +3109,15 @@ mod tests {
         let replacement_request = joining.enrollment().unwrap();
         assert_eq!(replacement_request.device_id, replacement_device_id);
         genesis.enroll(replacement_request).unwrap();
-        assert_eq!(joining.open(&package).unwrap().mode, ReplicationMode::Active);
+
+        // The library was written under vault generation 1, which the store already holds; the
+        // replacement enrollment adds envelopes for every generation, so rejoining only installs
+        // the missing generation 2 key — no re-key, no data loss.
+        let rejoined = joining.open(&package).unwrap();
+        assert_eq!(rejoined.mode, ReplicationMode::Active);
+        assert_eq!(joining_catalog.snapshot().unwrap(), catalog_before);
+        assert_eq!(joining_store.get(&local_secret).unwrap().as_slice(), b"still here");
+        assert!(joining_store.generation_public(2).unwrap().is_some());
     }
 
     #[test]

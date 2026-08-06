@@ -40,7 +40,12 @@ const MAX_DESCRIPTOR_BYTES: u64 = 64 * 1024;
 const MAX_OPERATION_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_OBJECT_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_REPORTED_DAMAGED_FILES: usize = 20;
-const VAULT_STATE_LOGICAL_ID: &str = "vault-state/v1";
+/// Operation payload format: v2 carries per-entity deltas of one committed local transaction.
+const PAYLOAD_FORMAT_VERSION: u32 = 2;
+/// Transitional logical entity for whole-catalog metadata until catalog rows become entities.
+const CATALOG_LOGICAL_ID: &str = "catalog/v1";
+/// Placeholder logical id recorded on outbox rows (real per-entity ids live in the delta).
+const TRANSACTION_LOGICAL_ID: &str = "txn/v2";
 
 #[derive(Debug, Error)]
 pub enum ReplicationError {
@@ -276,12 +281,13 @@ pub struct ReplicationDevice {
 
 /// One already-sequenced local mutation. `operation_id` and `sequence` are supplied by the
 /// durable outbox layer so a crash can persist and retry exactly one signed envelope.
-pub struct PackageMutation<'a> {
-    pub sequence: u64,
-    pub operation_id: &'a str,
-    pub logical_id: &'a str,
-    pub parents: &'a [String],
-    pub value: &'a [u8],
+pub(crate) struct PackageMutation<'a> {
+    pub(crate) sequence: u64,
+    pub(crate) operation_id: &'a str,
+    /// Per-entity deltas of the committed local transaction.
+    pub(crate) entities: &'a [EntityPayload],
+    /// Verbatim store version files referenced by the entities, keyed by their digest.
+    pub(crate) objects: &'a [PreparedObject],
 }
 
 /// Fully encrypted, signed bytes. Persist this value locally before calling `publish`; retrying a
@@ -290,9 +296,15 @@ pub struct PackageMutation<'a> {
 pub struct PreparedPublication {
     pub sequence: u64,
     pub operation_id: String,
-    pub object_id: String,
-    object: Vec<u8>,
+    /// Verbatim store version files to publish under `objects/<id>.age` — never re-encrypted.
+    objects: Vec<PreparedObject>,
     operation: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PreparedObject {
+    pub(crate) id: String,
+    pub(crate) bytes: Vec<u8>,
 }
 
 /// A local-store mutation that must become an immutable version before the catalog outbox can
@@ -344,7 +356,7 @@ impl ReplicationIntent {
         Ok(intent)
     }
 
-    fn snapshot(
+    fn transaction(
         intent_id: impl Into<String>,
         parents: Vec<String>,
         store_versions: Vec<floria_catalog::ReplicationStoreVersionRef>,
@@ -353,7 +365,7 @@ impl ReplicationIntent {
     ) -> ReplicationResult<Self> {
         let intent = Self {
             intent_id: intent_id.into(),
-            logical_id: VAULT_STATE_LOGICAL_ID.to_string(),
+            logical_id: TRANSACTION_LOGICAL_ID.to_string(),
             parents,
             store_mutations: Vec::new(),
             store_versions,
@@ -666,10 +678,22 @@ pub struct VerifiedMutation {
     pub key_generation: u32,
     pub sequence: u64,
     pub operation_id: String,
-    pub logical_id: String,
-    pub parents: Vec<String>,
-    pub object_id: String,
-    pub value: Zeroizing<Vec<u8>>,
+    /// Decrypted, validated per-entity payload. Object bytes are NOT here — they stay verbatim
+    /// in `objects/` and are handed to the store during import.
+    payload: OperationPayload,
+}
+
+impl VerifiedMutation {
+    fn entity_ids(&self) -> impl Iterator<Item = &str> {
+        self.payload.entities.iter().map(|entity| entity.logical_id.as_str())
+    }
+
+    fn all_parents(&self) -> impl Iterator<Item = &str> {
+        self.payload
+            .entities
+            .iter()
+            .flat_map(|entity| entity.parents.iter().map(String::as_str))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -797,6 +821,8 @@ struct KeyGenerationUnsigned {
     authorized_by: String,
     envelopes: BTreeMap<String, String>,
     revoked_devices: BTreeMap<String, u64>,
+    /// The vault-wide recovery recipient every store encrypts to (from the genesis store).
+    recovery_public: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -808,6 +834,7 @@ struct KeyGenerationDocument {
     authorized_by: String,
     envelopes: BTreeMap<String, String>,
     revoked_devices: BTreeMap<String, u64>,
+    recovery_public: String,
     signature: String,
 }
 
@@ -821,6 +848,7 @@ impl KeyGenerationDocument {
             authorized_by: self.authorized_by.clone(),
             envelopes: self.envelopes.clone(),
             revoked_devices: self.revoked_devices.clone(),
+            recovery_public: self.recovery_public.clone(),
         }
     }
 }
@@ -862,15 +890,52 @@ impl OperationDocument {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+/// The encrypted business payload of one operation: the entity-level deltas of a single
+/// committed local transaction. Secret content never rides in the payload — version bytes are
+/// verbatim store files published as objects and referenced by digest (invariants 13/14 in
+/// `docs/design/portable-replication.md`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct OperationPayload {
     format_version: u32,
+    entities: Vec<EntityPayload>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct EntityPayload {
+    /// Shared entity UUID (a secret id), or [`CATALOG_LOGICAL_ID`] for the transitional
+    /// whole-catalog metadata entity.
     logical_id: String,
+    /// Head operation ids of THIS entity that the delta builds on.
     parents: Vec<String>,
+    delta: EntityDelta,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum EntityDelta {
+    Secret(SecretDelta),
+    /// Serialized `ReplicatedCatalog` (metadata only). Transitional single entity until catalog
+    /// rows become individual entities.
+    Catalog { payload: Vec<u8> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SecretDelta {
+    descriptor: ExportStoreDescriptor,
+    /// New immutable versions introduced by this operation, oldest first.
+    versions: Vec<SecretVersionRef>,
+    /// The version the head points at after applying this delta.
+    head_uuid: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SecretVersionRef {
+    version_uuid: String,
+    generation: u32,
+    size: u64,
     object: ObjectReference,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct ObjectReference {
     id: String,
     ciphertext_size: u64,
@@ -890,6 +955,8 @@ struct PackageMetadata {
     current_generation: u32,
     generation_fingerprints: BTreeMap<u32, String>,
     trusted_devices: HashMap<String, TrustedDevice>,
+    /// From the highest signed key-generation document.
+    recovery_public: String,
 }
 
 #[derive(Clone)]
@@ -908,16 +975,31 @@ impl ReplicationPackage {
         vault_id: impl Into<String>,
         created_at: impl Into<String>,
         device: DeviceKeyMaterial,
+        vault_identity: x25519::Identity,
+        recovery_public: String,
     ) -> ReplicationResult<Self> {
-        Self::create_named(root, vault_id, created_at, device, None)
+        Self::create_named(
+            root,
+            vault_id,
+            created_at,
+            device,
+            None,
+            vault_identity,
+            recovery_public,
+        )
     }
 
+    /// Create the vault. Generation 1's identity comes from the genesis store (`keys/1`), so the
+    /// version files that store already wrote are decryptable by every enrolled device — the
+    /// zero-transcode property depends on this single key domain.
     pub fn create_named(
         root: impl Into<PathBuf>,
         vault_id: impl Into<String>,
         created_at: impl Into<String>,
         device: DeviceKeyMaterial,
         device_name: Option<String>,
+        vault_identity: x25519::Identity,
+        recovery_public: String,
     ) -> ReplicationResult<Self> {
         let root = root.into();
         let vault_id = vault_id.into();
@@ -933,7 +1015,6 @@ impl ReplicationPackage {
         })?;
         let temporary = parent.join(format!(".floria-vault-{}.tmp", uuid::Uuid::new_v4()));
         create_private_directory(&temporary)?;
-        let vault_identity = x25519::Identity::generate();
 
         let result = (|| {
             create_private_directory(&temporary.join("devices"))?;
@@ -991,6 +1072,7 @@ impl ReplicationPackage {
                     device.wrapping_identity.to_public(),
                 )]),
                 BTreeMap::new(),
+                &recovery_public,
                 &device.signing_key,
             )?;
             sync_directory(&temporary)?;
@@ -1029,6 +1111,7 @@ impl ReplicationPackage {
                 current_generation: 1,
                 generation_fingerprints,
                 trusted_devices,
+                recovery_public,
             }),
         })
     }
@@ -1142,7 +1225,12 @@ impl ReplicationPackage {
 
     /// Revoke a non-genesis Device and rotate the Vault data key. The signed generation document
     /// atomically binds the new envelopes to the revoked Device's final accepted sequence.
-    pub fn revoke_device(&self, device_id: &str) -> ReplicationResult<u32> {
+    pub fn revoke_device(
+        &self,
+        device_id: &str,
+        next_identity: x25519::Identity,
+        recovery_public: &str,
+    ) -> ReplicationResult<u32> {
         if self.device.device_id != self.vault.genesis_device_id {
             return Err(ReplicationError::Invalid(
                 "only the genesis Device may revoke another Device".to_string(),
@@ -1187,7 +1275,6 @@ impl ReplicationPackage {
                 .collect::<BTreeMap<_, _>>();
             (metadata.current_generation, generation, recipients)
         };
-        let vault_identity = x25519::Identity::generate();
         write_key_generation(
             &self
                 .root
@@ -1196,13 +1283,39 @@ impl ReplicationPackage {
             &self.vault,
             generation,
             Some(current_generation),
-            &vault_identity,
+            &next_identity,
             &recipients,
             BTreeMap::from([(device_id.to_string(), final_sequence)]),
+            recovery_public,
             &self.device.signing_key,
         )?;
         self.refresh_metadata()?;
         Ok(generation)
+    }
+
+    /// Every generation identity this device can unwrap, as wrappable secret strings
+    /// (for installing into the local store when joining a vault).
+    fn generation_identity_secrets(&self) -> Vec<(u32, Zeroizing<String>)> {
+        self.metadata
+            .read()
+            .expect("replication metadata poisoned")
+            .vault_identities
+            .iter()
+            .map(|(generation, identity)| {
+                (
+                    *generation,
+                    Zeroizing::new(identity.to_string().expose_secret().clone()),
+                )
+            })
+            .collect()
+    }
+
+    fn recovery_public(&self) -> String {
+        self.metadata
+            .read()
+            .expect("replication metadata poisoned")
+            .recovery_public
+            .clone()
     }
 
     pub fn vault_id(&self) -> &str {
@@ -1264,7 +1377,10 @@ impl ReplicationPackage {
         Ok(())
     }
 
-    pub fn prepare(&self, mutation: PackageMutation<'_>) -> ReplicationResult<PreparedPublication> {
+    pub(crate) fn prepare(
+        &self,
+        mutation: PackageMutation<'_>,
+    ) -> ReplicationResult<PreparedPublication> {
         self.refresh_metadata()?;
         if mutation.sequence == 0 {
             return Err(ReplicationError::Invalid(
@@ -1272,17 +1388,54 @@ impl ReplicationPackage {
             ));
         }
         require_uuid("operation id", mutation.operation_id)?;
-        if mutation.logical_id.is_empty() {
-            return Err(ReplicationError::Invalid("logical id is empty".to_string()));
+        validate_entities(mutation.operation_id, mutation.entities)?;
+        // Every referenced object must be supplied verbatim with a matching digest and size;
+        // unreferenced objects must not ride along.
+        let mut referenced: HashMap<&str, u64> = HashMap::new();
+        for entity in mutation.entities {
+            if let EntityDelta::Secret(delta) = &entity.delta {
+                for version in &delta.versions {
+                    if referenced
+                        .insert(&version.object.id, version.object.ciphertext_size)
+                        .is_some()
+                    {
+                        return Err(ReplicationError::Invalid(format!(
+                            "operation {} references object {} twice",
+                            mutation.operation_id, version.object.id
+                        )));
+                    }
+                }
+            }
         }
-        let mut unique_parents = HashSet::new();
-        for parent in mutation.parents {
-            require_uuid("parent operation id", parent)?;
-            if parent == mutation.operation_id || !unique_parents.insert(parent) {
+        if referenced.len() != mutation.objects.len() {
+            return Err(ReplicationError::Invalid(format!(
+                "operation {} supplies {} object(s) but references {}",
+                mutation.operation_id,
+                mutation.objects.len(),
+                referenced.len()
+            )));
+        }
+        for object in mutation.objects {
+            if digest(&object.bytes) != object.id {
                 return Err(ReplicationError::Invalid(format!(
-                    "operation {} has an invalid or duplicate parent {parent}",
-                    mutation.operation_id
+                    "supplied object {} does not match its digest",
+                    object.id
                 )));
+            }
+            match referenced.get(object.id.as_str()) {
+                Some(size) if *size == object.bytes.len() as u64 => {}
+                Some(_) => {
+                    return Err(ReplicationError::Invalid(format!(
+                        "supplied object {} does not match its referenced size",
+                        object.id
+                    )))
+                }
+                None => {
+                    return Err(ReplicationError::Invalid(format!(
+                        "supplied object {} is not referenced by any entity",
+                        object.id
+                    )))
+                }
             }
         }
         let (current_generation, vault_identity) = {
@@ -1300,16 +1453,9 @@ impl ReplicationPackage {
             (metadata.current_generation, identity)
         };
         let vault_recipient = vault_identity.to_public();
-        let object = encrypt(&vault_recipient, mutation.value)?;
-        let object_id = digest(&object);
         let payload = OperationPayload {
-            format_version: FORMAT_VERSION,
-            logical_id: mutation.logical_id.to_string(),
-            parents: mutation.parents.to_vec(),
-            object: ObjectReference {
-                id: object_id.clone(),
-                ciphertext_size: object.len() as u64,
-            },
+            format_version: PAYLOAD_FORMAT_VERSION,
+            entities: mutation.entities.to_vec(),
         };
         let ciphertext = encrypt(&vault_recipient, &serde_json::to_vec(&payload)?)?;
         let unsigned = OperationUnsigned {
@@ -1339,23 +1485,36 @@ impl ReplicationPackage {
         Ok(PreparedPublication {
             sequence: mutation.sequence,
             operation_id: unsigned.operation_id,
-            object_id,
-            object,
+            objects: mutation.objects.to_vec(),
             operation,
         })
     }
 
-    /// Publish the Object before the Operation. Existing identical immutable bytes are accepted;
-    /// a colliding canonical path with different bytes is never overwritten.
+    /// Publish every Object before the Operation. Existing identical immutable bytes are
+    /// accepted; a colliding canonical path with different bytes is never overwritten.
     pub fn publish(&self, prepared: &PreparedPublication) -> ReplicationResult<()> {
         self.refresh_metadata()?;
         self.verify_prepared(prepared)?;
-        publish_immutable(
-            &self.root.join("objects").join(format!("{}.age", prepared.object_id)),
-            &prepared.object,
-        )?;
+        for object in &prepared.objects {
+            publish_immutable(
+                &self.root.join("objects").join(format!("{}.age", object.id)),
+                &object.bytes,
+            )?;
+        }
         publish_immutable(&self.operation_path(prepared), &prepared.operation)?;
         Ok(())
+    }
+
+    /// Read one verified object's verbatim bytes (digest re-checked).
+    fn read_object(&self, id: &str) -> ReplicationResult<Vec<u8>> {
+        let path = self.root.join("objects").join(format!("{id}.age"));
+        let bytes = read_untrusted_file(&path, MAX_OBJECT_BYTES)?;
+        if digest(&bytes) != id {
+            return Err(ReplicationError::Invalid(format!(
+                "object {id} does not match its digest"
+            )));
+        }
+        Ok(bytes)
     }
 
     pub fn scan(&self) -> ReplicationResult<PackageScan> {
@@ -1503,10 +1662,12 @@ impl ReplicationPackage {
     }
 
     fn verify_prepared(&self, prepared: &PreparedPublication) -> ReplicationResult<()> {
-        if digest(&prepared.object) != prepared.object_id {
-            return Err(ReplicationError::Invalid(
-                "prepared object digest does not match its id".to_string(),
-            ));
+        for object in &prepared.objects {
+            if digest(&object.bytes) != object.id {
+                return Err(ReplicationError::Invalid(
+                    "prepared object digest does not match its id".to_string(),
+                ));
+            }
         }
         let operation: OperationDocument = serde_json::from_slice(&prepared.operation)?;
         self.validate_operation(&operation)?;
@@ -1619,7 +1780,7 @@ impl ReplicationPackage {
                 return Ok(false);
             }
         };
-        if payload.format_version != FORMAT_VERSION {
+        if payload.format_version != PAYLOAD_FORMAT_VERSION {
             report.damaged.push(DamagedFile {
                 path: operation_path,
                 reason: format!(
@@ -1629,72 +1790,149 @@ impl ReplicationPackage {
             });
             return Ok(false);
         }
-        let Some(object) = objects.get(&payload.object.id) else {
-            report.pending.push(PendingOperation {
-                device_id: operation.device_id,
-                sequence: operation.sequence,
-                operation_id: operation.operation_id,
-                reason: format!("object {} has not arrived", payload.object.id),
-            });
-            return Ok(false);
-        };
-        if object.len() as u64 != payload.object.ciphertext_size {
+        if let Err(error) = validate_entities(&operation.operation_id, &payload.entities) {
             report.damaged.push(DamagedFile {
-                path: self
-                    .root
-                    .join("objects")
-                    .join(format!("{}.age", payload.object.id)),
-                reason: format!("object {} has the wrong size", payload.object.id),
+                path: operation_path,
+                reason: error.to_string(),
             });
             return Ok(false);
         }
-        let value = match decrypt(vault_identity.as_ref(), object) {
-            Ok(value) => value,
-            Err(error) => {
-                report.damaged.push(DamagedFile {
-                    path: self
-                        .root
-                        .join("objects")
-                        .join(format!("{}.age", payload.object.id)),
-                    reason: error.to_string(),
-                });
-                return Ok(false);
+        // Objects are the verbatim store version files: presence and digest/size are checked
+        // here, decryption and payload binding are the importing store's job.
+        for entity in &payload.entities {
+            let EntityDelta::Secret(delta) = &entity.delta else { continue };
+            for version in &delta.versions {
+                let Some(object) = objects.get(&version.object.id) else {
+                    report.pending.push(PendingOperation {
+                        device_id: operation.device_id,
+                        sequence: operation.sequence,
+                        operation_id: operation.operation_id,
+                        reason: format!("object {} has not arrived", version.object.id),
+                    });
+                    return Ok(false);
+                };
+                if object.len() as u64 != version.object.ciphertext_size {
+                    report.damaged.push(DamagedFile {
+                        path: self
+                            .root
+                            .join("objects")
+                            .join(format!("{}.age", version.object.id)),
+                        reason: format!("object {} has the wrong size", version.object.id),
+                    });
+                    return Ok(false);
+                }
             }
-        };
+        }
         report.verified.push(VerifiedMutation {
             device_id: operation.device_id,
             key_generation: operation.key_generation,
             sequence: operation.sequence,
             operation_id: operation.operation_id,
-            logical_id: payload.logical_id,
-            parents: payload.parents,
-            object_id: payload.object.id,
-            value,
+            payload,
         });
         Ok(true)
     }
 }
 
+/// Shared structural validation of a v2 entity list (used by prepare and by import).
+fn validate_entities(operation_id: &str, entities: &[EntityPayload]) -> ReplicationResult<()> {
+    if entities.is_empty() {
+        return Err(ReplicationError::Invalid(format!(
+            "operation {operation_id} contains no entities"
+        )));
+    }
+    let mut seen = HashSet::new();
+    for entity in entities {
+        if entity.logical_id.is_empty() {
+            return Err(ReplicationError::Invalid(format!(
+                "operation {operation_id} contains an entity with an empty logical id"
+            )));
+        }
+        if !seen.insert(entity.logical_id.as_str()) {
+            return Err(ReplicationError::Invalid(format!(
+                "operation {operation_id} names entity {} twice",
+                entity.logical_id
+            )));
+        }
+        let mut unique_parents = HashSet::new();
+        for parent in &entity.parents {
+            require_uuid("parent operation id", parent)?;
+            if parent == operation_id || !unique_parents.insert(parent.as_str()) {
+                return Err(ReplicationError::Invalid(format!(
+                    "operation {operation_id} has an invalid or duplicate parent {parent}"
+                )));
+            }
+        }
+        match &entity.delta {
+            EntityDelta::Secret(delta) => {
+                if entity.logical_id.parse::<SecretId>().is_err() {
+                    return Err(ReplicationError::Invalid(format!(
+                        "operation {operation_id} secret entity has a non-uuid id {}",
+                        entity.logical_id
+                    )));
+                }
+                if delta.head_uuid.is_empty() {
+                    return Err(ReplicationError::Invalid(format!(
+                        "operation {operation_id} secret entity {} has no head",
+                        entity.logical_id
+                    )));
+                }
+                let mut uuids = HashSet::new();
+                for version in &delta.versions {
+                    if version.version_uuid.is_empty()
+                        || version.generation == 0
+                        || version.object.id.is_empty()
+                        || !uuids.insert(version.version_uuid.as_str())
+                    {
+                        return Err(ReplicationError::Invalid(format!(
+                            "operation {operation_id} secret entity {} has an invalid version",
+                            entity.logical_id
+                        )));
+                    }
+                }
+            }
+            EntityDelta::Catalog { payload } => {
+                if entity.logical_id != CATALOG_LOGICAL_ID {
+                    return Err(ReplicationError::Invalid(format!(
+                        "operation {operation_id} catalog entity has unexpected id {}",
+                        entity.logical_id
+                    )));
+                }
+                if payload.is_empty() {
+                    return Err(ReplicationError::Invalid(format!(
+                        "operation {operation_id} catalog entity has an empty payload"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn resolve_logical_history(report: &mut PackageScan) {
     let candidates = std::mem::take(&mut report.verified);
+    // An operation may touch several entities; each entity declares its own parents. A parent
+    // is valid for an entity only if that parent operation itself touches the same entity.
     let ownership = candidates
         .iter()
-        .map(|mutation| (mutation.operation_id.clone(), mutation.logical_id.clone()))
+        .map(|mutation| {
+            (
+                mutation.operation_id.clone(),
+                mutation.entity_ids().map(str::to_owned).collect::<HashSet<_>>(),
+            )
+        })
         .collect::<HashMap<_, _>>();
     let mut remaining = Vec::with_capacity(candidates.len());
     for mutation in candidates {
-        let mut unique_parents = HashSet::new();
-        let problem = mutation.parents.iter().find_map(|parent| {
-            if !unique_parents.insert(parent.as_str()) {
-                return Some(format!("parent operation {parent} is listed more than once"));
-            }
-            match ownership.get(parent) {
+        let problem = mutation.payload.entities.iter().find_map(|entity| {
+            entity.parents.iter().find_map(|parent| match ownership.get(parent) {
                 None => Some(format!("parent operation {parent} has not arrived")),
-                Some(logical_id) if logical_id != &mutation.logical_id => Some(format!(
-                    "parent operation {parent} belongs to logical item {logical_id}"
+                Some(entities) if !entities.contains(&entity.logical_id) => Some(format!(
+                    "parent operation {parent} does not touch entity {}",
+                    entity.logical_id
                 )),
                 Some(_) => None,
-            }
+            })
         });
         if let Some(reason) = problem {
             report.pending.push(PendingOperation {
@@ -1712,7 +1950,7 @@ fn resolve_logical_history(report: &mut PackageScan) {
     let mut ordered = Vec::with_capacity(remaining.len());
     while let Some(index) = remaining
         .iter()
-        .position(|mutation| mutation.parents.iter().all(|parent| emitted.contains(parent)))
+        .position(|mutation| mutation.all_parents().all(|parent| emitted.contains(parent)))
     {
         let mutation = remaining.remove(index);
         emitted.insert(mutation.operation_id.clone());
@@ -1729,11 +1967,13 @@ fn resolve_logical_history(report: &mut PackageScan) {
 
     let mut heads: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for mutation in &ordered {
-        let logical_heads = heads.entry(mutation.logical_id.clone()).or_default();
-        for parent in &mutation.parents {
-            logical_heads.remove(parent);
+        for entity in &mutation.payload.entities {
+            let logical_heads = heads.entry(entity.logical_id.clone()).or_default();
+            for parent in &entity.parents {
+                logical_heads.remove(parent);
+            }
+            logical_heads.insert(mutation.operation_id.clone());
         }
-        logical_heads.insert(mutation.operation_id.clone());
     }
     report.conflicts = heads
         .into_iter()
@@ -1764,24 +2004,7 @@ pub struct ReplicationReport {
     pub messages: Vec<String>,
 }
 
-#[derive(Serialize, Deserialize)]
-struct ExportCommit<'a> {
-    format_version: u32,
-    catalog_payload: std::borrow::Cow<'a, [u8]>,
-    store_values: Vec<ExportStoreValue<'a>>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct ExportStoreValue<'a> {
-    secret_id: std::borrow::Cow<'a, str>,
-    // Identifies the immutable source value captured by this commit. Destination stores keep
-    // their own machine-local version sequence and must not reuse this number as a local version.
-    version: u32,
-    descriptor: ExportStoreDescriptor,
-    value: std::borrow::Cow<'a, [u8]>,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct ExportStoreDescriptor {
     label: String,
     mode: u32,
@@ -1790,19 +2013,108 @@ struct ExportStoreDescriptor {
     metadata: ItemMetadata,
 }
 
-impl Drop for ExportCommit<'_> {
-    fn drop(&mut self) {
-        if let std::borrow::Cow::Owned(payload) = &mut self.catalog_payload {
-            payload.zeroize();
-        }
-    }
+/// The durable outbox form of one committed transaction's entity deltas (stored in the outbox
+/// row's payload column; secret content never rides here).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct TransactionDelta {
+    format_version: u32,
+    entities: Vec<EntityPayload>,
 }
 
-impl Drop for ExportStoreValue<'_> {
-    fn drop(&mut self) {
-        if let std::borrow::Cow::Owned(value) = &mut self.value {
-            value.zeroize();
+/// Everything already replicated or locally queued, folded from causally ordered verified
+/// operations plus the pending outbox. Staging diffs the live catalog/store against this.
+#[derive(Default)]
+struct KnownState {
+    catalog_payload: Option<Vec<u8>>,
+    catalog_heads: Vec<String>,
+    secrets: HashMap<String, KnownSecret>,
+}
+
+#[derive(Default)]
+struct KnownSecret {
+    version_uuids: HashSet<String>,
+    head_uuid: String,
+    descriptor: Option<ExportStoreDescriptor>,
+    heads: Vec<String>,
+}
+
+fn fold_known_state(
+    verified: &[VerifiedMutation],
+    outbox: &[ReplicationOutboxEntry],
+) -> ReplicationResult<KnownState> {
+    let mut state = KnownState::default();
+    let mut catalog_heads: BTreeSet<String> = BTreeSet::new();
+    let mut secret_heads: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let mut apply = |operation_id: &str, entities: &[EntityPayload]| {
+        for entity in entities {
+            match &entity.delta {
+                EntityDelta::Catalog { payload } => {
+                    state.catalog_payload = Some(payload.clone());
+                    for parent in &entity.parents {
+                        catalog_heads.remove(parent);
+                    }
+                    catalog_heads.insert(operation_id.to_string());
+                }
+                EntityDelta::Secret(delta) => {
+                    let secret =
+                        state.secrets.entry(entity.logical_id.clone()).or_default();
+                    for version in &delta.versions {
+                        secret.version_uuids.insert(version.version_uuid.clone());
+                    }
+                    secret.head_uuid = delta.head_uuid.clone();
+                    secret.descriptor = Some(delta.descriptor.clone());
+                    let heads = secret_heads.entry(entity.logical_id.clone()).or_default();
+                    for parent in &entity.parents {
+                        heads.remove(parent);
+                    }
+                    heads.insert(operation_id.to_string());
+                }
+            }
         }
+    };
+    for mutation in verified {
+        apply(&mutation.operation_id, &mutation.payload.entities);
+    }
+    for entry in outbox {
+        let delta: TransactionDelta = serde_json::from_slice(&entry.catalog_payload)?;
+        if delta.format_version != PAYLOAD_FORMAT_VERSION {
+            return Err(ReplicationError::Invalid(format!(
+                "outbox intent {} has unsupported delta format {}",
+                entry.intent_id, delta.format_version
+            )));
+        }
+        apply(&entry.intent_id, &delta.entities);
+    }
+    state.catalog_heads = catalog_heads.into_iter().collect();
+    for (logical_id, heads) in secret_heads {
+        if let Some(secret) = state.secrets.get_mut(&logical_id) {
+            secret.heads = heads.into_iter().collect();
+        }
+    }
+    Ok(state)
+}
+
+/// Generation-1 material for creating a vault from the genesis store. The store's own keys ARE
+/// the vault keys — its version files must decrypt under the vault's generation identities.
+fn genesis_generation_material(
+    store: &AgeDirStore,
+) -> ReplicationResult<(x25519::Identity, String)> {
+    let generation = store.current_generation()?;
+    if generation != 1 {
+        return Err(ReplicationError::Invalid(format!(
+            "creating a vault from a store at key generation {generation} is not supported yet"
+        )));
+    }
+    Ok((store.generation_identity(1)?, store.recovery_recipient()?))
+}
+
+fn descriptor_from_record(record: &floria_store::SecretRecord) -> ExportStoreDescriptor {
+    ExportStoreDescriptor {
+        label: portable_store_label(&record.origin),
+        mode: record.mode,
+        enforcement: record.enforcement,
+        environment_ids: record.environment_ids.clone(),
+        metadata: record.metadata.clone(),
     }
 }
 
@@ -1851,8 +2163,7 @@ impl ReplicationEngine {
         device: DeviceKeyMaterial,
         runtime: ReplicationRuntime,
     ) -> ReplicationResult<Self> {
-        let package = ReplicationPackage::create(directory, vault_id, created_at, device)?;
-        Self::with_runtime(package, runtime)
+        Self::create_named(directory, vault_id, created_at, device, None, runtime)
     }
 
     pub fn create_named(
@@ -1863,12 +2174,15 @@ impl ReplicationEngine {
         device_name: Option<String>,
         runtime: ReplicationRuntime,
     ) -> ReplicationResult<Self> {
+        let (vault_identity, recovery_public) = genesis_generation_material(&runtime.store)?;
         let package = ReplicationPackage::create_named(
             directory,
             vault_id,
             created_at,
             device,
             device_name,
+            vault_identity,
+            recovery_public,
         )?;
         Self::with_runtime(package, runtime)
     }
@@ -1954,7 +2268,29 @@ impl ReplicationEngine {
 
     pub fn revoke_device(&self, device_id: &str) -> ReplicationResult<ReplicationReport> {
         self.mutations.run(|| {
-            self.package.revoke_device(device_id)?;
+            // The new generation is born in the store (its files are the objects), then the
+            // vault publishes its signed document and envelopes. A crash between the two leaves
+            // the store one generation ahead; the retry reuses it instead of rotating again.
+            let package_generation = self.package.current_generation();
+            let store_generation = self.store.current_generation()?;
+            let next = if store_generation == package_generation.saturating_add(1) {
+                store_generation
+            } else if store_generation == package_generation {
+                self.store.rotate_generation()?
+            } else {
+                return Err(ReplicationError::Invalid(format!(
+                    "store generation {store_generation} and vault generation \
+                     {package_generation} have diverged"
+                )));
+            };
+            let identity = self.store.generation_identity(next)?;
+            let recovery = self.store.recovery_recipient()?;
+            let generation = self.package.revoke_device(device_id, identity, &recovery)?;
+            if generation != next {
+                return Err(ReplicationError::Invalid(format!(
+                    "vault rotated to generation {generation} but the store rotated to {next}"
+                )));
+            }
             self.sync_uncoordinated()
         })
     }
@@ -1998,30 +2334,115 @@ impl ReplicationEngine {
                     .to_string(),
             ));
         }
-        let latest_pending = outbox.last();
-        let latest_published = scan
-            .verified
-            .iter()
-            .rfind(|mutation| mutation.logical_id == VAULT_STATE_LOGICAL_ID);
-        let parents = latest_pending.map_or_else(
-            || {
-                latest_published
-                    .map(|mutation| vec![mutation.operation_id.clone()])
-                    .unwrap_or_default()
-            },
-            |entry| vec![entry.intent_id.clone()],
-        );
-        let (entry, encoded) = self.build_snapshot_entry(parents, created_at)?;
-        let unchanged = match latest_pending {
-            Some(entry) => self.export_value(entry)?.as_slice() == encoded.as_slice(),
-            None => latest_published
-                .is_some_and(|mutation| mutation.value.as_slice() == encoded.as_slice()),
-        };
-        if unchanged {
+        let known = fold_known_state(&scan.verified, &outbox)?;
+        let (entities, store_versions) = self.build_delta_entities(&known, None)?;
+        if entities.is_empty() {
             return Ok(false);
         }
-        self.enqueue_snapshot(entry)?;
+        self.enqueue_transaction(entities, store_versions, created_at)?;
         Ok(true)
+    }
+
+    /// Compute the entity deltas between the local catalog/store and the already replicated or
+    /// queued state. `conflict_parents` overrides per-entity parents when building an explicit
+    /// merge (conflict resolution); `None` means normal forward progress from the known heads.
+    fn build_delta_entities(
+        &self,
+        known: &KnownState,
+        conflict_parents: Option<&HashMap<String, Vec<String>>>,
+    ) -> ReplicationResult<(Vec<EntityPayload>, Vec<floria_catalog::ReplicationStoreVersionRef>)>
+    {
+        let parents_for = |logical_id: &str, known_heads: &[String]| -> Vec<String> {
+            match conflict_parents {
+                Some(overrides) => overrides
+                    .get(logical_id)
+                    .cloned()
+                    .unwrap_or_else(|| known_heads.to_vec()),
+                None => known_heads.to_vec(),
+            }
+        };
+        let mut entities = Vec::new();
+        let mut store_versions = Vec::new();
+
+        let projection = self.catalog.replicated_catalog()?;
+        let catalog_payload = serde_json::to_vec(&projection)?;
+        let catalog_changed = known.catalog_payload.as_deref() != Some(catalog_payload.as_slice());
+        let forced_catalog = conflict_parents.is_some_and(|c| c.contains_key(CATALOG_LOGICAL_ID));
+        if catalog_changed || forced_catalog {
+            entities.push(EntityPayload {
+                logical_id: CATALOG_LOGICAL_ID.to_string(),
+                parents: parents_for(CATALOG_LOGICAL_ID, &known.catalog_heads),
+                delta: EntityDelta::Catalog { payload: catalog_payload },
+            });
+        }
+
+        let secret_ids = projection
+            .resources
+            .iter()
+            .filter_map(|resource| match &resource.source {
+                floria_catalog::ResourceSource::SecretRef { secret_id } => {
+                    Some(secret_id.clone())
+                }
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        for secret_id in secret_ids {
+            let parsed: SecretId = secret_id.parse()?;
+            let record = self.store.record(&parsed)?.ok_or_else(|| {
+                ReplicationError::Invalid(format!(
+                    "portable catalog references missing secret {secret_id}"
+                ))
+            })?;
+            let descriptor = descriptor_from_record(&record);
+            let head_uuid = self.store.head_version_uuid(&parsed)?;
+            let known_secret = known.secrets.get(secret_id.as_str());
+            let refs = self.store.version_refs(&parsed)?;
+            let new_versions = refs
+                .iter()
+                .filter(|reference| {
+                    known_secret
+                        .is_none_or(|secret| !secret.version_uuids.contains(&reference.version_uuid))
+                })
+                .collect::<Vec<_>>();
+            let forced = conflict_parents.is_some_and(|c| c.contains_key(secret_id.as_str()));
+            let changed = !new_versions.is_empty()
+                || known_secret.is_none_or(|secret| {
+                    secret.head_uuid != head_uuid
+                        || secret.descriptor.as_ref() != Some(&descriptor)
+                });
+            if !(changed || forced) {
+                continue;
+            }
+            let known_heads =
+                known_secret.map(|secret| secret.heads.as_slice()).unwrap_or_default();
+            entities.push(EntityPayload {
+                logical_id: secret_id.clone(),
+                parents: parents_for(&secret_id, known_heads),
+                delta: EntityDelta::Secret(SecretDelta {
+                    descriptor,
+                    versions: new_versions
+                        .iter()
+                        .map(|reference| SecretVersionRef {
+                            version_uuid: reference.version_uuid.clone(),
+                            generation: reference.generation,
+                            size: reference.size,
+                            object: ObjectReference {
+                                id: reference.digest.clone(),
+                                ciphertext_size: reference.ciphertext_size,
+                            },
+                        })
+                        .collect(),
+                    head_uuid,
+                }),
+            });
+            store_versions.extend(new_versions.iter().map(|reference| {
+                floria_catalog::ReplicationStoreVersionRef {
+                    secret_id: secret_id.clone(),
+                    version: reference.ordinal,
+                }
+            }));
+        }
+        Ok((entities, store_versions))
     }
 
     fn resolve_conflict_with_current_uncoordinated(
@@ -2048,22 +2469,40 @@ impl ReplicationEngine {
                 "the local Device is fenced and cannot resolve conflicts".to_string(),
             ));
         }
-        let mut conflicts = scan
-            .conflicts
-            .iter()
-            .filter(|conflict| conflict.logical_id == VAULT_STATE_LOGICAL_ID);
-        let conflict = conflicts.next().ok_or_else(|| {
-            ReplicationError::Invalid("there is no replicated-state conflict to resolve".to_string())
-        })?;
-        if conflicts.next().is_some() || scan.conflicts.len() != 1 {
+        if scan.conflicts.is_empty() {
             return Err(ReplicationError::Invalid(
-                "multiple replicated conflicts require a newer resolver".to_string(),
+                "there is no replicated-state conflict to resolve".to_string(),
             ));
         }
 
-        let (entry, _) =
-            self.build_snapshot_entry(conflict.head_operation_ids.clone(), created_at)?;
-        self.enqueue_snapshot(entry)?;
+        // The signed merge covers exactly the conflicted entities; each names all of its heads
+        // as parents and carries this Device's current state for that entity.
+        let known = fold_known_state(&scan.verified, &[])?;
+        let conflict_parents = scan
+            .conflicts
+            .iter()
+            .map(|conflict| (conflict.logical_id.clone(), conflict.head_operation_ids.clone()))
+            .collect::<HashMap<_, _>>();
+        let (entities, store_versions) =
+            self.build_delta_entities(&known, Some(&conflict_parents))?;
+        let entities = entities
+            .into_iter()
+            .filter(|entity| conflict_parents.contains_key(&entity.logical_id))
+            .collect::<Vec<_>>();
+        if entities.len() != conflict_parents.len() {
+            return Err(ReplicationError::Invalid(
+                "cannot build a local merge for every conflicted entity".to_string(),
+            ));
+        }
+        let kept = entities
+            .iter()
+            .map(|entity| entity.logical_id.clone())
+            .collect::<HashSet<_>>();
+        let store_versions = store_versions
+            .into_iter()
+            .filter(|reference| kept.contains(reference.secret_id.as_str()))
+            .collect::<Vec<_>>();
+        self.enqueue_transaction(entities, store_versions, created_at)?;
 
         // The explicit merge acknowledges every parent branch. Checkpoint their per-Device slots
         // without projecting their values: the current catalog/store is the user-selected merge
@@ -2092,58 +2531,41 @@ impl ReplicationEngine {
         self.sync_uncoordinated()
     }
 
-    fn build_snapshot_entry(
+    /// Queue one transaction delta durably: pre-commit journal first, then the catalog outbox.
+    fn enqueue_transaction(
         &self,
-        parents: Vec<String>,
+        entities: Vec<EntityPayload>,
+        store_versions: Vec<floria_catalog::ReplicationStoreVersionRef>,
         created_at: &str,
-    ) -> ReplicationResult<(ReplicationOutboxEntry, Zeroizing<Vec<u8>>)> {
+    ) -> ReplicationResult<()> {
         if created_at.trim().is_empty() {
             return Err(ReplicationError::Invalid(
-                "replication snapshot creation time is empty".to_string(),
+                "replication transaction creation time is empty".to_string(),
             ));
         }
-        let projection = self.catalog.replicated_catalog()?;
-        let catalog_payload = serde_json::to_vec(&projection)?;
-        let secret_ids = projection
-            .resources
-            .iter()
-            .filter_map(|resource| match &resource.source {
-                floria_catalog::ResourceSource::SecretRef { secret_id } => {
-                    Some(secret_id.clone())
-                }
-                _ => None,
-            })
-            .collect::<BTreeSet<_>>();
-        let store_versions = secret_ids
-            .into_iter()
-            .map(|secret_id| {
-                let parsed: SecretId = secret_id.parse()?;
-                let record = self.store.record(&parsed)?.ok_or_else(|| {
-                    ReplicationError::Invalid(format!(
-                        "portable catalog references missing secret {secret_id}"
-                    ))
-                })?;
-                Ok(floria_catalog::ReplicationStoreVersionRef {
-                    secret_id,
-                    version: record.current_version,
-                })
-            })
-            .collect::<ReplicationResult<Vec<_>>>()?;
+        let intent_id = uuid::Uuid::new_v4().to_string();
+        validate_entities(&intent_id, &entities)?;
+        let parents = {
+            let mut parents = entities
+                .iter()
+                .flat_map(|entity| entity.parents.iter().cloned())
+                .collect::<BTreeSet<_>>();
+            parents.take(&intent_id);
+            parents.into_iter().collect::<Vec<_>>()
+        };
+        let delta = TransactionDelta {
+            format_version: PAYLOAD_FORMAT_VERSION,
+            entities,
+        };
         let entry = ReplicationOutboxEntry {
-            intent_id: uuid::Uuid::new_v4().to_string(),
-            logical_id: VAULT_STATE_LOGICAL_ID.to_string(),
+            intent_id: intent_id.clone(),
+            logical_id: TRANSACTION_LOGICAL_ID.to_string(),
             parents,
             store_versions,
-            catalog_payload,
+            catalog_payload: serde_json::to_vec(&delta)?,
             created_at: created_at.to_string(),
         };
-        let encoded = self.export_value(&entry)?;
-        Ok((entry, encoded))
-    }
-
-    fn enqueue_snapshot(&self, entry: ReplicationOutboxEntry) -> ReplicationResult<()> {
-        let intent_id = entry.intent_id.clone();
-        self.intents.enqueue(ReplicationIntent::snapshot(
+        self.intents.enqueue(ReplicationIntent::transaction(
             &intent_id,
             entry.parents.clone(),
             entry.store_versions.clone(),
@@ -2161,7 +2583,79 @@ impl ReplicationEngine {
         self.mutations.run(|| self.sync_uncoordinated())
     }
 
+    /// Align the local store's generation keys with the vault's, so imported version files and
+    /// new local writes share the vault's key domain — the zero-transcode invariant.
+    ///
+    /// Three cases:
+    /// - no overlap (a freshly enrolled device whose store only has its unused self-generated
+    ///   keys): adopt the vault's generation set wholesale — legal only for an empty store;
+    /// - every store generation matches the vault's by public key: install any generations the
+    ///   store is missing (a re-enrolled member learning newer keys) without touching files;
+    /// - a store generation differs from the vault's, or the store holds generations the vault
+    ///   does not know (beyond one pending local rotation): fail loudly — a populated library
+    ///   in a foreign key domain needs a one-time re-key that v1 does not implement.
+    fn reconcile_generations(&self) -> ReplicationResult<()> {
+        let identities = self.package.generation_identity_secrets();
+        if identities.is_empty() {
+            return Ok(());
+        }
+        let recovery = self.package.recovery_public();
+        let mut matched = 0usize;
+        let mut mismatched = false;
+        let mut missing = Vec::new();
+        for (generation, secret) in &identities {
+            let expected = secret
+                .trim()
+                .parse::<x25519::Identity>()
+                .map_err(|error| {
+                    ReplicationError::Invalid(format!(
+                        "vault generation {generation} identity is invalid: {error}"
+                    ))
+                })?
+                .to_public()
+                .to_string();
+            match self.store.generation_public(*generation)? {
+                Some(public) if public == expected => matched += 1,
+                Some(_) => mismatched = true,
+                None => missing.push((*generation, secret)),
+            }
+        }
+        if matched == 0 {
+            // Fresh join: adopt everything. Fails loudly for a populated store.
+            self.store.adopt_generations(&identities, &recovery)?;
+            return Ok(());
+        }
+        if mismatched {
+            return Err(ReplicationError::Invalid(
+                "a local store key generation differs from the vault's; the local library is in \
+                 a foreign key domain"
+                    .to_string(),
+            ));
+        }
+        let vault_max = identities
+            .iter()
+            .map(|(generation, _)| *generation)
+            .max()
+            .expect("identities are non-empty");
+        let store_current = self.store.current_generation()?;
+        if store_current > vault_max.saturating_add(1) {
+            return Err(ReplicationError::Invalid(format!(
+                "store generation {store_current} is ahead of vault generation {vault_max}"
+            )));
+        }
+        if self.store.recovery_recipient()? != recovery {
+            return Err(ReplicationError::Invalid(
+                "the store's recovery recipient differs from the vault's".to_string(),
+            ));
+        }
+        for (generation, secret) in missing {
+            self.store.install_generation(generation, secret)?;
+        }
+        Ok(())
+    }
+
     fn sync_uncoordinated(&self) -> ReplicationResult<ReplicationReport> {
+        self.reconcile_generations()?;
         let scan = self.package.scan()?;
         let mut report = ReplicationReport {
             observed: scan.observed.len(),
@@ -2329,7 +2823,25 @@ impl ReplicationEngine {
             let prepared = match intent.prepared() {
                 Some(prepared) => prepared.clone(),
                 None => {
-                    let value = self.export_value(&entry)?;
+                    let delta: TransactionDelta = serde_json::from_slice(&entry.catalog_payload)?;
+                    if delta.format_version != PAYLOAD_FORMAT_VERSION {
+                        return Err(ReplicationError::Invalid(format!(
+                            "outbox intent {} has unsupported delta format {}",
+                            entry.intent_id, delta.format_version
+                        )));
+                    }
+                    // Fetch every referenced version file verbatim from the local store.
+                    // Zero transcoding: the bytes published as objects are the store files.
+                    let mut objects = Vec::with_capacity(entry.store_versions.len());
+                    for reference in &entry.store_versions {
+                        let secret_id: SecretId = reference.secret_id.parse()?;
+                        let export =
+                            self.store.export_version(&secret_id, reference.version)?;
+                        objects.push(PreparedObject {
+                            id: export.digest,
+                            bytes: export.ciphertext,
+                        });
+                    }
                     let next = self
                         .intents
                         .device_sequence(self.package.device_id())
@@ -2342,9 +2854,8 @@ impl ReplicationEngine {
                     let prepared = self.package.prepare(PackageMutation {
                         sequence: next,
                         operation_id: &entry.intent_id,
-                        logical_id: &entry.logical_id,
-                        parents: &entry.parents,
-                        value: &value,
+                        entities: &delta.entities,
+                        objects: &objects,
                     })?;
                     self.intents.save_prepared(&entry.intent_id, prepared.clone())?;
                     prepared
@@ -2456,71 +2967,45 @@ impl ReplicationEngine {
     }
 
     fn apply_verified_mutation(&self, mutation: &VerifiedMutation) -> ReplicationResult<()> {
-        let commit: ExportCommit<'_> = serde_json::from_slice(&mutation.value)?;
-        if commit.format_version != FORMAT_VERSION {
-            return Err(ReplicationError::Invalid(format!(
-                "unsupported exported commit format {}",
-                commit.format_version
-            )));
-        }
-        let projection: ReplicatedCatalog = serde_json::from_slice(&commit.catalog_payload)?;
-        let referenced_secret_ids = projection
-            .resources
-            .iter()
-            .filter_map(|resource| match &resource.source {
-                floria_catalog::ResourceSource::SecretRef { secret_id } => Some(secret_id.as_str()),
-                _ => None,
-            })
-            .collect::<HashSet<_>>();
-        let mut imported_secret_ids = HashSet::new();
-        for imported in &commit.store_values {
-            if imported.version == 0
-                || !referenced_secret_ids.contains(imported.secret_id.as_ref())
-                || !imported_secret_ids.insert(imported.secret_id.as_ref())
-            {
-                return Err(ReplicationError::Invalid(format!(
-                    "operation {} contains an invalid or duplicate store value",
-                    mutation.operation_id
-                )));
-            }
-            let secret_id: SecretId = imported.secret_id.parse()?;
-            match self.store.record(&secret_id)? {
-                None => {
-                    self.store.put_identified(
-                        secret_id.clone(),
-                        NewSecret {
-                            origin: SecretOrigin::Managed {
-                                label: imported.descriptor.label.clone(),
-                            },
-                            mode: imported.descriptor.mode,
-                            enforcement: imported.descriptor.enforcement,
-                        },
-                        imported.value.as_ref(),
-                        &mutation.operation_id,
-                    )?;
+        for entity in &mutation.payload.entities {
+            match &entity.delta {
+                EntityDelta::Catalog { payload } => {
+                    let projection: ReplicatedCatalog = serde_json::from_slice(payload)?;
+                    self.catalog.apply_replicated_catalog(&projection)?;
                 }
-                Some(_) => match self
-                    .store
-                    .version_for_mutation(&secret_id, &mutation.operation_id)?
-                {
-                    Some(_) => {}
-                    None => {
-                        self.store.append_version_identified(
+                EntityDelta::Secret(delta) => {
+                    let secret_id: SecretId = entity.logical_id.parse()?;
+                    for version in &delta.versions {
+                        // The object is the exact version file another store wrote: verify and
+                        // land it verbatim. The store re-checks digest, decryptability, payload
+                        // binding, and declared size before trusting it.
+                        let bytes = self.package.read_object(&version.object.id)?;
+                        self.store.import_version(
                             &secret_id,
-                            imported.value.as_ref(),
+                            Some(NewSecret {
+                                origin: SecretOrigin::Managed {
+                                    label: delta.descriptor.label.clone(),
+                                },
+                                mode: delta.descriptor.mode,
+                                enforcement: delta.descriptor.enforcement,
+                            }),
+                            &bytes,
+                            &version.version_uuid,
+                            version.generation,
+                            version.size,
                             &mutation.operation_id,
                         )?;
                     }
-                },
+                    self.store.set_head_to_uuid(&secret_id, &delta.head_uuid)?;
+                    self.store.update_settings(
+                        &secret_id,
+                        delta.descriptor.metadata.clone(),
+                        delta.descriptor.enforcement,
+                        delta.descriptor.environment_ids.clone(),
+                    )?;
+                }
             }
-            self.store.update_settings(
-                &secret_id,
-                imported.descriptor.metadata.clone(),
-                imported.descriptor.enforcement,
-                imported.descriptor.environment_ids.clone(),
-            )?;
         }
-        self.catalog.apply_replicated_catalog(&projection)?;
         Ok(())
     }
 
@@ -2538,50 +3023,6 @@ impl ReplicationEngine {
         Ok(true)
     }
 
-    fn export_value(&self, entry: &ReplicationOutboxEntry) -> ReplicationResult<Zeroizing<Vec<u8>>> {
-        let _maintenance = self.store.lock_for_maintenance()?;
-        let plaintexts = entry
-            .store_versions
-            .iter()
-            .map(|reference| {
-                let secret_id: SecretId = reference.secret_id.parse()?;
-                self.store.get_version(&secret_id, reference.version)
-            })
-            .collect::<Result<Vec<_>, floria_store::StoreError>>()?;
-        let records = entry
-            .store_versions
-            .iter()
-            .map(|reference| {
-                let secret_id: SecretId = reference.secret_id.parse()?;
-                self.store.record(&secret_id)?.ok_or_else(|| {
-                    floria_store::StoreError::NotFound(reference.secret_id.clone())
-                })
-            })
-            .collect::<Result<Vec<_>, floria_store::StoreError>>()?;
-        let store_values = entry
-            .store_versions
-            .iter()
-            .zip(plaintexts.iter().zip(&records))
-            .map(|(reference, (value, record))| ExportStoreValue {
-                secret_id: std::borrow::Cow::Borrowed(&reference.secret_id),
-                version: reference.version,
-                descriptor: ExportStoreDescriptor {
-                    label: portable_store_label(&record.origin),
-                    mode: record.mode,
-                    enforcement: record.enforcement,
-                    environment_ids: record.environment_ids.clone(),
-                    metadata: record.metadata.clone(),
-                },
-                value: std::borrow::Cow::Borrowed(value.as_slice()),
-            })
-            .collect();
-        let encoded = serde_json::to_vec(&ExportCommit {
-            format_version: FORMAT_VERSION,
-            catalog_payload: std::borrow::Cow::Borrowed(&entry.catalog_payload),
-            store_values,
-        })?;
-        Ok(Zeroizing::new(encoded))
-    }
 }
 
 fn portable_store_label(origin: &SecretOrigin) -> String {
@@ -2802,6 +3243,7 @@ fn write_key_generation(
     vault_identity: &x25519::Identity,
     recipients: &BTreeMap<String, x25519::Recipient>,
     revoked_devices: BTreeMap<String, u64>,
+    recovery_public: &str,
     genesis_signing_key: &SigningKey,
 ) -> ReplicationResult<()> {
     if generation == 0
@@ -2837,6 +3279,7 @@ fn write_key_generation(
         authorized_by: vault.genesis_device_id.clone(),
         envelopes,
         revoked_devices,
+        recovery_public: recovery_public.to_string(),
     };
     let signature = sign_struct(
         KEY_GENERATION_SIGNATURE_CONTEXT,
@@ -2851,6 +3294,7 @@ fn write_key_generation(
         authorized_by: unsigned.authorized_by,
         envelopes: unsigned.envelopes,
         revoked_devices: unsigned.revoked_devices,
+        recovery_public: unsigned.recovery_public,
         signature,
     };
     write_new_atomic(path, &serde_json::to_vec_pretty(&document)?)
@@ -2942,11 +3386,17 @@ fn load_package_metadata(
         .expect("key generations were validated as non-empty");
     let vault_identities = load_vault_identities(root, device, &generations)?;
     let generation_fingerprints = key_generation_fingerprints(&generations)?;
+    let recovery_public = generations
+        .values()
+        .next_back()
+        .map(|document| document.recovery_public.clone())
+        .expect("key generations were validated as non-empty");
     Ok(PackageMetadata {
         vault_identities,
         current_generation,
         generation_fingerprints,
         trusted_devices,
+        recovery_public,
     })
 }
 
@@ -3803,9 +4253,90 @@ mod tests {
             VAULT_ID,
             "2026-08-06T00:00:00Z",
             keys(7, x25519::Identity::generate()),
+            x25519::Identity::generate(),
+            x25519::Identity::generate().to_public().to_string(),
         )
         .unwrap();
         (directory, package)
+    }
+
+    fn open_store(directory: &Path, label: &str) -> Arc<AgeDirStore> {
+        Arc::new(
+            AgeDirStore::open(
+                directory.join(format!("{label}-store")),
+                Arc::new(LocalStoreKeys(x25519::Identity::generate())),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// Create a Vault whose generation 1 IS the local store's, so the version files that store
+    /// already wrote stay decryptable for every enrolled Device (zero transcoding).
+    fn package_for_store(
+        root: &Path,
+        store: &AgeDirStore,
+        device: DeviceKeyMaterial,
+    ) -> ReplicationPackage {
+        ReplicationPackage::create(
+            root,
+            VAULT_ID,
+            "2026-08-06T00:00:00Z",
+            device,
+            store.generation_identity(1).unwrap(),
+            store.recovery_recipient().unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn catalog_entity(projection: &ReplicatedCatalog, parents: Vec<String>) -> EntityPayload {
+        EntityPayload {
+            logical_id: CATALOG_LOGICAL_ID.to_string(),
+            parents,
+            delta: EntityDelta::Catalog {
+                payload: serde_json::to_vec(projection).unwrap(),
+            },
+        }
+    }
+
+    fn decoded_catalog(entity: &EntityPayload) -> ReplicatedCatalog {
+        match &entity.delta {
+            EntityDelta::Catalog { payload } => serde_json::from_slice(payload).unwrap(),
+            EntityDelta::Secret(_) => panic!("expected a catalog entity"),
+        }
+    }
+
+    /// One secret entity plus the verbatim version file it references, taken from a local store.
+    fn secret_entity(
+        store: &AgeDirStore,
+        id: &SecretId,
+        ordinal: u32,
+        parents: Vec<String>,
+    ) -> (EntityPayload, PreparedObject) {
+        let export = store.export_version(id, ordinal).unwrap();
+        let descriptor = descriptor_from_record(&store.record(id).unwrap().unwrap());
+        let entity = EntityPayload {
+            logical_id: id.to_string(),
+            parents,
+            delta: EntityDelta::Secret(SecretDelta {
+                descriptor,
+                versions: vec![SecretVersionRef {
+                    version_uuid: export.version_uuid.clone(),
+                    generation: export.generation,
+                    size: export.size,
+                    object: ObjectReference {
+                        id: export.digest.clone(),
+                        ciphertext_size: export.ciphertext.len() as u64,
+                    },
+                }],
+                head_uuid: export.version_uuid,
+            }),
+        };
+        (entity, PreparedObject { id: export.digest, bytes: export.ciphertext })
+    }
+
+    fn version_blob(store: &AgeDirStore, id: &SecretId, digest: &str) -> Vec<u8> {
+        fs::read(store.root().join(id.to_string()).join("v").join(format!("{digest}.age")))
+            .unwrap()
     }
 
     fn intent(intent_id: &str) -> ReplicationIntent {
@@ -3869,16 +4400,10 @@ mod tests {
         label: &str,
         package: ReplicationPackage,
         authentication_key: [u8; 32],
-    ) -> (ReplicationEngine, Arc<Catalog>, Arc<AgeDirStore>) {
+        store: Arc<AgeDirStore>,
+    ) -> (ReplicationEngine, Arc<Catalog>) {
         let catalog = Arc::new(
             Catalog::open(directory.join(format!("{label}-catalog.sqlite"))).unwrap(),
-        );
-        let store = Arc::new(
-            AgeDirStore::open(
-                directory.join(format!("{label}-store")),
-                Arc::new(LocalStoreKeys(x25519::Identity::generate())),
-            )
-            .unwrap(),
         );
         let engine = ReplicationEngine::from_parts(
             package,
@@ -3891,9 +4416,9 @@ mod tests {
                 .unwrap(),
             ),
             Arc::clone(&catalog),
-            Arc::clone(&store),
+            store,
         );
-        (engine, catalog, store)
+        (engine, catalog)
     }
 
     struct LocalStoreKeys(x25519::Identity);
@@ -3912,13 +4437,13 @@ mod tests {
     fn create_open_and_single_device_round_trip() {
         let (directory, package) = package();
         let identity = package.device.wrapping_identity.clone();
+        let projection = project_projection("Fixture project");
         let prepared = package
             .prepare(PackageMutation {
                 sequence: 1,
                 operation_id: OPERATION_ID,
-                logical_id: "managed-item-1",
-                parents: &[],
-                value: b"fixture payload, not a credential",
+                entities: &[catalog_entity(&projection, Vec::new())],
+                objects: &[],
             })
             .unwrap();
         package.publish(&prepared).unwrap();
@@ -3933,8 +4458,10 @@ mod tests {
         assert!(scan.pending.is_empty());
         assert!(scan.damaged.is_empty());
         assert_eq!(scan.verified.len(), 1);
-        assert_eq!(scan.verified[0].logical_id, "managed-item-1");
-        assert_eq!(&*scan.verified[0].value, b"fixture payload, not a credential");
+        let entities = &scan.verified[0].payload.entities;
+        assert_eq!(entities.len(), 1);
+        assert_eq!(entities[0].logical_id, CATALOG_LOGICAL_ID);
+        assert_eq!(decoded_catalog(&entities[0]), projection);
     }
 
     #[test]
@@ -3946,19 +4473,21 @@ mod tests {
             VAULT_ID,
             "2026-08-06T00:00:00Z",
             keys(7, x25519::Identity::generate()),
+            x25519::Identity::generate(),
+            x25519::Identity::generate().to_public().to_string(),
         )
         .unwrap();
         let second_wrapping_identity = x25519::Identity::generate();
         let second = second_device_keys(8, second_wrapping_identity.clone());
         genesis.enroll_device(second.enrollment()).unwrap();
 
+        let from_genesis = project_projection("From genesis");
         let genesis_publication = genesis
             .prepare(PackageMutation {
                 sequence: 1,
                 operation_id: OPERATION_ID,
-                logical_id: "managed-item-1",
-                parents: &[],
-                value: b"from genesis",
+                entities: &[catalog_entity(&from_genesis, Vec::new())],
+                objects: &[],
             })
             .unwrap();
         genesis.publish(&genesis_publication).unwrap();
@@ -3971,15 +4500,18 @@ mod tests {
         let initial_scan = second.scan().unwrap();
         assert!(initial_scan.damaged.is_empty());
         assert_eq!(initial_scan.verified.len(), 1);
-        assert_eq!(&*initial_scan.verified[0].value, b"from genesis");
+        assert_eq!(
+            decoded_catalog(&initial_scan.verified[0].payload.entities[0]),
+            from_genesis
+        );
 
+        let from_second = project_projection("From second Device");
         let second_publication = second
             .prepare(PackageMutation {
                 sequence: 1,
                 operation_id: SECOND_OPERATION_ID,
-                logical_id: "managed-item-2",
-                parents: &[],
-                value: b"from second Device",
+                entities: &[catalog_entity(&from_second, vec![OPERATION_ID.to_string()])],
+                objects: &[],
             })
             .unwrap();
         second.publish(&second_publication).unwrap();
@@ -3990,7 +4522,7 @@ mod tests {
         assert!(final_scan.verified.iter().any(|mutation| {
             mutation.device_id == SECOND_DEVICE_ID
                 && mutation.operation_id == SECOND_OPERATION_ID
-                && mutation.value.as_slice() == b"from second Device"
+                && decoded_catalog(&mutation.payload.entities[0]) == from_second
         }));
     }
 
@@ -4073,6 +4605,8 @@ mod tests {
             VAULT_ID,
             "2026-08-06T00:00:00Z",
             keys(7, x25519::Identity::generate()),
+            x25519::Identity::generate(),
+            x25519::Identity::generate().to_public().to_string(),
         )
         .unwrap();
         let second_wrapping_identity = x25519::Identity::generate();
@@ -4091,9 +4625,8 @@ mod tests {
             .prepare(PackageMutation {
                 sequence: 1,
                 operation_id: OPERATION_ID,
-                logical_id: "managed-item-1",
-                parents: &[],
-                value: b"base",
+                entities: &[catalog_entity(&project_projection("Base"), Vec::new())],
+                objects: &[],
             })
             .unwrap();
         genesis.publish(&base).unwrap();
@@ -4102,9 +4635,11 @@ mod tests {
             .prepare(PackageMutation {
                 sequence: 2,
                 operation_id: GENESIS_CHILD_OPERATION_ID,
-                logical_id: "managed-item-1",
-                parents: &base_parent,
-                value: b"genesis branch",
+                entities: &[catalog_entity(
+                    &project_projection("Genesis branch"),
+                    base_parent.clone(),
+                )],
+                objects: &[],
             })
             .unwrap();
         genesis.publish(&genesis_child).unwrap();
@@ -4112,9 +4647,11 @@ mod tests {
             .prepare(PackageMutation {
                 sequence: 1,
                 operation_id: SECOND_OPERATION_ID,
-                logical_id: "managed-item-1",
-                parents: &base_parent,
-                value: b"second branch",
+                entities: &[catalog_entity(
+                    &project_projection("Second branch"),
+                    base_parent.clone(),
+                )],
+                objects: &[],
             })
             .unwrap();
         second.publish(&second_child).unwrap();
@@ -4122,6 +4659,7 @@ mod tests {
         let conflicted = genesis.scan().unwrap();
         assert!(conflicted.pending.is_empty());
         assert_eq!(conflicted.conflicts.len(), 1);
+        assert_eq!(conflicted.conflicts[0].logical_id, CATALOG_LOGICAL_ID);
         assert_eq!(
             conflicted.conflicts[0].head_operation_ids,
             vec![SECOND_OPERATION_ID.to_string(), GENESIS_CHILD_OPERATION_ID.to_string()]
@@ -4135,9 +4673,8 @@ mod tests {
             .prepare(PackageMutation {
                 sequence: 3,
                 operation_id: MERGE_OPERATION_ID,
-                logical_id: "managed-item-1",
-                parents: &merge_parents,
-                value: b"merged",
+                entities: &[catalog_entity(&project_projection("Merged"), merge_parents)],
+                objects: &[],
             })
             .unwrap();
         genesis.publish(&merge).unwrap();
@@ -4153,13 +4690,13 @@ mod tests {
     fn concurrent_local_snapshots_keep_each_devices_projection_and_report_the_conflict() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("Personal.floriavault");
-        let mut genesis = ReplicationPackage::create(
+        let genesis_store = open_store(directory.path(), "genesis");
+        let second_store = open_store(directory.path(), "second");
+        let mut genesis = package_for_store(
             &root,
-            VAULT_ID,
-            "2026-08-06T00:00:00Z",
+            &genesis_store,
             keys(7, x25519::Identity::generate()),
-        )
-        .unwrap();
+        );
         let second_wrapping_identity = x25519::Identity::generate();
         genesis
             .enroll_device(
@@ -4171,10 +4708,20 @@ mod tests {
             second_device_keys(8, second_wrapping_identity),
         )
         .unwrap();
-        let (genesis, genesis_catalog, genesis_store) =
-            engine_for_package(directory.path(), "genesis", genesis, [81; 32]);
-        let (second, second_catalog, second_store) =
-            engine_for_package(directory.path(), "second", second, [82; 32]);
+        let (genesis, genesis_catalog) = engine_for_package(
+            directory.path(),
+            "genesis",
+            genesis,
+            [81; 32],
+            Arc::clone(&genesis_store),
+        );
+        let (second, second_catalog) = engine_for_package(
+            directory.path(),
+            "second",
+            second,
+            [82; 32],
+            Arc::clone(&second_store),
+        );
 
         let secret_id: SecretId = "77777777-7777-4777-8777-777777777777".parse().unwrap();
         genesis_store
@@ -4221,9 +4768,10 @@ mod tests {
         assert_eq!(genesis.sync().unwrap().published, 1);
         let second_report = second.sync().unwrap();
 
+        // Both Devices changed the catalog and the same secret: two entities, two conflicts.
         assert_eq!(second_report.published, 1);
         assert_eq!(second_report.imported, 0);
-        assert_eq!(second_report.conflicts, 1);
+        assert_eq!(second_report.conflicts, 2);
         assert_eq!(
             genesis_catalog.replicated_catalog().unwrap(),
             project_with_secret_projection(&secret_id, "Genesis branch")
@@ -4240,7 +4788,7 @@ mod tests {
             second_store.get(&secret_id).unwrap().as_slice(),
             b"second branch fixture payload"
         );
-        assert_eq!(genesis.sync().unwrap().conflicts, 1);
+        assert_eq!(genesis.sync().unwrap().conflicts, 2);
 
         let resolved = second
             .resolve_conflict_with_current("keep second branch")
@@ -4271,12 +4819,15 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("Personal.floriavault");
         let genesis_wrapping_identity = x25519::Identity::generate();
+        let genesis_store = open_store(directory.path(), "genesis");
         let mut genesis = ReplicationPackage::create_named(
             &root,
             VAULT_ID,
             "2026-08-06T00:00:00Z",
             keys(7, genesis_wrapping_identity.clone()),
             Some("Owner Mac".to_string()),
+            genesis_store.generation_identity(1).unwrap(),
+            genesis_store.recovery_recipient().unwrap(),
         )
         .unwrap();
         let second_wrapping_identity = x25519::Identity::generate();
@@ -4295,9 +4846,11 @@ mod tests {
             .prepare(PackageMutation {
                 sequence: 1,
                 operation_id: SECOND_OPERATION_ID,
-                logical_id: "second-item",
-                parents: &[],
-                value: b"accepted before revocation",
+                entities: &[catalog_entity(
+                    &project_projection("Accepted before revocation"),
+                    Vec::new(),
+                )],
+                objects: &[],
             })
             .unwrap();
         second.publish(&before_revocation).unwrap();
@@ -4305,12 +4858,21 @@ mod tests {
             .prepare(PackageMutation {
                 sequence: 2,
                 operation_id: GENESIS_CHILD_OPERATION_ID,
-                logical_id: "late-item",
-                parents: &[],
-                value: b"must not be accepted",
+                entities: &[catalog_entity(
+                    &project_projection("Must not be accepted"),
+                    vec![SECOND_OPERATION_ID.to_string()],
+                )],
+                objects: &[],
             })
             .unwrap();
 
+        let (mut genesis, _genesis_catalog) = engine_for_package(
+            directory.path(),
+            "genesis",
+            genesis,
+            [83; 32],
+            Arc::clone(&genesis_store),
+        );
         let devices = genesis.devices();
         assert_eq!(devices.len(), 2);
         assert_eq!(devices[0].device_name.as_deref(), Some("Owner Mac"));
@@ -4318,8 +4880,25 @@ mod tests {
         assert_eq!(devices[1].device_name.as_deref(), Some("Second Mac"));
         assert!(!devices[1].is_current);
 
-        assert_eq!(genesis.revoke_device(SECOND_DEVICE_ID).unwrap(), 2);
+        // Revocation rotates the store first, then publishes the matching Vault generation, so
+        // the two key domains stay in lockstep.
+        assert!(!genesis.revoke_device(SECOND_DEVICE_ID).unwrap().local_device_fenced);
         assert_eq!(genesis.current_generation(), 2);
+        assert_eq!(genesis_store.current_generation().unwrap(), 2);
+        assert_eq!(
+            genesis_store.generation_public(2).unwrap(),
+            Some(
+                genesis
+                    .package
+                    .generation_identity_secrets()
+                    .into_iter()
+                    .find(|(generation, _)| *generation == 2)
+                    .map(|(_, secret)| secret.trim().parse::<x25519::Identity>().unwrap())
+                    .unwrap()
+                    .to_public()
+                    .to_string()
+            )
+        );
         assert_eq!(genesis.devices()[1].revoked_generation, Some(2));
         let re_enrollment = genesis
             .enroll_device(
@@ -4328,26 +4907,24 @@ mod tests {
             .unwrap_err();
         assert!(re_enrollment.to_string().contains("new Device id"));
         let after_rotation = genesis
+            .package
             .prepare(PackageMutation {
                 sequence: 1,
                 operation_id: OPERATION_ID,
-                logical_id: "genesis-item",
-                parents: &[],
-                value: b"new generation",
+                entities: &[catalog_entity(
+                    &project_projection("New generation"),
+                    vec![SECOND_OPERATION_ID.to_string()],
+                )],
+                objects: &[],
             })
             .unwrap();
-        genesis.publish(&after_rotation).unwrap();
+        genesis.package.publish(&after_rotation).unwrap();
 
         let local_fence = second.publish(&late).unwrap_err();
         assert!(local_fence.to_string().contains("was revoked at key generation 2"));
-        publish_immutable(
-            &second.root.join("objects").join(format!("{}.age", late.object_id)),
-            &late.object,
-        )
-        .unwrap();
         publish_immutable(&second.operation_path(&late), &late.operation).unwrap();
 
-        let scan = genesis.scan().unwrap();
+        let scan = genesis.package.scan().unwrap();
         assert_eq!(scan.verified.len(), 2);
         assert!(scan.damaged.iter().any(|damaged| {
             damaged.reason.contains("not authorized for key generation")
@@ -4382,13 +4959,15 @@ mod tests {
             .prepare(PackageMutation {
                 sequence: 1,
                 operation_id: THIRD_OPERATION_ID,
-                logical_id: "third-item",
-                parents: &[],
-                value: b"enrolled after rotation",
+                entities: &[catalog_entity(
+                    &project_projection("Enrolled after rotation"),
+                    vec![OPERATION_ID.to_string()],
+                )],
+                objects: &[],
             })
             .unwrap();
         third.publish(&third_publication).unwrap();
-        let final_scan = genesis.scan().unwrap();
+        let final_scan = genesis.package.scan().unwrap();
         assert!(final_scan.verified.iter().any(|mutation| {
             mutation.device_id == third.device_id()
                 && mutation.key_generation == 2
@@ -4398,14 +4977,24 @@ mod tests {
 
     #[test]
     fn operation_waits_when_object_has_not_arrived() {
-        let (_directory, package) = package();
+        let (directory, package) = package();
+        let store = open_store(directory.path(), "source");
+        let secret_id: SecretId = "55555555-5555-4555-8555-555555555555".parse().unwrap();
+        store
+            .put_identified(
+                secret_id.clone(),
+                NewSecret::managed("Fixture value"),
+                b"fixture payload, not a credential",
+                "66666666-6666-4666-8666-666666666666",
+            )
+            .unwrap();
+        let (entity, object) = secret_entity(&store, &secret_id, 1, Vec::new());
         let prepared = package
             .prepare(PackageMutation {
                 sequence: 1,
                 operation_id: OPERATION_ID,
-                logical_id: "managed-item-1",
-                parents: &[],
-                value: b"fixture payload",
+                entities: &[entity],
+                objects: std::slice::from_ref(&object),
             })
             .unwrap();
         publish_immutable(&package.operation_path(&prepared), &prepared.operation).unwrap();
@@ -4415,8 +5004,8 @@ mod tests {
         assert!(pending.pending[0].reason.contains("has not arrived"));
 
         publish_immutable(
-            &package.root.join("objects").join(format!("{}.age", prepared.object_id)),
-            &prepared.object,
+            &package.root.join("objects").join(format!("{}.age", object.id)),
+            &object.bytes,
         )
         .unwrap();
         let complete = package.scan().unwrap();
@@ -4426,18 +5015,28 @@ mod tests {
 
     #[test]
     fn object_conflict_copy_is_validated_and_normalized_by_digest() {
-        let (_directory, package) = package();
+        let (directory, package) = package();
+        let store = open_store(directory.path(), "source");
+        let secret_id: SecretId = "55555555-5555-4555-8555-555555555555".parse().unwrap();
+        store
+            .put_identified(
+                secret_id.clone(),
+                NewSecret::managed("Fixture value"),
+                b"fixture payload, not a credential",
+                "66666666-6666-4666-8666-666666666666",
+            )
+            .unwrap();
+        let (entity, object) = secret_entity(&store, &secret_id, 1, Vec::new());
         let prepared = package
             .prepare(PackageMutation {
                 sequence: 1,
                 operation_id: OPERATION_ID,
-                logical_id: "managed-item-1",
-                parents: &[],
-                value: b"fixture payload",
+                entities: &[entity],
+                objects: std::slice::from_ref(&object),
             })
             .unwrap();
         let conflict_copy = package.root.join("objects/object (conflicted copy).age");
-        fs::write(&conflict_copy, &prepared.object).unwrap();
+        fs::write(&conflict_copy, &object.bytes).unwrap();
         publish_immutable(&package.operation_path(&prepared), &prepared.operation).unwrap();
 
         let scan = package.scan().unwrap();
@@ -4445,7 +5044,7 @@ mod tests {
         assert!(package
             .root
             .join("objects")
-            .join(format!("{}.age", prepared.object_id))
+            .join(format!("{}.age", object.id))
             .is_file());
     }
 
@@ -4456,9 +5055,8 @@ mod tests {
             .prepare(PackageMutation {
                 sequence: 1,
                 operation_id: OPERATION_ID,
-                logical_id: "managed-item-1",
-                parents: &[],
-                value: b"fixture payload",
+                entities: &[catalog_entity(&project_projection("Fixture"), Vec::new())],
+                objects: &[],
             })
             .unwrap();
         package.publish(&prepared).unwrap();
@@ -4481,9 +5079,8 @@ mod tests {
             .prepare(PackageMutation {
                 sequence: 2,
                 operation_id: OPERATION_ID,
-                logical_id: "managed-item-1",
-                parents: &[],
-                value: b"fixture payload",
+                entities: &[catalog_entity(&project_projection("Fixture"), Vec::new())],
+                objects: &[],
             })
             .unwrap();
         package.publish(&prepared).unwrap();
@@ -4501,18 +5098,16 @@ mod tests {
             .prepare(PackageMutation {
                 sequence: 1,
                 operation_id: OPERATION_ID,
-                logical_id: "managed-item-1",
-                parents: &[],
-                value: b"first fixture payload",
+                entities: &[catalog_entity(&project_projection("First"), Vec::new())],
+                objects: &[],
             })
             .unwrap();
         let second = package
             .prepare(PackageMutation {
                 sequence: 1,
                 operation_id: "44444444-4444-4444-8444-444444444444",
-                logical_id: "managed-item-1",
-                parents: &[],
-                value: b"second fixture payload",
+                entities: &[catalog_entity(&project_projection("Second"), Vec::new())],
+                objects: &[],
             })
             .unwrap();
         package.publish(&first).unwrap();
@@ -4551,6 +5146,8 @@ mod tests {
             VAULT_ID,
             "2026-08-06T00:00:00Z",
             keys(7, x25519::Identity::generate()),
+            x25519::Identity::generate(),
+            x25519::Identity::generate().to_public().to_string(),
         )
         .err()
         .unwrap();
@@ -4578,7 +5175,9 @@ mod tests {
     fn engine_reports_damaged_files_relative_to_the_replication_package() {
         let (directory, package) = package();
         let root = package.root.clone();
-        let (engine, _, _) = engine_for_package(directory.path(), "damaged", package, [43; 32]);
+        let store = open_store(directory.path(), "damaged");
+        let (engine, _) =
+            engine_for_package(directory.path(), "damaged", package, [43; 32], store);
         let relative = PathBuf::from("objects").join(format!("{}.age", "0".repeat(64)));
         fs::write(root.join(&relative), b"not an age ciphertext").unwrap();
 
@@ -4715,15 +5314,16 @@ mod tests {
             VAULT_ID,
             "2026-08-06T00:00:00Z",
             keys(7, x25519::Identity::generate()),
+            x25519::Identity::generate(),
+            x25519::Identity::generate().to_public().to_string(),
         )
         .unwrap();
         let prepared = package
             .prepare(PackageMutation {
                 sequence: 1,
                 operation_id: OPERATION_ID,
-                logical_id: "managed-item-1",
-                parents: &[],
-                value: b"fixture payload",
+                entities: &[catalog_entity(&project_projection("Fixture"), Vec::new())],
+                objects: &[],
             })
             .unwrap();
 
@@ -4736,9 +5336,11 @@ mod tests {
             .prepare(PackageMutation {
                 sequence: 1,
                 operation_id: OPERATION_ID,
-                logical_id: "managed-item-1",
-                parents: &[],
-                value: b"different fixture payload",
+                entities: &[catalog_entity(
+                    &project_projection("Different fixture"),
+                    Vec::new(),
+                )],
+                objects: &[],
             })
             .unwrap();
         assert!(journal
@@ -4772,13 +5374,22 @@ mod tests {
     #[test]
     fn engine_publishes_committed_outbox_from_the_exact_store_version() {
         let directory = tempfile::tempdir().unwrap();
-        let package = ReplicationPackage::create(
-            directory.path().join("Personal.floriavault"),
-            VAULT_ID,
-            "2026-08-06T00:00:00Z",
+        let store = open_store(directory.path(), "local");
+        let secret_id: SecretId = "55555555-5555-4555-8555-555555555555".parse().unwrap();
+        let mutation_id = "66666666-6666-4666-8666-666666666666";
+        store
+            .put_identified(
+                secret_id.clone(),
+                NewSecret::managed("replicated fixture"),
+                b"fixture payload, not a credential",
+                mutation_id,
+            )
+            .unwrap();
+        let package = package_for_store(
+            &directory.path().join("Personal.floriavault"),
+            &store,
             keys(7, x25519::Identity::generate()),
-        )
-        .unwrap();
+        );
         let authenticator = Arc::new(StateAuthenticator::for_tests([74; 32]));
         let intents = Arc::new(
             ReplicationIntentJournal::open(
@@ -4789,29 +5400,32 @@ mod tests {
             .unwrap(),
         );
         let catalog = Arc::new(Catalog::open(directory.path().join("catalog.sqlite")).unwrap());
-        let store = Arc::new(
-            AgeDirStore::open(
-                directory.path().join("store"),
-                Arc::new(LocalStoreKeys(x25519::Identity::generate())),
-            )
-            .unwrap(),
-        );
-        let secret_id: SecretId = "55555555-5555-4555-8555-555555555555".parse().unwrap();
-        let mutation_id = "66666666-6666-4666-8666-666666666666";
-        let catalog_payload = br#"{"kind":"fixture"}"#.to_vec();
-        intents.enqueue(intent(OPERATION_ID)).unwrap();
-        store
-            .put_identified(
-                secret_id.clone(),
-                NewSecret::managed("replicated fixture"),
-                b"fixture payload, not a credential",
-                mutation_id,
+        let (entity, object) = secret_entity(&store, &secret_id, 1, Vec::new());
+        let catalog_payload = serde_json::to_vec(&TransactionDelta {
+            format_version: PAYLOAD_FORMAT_VERSION,
+            entities: vec![entity],
+        })
+        .unwrap();
+        intents
+            .enqueue(
+                ReplicationIntent::new(
+                    OPERATION_ID,
+                    TRANSACTION_LOGICAL_ID,
+                    Vec::new(),
+                    vec![IntentStoreMutation {
+                        secret_id: secret_id.to_string(),
+                        mutation_id: mutation_id.to_string(),
+                    }],
+                    catalog_payload.clone(),
+                    "2026-08-06T00:00:00Z",
+                )
+                .unwrap(),
             )
             .unwrap();
         catalog
             .enqueue_replication_outbox(&ReplicationOutboxEntry {
                 intent_id: OPERATION_ID.to_string(),
-                logical_id: "managed-item-1".to_string(),
+                logical_id: TRANSACTION_LOGICAL_ID.to_string(),
                 parents: Vec::new(),
                 store_versions: vec![ReplicationStoreVersionRef {
                     secret_id: secret_id.to_string(),
@@ -4837,6 +5451,18 @@ mod tests {
         assert_eq!(intents.device_sequence(DEVICE_ID), 1);
         let scan = engine.package.scan().unwrap();
         assert_eq!(scan.verified.len(), 1);
+        // Zero transcoding: the published Object is byte-for-byte the store's version file.
+        assert_eq!(
+            fs::read(
+                engine
+                    .package
+                    .root
+                    .join("objects")
+                    .join(format!("{}.age", object.id))
+            )
+            .unwrap(),
+            version_blob(&store, &secret_id, &object.id)
+        );
     }
 
     #[test]
@@ -4852,20 +5478,13 @@ mod tests {
             .unwrap(),
         );
         let catalog = Arc::new(Catalog::open(directory.path().join("catalog.sqlite")).unwrap());
-        let store = Arc::new(
-            AgeDirStore::open(
-                directory.path().join("store"),
-                Arc::new(LocalStoreKeys(x25519::Identity::generate())),
-            )
-            .unwrap(),
-        );
+        let store = open_store(directory.path(), "local");
         let prepared = package
             .prepare(PackageMutation {
                 sequence: 1,
                 operation_id: OPERATION_ID,
-                logical_id: "managed-item-1",
-                parents: &[],
-                value: b"fixture payload",
+                entities: &[catalog_entity(&project_projection("Fixture"), Vec::new())],
+                objects: &[],
             })
             .unwrap();
         package.publish(&prepared).unwrap();
@@ -4887,13 +5506,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("Personal.floriavault");
         let genesis_wrapping_identity = x25519::Identity::generate();
-        let mut administrator = ReplicationPackage::create(
+        let administrator_store = open_store(directory.path(), "administrator");
+        let mut administrator = package_for_store(
             &root,
-            VAULT_ID,
-            "2026-08-06T00:00:00Z",
+            &administrator_store,
             keys(7, genesis_wrapping_identity.clone()),
-        )
-        .unwrap();
+        );
         administrator
             .enroll_device(
                 second_device_keys(8, x25519::Identity::generate()).enrollment(),
@@ -4915,17 +5533,18 @@ mod tests {
             .unwrap(),
             intents,
             Arc::new(Catalog::open(directory.path().join("catalog.sqlite")).unwrap()),
-            Arc::new(
-                AgeDirStore::open(
-                    directory.path().join("store"),
-                    Arc::new(LocalStoreKeys(x25519::Identity::generate())),
-                )
-                .unwrap(),
-            ),
+            open_store(directory.path(), "local"),
         );
 
         assert!(!engine.sync().unwrap().local_device_fenced);
-        administrator.revoke_device(SECOND_DEVICE_ID).unwrap();
+        let rotated = administrator_store.rotate_generation().unwrap();
+        administrator
+            .revoke_device(
+                SECOND_DEVICE_ID,
+                administrator_store.generation_identity(rotated).unwrap(),
+                &administrator_store.recovery_recipient().unwrap(),
+            )
+            .unwrap();
         assert!(!engine.sync().unwrap().local_device_fenced);
         assert_eq!(engine.package.current_generation(), 2);
 
@@ -4940,13 +5559,12 @@ mod tests {
     fn verified_commit_replays_into_an_empty_catalog_and_store() {
         let directory = tempfile::tempdir().unwrap();
         let genesis_wrapping_identity = x25519::Identity::generate();
-        let mut package = ReplicationPackage::create(
-            directory.path().join("Personal.floriavault"),
-            VAULT_ID,
-            "2026-08-06T00:00:00Z",
+        let source_store = open_store(directory.path(), "source");
+        let mut package = package_for_store(
+            &directory.path().join("Personal.floriavault"),
+            &source_store,
             keys(7, genesis_wrapping_identity.clone()),
-        )
-        .unwrap();
+        );
         let target_wrapping_identity = x25519::Identity::generate();
         package
             .enroll_device(
@@ -4963,13 +5581,6 @@ mod tests {
         );
         let source_catalog = Arc::new(
             Catalog::open(directory.path().join("source-catalog.sqlite")).unwrap(),
-        );
-        let source_store = Arc::new(
-            AgeDirStore::open(
-                directory.path().join("source-store"),
-                Arc::new(LocalStoreKeys(x25519::Identity::generate())),
-            )
-            .unwrap(),
         );
         let secret_id: SecretId = "55555555-5555-4555-8555-555555555555".parse().unwrap();
         let store_mutation_id = "66666666-6666-4666-8666-666666666666";
@@ -5010,13 +5621,7 @@ mod tests {
         let restored_catalog = Arc::new(
             Catalog::open(directory.path().join("restored-catalog.sqlite")).unwrap(),
         );
-        let restored_store = Arc::new(
-            AgeDirStore::open(
-                directory.path().join("restored-store"),
-                Arc::new(LocalStoreKeys(x25519::Identity::generate())),
-            )
-            .unwrap(),
-        );
+        let restored_store = open_store(directory.path(), "restored");
         let restored = ReplicationEngine::from_parts(
             ReplicationPackage::open(
                 directory.path().join("Personal.floriavault"),
@@ -5046,13 +5651,7 @@ mod tests {
         let target_catalog = Arc::new(
             Catalog::open(directory.path().join("target-catalog.sqlite")).unwrap(),
         );
-        let target_store = Arc::new(
-            AgeDirStore::open(
-                directory.path().join("target-store"),
-                Arc::new(LocalStoreKeys(x25519::Identity::generate())),
-            )
-            .unwrap(),
-        );
+        let target_store = open_store(directory.path(), "target");
         let target = ReplicationEngine::from_parts(
             ReplicationPackage::open(
                 directory.path().join("Personal.floriavault"),
@@ -5082,5 +5681,107 @@ mod tests {
             b"fixture payload version three"
         );
         assert_eq!(target_catalog.replicated_catalog().unwrap(), projection(&secret_id));
+
+        // Zero transcoding end to end: source version file == published Object == imported file.
+        for reference in source_store.version_refs(&secret_id).unwrap() {
+            let source_bytes = version_blob(&source_store, &secret_id, &reference.digest);
+            assert_eq!(
+                fs::read(
+                    directory
+                        .path()
+                        .join("Personal.floriavault/objects")
+                        .join(format!("{}.age", reference.digest))
+                )
+                .unwrap(),
+                source_bytes
+            );
+            assert_eq!(
+                version_blob(&target_store, &secret_id, &reference.digest),
+                source_bytes
+            );
+        }
+    }
+
+    #[test]
+    fn disjoint_entity_edits_from_two_devices_do_not_conflict() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("Personal.floriavault");
+        let genesis_store = open_store(directory.path(), "genesis");
+        let second_store = open_store(directory.path(), "second");
+        let mut genesis_package = package_for_store(
+            &root,
+            &genesis_store,
+            keys(7, x25519::Identity::generate()),
+        );
+        let second_wrapping_identity = x25519::Identity::generate();
+        genesis_package
+            .enroll_device(
+                second_device_keys(8, second_wrapping_identity.clone()).enrollment(),
+            )
+            .unwrap();
+        let second_package = ReplicationPackage::open(
+            &root,
+            second_device_keys(8, second_wrapping_identity),
+        )
+        .unwrap();
+        let (genesis, genesis_catalog) = engine_for_package(
+            directory.path(),
+            "genesis",
+            genesis_package,
+            [84; 32],
+            Arc::clone(&genesis_store),
+        );
+        let (second, second_catalog) = engine_for_package(
+            directory.path(),
+            "second",
+            second_package,
+            [85; 32],
+            Arc::clone(&second_store),
+        );
+
+        let secret_id: SecretId = "55555555-5555-4555-8555-555555555555".parse().unwrap();
+        genesis_store
+            .put_identified(
+                secret_id.clone(),
+                NewSecret::managed("Disjoint fixture"),
+                b"base fixture payload",
+                "66666666-6666-4666-8666-666666666666",
+            )
+            .unwrap();
+        genesis_catalog
+            .apply_replicated_catalog(&project_with_secret_projection(&secret_id, "Base"))
+            .unwrap();
+        assert!(genesis.stage_current_snapshot("base").unwrap());
+        assert_eq!(genesis.sync().unwrap().published, 1);
+        assert_eq!(second.sync().unwrap().imported, 1);
+
+        // One Device touches only the secret, the other only the catalog: different entities.
+        genesis_store
+            .append_version(&secret_id, b"genesis only touches the secret")
+            .unwrap();
+        second_catalog
+            .apply_replicated_catalog(&project_with_secret_projection(&secret_id, "Renamed"))
+            .unwrap();
+        assert!(genesis.stage_current_snapshot("secret edit").unwrap());
+        assert!(second.stage_current_snapshot("catalog edit").unwrap());
+
+        assert_eq!(genesis.sync().unwrap().published, 1);
+        let second_report = second.sync().unwrap();
+        assert_eq!(second_report.published, 1);
+        assert_eq!(second_report.imported, 1);
+        assert_eq!(second_report.conflicts, 0);
+        let genesis_report = genesis.sync().unwrap();
+        assert_eq!(genesis_report.imported, 1);
+        assert_eq!(genesis_report.conflicts, 0);
+
+        let converged = project_with_secret_projection(&secret_id, "Renamed");
+        assert_eq!(genesis_catalog.replicated_catalog().unwrap(), converged);
+        assert_eq!(second_catalog.replicated_catalog().unwrap(), converged);
+        assert_eq!(
+            second_store.get(&secret_id).unwrap().as_slice(),
+            b"genesis only touches the secret"
+        );
+        assert!(!genesis.stage_current_snapshot("converged").unwrap());
+        assert!(!second.stage_current_snapshot("converged").unwrap());
     }
 }

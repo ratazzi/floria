@@ -534,6 +534,270 @@ impl AgeDirStore {
         self.append_version_internal(id, plaintext, Some(mutation_id.to_string()))
     }
 
+    /// All versions of a secret as lightweight replication references (no ciphertext), oldest
+    /// first.
+    pub fn version_refs(&self, id: &SecretId) -> StoreResult<Vec<StoreVersionRef>> {
+        self.verify_security_state()?;
+        self.read_meta(id)?;
+        let mut refs = self
+            .version_files(id)?
+            .into_iter()
+            .map(|(digest, vmeta)| {
+                let blob = self.version_blob_path(id, &digest);
+                let ciphertext_size = std::fs::metadata(&blob)
+                    .map_err(|e| StoreError::io(&blob, e))?
+                    .len();
+                Ok(StoreVersionRef {
+                    ordinal: vmeta.version,
+                    version_uuid: vmeta.version_uuid,
+                    generation: vmeta.generation,
+                    size: vmeta.size,
+                    ciphertext_size,
+                    digest,
+                })
+            })
+            .collect::<StoreResult<Vec<_>>>()?;
+        refs.sort_by_key(|reference| reference.ordinal);
+        Ok(refs)
+    }
+
+    /// Export one immutable version verbatim for replication: `ciphertext` is the exact on-disk
+    /// file, `digest` its filename. Zero transcoding — the same bytes land in the vault's
+    /// `objects/` and in the importing machine's store.
+    pub fn export_version(&self, id: &SecretId, ordinal: u32) -> StoreResult<VersionExport> {
+        self.verify_security_state()?;
+        let (digest, vmeta) = self.find_version(id, ordinal)?;
+        let ciphertext = self.read_ciphertext_by_digest(id, &digest)?;
+        Ok(VersionExport {
+            ordinal,
+            version_uuid: vmeta.version_uuid,
+            generation: vmeta.generation,
+            size: vmeta.size,
+            digest,
+            ciphertext,
+        })
+    }
+
+    /// The transport-stable identity of the head version.
+    pub fn head_version_uuid(&self, id: &SecretId) -> StoreResult<String> {
+        self.verify_security_state()?;
+        let meta = self.read_meta(id)?;
+        let (_, vmeta) = self.find_version(id, meta.current_version)?;
+        Ok(vmeta.version_uuid)
+    }
+
+    /// Point the head at the version carrying `version_uuid` (the replicated head reference);
+    /// returns its machine-local ordinal. Idempotent.
+    pub fn set_head_to_uuid(&self, id: &SecretId, version_uuid: &str) -> StoreResult<u32> {
+        let _lock = self.lock_exclusive()?;
+        self.verify_security_state()?;
+        let mut meta = self.read_meta(id)?;
+        let mut matches = self
+            .version_files(id)?
+            .into_iter()
+            .filter(|(_, vmeta)| vmeta.version_uuid == version_uuid)
+            .collect::<Vec<_>>();
+        let ordinal = match matches.len() {
+            0 => return Err(StoreError::NotFound(format!("{id} version {version_uuid}"))),
+            1 => matches.remove(0).1.version,
+            _ => {
+                return Err(StoreError::Corrupt {
+                    id: id.to_string(),
+                    reason: format!("multiple version files claim uuid {version_uuid}"),
+                })
+            }
+        };
+        if meta.current_version != ordinal {
+            meta.current_version = ordinal;
+            self.write_meta(id, &meta)?;
+            self.seal_security_state()?;
+        }
+        Ok(ordinal)
+    }
+
+    /// Import a verbatim version blob replicated from another machine's store.
+    ///
+    /// The bytes are verified (digest, decrypt, payload binding, declared size) before anything
+    /// is written, then land on disk unchanged. `create` supplies entry metadata when the secret
+    /// does not exist locally yet. Idempotent by `version_uuid`: a blob that already arrived
+    /// returns its existing ordinal, and the same uuid with different bytes is corruption.
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_version(
+        &self,
+        id: &SecretId,
+        create: Option<NewSecret>,
+        ciphertext: &[u8],
+        version_uuid: &str,
+        generation: u32,
+        expected_size: u64,
+        mutation_id: &str,
+    ) -> StoreResult<u32> {
+        validate_mutation_id(mutation_id)?;
+        let _lock = self.lock_exclusive()?;
+        self.verify_security_state()?;
+        let digest = hex_sha256(ciphertext);
+        let exists = match self.read_meta(id) {
+            Ok(_) => true,
+            Err(StoreError::NotFound(_)) => false,
+            Err(error) => return Err(error),
+        };
+        if exists {
+            if let Some((have_digest, vmeta)) = self
+                .version_files(id)?
+                .into_iter()
+                .find(|(_, vmeta)| vmeta.version_uuid == version_uuid)
+            {
+                if have_digest != digest {
+                    return Err(StoreError::Corrupt {
+                        id: id.to_string(),
+                        reason: format!(
+                            "version {version_uuid} already exists with different bytes"
+                        ),
+                    });
+                }
+                return Ok(vmeta.version);
+            }
+        }
+        let identity = self.generations.identity(generation, &*self.keys)?;
+        let decrypted = self.decrypt_with_identity(ciphertext, &identity)?;
+        let plaintext = decode_bound_payload(id, version_uuid, decrypted)?;
+        if plaintext.len() as u64 != expected_size {
+            return Err(StoreError::Invalid(format!(
+                "imported version {version_uuid} declares {expected_size} bytes but decrypts to {}",
+                plaintext.len()
+            )));
+        }
+        let ordinal = if exists {
+            self.max_version(id)?.checked_add(1).ok_or_else(|| {
+                StoreError::Invalid(format!("secret {id} version overflow"))
+            })?
+        } else {
+            1
+        };
+        if !exists {
+            let Some(create) = create else {
+                return Err(StoreError::Invalid(format!(
+                    "secret {id} does not exist locally and no descriptor was provided"
+                )));
+            };
+            let mode = create.mode;
+            let enforcement = create.enforcement;
+            let (source_path, managed_label) = validate_new_secret_origin(create.origin)?;
+            let vdir = self.versions_dir(id);
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&vdir)
+                .map_err(|error| StoreError::io(&vdir, error))?;
+            self.write_meta(
+                id,
+                &MetaFile {
+                    format: STORE_FORMAT_VERSION,
+                    id: id.to_string(),
+                    source_path,
+                    managed_label,
+                    mode,
+                    created: now_rfc3339(),
+                    current_version: ordinal,
+                    enforcement,
+                    environment_ids: None,
+                    metadata: ItemMetadata::default(),
+                },
+            )?;
+        }
+        write_private(&self.version_blob_path(id, &digest), ciphertext)?;
+        let vmeta = VersionMetaFile {
+            version: ordinal,
+            version_uuid: version_uuid.to_string(),
+            generation,
+            size: expected_size,
+            created: now_rfc3339(),
+            note: None,
+            mutation_id: Some(mutation_id.to_string()),
+        };
+        let text = toml::to_string_pretty(&vmeta)
+            .map_err(|e| StoreError::Crypto(format!("serialize version meta: {e}")))?;
+        write_private(&self.version_meta_path(id, &digest), text.as_bytes())?;
+        self.seal_security_state()?;
+        Ok(ordinal)
+    }
+
+    /// The generation new versions are encrypted under right now.
+    pub fn current_generation(&self) -> StoreResult<u32> {
+        self.generations.encryption_generation()
+    }
+
+    /// Unwrap the identity for `generation` with the device key (cached per store instance).
+    pub fn generation_identity(&self, generation: u32) -> StoreResult<age::x25519::Identity> {
+        self.generations.identity(generation, &*self.keys)
+    }
+
+    /// The secret string of a generation identity, for wrapping into device envelopes.
+    pub fn generation_identity_secret(&self, generation: u32) -> StoreResult<Zeroizing<String>> {
+        self.generations.identity_secret(generation, &*self.keys)
+    }
+
+    /// Encryption recipients (current generation + recovery), usable without unlocking keys.
+    pub fn generation_recipients(&self) -> StoreResult<Vec<Box<dyn age::Recipient + Send>>> {
+        self.generations.recipients()
+    }
+
+    /// The plaintext recovery recipient string.
+    pub fn recovery_recipient(&self) -> StoreResult<String> {
+        self.generations.recovery_public()
+    }
+
+    /// The public key of a generation, or `None` if this store doesn't know it.
+    pub fn generation_public(&self, generation: u32) -> StoreResult<Option<String>> {
+        self.generations.generation_public(generation)
+    }
+
+    /// Start a new generation (device revocation). Existing version files keep their bytes.
+    pub fn rotate_generation(&self) -> StoreResult<u32> {
+        let _lock = self.lock_exclusive()?;
+        self.verify_security_state()?;
+        let generation = self.generations.rotate(&*self.keys)?;
+        self.seal_security_state()?;
+        Ok(generation)
+    }
+
+    /// Install one missing generation without touching existing keys (an already-aligned store
+    /// learning a newer vault generation, e.g. after re-enrollment). Idempotent for the same
+    /// key; a different key for an existing generation fails.
+    pub fn install_generation(&self, generation: u32, secret: &str) -> StoreResult<()> {
+        let _lock = self.lock_exclusive()?;
+        self.verify_security_state()?;
+        self.generations.install(generation, secret, &*self.keys)?;
+        self.seal_security_state()
+    }
+
+    /// Adopt a vault's generation set (joining as a new device). Fails if this store already
+    /// holds secret entries — their versions are bound to the local generations.
+    pub fn adopt_generations(
+        &self,
+        generations: &[(u32, Zeroizing<String>)],
+        recovery_public: &str,
+    ) -> StoreResult<()> {
+        let _lock = self.lock_exclusive()?;
+        self.verify_security_state()?;
+        let has_entries = std::fs::read_dir(&self.root)
+            .map_err(|e| StoreError::io(&self.root, e))?
+            .filter_map(|entry| entry.ok())
+            .any(|entry| {
+                entry.path().is_dir()
+                    && entry.file_name().to_string_lossy().parse::<SecretId>().is_ok()
+            });
+        if has_entries {
+            return Err(StoreError::Invalid(
+                "cannot adopt vault generations: this store already holds secrets \
+                 (joining a vault with an existing local library is not supported yet)"
+                    .to_string(),
+            ));
+        }
+        self.generations.adopt(&*self.keys, generations, recovery_public)?;
+        self.seal_security_state()
+    }
+
     /// Find the immutable version produced by a durable mutation without reading mutable head.
     pub fn version_for_mutation(
         &self,
@@ -1436,6 +1700,75 @@ mod tests {
         let decrypted = s.decrypt_with_identity(&blob, &recovery).unwrap();
         let plaintext = decode_bound_payload(&id, &vmeta.version_uuid, decrypted).unwrap();
         assert_eq!(plaintext.as_slice(), b"recoverable");
+    }
+
+    #[test]
+    fn verbatim_export_import_roundtrip_across_stores() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = store(tmp.path().join("a"));
+        let b_keys: Arc<dyn KeyProvider> =
+            Arc::new(X25519Keys(age::x25519::Identity::generate()));
+        let b = AgeDirStore::open(tmp.path().join("b"), b_keys).unwrap();
+
+        // Machine B joins A's key domain: adopt every generation + the recovery recipient.
+        let generations = vec![(1u32, a.generation_identity_secret(1).unwrap())];
+        b.adopt_generations(&generations, &a.recovery_recipient().unwrap()).unwrap();
+
+        let id = a.put(NewSecret::managed("shared fixture"), b"v1 bytes").unwrap();
+        a.append_version(&id, b"v2 bytes").unwrap();
+        let mutation = "44444444-4444-4444-8444-444444444444";
+
+        for ordinal in [1u32, 2] {
+            let export = a.export_version(&id, ordinal).unwrap();
+            // Zero transcode: the exported bytes are the on-disk file, name = digest.
+            let on_disk = std::fs::read(a.version_blob_path(&id, &export.digest)).unwrap();
+            assert_eq!(on_disk, export.ciphertext);
+            let assigned = b
+                .import_version(
+                    &id,
+                    Some(NewSecret::managed("shared fixture")),
+                    &export.ciphertext,
+                    &export.version_uuid,
+                    export.generation,
+                    export.size,
+                    mutation,
+                )
+                .unwrap();
+            assert_eq!(assigned, ordinal);
+            // Idempotent re-import returns the same ordinal.
+            assert_eq!(
+                b.import_version(
+                    &id,
+                    None,
+                    &export.ciphertext,
+                    &export.version_uuid,
+                    export.generation,
+                    export.size,
+                    mutation,
+                )
+                .unwrap(),
+                ordinal
+            );
+            // Byte-identical on B's disk too.
+            let b_disk = std::fs::read(b.version_blob_path(&id, &export.digest)).unwrap();
+            assert_eq!(b_disk, export.ciphertext);
+        }
+
+        // import_version never moves the head: replicated head moves are explicit deltas.
+        assert_eq!(b.get(&id).unwrap().as_slice(), b"v1 bytes");
+        let v2_uuid = a.export_version(&id, 2).unwrap().version_uuid;
+        assert_eq!(b.set_head_to_uuid(&id, &v2_uuid).unwrap(), 2);
+        assert_eq!(b.get(&id).unwrap().as_slice(), b"v2 bytes");
+        let v1_uuid = a.export_version(&id, 1).unwrap().version_uuid;
+        assert_eq!(b.set_head_to_uuid(&id, &v1_uuid).unwrap(), 1);
+        assert_eq!(b.get(&id).unwrap().as_slice(), b"v1 bytes");
+
+        // A populated store must refuse to adopt foreign generations.
+        assert!(a
+            .adopt_generations(&generations, &a.recovery_recipient().unwrap())
+            .unwrap_err()
+            .to_string()
+            .contains("already holds secrets"));
     }
 
     #[test]
