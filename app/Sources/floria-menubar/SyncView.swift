@@ -11,7 +11,7 @@ struct SyncView: View {
     @State private var errorMessage: String?
     @State private var showingDisableConfirmation = false
     @State private var showingKeepCurrentConfirmation = false
-    @State private var pendingApproval: ReplicationEnrollment?
+    @State private var pendingApproval: ReplicationPendingEnrollment?
     @State private var showingApprovalConfirmation = false
     @State private var pendingDeviceRemoval: ReplicationDevice?
     @State private var showingReenrollmentConfirmation = false
@@ -96,14 +96,15 @@ struct SyncView: View {
         .confirmationDialog(
             "Approve Another Mac?", isPresented: $showingApprovalConfirmation,
             presenting: pendingApproval
-        ) { enrollment in
-            Button("Approve Mac") {
-                perform { try await store.approveReplicationDevice(enrollment) }
+        ) { request in
+            Button("Codes Match — Approve") {
+                perform { try await store.approveReplicationRequest(deviceID: request.deviceID) }
             }
             Button("Cancel", role: .cancel) {}
-        } message: { enrollment in
+        } message: { request in
             Text(
-                "This grants \(enrollment.deviceName ?? "Mac \(shortDeviceID(enrollment.deviceID))") access to the encrypted sync folder."
+                "Only approve if the other Mac shows exactly this code: \(request.fingerprint). "
+                    + "This grants \(request.deviceName ?? "Mac \(shortDeviceID(request.deviceID))") access to the encrypted sync folder."
             )
         }
         .confirmationDialog(
@@ -318,16 +319,18 @@ struct SyncView: View {
                         }
                     }
                 } else {
-                    HStack(spacing: 10) {
-                        Button("Sync Now", systemImage: "arrow.clockwise") {
-                            perform { try await store.syncReplicationPackage() }
+                    VStack(alignment: .leading, spacing: 14) {
+                        if !status.pendingEnrollments.isEmpty {
+                            pendingEnrollmentSection(status)
                         }
-                        .buttonStyle(.borderedProminent)
-                        Button("Approve Another Mac…", systemImage: "laptopcomputer.and.arrow.down") {
-                            chooseApprovalRequest()
-                        }
-                        Button("Stop Syncing…", role: .destructive) {
-                            showingDisableConfirmation = true
+                        HStack(spacing: 10) {
+                            Button("Sync Now", systemImage: "arrow.clockwise") {
+                                perform { try await store.syncReplicationPackage() }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            Button("Stop Syncing…", role: .destructive) {
+                                showingDisableConfirmation = true
+                            }
                         }
                     }
                 }
@@ -337,22 +340,21 @@ struct SyncView: View {
         case .waitingForEnrollment:
             VStack(alignment: .leading, spacing: 12) {
                 Text(
-                    "Save this Mac’s approval request, then open Sync on a Mac that already uses this folder and choose Approve Another Mac."
+                    "This Mac’s request travels through the sync folder automatically. Open Sync on the Mac that created this folder and approve it there — after checking that it shows exactly this code:"
                 )
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-                HStack(spacing: 10) {
-                    Button("Save Approval Request…", systemImage: "square.and.arrow.up") {
-                        saveEnrollmentRequest()
-                    }
-                    .buttonStyle(.borderedProminent)
-                    Button("Copy Request", systemImage: "doc.on.doc") {
-                        copyEnrollmentRequest()
-                    }
-                    Button("Check Again", systemImage: "arrow.clockwise") {
-                        perform { try await store.syncReplicationPackage() }
-                    }
+                if let fingerprint = status.deviceFingerprint {
+                    Text(fingerprint)
+                        .font(.title3.monospaced().weight(.semibold))
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 8)
+                        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+                        .textSelection(.enabled)
+                }
+                Button("Check Again", systemImage: "arrow.clockwise") {
+                    perform { try await store.syncReplicationPackage() }
                 }
                 .disabled(isWorking)
             }
@@ -500,69 +502,46 @@ struct SyncView: View {
         perform { try await store.openReplicationPackage(at: url.path) }
     }
 
-    private func chooseApprovalRequest() {
-        let panel = NSOpenPanel()
-        panel.title = "Approve Another Mac"
-        panel.prompt = "Review"
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        panel.allowedContentTypes = [.json]
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        do {
-            pendingApproval = try JSONDecoder().decode(
-                ReplicationEnrollment.self, from: Data(contentsOf: url))
-            showingApprovalConfirmation = true
-            errorMessage = nil
-        } catch {
-            errorMessage = "This is not a valid Floria approval request."
-        }
-    }
-
-    private func saveEnrollmentRequest() {
-        guard !isWorking else { return }
-        let panel = NSSavePanel()
-        panel.title = "Save Approval Request"
-        panel.prompt = "Save"
-        panel.canCreateDirectories = true
-        panel.allowedContentTypes = [.json]
-        panel.nameFieldStringValue = "Floria Mac Approval Request.json"
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        isWorking = true
-        Task {
-            defer { isWorking = false }
-            do {
-                let enrollment = try await store.replicationEnrollment()
-                try enrollmentData(enrollment).write(to: url, options: .atomic)
-                NSWorkspace.shared.activateFileViewerSelecting([url])
-                errorMessage = nil
-            } catch {
-                errorMessage = displayMessage(for: error)
+    private func pendingEnrollmentSection(_ status: ReplicationStatus) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Macs waiting for approval")
+                .font(.headline)
+            Text(
+                "A new Mac asked to join through the sync folder. Compare the code with the one shown on that Mac before approving."
+            )
+            .font(.callout)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            VStack(spacing: 0) {
+                ForEach(Array(status.pendingEnrollments.enumerated()), id: \.element.id) {
+                    index, request in
+                    HStack(spacing: 12) {
+                        Image(systemName: "laptopcomputer.and.arrow.down")
+                            .foregroundStyle(.orange)
+                            .frame(width: 24)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(request.deviceName ?? "Mac \(shortDeviceID(request.deviceID))")
+                                .font(.callout.weight(.medium))
+                            Text(request.fingerprint)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("Approve…") {
+                            pendingApproval = request
+                            showingApprovalConfirmation = true
+                        }
+                        .controlSize(.small)
+                    }
+                    .padding(.horizontal, 12)
+                    .frame(minHeight: 52)
+                    if index < status.pendingEnrollments.count - 1 {
+                        Divider().padding(.leading, 48)
+                    }
+                }
             }
+            .background(Color.orange.opacity(0.06), in: RoundedRectangle(cornerRadius: 9))
         }
-    }
-
-    private func copyEnrollmentRequest() {
-        guard !isWorking else { return }
-        isWorking = true
-        Task {
-            defer { isWorking = false }
-            do {
-                let enrollment = try await store.replicationEnrollment()
-                let value = String(decoding: try enrollmentData(enrollment), as: UTF8.self)
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(value, forType: .string)
-                errorMessage = nil
-            } catch {
-                errorMessage = displayMessage(for: error)
-            }
-        }
-    }
-
-    private func enrollmentData(_ enrollment: ReplicationEnrollment) throws -> Data {
-        let encoder = JSONEncoder()
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        return try encoder.encode(enrollment)
     }
 
     private func statusTitle(_ status: ReplicationStatus) -> String {

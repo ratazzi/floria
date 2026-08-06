@@ -15,7 +15,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertNil(request["params"])
 
         let response = Data(
-            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":9,"daemon_version":"0.1.0","schema_version":14,"minimum_schema_version":14,"store_format_version":2,"minimum_store_format_version":1}}}"#.utf8)
+            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":10,"daemon_version":"0.1.0","schema_version":14,"minimum_schema_version":14,"store_format_version":5,"minimum_store_format_version":5}}}"#.utf8)
         let decoded = try JSONDecoder().decode(
             ControlResponseEnvelope<ControlServerInfo>.self, from: response)
         let info = try XCTUnwrap(decoded.result?.value)
@@ -24,8 +24,8 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(info.daemonVersion, "0.1.0")
         XCTAssertEqual(info.schemaVersion, 14)
         XCTAssertEqual(info.minimumSchemaVersion, 14)
-        XCTAssertEqual(info.storeFormatVersion, 2)
-        XCTAssertEqual(info.minimumStoreFormatVersion, 1)
+        XCTAssertEqual(info.storeFormatVersion, 5)
+        XCTAssertEqual(info.minimumStoreFormatVersion, 5)
     }
 
     func testHealthRequestAndRedactedReportMatchRustWireShape() throws {
@@ -126,7 +126,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertNil(reenroll["params"])
 
         let response = Data(
-            #"{"request_id":64,"status":"ok","result":{"type":"replication_status","value":{"mode":"waiting_for_enrollment","directory":"/tmp/Personal.floriavault","device_id":"fixture-device","vault_id":"fixture-vault","key_generation":2,"published":3,"imported":4,"pending":1,"conflicts":0,"damaged":1,"damaged_files":["objects/damaged.age"],"devices":[],"message":"Approval required"}}}"#.utf8)
+            #"{"request_id":64,"status":"ok","result":{"type":"replication_status","value":{"mode":"waiting_for_enrollment","directory":"/tmp/Personal.floriavault","device_id":"fixture-device","vault_id":"fixture-vault","key_generation":2,"published":3,"imported":4,"pending":1,"conflicts":0,"damaged":1,"damaged_files":["objects/damaged.age"],"devices":[],"message":"Approval required","device_fingerprint":"3F09-A2C4-88D1","pending_enrollments":[{"device_id":"fixture-joining","device_name":"Fixture Laptop","fingerprint":"AB12-CD34-EF56","requested_at":"2026-08-06T00:00:00Z"}]}}}"#.utf8)
         let decoded = try JSONDecoder().decode(
             ControlResponseEnvelope<ReplicationStatus>.self, from: response)
         let status = try XCTUnwrap(decoded.result?.value)

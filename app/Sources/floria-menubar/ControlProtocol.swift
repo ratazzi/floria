@@ -1,6 +1,6 @@
 import Foundation
 
-let supportedControlProtocolVersion: UInt32 = 9
+let supportedControlProtocolVersion: UInt32 = 10
 
 struct ControlServerInfo: Decodable, Equatable, Sendable {
     let protocolVersion: UInt32?
@@ -984,6 +984,11 @@ struct ReplicationStatus: Codable, Equatable, Sendable {
     let damagedFiles: [String]
     let devices: [ReplicationDevice]
     let message: String?
+    /// This Mac's signing-key fingerprint, shown while waiting for approval so the user can
+    /// compare it on the genesis Mac.
+    let deviceFingerprint: String?
+    /// Enrollment requests found in the sync directory that await approval on this Mac.
+    let pendingEnrollments: [ReplicationPendingEnrollment]
 
     enum CodingKeys: String, CodingKey {
         case mode, directory, published, imported, pending, conflicts, damaged, devices, message
@@ -991,6 +996,25 @@ struct ReplicationStatus: Codable, Equatable, Sendable {
         case vaultID = "vault_id"
         case keyGeneration = "key_generation"
         case damagedFiles = "damaged_files"
+        case deviceFingerprint = "device_fingerprint"
+        case pendingEnrollments = "pending_enrollments"
+    }
+}
+
+struct ReplicationPendingEnrollment: Codable, Equatable, Identifiable, Sendable {
+    let deviceID: String
+    let deviceName: String?
+    /// Compare this fingerprint with the one shown on the requesting Mac before approving.
+    let fingerprint: String
+    let requestedAt: String
+
+    var id: String { deviceID }
+
+    enum CodingKeys: String, CodingKey {
+        case fingerprint
+        case deviceID = "device_id"
+        case deviceName = "device_name"
+        case requestedAt = "requested_at"
     }
 }
 
@@ -1051,6 +1075,7 @@ enum ControlCommand: Sendable {
     case replicationDisable
     case replicationEnrollment
     case replicationEnroll(ReplicationEnrollment)
+    case replicationApprove(deviceID: String)
     case snapshot
     case discover(paths: [String])
     case discoverStart(paths: [String])
@@ -1135,6 +1160,7 @@ enum ControlCommand: Sendable {
         case .replicationDisable: "replication_disable"
         case .replicationEnrollment: "replication_enrollment"
         case .replicationEnroll: "replication_enroll"
+        case .replicationApprove: "replication_approve"
         case .snapshot: "snapshot"
         case .discover: "discover"
         case .discoverStart: "discover_start"
@@ -1238,6 +1264,11 @@ enum ControlCommand: Sendable {
                     requestID: requestID, method: method,
                     params: ReplicationEnrollParams(enrollment: enrollment)))
         case .replicationRevokeDevice(let deviceID):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: ReplicationRevokeDeviceParams(deviceID: deviceID)))
+        case .replicationApprove(let deviceID):
             return try encoder.encode(
                 ControlRequest(
                     requestID: requestID, method: method,

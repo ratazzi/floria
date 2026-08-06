@@ -990,6 +990,11 @@ final class WorkspaceStore {
         return try await controlClient.enrollReplicationDevice(enrollment)
     }
 
+    func approveReplicationRequest(deviceID: String) async throws -> ReplicationStatus {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        return try await controlClient.approveReplicationRequest(deviceID: deviceID)
+    }
+
     func applyDiscovery(
         at paths: [String], imports: [DiscoveryImport],
         separateEntries: [DiscoverySeparateEntry],

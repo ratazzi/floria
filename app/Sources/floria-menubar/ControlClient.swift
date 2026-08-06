@@ -184,6 +184,10 @@ final class ControlClient: @unchecked Sendable {
         try await replicationStatusRequest(.replicationEnroll(enrollment))
     }
 
+    func approveReplicationRequest(deviceID: String) async throws -> ReplicationStatus {
+        try await replicationStatusRequest(.replicationApprove(deviceID: deviceID))
+    }
+
     private func replicationStatusRequest(_ command: ControlCommand) async throws
         -> ReplicationStatus
     {
