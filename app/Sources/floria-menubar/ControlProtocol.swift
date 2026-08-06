@@ -1,6 +1,6 @@
 import Foundation
 
-let supportedControlProtocolVersion: UInt32 = 6
+let supportedControlProtocolVersion: UInt32 = 7
 
 struct ControlServerInfo: Decodable, Equatable, Sendable {
     let protocolVersion: UInt32?
@@ -980,13 +980,34 @@ struct ReplicationStatus: Codable, Equatable, Sendable {
     let pending: Int
     let conflicts: Int
     let damaged: Int
+    let devices: [ReplicationDevice]
     let message: String?
 
     enum CodingKeys: String, CodingKey {
-        case mode, directory, published, imported, pending, conflicts, damaged, message
+        case mode, directory, published, imported, pending, conflicts, damaged, devices, message
         case deviceID = "device_id"
         case vaultID = "vault_id"
         case keyGeneration = "key_generation"
+    }
+}
+
+struct ReplicationDevice: Codable, Equatable, Identifiable, Sendable {
+    let deviceID: String
+    let deviceName: String?
+    let enrolledGeneration: UInt32
+    let revokedGeneration: UInt32?
+    let isGenesis: Bool
+    let isCurrent: Bool
+
+    var id: String { deviceID }
+
+    enum CodingKeys: String, CodingKey {
+        case deviceID = "device_id"
+        case deviceName = "device_name"
+        case enrolledGeneration = "enrolled_generation"
+        case revokedGeneration = "revoked_generation"
+        case isGenesis = "is_genesis"
+        case isCurrent = "is_current"
     }
 }
 
@@ -994,11 +1015,13 @@ struct ReplicationEnrollment: Codable, Equatable, Sendable {
     let deviceID: String
     let signingPublicKey: String
     let wrappingRecipient: String
+    let deviceName: String?
 
     enum CodingKeys: String, CodingKey {
         case deviceID = "device_id"
         case signingPublicKey = "signing_public_key"
         case wrappingRecipient = "wrapping_recipient"
+        case deviceName = "device_name"
     }
 }
 
@@ -1020,6 +1043,7 @@ enum ControlCommand: Sendable {
     case replicationOpen(directory: String)
     case replicationSync
     case replicationResolveWithCurrent
+    case replicationRevokeDevice(deviceID: String)
     case replicationDisable
     case replicationEnrollment
     case replicationEnroll(ReplicationEnrollment)
@@ -1102,6 +1126,7 @@ enum ControlCommand: Sendable {
         case .replicationOpen: "replication_open"
         case .replicationSync: "replication_sync"
         case .replicationResolveWithCurrent: "replication_resolve_with_current"
+        case .replicationRevokeDevice: "replication_revoke_device"
         case .replicationDisable: "replication_disable"
         case .replicationEnrollment: "replication_enrollment"
         case .replicationEnroll: "replication_enroll"
@@ -1207,6 +1232,11 @@ enum ControlCommand: Sendable {
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: ReplicationEnrollParams(enrollment: enrollment)))
+        case .replicationRevokeDevice(let deviceID):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: ReplicationRevokeDeviceParams(deviceID: deviceID)))
         case .discover(let paths):
             return try encoder.encode(
                 ControlRequest(
@@ -1411,6 +1441,11 @@ private struct DiagnosticsExportParams: Encodable {
 }
 private struct ReplicationDirectoryParams: Encodable { let directory: String }
 private struct ReplicationEnrollParams: Encodable { let enrollment: ReplicationEnrollment }
+private struct ReplicationRevokeDeviceParams: Encodable {
+    let deviceID: String
+
+    enum CodingKeys: String, CodingKey { case deviceID = "device_id" }
+}
 private struct DiscoverParams: Encodable { let paths: [String] }
 private struct DiscoveryJobIDParams: Encodable { let id: String }
 private struct DiscoverApplyParams: Encodable {

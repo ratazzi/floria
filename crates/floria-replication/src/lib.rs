@@ -115,10 +115,15 @@ impl DeviceKeyMaterial {
     }
 
     pub fn enrollment(&self) -> DeviceEnrollment {
+        self.enrollment_named(None)
+    }
+
+    pub fn enrollment_named(&self, device_name: Option<String>) -> DeviceEnrollment {
         DeviceEnrollment {
             device_id: self.device_id.clone(),
             signing_public_key: encode(self.verifying_key().as_bytes()),
             wrapping_recipient: self.wrapping_identity.to_public().to_string(),
+            device_name,
         }
     }
 }
@@ -237,6 +242,19 @@ pub struct DeviceEnrollment {
     pub device_id: String,
     pub signing_public_key: String,
     pub wrapping_recipient: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_name: Option<String>,
+}
+
+/// Authenticated device membership projected from signed identity and key-generation documents.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplicationDevice {
+    pub device_id: String,
+    pub device_name: Option<String>,
+    pub enrolled_generation: u32,
+    pub revoked_generation: Option<u32>,
+    pub is_genesis: bool,
+    pub is_current: bool,
 }
 
 /// One already-sequenced local mutation. `operation_id` and `sequence` are supplied by the
@@ -718,6 +736,8 @@ struct DeviceUnsigned {
     device_id: String,
     signing_public_key: String,
     wrapping_recipient: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device_name: Option<String>,
     authorized_by: String,
     enrolled_generation: u32,
 }
@@ -729,6 +749,8 @@ struct DeviceDocument {
     device_id: String,
     signing_public_key: String,
     wrapping_recipient: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    device_name: Option<String>,
     authorized_by: String,
     enrolled_generation: u32,
     signature: String,
@@ -742,6 +764,7 @@ impl DeviceDocument {
             device_id: self.device_id.clone(),
             signing_public_key: self.signing_public_key.clone(),
             wrapping_recipient: self.wrapping_recipient.clone(),
+            device_name: self.device_name.clone(),
             authorized_by: self.authorized_by.clone(),
             enrolled_generation: self.enrolled_generation,
         }
@@ -856,6 +879,7 @@ struct PackageMetadata {
 struct TrustedDevice {
     verifying_key: VerifyingKey,
     wrapping_recipient: x25519::Recipient,
+    device_name: Option<String>,
     enrolled_generation: u32,
     revoked_generation: Option<u32>,
     revoked_after_sequence: Option<u64>,
@@ -867,6 +891,16 @@ impl ReplicationPackage {
         vault_id: impl Into<String>,
         created_at: impl Into<String>,
         device: DeviceKeyMaterial,
+    ) -> ReplicationResult<Self> {
+        Self::create_named(root, vault_id, created_at, device, None)
+    }
+
+    pub fn create_named(
+        root: impl Into<PathBuf>,
+        vault_id: impl Into<String>,
+        created_at: impl Into<String>,
+        device: DeviceKeyMaterial,
+        device_name: Option<String>,
     ) -> ReplicationResult<Self> {
         let root = root.into();
         let vault_id = vault_id.into();
@@ -920,7 +954,7 @@ impl ReplicationPackage {
             write_device_identity(
                 &device_directory.join("identity.json"),
                 &vault,
-                &device.enrollment(),
+                &device.enrollment_named(device_name.clone()),
                 1,
                 &device.signing_key,
             )?;
@@ -962,6 +996,7 @@ impl ReplicationPackage {
             TrustedDevice {
                 verifying_key: device.verifying_key(),
                 wrapping_recipient: device.wrapping_identity.to_public(),
+                device_name,
                 enrolled_generation: 1,
                 revoked_generation: None,
                 revoked_after_sequence: None,
@@ -1090,7 +1125,7 @@ impl ReplicationPackage {
 
     /// Revoke a non-genesis Device and rotate the Vault data key. The signed generation document
     /// atomically binds the new envelopes to the revoked Device's final accepted sequence.
-    pub fn revoke_device(&mut self, device_id: &str) -> ReplicationResult<u32> {
+    pub fn revoke_device(&self, device_id: &str) -> ReplicationResult<u32> {
         if self.device.device_id != self.vault.genesis_device_id {
             return Err(ReplicationError::Invalid(
                 "only the genesis Device may revoke another Device".to_string(),
@@ -1162,6 +1197,32 @@ impl ReplicationPackage {
             .read()
             .expect("replication metadata poisoned")
             .current_generation
+    }
+
+    pub fn devices(&self) -> Vec<ReplicationDevice> {
+        let metadata = self.metadata.read().expect("replication metadata poisoned");
+        let mut devices = metadata
+            .trusted_devices
+            .iter()
+            .map(|(device_id, device)| ReplicationDevice {
+                device_id: device_id.clone(),
+                device_name: device.device_name.clone(),
+                enrolled_generation: device.enrolled_generation,
+                revoked_generation: device.revoked_generation,
+                is_genesis: device_id == &self.vault.genesis_device_id,
+                is_current: device_id == &self.device.device_id,
+            })
+            .collect::<Vec<_>>();
+        devices.sort_by(|left, right| {
+            right
+                .is_current
+                .cmp(&left.is_current)
+                .then(right.is_genesis.cmp(&left.is_genesis))
+                .then(left.revoked_generation.is_some().cmp(&right.revoked_generation.is_some()))
+                .then(left.device_name.cmp(&right.device_name))
+                .then(left.device_id.cmp(&right.device_id))
+        });
+        devices
     }
 
     pub fn root(&self) -> &Path {
@@ -1773,6 +1834,24 @@ impl ReplicationEngine {
         Self::with_runtime(package, runtime)
     }
 
+    pub fn create_named(
+        directory: impl Into<PathBuf>,
+        vault_id: impl Into<String>,
+        created_at: impl Into<String>,
+        device: DeviceKeyMaterial,
+        device_name: Option<String>,
+        runtime: ReplicationRuntime,
+    ) -> ReplicationResult<Self> {
+        let package = ReplicationPackage::create_named(
+            directory,
+            vault_id,
+            created_at,
+            device,
+            device_name,
+        )?;
+        Self::with_runtime(package, runtime)
+    }
+
     fn with_runtime(
         package: ReplicationPackage,
         runtime: ReplicationRuntime,
@@ -1840,12 +1919,23 @@ impl ReplicationEngine {
         self.package.current_generation()
     }
 
+    pub fn devices(&self) -> Vec<ReplicationDevice> {
+        self.package.devices()
+    }
+
     pub fn enrollment(&self) -> DeviceEnrollment {
         self.package.device.enrollment()
     }
 
     pub fn enroll_device(&mut self, enrollment: DeviceEnrollment) -> ReplicationResult<()> {
         self.package.enroll_device(enrollment)
+    }
+
+    pub fn revoke_device(&self, device_id: &str) -> ReplicationResult<ReplicationReport> {
+        self.mutations.run(|| {
+            self.package.revoke_device(device_id)?;
+            self.sync_uncoordinated()
+        })
     }
 
     /// Stage one complete, portable Vault-state snapshot after the caller has serialized normal
@@ -2617,6 +2707,7 @@ fn device_unsigned(
         device_id: enrollment.device_id.clone(),
         signing_public_key: enrollment.signing_public_key.clone(),
         wrapping_recipient: enrollment.wrapping_recipient.clone(),
+        device_name: enrollment.device_name.clone(),
         authorized_by: vault.genesis_device_id.clone(),
         enrolled_generation,
     }
@@ -2650,6 +2741,7 @@ fn write_device_identity(
         device_id: unsigned.device_id,
         signing_public_key: unsigned.signing_public_key,
         wrapping_recipient: unsigned.wrapping_recipient,
+        device_name: unsigned.device_name,
         authorized_by: unsigned.authorized_by,
         enrolled_generation: unsigned.enrolled_generation,
         signature,
@@ -2920,6 +3012,7 @@ fn load_trusted_devices(
                         "invalid Device wrapping recipient: {error}"
                     ))
                 })?,
+            device_name: identity.device_name.clone(),
             enrolled_generation: identity.enrolled_generation,
             revoked_generation: None,
             revoked_after_sequence: None,
@@ -3029,6 +3122,18 @@ fn read_device_identity(
 
 fn validate_enrollment(enrollment: &DeviceEnrollment) -> ReplicationResult<()> {
     require_uuid("device id", &enrollment.device_id)?;
+    if let Some(device_name) = &enrollment.device_name {
+        if device_name.is_empty()
+            || device_name.trim() != device_name
+            || device_name.chars().count() > 80
+            || device_name.chars().any(char::is_control)
+        {
+            return Err(ReplicationError::Invalid(
+                "Device name must be 1-80 printable characters without surrounding whitespace"
+                    .to_string(),
+            ));
+        }
+    }
     verifying_key("Device public key", &enrollment.signing_public_key)?;
     enrollment
         .wrapping_recipient
@@ -3069,6 +3174,7 @@ fn validate_device_identity(
         device_id: identity.device_id.clone(),
         signing_public_key: identity.signing_public_key.clone(),
         wrapping_recipient: identity.wrapping_recipient.clone(),
+        device_name: identity.device_name.clone(),
     })?;
     if identity.device_id == vault.genesis_device_id
         && identity.signing_public_key != vault.genesis_public_key
@@ -4098,17 +4204,19 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("Personal.floriavault");
         let genesis_wrapping_identity = x25519::Identity::generate();
-        let mut genesis = ReplicationPackage::create(
+        let mut genesis = ReplicationPackage::create_named(
             &root,
             VAULT_ID,
             "2026-08-06T00:00:00Z",
             keys(7, genesis_wrapping_identity.clone()),
+            Some("Owner Mac".to_string()),
         )
         .unwrap();
         let second_wrapping_identity = x25519::Identity::generate();
         genesis
             .enroll_device(
-                second_device_keys(8, second_wrapping_identity.clone()).enrollment(),
+                second_device_keys(8, second_wrapping_identity.clone())
+                    .enrollment_named(Some("Second Mac".to_string())),
             )
             .unwrap();
         let second = ReplicationPackage::open(
@@ -4136,8 +4244,16 @@ mod tests {
             })
             .unwrap();
 
+        let devices = genesis.devices();
+        assert_eq!(devices.len(), 2);
+        assert_eq!(devices[0].device_name.as_deref(), Some("Owner Mac"));
+        assert!(devices[0].is_current);
+        assert_eq!(devices[1].device_name.as_deref(), Some("Second Mac"));
+        assert!(!devices[1].is_current);
+
         assert_eq!(genesis.revoke_device(SECOND_DEVICE_ID).unwrap(), 2);
         assert_eq!(genesis.current_generation(), 2);
+        assert_eq!(genesis.devices()[1].revoked_generation, Some(2));
         let re_enrollment = genesis
             .enroll_device(
                 second_device_keys(8, second_wrapping_identity.clone()).enrollment(),

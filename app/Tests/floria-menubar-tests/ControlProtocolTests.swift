@@ -15,7 +15,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertNil(request["params"])
 
         let response = Data(
-            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":6,"daemon_version":"0.1.0","schema_version":14,"minimum_schema_version":14,"store_format_version":2,"minimum_store_format_version":1}}}"#.utf8)
+            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":7,"daemon_version":"0.1.0","schema_version":14,"minimum_schema_version":14,"store_format_version":2,"minimum_store_format_version":1}}}"#.utf8)
         let decoded = try JSONDecoder().decode(
             ControlResponseEnvelope<ControlServerInfo>.self, from: response)
         let info = try XCTUnwrap(decoded.result?.value)
@@ -90,7 +90,8 @@ final class ControlProtocolTests: XCTestCase {
         let enrollment = ReplicationEnrollment(
             deviceID: "fixture-device",
             signingPublicKey: "fixture-signing-key",
-            wrappingRecipient: "fixture-recipient")
+            wrappingRecipient: "fixture-recipient",
+            deviceName: "Fixture Mac")
         let enrollData = try ControlCommand.replicationEnroll(enrollment)
             .requestData(requestID: 65, encoder: encoder)
         let enroll = try XCTUnwrap(
@@ -108,8 +109,17 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(resolve["method"] as? String, "replication_resolve_with_current")
         XCTAssertNil(resolve["params"])
 
+        let revokeData = try ControlCommand.replicationRevokeDevice(deviceID: "fixture-device")
+            .requestData(requestID: 67, encoder: encoder)
+        let revoke = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: revokeData) as? [String: Any])
+        XCTAssertEqual(revoke["method"] as? String, "replication_revoke_device")
+        XCTAssertEqual(
+            (revoke["params"] as? [String: Any])?["device_id"] as? String,
+            "fixture-device")
+
         let response = Data(
-            #"{"request_id":64,"status":"ok","result":{"type":"replication_status","value":{"mode":"waiting_for_enrollment","directory":"/tmp/Personal.floriavault","device_id":"fixture-device","vault_id":"fixture-vault","key_generation":2,"published":3,"imported":4,"pending":1,"conflicts":0,"damaged":0,"message":"Approval required"}}}"#.utf8)
+            #"{"request_id":64,"status":"ok","result":{"type":"replication_status","value":{"mode":"waiting_for_enrollment","directory":"/tmp/Personal.floriavault","device_id":"fixture-device","vault_id":"fixture-vault","key_generation":2,"published":3,"imported":4,"pending":1,"conflicts":0,"damaged":0,"devices":[],"message":"Approval required"}}}"#.utf8)
         let decoded = try JSONDecoder().decode(
             ControlResponseEnvelope<ReplicationStatus>.self, from: response)
         let status = try XCTUnwrap(decoded.result?.value)

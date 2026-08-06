@@ -13,6 +13,7 @@ struct SyncView: View {
     @State private var showingKeepCurrentConfirmation = false
     @State private var pendingApproval: ReplicationEnrollment?
     @State private var showingApprovalConfirmation = false
+    @State private var pendingDeviceRemoval: ReplicationDevice?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -24,6 +25,9 @@ struct SyncView: View {
                     if let status {
                         statusHeader(status)
                         statusActions(status)
+                        if status.mode == .active, !status.devices.isEmpty {
+                            deviceSection(status)
+                        }
                     } else if isWorking {
                         HStack(spacing: 10) {
                             ProgressView().controlSize(.small)
@@ -98,7 +102,24 @@ struct SyncView: View {
             Button("Cancel", role: .cancel) {}
         } message: { enrollment in
             Text(
-                "This grants the Mac identified as \(shortDeviceID(enrollment.deviceID)) access to the encrypted sync folder."
+                "This grants \(enrollment.deviceName ?? "Mac \(shortDeviceID(enrollment.deviceID))") access to the encrypted sync folder."
+            )
+        }
+        .confirmationDialog(
+            "Remove This Mac?",
+            isPresented: Binding(
+                get: { pendingDeviceRemoval != nil },
+                set: { if !$0 { pendingDeviceRemoval = nil } }),
+            presenting: pendingDeviceRemoval
+        ) { device in
+            Button("Remove Mac", role: .destructive) {
+                pendingDeviceRemoval = nil
+                perform { try await store.revokeReplicationDevice(device.deviceID) }
+            }
+            Button("Cancel", role: .cancel) { pendingDeviceRemoval = nil }
+        } message: { device in
+            Text(
+                "\(deviceDisplayName(device)) will lose access to future changes. Floria will rotate the sync-folder encryption key, and that Mac must request approval with a new identity to return."
             )
         }
     }
@@ -277,6 +298,52 @@ struct SyncView: View {
         }
     }
 
+    private func deviceSection(_ status: ReplicationStatus) -> some View {
+        let activeCount = status.devices.count { $0.revokedGeneration == nil }
+        let localCanRemove = status.devices.contains { $0.isCurrent && $0.isGenesis }
+        return VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Macs")
+                    .font(.headline)
+                Spacer()
+                Text("\(activeCount) approved")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            VStack(spacing: 0) {
+                ForEach(Array(status.devices.enumerated()), id: \.element.id) { index, device in
+                    HStack(spacing: 12) {
+                        Image(systemName: "laptopcomputer")
+                            .foregroundStyle(device.revokedGeneration == nil ? .blue : .secondary)
+                            .frame(width: 24)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(deviceDisplayName(device))
+                                .font(.callout.weight(.medium))
+                            Text(deviceSummary(device))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        if localCanRemove && !device.isCurrent && !device.isGenesis
+                            && device.revokedGeneration == nil
+                        {
+                            Button("Remove…", role: .destructive) {
+                                pendingDeviceRemoval = device
+                            }
+                            .controlSize(.small)
+                        }
+                    }
+                    .padding(.horizontal, 12)
+                    .frame(minHeight: 52)
+                    if index < status.devices.count - 1 {
+                        Divider().padding(.leading, 48)
+                    }
+                }
+            }
+            .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 9))
+        }
+    }
+
     private func refreshStatus() async {
         guard status == nil else { return }
         isWorking = true
@@ -448,6 +515,20 @@ struct SyncView: View {
 
     private func shortDeviceID(_ id: String) -> String {
         id.count > 12 ? String(id.prefix(12)) + "…" : id
+    }
+
+    private func deviceDisplayName(_ device: ReplicationDevice) -> String {
+        if let name = device.deviceName, !name.isEmpty { return name }
+        if device.isGenesis { return "Owner Mac" }
+        return "Mac \(shortDeviceID(device.deviceID))"
+    }
+
+    private func deviceSummary(_ device: ReplicationDevice) -> String {
+        if device.revokedGeneration != nil { return "Removed" }
+        if device.isCurrent && device.isGenesis { return "This Mac · Created this sync folder" }
+        if device.isCurrent { return "This Mac" }
+        if device.isGenesis { return "Created this sync folder" }
+        return "Approved"
     }
 
     private func displayMessage(for error: Error) -> String {

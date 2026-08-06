@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 const MAX_MSG: usize = 8 << 20;
-pub const CONTROL_PROTOCOL_VERSION: u32 = 6;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 7;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRequest {
@@ -73,6 +73,7 @@ pub enum ControlCommand {
     ReplicationOpen { directory: PathBuf },
     ReplicationSync,
     ReplicationResolveWithCurrent,
+    ReplicationRevokeDevice { device_id: String },
     ReplicationDisable,
     ReplicationEnrollment,
     ReplicationEnroll { enrollment: ReplicationEnrollment },
@@ -268,7 +269,18 @@ pub struct ReplicationStatus {
     pub pending: usize,
     pub conflicts: usize,
     pub damaged: usize,
+    pub devices: Vec<ReplicationDevice>,
     pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicationDevice {
+    pub device_id: String,
+    pub device_name: Option<String>,
+    pub enrolled_generation: u32,
+    pub revoked_generation: Option<u32>,
+    pub is_genesis: bool,
+    pub is_current: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -276,6 +288,7 @@ pub struct ReplicationEnrollment {
     pub device_id: String,
     pub signing_public_key: String,
     pub wrapping_recipient: String,
+    pub device_name: Option<String>,
 }
 
 #[derive(
@@ -969,6 +982,7 @@ mod tests {
             device_id: "fixture-device".to_string(),
             signing_public_key: "fixture-signing-key".to_string(),
             wrapping_recipient: "fixture-recipient".to_string(),
+            device_name: Some("Fixture Mac".to_string()),
         };
         let enroll = serde_json::to_value(ControlRequest {
             request_id: 25,
@@ -988,6 +1002,15 @@ mod tests {
         })
         .unwrap();
         assert_eq!(resolve["method"], "replication_resolve_with_current");
+        let revoke = serde_json::to_value(ControlRequest {
+            request_id: 27,
+            command: ControlCommand::ReplicationRevokeDevice {
+                device_id: "fixture-device".to_string(),
+            },
+        })
+        .unwrap();
+        assert_eq!(revoke["method"], "replication_revoke_device");
+        assert_eq!(revoke["params"]["device_id"], "fixture-device");
 
         let status = serde_json::to_value(ControlResult::ReplicationStatus(
             ReplicationStatus {
@@ -1001,6 +1024,14 @@ mod tests {
                 pending: 1,
                 conflicts: 0,
                 damaged: 0,
+                devices: vec![ReplicationDevice {
+                    device_id: "fixture-device".to_string(),
+                    device_name: Some("Fixture Mac".to_string()),
+                    enrolled_generation: 1,
+                    revoked_generation: None,
+                    is_genesis: true,
+                    is_current: true,
+                }],
                 message: Some("Approval required".to_string()),
             },
         ))
@@ -1009,6 +1040,7 @@ mod tests {
         assert_eq!(status["value"]["mode"], "waiting_for_enrollment");
         assert_eq!(status["value"]["key_generation"], 2);
         assert_eq!(status["value"]["pending"], 1);
+        assert_eq!(status["value"]["devices"][0]["device_name"], "Fixture Mac");
     }
 
     #[test]

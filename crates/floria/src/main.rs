@@ -16,6 +16,7 @@ use floria_control::{
     CatalogObserver, ControlClient, ControlCommand, ControlResult, ControlRuntimeServices,
     ControlServer, ManagedSshConfig, ProtectedFile, RuntimeDiagnosticsExporter,
     RecoveryKeyExporter, RuntimeHealthReporter, RuntimePolicyController, SshConfigManager,
+    ReplicationDevice as ControlReplicationDevice,
     ReplicationEnrollment as ControlReplicationEnrollment, ReplicationMode, ReplicationStatus,
     RuntimeReplicationService, SshIdentity, SshIdentityDiscovery,
 };
@@ -212,6 +213,8 @@ enum SyncCmd {
     Now,
     /// Resolve a sync conflict by keeping this Mac's current managed state.
     ResolveCurrent,
+    /// Remove another enrolled Mac and rotate the sync-folder encryption key.
+    RemoveDevice { device_id: String },
     Disable,
     /// Print this Mac's public enrollment request as JSON.
     Enrollment,
@@ -1503,6 +1506,24 @@ impl DaemonReplicationService {
             pending: state.last_report.pending,
             conflicts: state.last_report.conflicts,
             damaged: state.last_report.damaged,
+            devices: state
+                .engine
+                .as_ref()
+                .map(|engine| {
+                    engine
+                        .devices()
+                        .into_iter()
+                        .map(|device| ControlReplicationDevice {
+                            device_id: device.device_id,
+                            device_name: device.device_name,
+                            enrolled_generation: device.enrolled_generation,
+                            revoked_generation: device.revoked_generation,
+                            is_genesis: device.is_genesis,
+                            is_current: device.is_current,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             message: state.message.clone(),
         }
     }
@@ -1531,11 +1552,12 @@ impl RuntimeReplicationService for DaemonReplicationService {
 
     fn create(&self, directory: &Path) -> Result<ReplicationStatus, String> {
         let device = self.device_keys().map_err(|error| error.to_string())?;
-        let engine = ReplicationEngine::create(
+        let engine = ReplicationEngine::create_named(
             directory,
             uuid::Uuid::new_v4().to_string(),
             replication_timestamp(),
             device,
+            local_device_name(),
             self.replication_runtime(),
         )
         .map_err(|error| error.to_string())?;
@@ -1632,6 +1654,17 @@ impl RuntimeReplicationService for DaemonReplicationService {
         Ok(Self::update_after_sync(&mut state, report))
     }
 
+    fn revoke_device(&self, device_id: &str) -> Result<ReplicationStatus, String> {
+        let mut state = self.state.lock().expect("replication runtime state poisoned");
+        let report = state
+            .engine
+            .as_ref()
+            .ok_or_else(|| "replication is not active on this Mac".to_string())?
+            .revoke_device(device_id)
+            .map_err(|error| error.to_string())?;
+        Ok(Self::update_after_sync(&mut state, report))
+    }
+
     fn disable(&self) -> Result<ReplicationStatus, String> {
         let mut state = self.state.lock().expect("replication runtime state poisoned");
         self.persist_directory(&mut state, None)?;
@@ -1647,7 +1680,7 @@ impl RuntimeReplicationService for DaemonReplicationService {
         let enrollment = self
             .device_keys()
             .map_err(|error| error.to_string())?
-            .enrollment();
+            .enrollment_named(local_device_name());
         Ok(control_replication_enrollment(enrollment))
     }
 
@@ -1665,6 +1698,7 @@ impl RuntimeReplicationService for DaemonReplicationService {
                 device_id: enrollment.device_id,
                 signing_public_key: enrollment.signing_public_key,
                 wrapping_recipient: enrollment.wrapping_recipient,
+                device_name: enrollment.device_name,
             })
             .map_err(|error| error.to_string())?;
         Ok(Self::status_from(&state))
@@ -1691,7 +1725,22 @@ fn control_replication_enrollment(enrollment: DeviceEnrollment) -> ControlReplic
         device_id: enrollment.device_id,
         signing_public_key: enrollment.signing_public_key,
         wrapping_recipient: enrollment.wrapping_recipient,
+        device_name: enrollment.device_name,
     }
+}
+
+fn local_device_name() -> Option<String> {
+    let mut buffer = [0 as libc::c_char; 256];
+    if unsafe { libc::gethostname(buffer.as_mut_ptr(), buffer.len() - 1) } != 0 {
+        return None;
+    }
+    let value = unsafe { CStr::from_ptr(buffer.as_ptr()) }.to_string_lossy();
+    let value = value.trim();
+    let value = value.strip_suffix(".local").unwrap_or(value).trim();
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return None;
+    }
+    Some(value.chars().take(80).collect())
 }
 
 fn replication_timestamp() -> String {
@@ -1973,6 +2022,9 @@ fn cmd_sync(command: SyncCmd, config: &Path) -> Result<()> {
         },
         SyncCmd::Now => ControlCommand::ReplicationSync,
         SyncCmd::ResolveCurrent => ControlCommand::ReplicationResolveWithCurrent,
+        SyncCmd::RemoveDevice { device_id } => {
+            ControlCommand::ReplicationRevokeDevice { device_id }
+        }
         SyncCmd::Disable => ControlCommand::ReplicationDisable,
         SyncCmd::Enrollment => ControlCommand::ReplicationEnrollment,
         SyncCmd::Enroll { request } => {
@@ -2826,6 +2878,9 @@ mod tests {
         let created = service.create(&package).unwrap();
         assert_eq!(created.mode, ReplicationMode::Active);
         assert_eq!(created.published, 1);
+        assert_eq!(created.devices.len(), 1);
+        assert!(created.devices[0].is_current);
+        assert!(created.devices[0].is_genesis);
         assert!(package.join("vault.json").is_file());
         assert!(service.enrollment().unwrap().device_id.len() > 30);
 
