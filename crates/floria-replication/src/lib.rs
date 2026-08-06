@@ -51,6 +51,8 @@ pub enum ReplicationError {
     },
     #[error("invalid replication package: {0}")]
     Invalid(String),
+    #[error("Device {device_id} is waiting for enrollment in this Vault")]
+    EnrollmentRequired { device_id: String },
     #[error("replication encoding failed: {0}")]
     Encoding(#[from] serde_json::Error),
     #[error("replication encryption failed: {0}")]
@@ -1730,24 +1732,73 @@ pub struct ReplicationEngine {
     mutations: Arc<ManagedMutationCoordinator>,
 }
 
-impl ReplicationEngine {
-    pub fn open(
-        directory: impl Into<PathBuf>,
-        device: DeviceKeyMaterial,
-        local_state_directory: &Path,
+#[derive(Clone)]
+pub struct ReplicationRuntime {
+    local_state_directory: PathBuf,
+    authenticator: Arc<StateAuthenticator>,
+    catalog: Arc<Catalog>,
+    store: Arc<AgeDirStore>,
+    mutations: Arc<ManagedMutationCoordinator>,
+}
+
+impl ReplicationRuntime {
+    pub fn new(
+        local_state_directory: impl Into<PathBuf>,
         authenticator: Arc<StateAuthenticator>,
         catalog: Arc<Catalog>,
         store: Arc<AgeDirStore>,
         mutations: Arc<ManagedMutationCoordinator>,
+    ) -> Self {
+        Self {
+            local_state_directory: local_state_directory.into(),
+            authenticator,
+            catalog,
+            store,
+            mutations,
+        }
+    }
+}
+
+impl ReplicationEngine {
+    pub fn create(
+        directory: impl Into<PathBuf>,
+        vault_id: impl Into<String>,
+        created_at: impl Into<String>,
+        device: DeviceKeyMaterial,
+        runtime: ReplicationRuntime,
+    ) -> ReplicationResult<Self> {
+        let package = ReplicationPackage::create(directory, vault_id, created_at, device)?;
+        Self::with_runtime(package, runtime)
+    }
+
+    fn with_runtime(
+        package: ReplicationPackage,
+        runtime: ReplicationRuntime,
+    ) -> ReplicationResult<Self> {
+        ensure_private_local_state_directory(&runtime.local_state_directory)?;
+        let intents = Arc::new(ReplicationIntentJournal::open(
+            runtime
+                .local_state_directory
+                .join(format!("replication-{}.json", package.vault_id())),
+            package.vault_id(),
+            runtime.authenticator,
+        )?);
+        Ok(Self {
+            package,
+            intents,
+            catalog: runtime.catalog,
+            store: runtime.store,
+            mutations: runtime.mutations,
+        })
+    }
+
+    pub fn open(
+        directory: impl Into<PathBuf>,
+        device: DeviceKeyMaterial,
+        runtime: ReplicationRuntime,
     ) -> ReplicationResult<Self> {
         let package = ReplicationPackage::open(directory, device)?;
-        ensure_private_local_state_directory(local_state_directory)?;
-        let intents = Arc::new(ReplicationIntentJournal::open(
-            local_state_directory.join(format!("replication-{}.json", package.vault_id())),
-            package.vault_id(),
-            authenticator,
-        )?);
-        Ok(Self { package, intents, catalog, store, mutations })
+        Self::with_runtime(package, runtime)
     }
 
     pub fn from_parts(
@@ -1773,6 +1824,26 @@ impl ReplicationEngine {
         mutations: Arc<ManagedMutationCoordinator>,
     ) -> Self {
         Self { package, intents, catalog, store, mutations }
+    }
+
+    pub fn vault_id(&self) -> &str {
+        self.package.vault_id()
+    }
+
+    pub fn device_id(&self) -> &str {
+        self.package.device_id()
+    }
+
+    pub fn current_generation(&self) -> u32 {
+        self.package.current_generation()
+    }
+
+    pub fn enrollment(&self) -> DeviceEnrollment {
+        self.package.device.enrollment()
+    }
+
+    pub fn enroll_device(&mut self, enrollment: DeviceEnrollment) -> ReplicationResult<()> {
+        self.package.enroll_device(enrollment)
     }
 
     /// Stage one complete, portable Vault-state snapshot after the caller has serialized normal
@@ -2561,10 +2632,7 @@ fn load_package_metadata(
     let generations = load_key_generations(root, vault)?;
     apply_generation_membership(&mut trusted_devices, &generations, vault)?;
     let expected = trusted_devices.get(&device.device_id).ok_or_else(|| {
-        ReplicationError::Invalid(format!(
-            "device {} is not enrolled in this Vault",
-            device.device_id
-        ))
+        ReplicationError::EnrollmentRequired { device_id: device.device_id.clone() }
     })?;
     if expected.verifying_key != device.verifying_key()
         || expected.wrapping_recipient != device.wrapping_identity.to_public()

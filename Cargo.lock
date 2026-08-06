@@ -786,14 +786,17 @@ dependencies = [
  "floria-fs",
  "floria-integrity",
  "floria-platform",
+ "floria-replication",
  "floria-store",
  "floria-surface",
  "libc",
+ "serde",
  "serde_json",
  "ssh-key",
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "uuid",
  "zeroize",
 ]
 

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 const MAX_MSG: usize = 8 << 20;
-pub const CONTROL_PROTOCOL_VERSION: u32 = 4;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 5;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRequest {
@@ -68,6 +68,13 @@ pub enum ControlCommand {
     BackupVerify { backup: PathBuf },
     RecoveryKeyExport { destination: PathBuf, passphrase: SecretValue },
     DiagnosticsExport { destination: PathBuf, include_paths: bool },
+    ReplicationStatus,
+    ReplicationCreate { directory: PathBuf },
+    ReplicationOpen { directory: PathBuf },
+    ReplicationSync,
+    ReplicationDisable,
+    ReplicationEnrollment,
+    ReplicationEnroll { enrollment: ReplicationEnrollment },
     Snapshot,
     Discover { paths: Vec<PathBuf> },
     DiscoverStart { paths: Vec<PathBuf> },
@@ -210,6 +217,8 @@ pub enum ControlResult {
     Backup(BackupReport),
     RecoveryKey(RecoveryKeyReport),
     Diagnostics(DiagnosticsReport),
+    ReplicationStatus(ReplicationStatus),
+    ReplicationEnrollment(ReplicationEnrollment),
     Snapshot(WorkspaceSnapshot),
     Discovery(DiscoveryReviewPlan),
     DiscoveryJob(DiscoveryJobStatus),
@@ -234,6 +243,38 @@ pub enum ControlResult {
     SharedSecretRotated { resource_id: String, version: u32 },
     EnvFileCreated { resource: Resource, version: u32 },
     Empty,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplicationMode {
+    Off,
+    WaitingForEnrollment,
+    Active,
+    Fenced,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicationStatus {
+    pub mode: ReplicationMode,
+    pub directory: Option<PathBuf>,
+    pub device_id: Option<String>,
+    pub vault_id: Option<String>,
+    pub key_generation: Option<u32>,
+    pub published: usize,
+    pub imported: usize,
+    pub pending: usize,
+    pub conflicts: usize,
+    pub damaged: usize,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplicationEnrollment {
+    pub device_id: String,
+    pub signing_public_key: String,
+    pub wrapping_recipient: String,
 }
 
 #[derive(
@@ -906,6 +947,61 @@ mod tests {
         assert_eq!(result["type"], "backup");
         assert_eq!(result["value"]["path"], "/tmp/floria-backup");
         assert_eq!(result["value"]["versions"], 5);
+    }
+
+    #[test]
+    fn replication_commands_and_status_have_stable_wire_shapes() {
+        let create = serde_json::to_value(ControlRequest {
+            request_id: 24,
+            command: ControlCommand::ReplicationCreate {
+                directory: PathBuf::from("/tmp/Personal.floriavault"),
+            },
+        })
+        .unwrap();
+        assert_eq!(create["method"], "replication_create");
+        assert_eq!(
+            create["params"]["directory"],
+            "/tmp/Personal.floriavault"
+        );
+
+        let enrollment = ReplicationEnrollment {
+            device_id: "fixture-device".to_string(),
+            signing_public_key: "fixture-signing-key".to_string(),
+            wrapping_recipient: "fixture-recipient".to_string(),
+        };
+        let enroll = serde_json::to_value(ControlRequest {
+            request_id: 25,
+            command: ControlCommand::ReplicationEnroll {
+                enrollment: enrollment.clone(),
+            },
+        })
+        .unwrap();
+        assert_eq!(enroll["method"], "replication_enroll");
+        assert_eq!(
+            enroll["params"]["enrollment"]["device_id"],
+            "fixture-device"
+        );
+
+        let status = serde_json::to_value(ControlResult::ReplicationStatus(
+            ReplicationStatus {
+                mode: ReplicationMode::WaitingForEnrollment,
+                directory: Some(PathBuf::from("/tmp/Personal.floriavault")),
+                device_id: Some("fixture-device".to_string()),
+                vault_id: Some("fixture-vault".to_string()),
+                key_generation: Some(2),
+                published: 3,
+                imported: 4,
+                pending: 1,
+                conflicts: 0,
+                damaged: 0,
+                message: Some("Approval required".to_string()),
+            },
+        ))
+        .unwrap();
+        assert_eq!(status["type"], "replication_status");
+        assert_eq!(status["value"]["mode"], "waiting_for_enrollment");
+        assert_eq!(status["value"]["key_generation"], 2);
+        assert_eq!(status["value"]["pending"], 1);
     }
 
     #[test]

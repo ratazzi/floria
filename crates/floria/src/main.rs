@@ -16,13 +16,18 @@ use floria_control::{
     CatalogObserver, ControlClient, ControlCommand, ControlResult, ControlRuntimeServices,
     ControlServer, ManagedSshConfig, ProtectedFile, RuntimeDiagnosticsExporter,
     RecoveryKeyExporter, RuntimeHealthReporter, RuntimePolicyController, SshConfigManager,
-    SshIdentity, SshIdentityDiscovery,
+    ReplicationEnrollment as ControlReplicationEnrollment, ReplicationMode, ReplicationStatus,
+    RuntimeReplicationService, SshIdentity, SshIdentityDiscovery,
 };
 use floria_core::audit::{AuditAuthority, AuditCheckpoint, AuditLog};
 use floria_core::authz::{Authorizer, PolicyMode, PolicyModeStatus};
 use floria_core::config::{Config, ResolvedConfig, StoreKeySource};
 use floria_discover::{GitCheckoutMonitor, MonitoredGitProject};
 use floria_platform::{CodeSignedPeerVerifier, PeerAccess, SocketPeerVerifier};
+use floria_replication::{
+    DeviceEnrollment, DeviceKeyStore, ReplicationEngine, ReplicationError, ReplicationReport,
+    ReplicationRuntime,
+};
 use floria_store::{
     AgeDirStore, KeychainKeyProvider, SecretId, SecretRecord, SecretStore, SshKeyProvider,
 };
@@ -34,6 +39,7 @@ use floria_surface::{
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use serde::{Deserialize, Serialize};
 use tracing_subscriber::EnvFilter;
 
 mod diagnostics;
@@ -140,6 +146,13 @@ enum Cmd {
         #[arg(short, long, default_value_os_t = default_config_path())]
         config: PathBuf,
     },
+    /// Create, join, or synchronize a portable Floria replication package.
+    Sync {
+        #[command(subcommand)]
+        command: SyncCmd,
+        #[arg(short, long, default_value_os_t = default_config_path())]
+        config: PathBuf,
+    },
     /// Create or verify an encrypted backup of all Floria-managed data.
     Backup {
         #[command(subcommand)]
@@ -189,6 +202,19 @@ enum BackupCmd {
         #[arg(short, long, default_value_os_t = default_config_path())]
         config: PathBuf,
     },
+}
+
+#[derive(Subcommand)]
+enum SyncCmd {
+    Status,
+    Create { directory: PathBuf },
+    Open { directory: PathBuf },
+    Now,
+    Disable,
+    /// Print this Mac's public enrollment request as JSON.
+    Enrollment,
+    /// Approve a public enrollment request exported by another Mac.
+    Enroll { request: PathBuf },
 }
 
 #[derive(Subcommand)]
@@ -302,6 +328,7 @@ fn main() -> Result<()> {
         Cmd::Rollback { target, version, config } => cmd_rollback(&target, version, &config),
         Cmd::List { config } => cmd_list(&config),
         Cmd::Control { command, socket, config } => cmd_control(command, socket, &config),
+        Cmd::Sync { command, config } => cmd_sync(command, &config),
         Cmd::Backup { command } => match command {
             BackupCmd::Create { destination, config } => {
                 cmd_backup_create(&destination, &config)
@@ -952,6 +979,30 @@ fn cmd_mount(config: &Path) -> Result<()> {
         Arc::clone(&state_authenticator),
     )
         .with_context(|| format!("opening catalog at {}", catalog_path.display()))?;
+    let concrete_store = Arc::new(store);
+    let mutations = Arc::new(floria_surface::ManagedMutationCoordinator::new());
+    let replication = Arc::new(
+        DaemonReplicationService::start(
+            support_dir.join("replication"),
+            Arc::clone(&key_provider),
+            Arc::clone(&state_authenticator),
+            Arc::new(catalog.clone()),
+            Arc::clone(&concrete_store),
+            Arc::clone(&mutations),
+        )
+        .context("starting replication runtime")?,
+    );
+    if replication.status().mode == ReplicationMode::Active {
+        match replication.sync() {
+            Ok(status) => tracing::info!(
+                imported = status.imported,
+                published = status.published,
+                pending = status.pending,
+                "synchronized configured replication package"
+            ),
+            Err(error) => tracing::warn!(%error, "initial replication sync failed"),
+        }
+    }
     let snapshot = catalog.snapshot().context("loading initial surface registry")?;
     let checkout_monitor = Arc::new(
         GitCheckoutMonitor::start(monitored_git_projects(&snapshot))
@@ -960,7 +1011,6 @@ fn cmd_mount(config: &Path) -> Result<()> {
     let surface_registry = Arc::new(SurfaceRegistry::from_snapshot(&snapshot));
     let linked_file_surfaces =
         file_surface_instances(&snapshot).context("materializing project checkout links")?;
-    let concrete_store = Arc::new(store);
     let backup: Arc<dyn BackupService> =
         Arc::new(DaemonBackupService { store: Arc::clone(&concrete_store) });
     let recovery_key: Arc<dyn RecoveryKeyExporter> = Arc::new(
@@ -970,11 +1020,11 @@ fn cmd_mount(config: &Path) -> Result<()> {
             cfg.store_ssh_key.clone(),
         ),
     );
-    let store: Arc<dyn SecretStore> = concrete_store;
+    let store: Arc<dyn SecretStore> = concrete_store.clone();
     let health: Arc<dyn RuntimeHealthReporter> = Arc::new(RuntimeHealth::new(
         catalog.clone(),
         Arc::clone(&store),
-        key_provider,
+        Arc::clone(&key_provider),
         cfg.mount_path.clone(),
         cfg.store_root.clone(),
     ));
@@ -1008,7 +1058,7 @@ fn cmd_mount(config: &Path) -> Result<()> {
         .context("starting agent socket")?;
     agent.replace_managed_policy(managed_policy_items(&snapshot, &records));
     let audit_authority = Arc::new(AuthenticatedAuditAuthority::new(
-        state_authenticator,
+        Arc::clone(&state_authenticator),
         cfg.audit_log.with_extension("integrity.json"),
     ));
     let audit = Arc::new(
@@ -1052,7 +1102,33 @@ fn cmd_mount(config: &Path) -> Result<()> {
         PathBuf::from(home).join(".ssh/config"),
         generated_ssh_config,
     ));
-    let mutations = Arc::new(floria_surface::ManagedMutationCoordinator::new());
+    let replication_worker = Arc::clone(&replication);
+    let replication_observer = Arc::clone(&observer);
+    let replication_catalog = catalog.clone();
+    std::thread::Builder::new()
+        .name("floria-replication".to_string())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(15));
+            let mode = replication_worker.status().mode;
+            if matches!(mode, ReplicationMode::Off | ReplicationMode::Fenced) {
+                continue;
+            }
+            match replication_worker.sync() {
+                Ok(status) if status.imported > 0 => {
+                    match replication_catalog.snapshot() {
+                        Ok(snapshot) => replication_observer.catalog_changed(&snapshot),
+                        Err(error) => tracing::warn!(
+                            %error,
+                            "refreshing runtime after replication import failed"
+                        ),
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => tracing::debug!(%error, "periodic replication sync deferred"),
+            }
+        })
+        .context("starting replication worker")?;
+    let replication: Arc<dyn RuntimeReplicationService> = replication;
     let _control = ControlServer::start_runtime_with_services(
         &control_path,
         catalog.clone(),
@@ -1069,6 +1145,7 @@ fn cmd_mount(config: &Path) -> Result<()> {
             recovery_key,
             health,
             diagnostics,
+            replication,
             audit_log: Arc::clone(&audit),
             peer_verifier: control_peer_verifier,
         },
@@ -1205,6 +1282,380 @@ fn control_backup_report(report: floria_backup::BackupReport) -> ControlBackupRe
         plaintext_bytes: report.plaintext_bytes,
         files: report.files,
     }
+}
+
+const REPLICATION_SETTINGS_DOMAIN: &str = "replication-runtime-settings";
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct ReplicationRuntimeSettings {
+    directory: Option<PathBuf>,
+}
+
+struct ReplicationRuntimeState {
+    settings_generation: u64,
+    settings: ReplicationRuntimeSettings,
+    engine: Option<ReplicationEngine>,
+    mode: ReplicationMode,
+    device_id: Option<String>,
+    vault_id: Option<String>,
+    last_report: ReplicationReport,
+    message: Option<String>,
+}
+
+struct DaemonReplicationService {
+    local_directory: PathBuf,
+    settings_path: PathBuf,
+    keys: Arc<dyn floria_store::KeyProvider>,
+    authenticator: Arc<floria_integrity::StateAuthenticator>,
+    catalog: Arc<Catalog>,
+    store: Arc<AgeDirStore>,
+    mutations: Arc<floria_surface::ManagedMutationCoordinator>,
+    state: Mutex<ReplicationRuntimeState>,
+}
+
+impl DaemonReplicationService {
+    fn start(
+        local_directory: PathBuf,
+        keys: Arc<dyn floria_store::KeyProvider>,
+        authenticator: Arc<floria_integrity::StateAuthenticator>,
+        catalog: Arc<Catalog>,
+        store: Arc<AgeDirStore>,
+        mutations: Arc<floria_surface::ManagedMutationCoordinator>,
+    ) -> Result<Self> {
+        std::fs::create_dir_all(&local_directory).with_context(|| {
+            format!("creating replication state at {}", local_directory.display())
+        })?;
+        std::fs::set_permissions(
+            &local_directory,
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .with_context(|| {
+            format!("securing replication state at {}", local_directory.display())
+        })?;
+        let settings_path = local_directory.join("settings.json");
+        let loaded = authenticator
+            .load::<ReplicationRuntimeSettings>(
+                &settings_path,
+                REPLICATION_SETTINGS_DOMAIN,
+            )
+            .context("loading authenticated replication settings")?;
+        let (settings_generation, settings) = match loaded.value {
+            Some(settings) => (loaded.generation, settings),
+            None if loaded.generation == 0 => {
+                let settings = ReplicationRuntimeSettings::default();
+                let generation = authenticator
+                    .persist(
+                        &settings_path,
+                        REPLICATION_SETTINGS_DOMAIN,
+                        0,
+                        &settings,
+                    )
+                    .context("initializing authenticated replication settings")?;
+                (generation, settings)
+            }
+            None => anyhow::bail!(
+                "replication settings are missing at authenticated generation {}",
+                loaded.generation
+            ),
+        };
+        let service = Self {
+            local_directory,
+            settings_path,
+            keys,
+            authenticator,
+            catalog,
+            store,
+            mutations,
+            state: Mutex::new(ReplicationRuntimeState {
+                settings_generation,
+                settings,
+                engine: None,
+                mode: ReplicationMode::Off,
+                device_id: None,
+                vault_id: None,
+                last_report: ReplicationReport::default(),
+                message: None,
+            }),
+        };
+        service.restore_configured_engine();
+        Ok(service)
+    }
+
+    fn device_keys(&self) -> floria_replication::ReplicationResult<floria_replication::DeviceKeyMaterial> {
+        DeviceKeyStore::new(
+            self.local_directory.join("device.age"),
+            Arc::clone(&self.keys),
+        )
+        .load_or_create()
+    }
+
+    fn replication_runtime(&self) -> ReplicationRuntime {
+        ReplicationRuntime::new(
+            &self.local_directory,
+            Arc::clone(&self.authenticator),
+            Arc::clone(&self.catalog),
+            Arc::clone(&self.store),
+            Arc::clone(&self.mutations),
+        )
+    }
+
+    fn restore_configured_engine(&self) {
+        let directory = self
+            .state
+            .lock()
+            .expect("replication runtime state poisoned")
+            .settings
+            .directory
+            .clone();
+        let Some(directory) = directory else { return };
+        let result = self.open_engine(&directory);
+        let mut state = self.state.lock().expect("replication runtime state poisoned");
+        match result {
+            Ok(engine) => {
+                state.device_id = Some(engine.device_id().to_string());
+                state.vault_id = Some(engine.vault_id().to_string());
+                state.mode = ReplicationMode::Active;
+                state.message = None;
+                state.engine = Some(engine);
+            }
+            Err(ReplicationError::EnrollmentRequired { device_id }) => {
+                state.device_id = Some(device_id);
+                state.mode = ReplicationMode::WaitingForEnrollment;
+                state.message = Some(
+                    "This Mac is waiting for an existing Device to approve enrollment"
+                        .to_string(),
+                );
+            }
+            Err(error) => {
+                state.mode = ReplicationMode::Error;
+                state.message = Some(error.to_string());
+            }
+        }
+    }
+
+    fn open_engine(
+        &self,
+        directory: &Path,
+    ) -> floria_replication::ReplicationResult<ReplicationEngine> {
+        ReplicationEngine::open(
+            directory,
+            self.device_keys()?,
+            self.replication_runtime(),
+        )
+    }
+
+    fn persist_directory(
+        &self,
+        state: &mut ReplicationRuntimeState,
+        directory: Option<PathBuf>,
+    ) -> Result<(), String> {
+        let settings = ReplicationRuntimeSettings { directory };
+        let generation = self
+            .authenticator
+            .persist(
+                &self.settings_path,
+                REPLICATION_SETTINGS_DOMAIN,
+                state.settings_generation,
+                &settings,
+            )
+            .map_err(|error| error.to_string())?;
+        state.settings_generation = generation;
+        state.settings = settings;
+        Ok(())
+    }
+
+    fn run_sync(engine: &ReplicationEngine) -> Result<ReplicationReport, String> {
+        let mut report = engine.sync().map_err(|error| error.to_string())?;
+        if report.local_device_fenced || report.conflicts > 0 || report.damaged > 0 {
+            return Ok(report);
+        }
+        if engine
+            .stage_current_snapshot(&replication_timestamp())
+            .map_err(|error| error.to_string())?
+        {
+            let published = engine.sync().map_err(|error| error.to_string())?;
+            report.published += published.published;
+            report.imported += published.imported;
+            report.recovered_local += published.recovered_local;
+            report.observed = published.observed;
+            report.pending = published.pending;
+            report.damaged = published.damaged;
+            report.conflicts = published.conflicts;
+            report.local_device_fenced = published.local_device_fenced;
+            report.messages.extend(published.messages);
+        }
+        Ok(report)
+    }
+
+    fn status_from(state: &ReplicationRuntimeState) -> ReplicationStatus {
+        ReplicationStatus {
+            mode: state.mode,
+            directory: state.settings.directory.clone(),
+            device_id: state.device_id.clone(),
+            vault_id: state.vault_id.clone(),
+            key_generation: state.engine.as_ref().map(ReplicationEngine::current_generation),
+            published: state.last_report.published,
+            imported: state.last_report.imported,
+            pending: state.last_report.pending,
+            conflicts: state.last_report.conflicts,
+            damaged: state.last_report.damaged,
+            message: state.message.clone(),
+        }
+    }
+
+    fn update_after_sync(
+        state: &mut ReplicationRuntimeState,
+        report: ReplicationReport,
+    ) -> ReplicationStatus {
+        state.mode = if report.local_device_fenced {
+            ReplicationMode::Fenced
+        } else {
+            ReplicationMode::Active
+        };
+        state.message = report.messages.first().cloned();
+        state.last_report = report;
+        Self::status_from(state)
+    }
+}
+
+impl RuntimeReplicationService for DaemonReplicationService {
+    fn status(&self) -> ReplicationStatus {
+        Self::status_from(
+            &self.state.lock().expect("replication runtime state poisoned"),
+        )
+    }
+
+    fn create(&self, directory: &Path) -> Result<ReplicationStatus, String> {
+        let device = self.device_keys().map_err(|error| error.to_string())?;
+        let engine = ReplicationEngine::create(
+            directory,
+            uuid::Uuid::new_v4().to_string(),
+            replication_timestamp(),
+            device,
+            self.replication_runtime(),
+        )
+        .map_err(|error| error.to_string())?;
+        let report = Self::run_sync(&engine)?;
+        let mut state = self.state.lock().expect("replication runtime state poisoned");
+        self.persist_directory(&mut state, Some(directory.to_path_buf()))?;
+        state.device_id = Some(engine.device_id().to_string());
+        state.vault_id = Some(engine.vault_id().to_string());
+        state.engine = Some(engine);
+        Ok(Self::update_after_sync(&mut state, report))
+    }
+
+    fn open(&self, directory: &Path) -> Result<ReplicationStatus, String> {
+        match self.open_engine(directory) {
+            Ok(engine) => {
+                let report = Self::run_sync(&engine)?;
+                let mut state = self.state.lock().expect("replication runtime state poisoned");
+                self.persist_directory(&mut state, Some(directory.to_path_buf()))?;
+                state.device_id = Some(engine.device_id().to_string());
+                state.vault_id = Some(engine.vault_id().to_string());
+                state.engine = Some(engine);
+                Ok(Self::update_after_sync(&mut state, report))
+            }
+            Err(ReplicationError::EnrollmentRequired { device_id }) => {
+                let mut state = self.state.lock().expect("replication runtime state poisoned");
+                self.persist_directory(&mut state, Some(directory.to_path_buf()))?;
+                state.engine = None;
+                state.device_id = Some(device_id);
+                state.vault_id = None;
+                state.mode = ReplicationMode::WaitingForEnrollment;
+                state.message = Some(
+                    "This Mac is waiting for an existing Device to approve enrollment"
+                        .to_string(),
+                );
+                Ok(Self::status_from(&state))
+            }
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    fn sync(&self) -> Result<ReplicationStatus, String> {
+        {
+            let state = self.state.lock().expect("replication runtime state poisoned");
+            if state.engine.is_none()
+                && state.settings.directory.is_some()
+                && state.mode != ReplicationMode::Off
+            {
+                drop(state);
+                self.restore_configured_engine();
+            }
+        }
+        let mut state = self.state.lock().expect("replication runtime state poisoned");
+        let report = {
+            let engine = state.engine.as_ref().ok_or_else(|| {
+                state
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "replication is not active".to_string())
+            })?;
+            Self::run_sync(engine)
+        };
+        let report = match report {
+            Ok(report) => report,
+            Err(error) => {
+                state.mode = ReplicationMode::Error;
+                state.message = Some(error.clone());
+                return Err(error);
+            }
+        };
+        Ok(Self::update_after_sync(&mut state, report))
+    }
+
+    fn disable(&self) -> Result<ReplicationStatus, String> {
+        let mut state = self.state.lock().expect("replication runtime state poisoned");
+        self.persist_directory(&mut state, None)?;
+        state.engine = None;
+        state.mode = ReplicationMode::Off;
+        state.vault_id = None;
+        state.last_report = ReplicationReport::default();
+        state.message = None;
+        Ok(Self::status_from(&state))
+    }
+
+    fn enrollment(&self) -> Result<ControlReplicationEnrollment, String> {
+        let enrollment = self
+            .device_keys()
+            .map_err(|error| error.to_string())?
+            .enrollment();
+        Ok(control_replication_enrollment(enrollment))
+    }
+
+    fn enroll(
+        &self,
+        enrollment: ControlReplicationEnrollment,
+    ) -> Result<ReplicationStatus, String> {
+        let mut state = self.state.lock().expect("replication runtime state poisoned");
+        let engine = state
+            .engine
+            .as_mut()
+            .ok_or_else(|| "replication is not active on this Mac".to_string())?;
+        engine
+            .enroll_device(DeviceEnrollment {
+                device_id: enrollment.device_id,
+                signing_public_key: enrollment.signing_public_key,
+                wrapping_recipient: enrollment.wrapping_recipient,
+            })
+            .map_err(|error| error.to_string())?;
+        Ok(Self::status_from(&state))
+    }
+}
+
+fn control_replication_enrollment(enrollment: DeviceEnrollment) -> ControlReplicationEnrollment {
+    ControlReplicationEnrollment {
+        device_id: enrollment.device_id,
+        signing_public_key: enrollment.signing_public_key,
+        wrapping_recipient: enrollment.wrapping_recipient,
+    }
+}
+
+fn replication_timestamp() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs().to_string())
+        .unwrap_or_else(|_| "0".to_string())
 }
 
 struct StoreManagedKeyReader {
@@ -1466,6 +1917,41 @@ fn reconcile_file_links(
     }
 }
 
+fn cmd_sync(command: SyncCmd, config: &Path) -> Result<()> {
+    let cfg = load(config)?;
+    let mut client = connect_control(&cfg)?;
+    let command = match command {
+        SyncCmd::Status => ControlCommand::ReplicationStatus,
+        SyncCmd::Create { directory } => ControlCommand::ReplicationCreate {
+            directory: absolute_cli_path(&directory)?,
+        },
+        SyncCmd::Open { directory } => ControlCommand::ReplicationOpen {
+            directory: absolute_cli_path(&directory)?,
+        },
+        SyncCmd::Now => ControlCommand::ReplicationSync,
+        SyncCmd::Disable => ControlCommand::ReplicationDisable,
+        SyncCmd::Enrollment => ControlCommand::ReplicationEnrollment,
+        SyncCmd::Enroll { request } => {
+            let bytes = std::fs::read(&request)
+                .with_context(|| format!("reading enrollment request {}", request.display()))?;
+            let enrollment = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parsing enrollment request {}", request.display()))?;
+            ControlCommand::ReplicationEnroll { enrollment }
+        }
+    };
+    match client.request(command)? {
+        ControlResult::ReplicationStatus(status) => {
+            println!("{}", serde_json::to_string_pretty(&status)?);
+            Ok(())
+        }
+        ControlResult::ReplicationEnrollment(enrollment) => {
+            println!("{}", serde_json::to_string_pretty(&enrollment)?);
+            Ok(())
+        }
+        result => anyhow::bail!("daemon returned an unexpected replication response: {result:?}"),
+    }
+}
+
 fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> Result<()> {
     let cfg = load(config)?;
     let mut client = match socket {
@@ -1538,6 +2024,12 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
         }
         ControlResult::Diagnostics(report) => {
             println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        ControlResult::ReplicationStatus(status) => {
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        ControlResult::ReplicationEnrollment(enrollment) => {
+            println!("{}", serde_json::to_string_pretty(&enrollment)?);
         }
         ControlResult::Snapshot(snapshot) => {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
@@ -2121,6 +2613,21 @@ mod tests {
     };
     use floria_core::authz::Enforcement;
     use floria_store::SecretOrigin;
+    use ssh_key::{Algorithm, LineEnding, PrivateKey};
+
+    fn test_store_key(directory: &Path) -> Arc<dyn floria_store::KeyProvider> {
+        let path = directory.join("id_ed25519");
+        let private = PrivateKey::random(&mut ssh_key::rand_core::OsRng, Algorithm::Ed25519)
+            .unwrap();
+        std::fs::write(&path, private.to_openssh(LineEnding::LF).unwrap()).unwrap();
+        std::fs::write(
+            path.with_extension("pub"),
+            private.public_key().to_openssh().unwrap(),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        Arc::new(SshKeyProvider::new(path, None))
+    }
 
     fn resource(id: &str, secret_id: &str, enforcement: Enforcement) -> Resource {
         Resource {
@@ -2188,7 +2695,8 @@ mod tests {
             | Cmd::History { config, .. }
             | Cmd::Rollback { config, .. }
             | Cmd::List { config }
-            | Cmd::Control { config, .. } => config,
+            | Cmd::Control { config, .. }
+            | Cmd::Sync { config, .. } => config,
             Cmd::Backup { command } => match command {
                 BackupCmd::Create { config, .. }
                 | BackupCmd::Verify { config, .. }
@@ -2219,6 +2727,7 @@ mod tests {
             &["floria", "rollback", "/tmp/.env", "1"],
             &["floria", "list"],
             &["floria", "control", "ping"],
+            &["floria", "sync", "status"],
             &["floria", "backup", "create", "/tmp/backup"],
             &["floria", "backup", "verify", "/tmp/backup"],
             &[
@@ -2248,6 +2757,39 @@ mod tests {
             ]),
             PathBuf::from("/tmp/custom-floria.toml")
         );
+    }
+
+    #[test]
+    fn replication_runtime_creates_disables_and_reopens_one_portable_package() {
+        let directory = tempfile::tempdir().unwrap();
+        let keys = test_store_key(directory.path());
+        let store = Arc::new(
+            AgeDirStore::open(directory.path().join("store"), Arc::clone(&keys)).unwrap(),
+        );
+        let catalog = Arc::new(Catalog::open(directory.path().join("catalog.sqlite")).unwrap());
+        let service = DaemonReplicationService::start(
+            directory.path().join("local-replication"),
+            keys,
+            Arc::new(floria_integrity::StateAuthenticator::for_tests([91; 32])),
+            catalog,
+            store,
+            Arc::new(floria_surface::ManagedMutationCoordinator::new()),
+        )
+        .unwrap();
+        let package = directory.path().join("Personal.floriavault");
+
+        assert_eq!(service.status().mode, ReplicationMode::Off);
+        let created = service.create(&package).unwrap();
+        assert_eq!(created.mode, ReplicationMode::Active);
+        assert_eq!(created.published, 1);
+        assert!(package.join("vault.json").is_file());
+        assert!(service.enrollment().unwrap().device_id.len() > 30);
+
+        assert_eq!(service.disable().unwrap().mode, ReplicationMode::Off);
+        let reopened = service.open(&package).unwrap();
+        assert_eq!(reopened.mode, ReplicationMode::Active);
+        assert_eq!(reopened.directory.as_deref(), Some(package.as_path()));
+        assert_eq!(service.sync().unwrap().mode, ReplicationMode::Active);
     }
 
     #[test]

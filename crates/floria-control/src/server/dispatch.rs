@@ -16,6 +16,14 @@ pub(super) fn dispatch_observed(
     observer: Option<&dyn CatalogObserver>,
 ) -> Result<ControlResult, DispatchError> {
     let mutating = !is_read_only(&command);
+    let self_coordinated = matches!(
+        command,
+        ControlCommand::ReplicationCreate { .. }
+            | ControlCommand::ReplicationOpen { .. }
+            | ControlCommand::ReplicationSync
+            | ControlCommand::ReplicationDisable
+            | ControlCommand::ReplicationEnroll { .. }
+    );
     let operation = || {
         let result = dispatch_uncoordinated(catalog, services, command);
         if result.is_ok() && mutating {
@@ -23,7 +31,7 @@ pub(super) fn dispatch_observed(
         }
         result
     };
-    if mutating {
+    if mutating && !self_coordinated {
         if let Some(mutations) = services.mutations {
             return mutations.run(operation);
         }
@@ -48,6 +56,7 @@ fn dispatch_uncoordinated(
         recovery_key,
         health,
         diagnostics,
+        replication,
         checkout_monitor,
         audit_log,
         discovery_jobs,
@@ -84,6 +93,81 @@ fn dispatch_uncoordinated(
                 .map(ControlResult::Diagnostics)
                 .map_err(DispatchError::Diagnostics)
         }
+        ControlCommand::ReplicationStatus => replication
+            .map(|service| ControlResult::ReplicationStatus(service.status()))
+            .ok_or_else(|| {
+                DispatchError::Validation(
+                    "replication is unavailable on this control server".to_string(),
+                )
+            }),
+        ControlCommand::ReplicationCreate { directory } => {
+            if !directory.is_absolute() {
+                return Err(DispatchError::Validation(
+                    "replication directory must be absolute".to_string(),
+                ));
+            }
+            replication
+                .ok_or_else(|| {
+                    DispatchError::Validation(
+                        "replication is unavailable on this control server".to_string(),
+                    )
+                })?
+                .create(&directory)
+                .map(ControlResult::ReplicationStatus)
+                .map_err(DispatchError::Replication)
+        }
+        ControlCommand::ReplicationOpen { directory } => {
+            if !directory.is_absolute() {
+                return Err(DispatchError::Validation(
+                    "replication directory must be absolute".to_string(),
+                ));
+            }
+            replication
+                .ok_or_else(|| {
+                    DispatchError::Validation(
+                        "replication is unavailable on this control server".to_string(),
+                    )
+                })?
+                .open(&directory)
+                .map(ControlResult::ReplicationStatus)
+                .map_err(DispatchError::Replication)
+        }
+        ControlCommand::ReplicationSync => replication
+            .ok_or_else(|| {
+                DispatchError::Validation(
+                    "replication is unavailable on this control server".to_string(),
+                )
+            })?
+            .sync()
+            .map(ControlResult::ReplicationStatus)
+            .map_err(DispatchError::Replication),
+        ControlCommand::ReplicationDisable => replication
+            .ok_or_else(|| {
+                DispatchError::Validation(
+                    "replication is unavailable on this control server".to_string(),
+                )
+            })?
+            .disable()
+            .map(ControlResult::ReplicationStatus)
+            .map_err(DispatchError::Replication),
+        ControlCommand::ReplicationEnrollment => replication
+            .ok_or_else(|| {
+                DispatchError::Validation(
+                    "replication is unavailable on this control server".to_string(),
+                )
+            })?
+            .enrollment()
+            .map(ControlResult::ReplicationEnrollment)
+            .map_err(DispatchError::Replication),
+        ControlCommand::ReplicationEnroll { enrollment } => replication
+            .ok_or_else(|| {
+                DispatchError::Validation(
+                    "replication is unavailable on this control server".to_string(),
+                )
+            })?
+            .enroll(enrollment)
+            .map(ControlResult::ReplicationStatus)
+            .map_err(DispatchError::Replication),
         ControlCommand::PolicyModeGet => policy
             .map(|controller| ControlResult::PolicyMode(controller.policy_mode()))
             .ok_or_else(|| {

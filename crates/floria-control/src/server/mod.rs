@@ -43,7 +43,7 @@ use crate::protocol::{
     DiagnosticsReport, DiscoveryReviewPlan, DiscoverySourceDisposition, HealthReport, ManagedLink,
     ManagedLinkStatus, ProjectCheckoutCandidate, ProjectCheckoutDiscovery,
     ProjectCheckoutInventory, ProtectedFile, ProtectedFileVersion, SecretValue, SshConfigStatus,
-    RecoveryKeyReport, SshIdentity, WorkspaceSnapshot,
+    RecoveryKeyReport, ReplicationEnrollment, ReplicationStatus, SshIdentity, WorkspaceSnapshot,
 };
 
 pub struct ControlServer {
@@ -121,6 +121,19 @@ pub trait RuntimeDiagnosticsExporter: Send + Sync + 'static {
     ) -> Result<DiagnosticsReport, String>;
 }
 
+/// Runtime-owned replication lifecycle. The control plane transports paths, public enrollment
+/// material, and redacted status; package keys, signatures, replay, and persistence remain behind
+/// this interface.
+pub trait RuntimeReplicationService: Send + Sync + 'static {
+    fn status(&self) -> ReplicationStatus;
+    fn create(&self, directory: &Path) -> Result<ReplicationStatus, String>;
+    fn open(&self, directory: &Path) -> Result<ReplicationStatus, String>;
+    fn sync(&self) -> Result<ReplicationStatus, String>;
+    fn disable(&self) -> Result<ReplicationStatus, String>;
+    fn enrollment(&self) -> Result<ReplicationEnrollment, String>;
+    fn enroll(&self, enrollment: ReplicationEnrollment) -> Result<ReplicationStatus, String>;
+}
+
 pub struct ControlRuntimeServices {
     pub mutations: Arc<ManagedMutationCoordinator>,
     pub observer: Arc<dyn CatalogObserver>,
@@ -132,6 +145,7 @@ pub struct ControlRuntimeServices {
     pub recovery_key: Arc<dyn RecoveryKeyExporter>,
     pub health: Arc<dyn RuntimeHealthReporter>,
     pub diagnostics: Arc<dyn RuntimeDiagnosticsExporter>,
+    pub replication: Arc<dyn RuntimeReplicationService>,
     pub audit_log: Arc<AuditLog>,
     pub peer_verifier: Arc<dyn SocketPeerVerifier>,
 }
@@ -150,6 +164,7 @@ struct ControlDependencies {
     recovery_key: Option<Arc<dyn RecoveryKeyExporter>>,
     health: Option<Arc<dyn RuntimeHealthReporter>>,
     diagnostics: Option<Arc<dyn RuntimeDiagnosticsExporter>>,
+    replication: Option<Arc<dyn RuntimeReplicationService>>,
     audit_log: Option<Arc<AuditLog>>,
     discovery_jobs: Option<Arc<DiscoveryJobManager>>,
 }
@@ -246,6 +261,7 @@ impl ControlServer {
                 recovery_key: Some(services.recovery_key),
                 health: Some(services.health),
                 diagnostics: Some(services.diagnostics),
+                replication: Some(services.replication),
                 audit_log: Some(services.audit_log),
                 discovery_jobs: None,
             },
@@ -379,6 +395,7 @@ fn handle_connection(
                 recovery_key: dependencies.recovery_key.as_deref(),
                 health: dependencies.health.as_deref(),
                 diagnostics: dependencies.diagnostics.as_deref(),
+                replication: dependencies.replication.as_deref(),
                 checkout_monitor: dependencies.checkout_monitor.as_deref(),
                 audit_log: dependencies.audit_log.as_deref(),
                 discovery_jobs: dependencies.discovery_jobs.as_deref(),
@@ -417,6 +434,8 @@ fn command_allowed_for_peer(access: PeerAccess, command: &ControlCommand) -> boo
                 | ControlCommand::PolicyModeGet
                 | ControlCommand::GrantList
                 | ControlCommand::AccessHistory { .. }
+                | ControlCommand::ReplicationStatus
+                | ControlCommand::ReplicationEnrollment
                 | ControlCommand::Snapshot
                 | ControlCommand::ProjectCheckoutInventory
                 | ControlCommand::ProjectCheckoutDiscover { .. }
@@ -443,6 +462,8 @@ fn is_read_only(command: &ControlCommand) -> bool {
             | ControlCommand::BackupCreate { .. }
             | ControlCommand::BackupVerify { .. }
             | ControlCommand::RecoveryKeyExport { .. }
+            | ControlCommand::ReplicationStatus
+            | ControlCommand::ReplicationEnrollment
             | ControlCommand::Snapshot
             | ControlCommand::Discover { .. }
             | ControlCommand::DiscoverStart { .. }
@@ -479,6 +500,7 @@ enum DispatchError {
     Backup(String),
     RecoveryKey(String),
     Diagnostics(String),
+    Replication(String),
     Validation(String),
     StoreUnavailable,
 }
@@ -501,6 +523,7 @@ struct DispatchServices<'a> {
     recovery_key: Option<&'a dyn RecoveryKeyExporter>,
     health: Option<&'a dyn RuntimeHealthReporter>,
     diagnostics: Option<&'a dyn RuntimeDiagnosticsExporter>,
+    replication: Option<&'a dyn RuntimeReplicationService>,
     checkout_monitor: Option<&'a GitCheckoutMonitor>,
     audit_log: Option<&'a AuditLog>,
     discovery_jobs: Option<&'a DiscoveryJobManager>,
@@ -549,6 +572,10 @@ impl DispatchError {
             },
             DispatchError::Diagnostics(message) => ControlErrorBody {
                 code: "diagnostics".to_string(),
+                message: message.clone(),
+            },
+            DispatchError::Replication(message) => ControlErrorBody {
+                code: "replication".to_string(),
                 message: message.clone(),
             },
             DispatchError::StoreUnavailable => ControlErrorBody {
