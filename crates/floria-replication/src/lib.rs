@@ -76,6 +76,20 @@ pub struct DeviceKeyMaterial {
 }
 
 impl DeviceKeyMaterial {
+    pub fn generate() -> ReplicationResult<Self> {
+        let mut signing_seed = [0_u8; 32];
+        getrandom::getrandom(&mut signing_seed).map_err(|error| {
+            ReplicationError::Encryption(format!("generate Device signing key: {error}"))
+        })?;
+        let material = Self::new(
+            uuid::Uuid::new_v4().to_string(),
+            signing_seed,
+            x25519::Identity::generate(),
+        );
+        signing_seed.zeroize();
+        material
+    }
+
     pub fn new(
         device_id: impl Into<String>,
         signing_seed: [u8; 32],
@@ -104,6 +118,113 @@ impl DeviceKeyMaterial {
             signing_public_key: encode(self.verifying_key().as_bytes()),
             wrapping_recipient: self.wrapping_identity.to_public().to_string(),
         }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct LocalDeviceSecretDocument {
+    format_version: u32,
+    device_id: String,
+    signing_seed: String,
+    wrapping_identity: String,
+}
+
+impl Drop for LocalDeviceSecretDocument {
+    fn drop(&mut self) {
+        self.signing_seed.zeroize();
+        self.wrapping_identity.zeroize();
+    }
+}
+
+/// Encrypted, machine-local persistence for one Device identity. The same `KeyProvider` that
+/// protects the local store wraps these bytes, so enabling replication adds no plaintext key file
+/// and no second platform credential source.
+pub struct DeviceKeyStore {
+    path: PathBuf,
+    keys: Arc<dyn floria_store::KeyProvider>,
+}
+
+impl DeviceKeyStore {
+    pub fn new(
+        path: impl Into<PathBuf>,
+        keys: Arc<dyn floria_store::KeyProvider>,
+    ) -> Self {
+        Self { path: path.into(), keys }
+    }
+
+    pub fn load_or_create(&self) -> ReplicationResult<DeviceKeyMaterial> {
+        let parent = self.path.parent().ok_or_else(|| {
+            ReplicationError::Invalid(format!("{} has no parent directory", self.path.display()))
+        })?;
+        ensure_private_local_state_directory(parent)?;
+        match fs::symlink_metadata(&self.path) {
+            Ok(_) => self.load(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let material = DeviceKeyMaterial::generate()?;
+                self.persist(&material)?;
+                Ok(material)
+            }
+            Err(source) => Err(io_error(&self.path, source)),
+        }
+    }
+
+    pub fn load(&self) -> ReplicationResult<DeviceKeyMaterial> {
+        let metadata = fs::symlink_metadata(&self.path)
+            .map_err(|source| io_error(&self.path, source))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err(ReplicationError::Invalid(format!(
+                "Device key path {} is not a regular file",
+                self.path.display()
+            )));
+        }
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(ReplicationError::Invalid(format!(
+                "Device key file {} must not be accessible by group or others",
+                self.path.display()
+            )));
+        }
+        let ciphertext = read_untrusted_file(&self.path, MAX_DESCRIPTOR_BYTES)?;
+        let plaintext = decrypt_with_provider(self.keys.as_ref(), &ciphertext)?;
+        let document: LocalDeviceSecretDocument = serde_json::from_slice(&plaintext)?;
+        if document.format_version != FORMAT_VERSION {
+            return Err(ReplicationError::Invalid(format!(
+                "unsupported local Device key format {}",
+                document.format_version
+            )));
+        }
+        let signing_seed = decode("Device signing seed", &document.signing_seed)?;
+        let mut signing_seed: [u8; 32] = signing_seed.try_into().map_err(|_| {
+            ReplicationError::Invalid("Device signing seed must be 32 bytes".to_string())
+        })?;
+        let wrapping_identity = document
+            .wrapping_identity
+            .parse::<x25519::Identity>()
+            .map_err(|error| {
+                ReplicationError::Invalid(format!("invalid Device wrapping identity: {error}"))
+            })?;
+        let material = DeviceKeyMaterial::new(
+            document.device_id.clone(),
+            signing_seed,
+            wrapping_identity,
+        );
+        signing_seed.zeroize();
+        material
+    }
+
+    fn persist(&self, material: &DeviceKeyMaterial) -> ReplicationResult<()> {
+        let document = LocalDeviceSecretDocument {
+            format_version: FORMAT_VERSION,
+            device_id: material.device_id.clone(),
+            signing_seed: encode(&material.signing_key.to_bytes()),
+            wrapping_identity: material
+                .wrapping_identity
+                .to_string()
+                .expose_secret()
+                .to_string(),
+        };
+        let plaintext = Zeroizing::new(serde_json::to_vec(&document)?);
+        let ciphertext = encrypt_with_provider(self.keys.as_ref(), &plaintext)?;
+        write_new_atomic(&self.path, &ciphertext)
     }
 }
 
@@ -2790,6 +2911,50 @@ fn encrypt(recipient: &x25519::Recipient, plaintext: &[u8]) -> ReplicationResult
     Ok(ciphertext)
 }
 
+fn encrypt_with_provider(
+    keys: &dyn floria_store::KeyProvider,
+    plaintext: &[u8],
+) -> ReplicationResult<Vec<u8>> {
+    let encryptor = age::Encryptor::with_recipients(keys.recipients()?)
+        .ok_or_else(|| ReplicationError::Encryption("Device key has no recipient".to_string()))?;
+    let mut ciphertext = Vec::new();
+    let mut writer = encryptor
+        .wrap_output(&mut ciphertext)
+        .map_err(|error| ReplicationError::Encryption(error.to_string()))?;
+    writer
+        .write_all(plaintext)
+        .map_err(|error| ReplicationError::Encryption(error.to_string()))?;
+    writer
+        .finish()
+        .map_err(|error| ReplicationError::Encryption(error.to_string()))?;
+    Ok(ciphertext)
+}
+
+fn decrypt_with_provider(
+    keys: &dyn floria_store::KeyProvider,
+    ciphertext: &[u8],
+) -> ReplicationResult<Zeroizing<Vec<u8>>> {
+    let decryptor = match age::Decryptor::new(ciphertext)
+        .map_err(|error| ReplicationError::Encryption(error.to_string()))?
+    {
+        age::Decryptor::Recipients(decryptor) => decryptor,
+        age::Decryptor::Passphrase(_) => {
+            return Err(ReplicationError::Encryption(
+                "Device key is passphrase-encrypted".to_string(),
+            ));
+        }
+    };
+    let identity = keys.identity()?;
+    let mut reader = decryptor
+        .decrypt(std::iter::once(identity.as_ref()))
+        .map_err(|error| ReplicationError::Encryption(error.to_string()))?;
+    let mut plaintext = Zeroizing::new(Vec::new());
+    reader
+        .read_to_end(&mut plaintext)
+        .map_err(|error| ReplicationError::Encryption(error.to_string()))?;
+    Ok(plaintext)
+}
+
 fn decrypt(identity: &x25519::Identity, ciphertext: &[u8]) -> ReplicationResult<Zeroizing<Vec<u8>>> {
     let decryptor = match age::Decryptor::new(ciphertext)
         .map_err(|error| ReplicationError::Encryption(error.to_string()))?
@@ -3847,6 +4012,59 @@ mod tests {
                 .unwrap(),
             "iGeZuPC-ulM5c5tLijmtXWaKPNQsaQX7djOuLPjM1o0hmI91TNixOcqsMBTnLA9GOIexEoS6-ydW4G5PJsx6BA"
         );
+    }
+
+    #[test]
+    fn device_key_store_encrypts_and_reopens_one_stable_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("replication/device.age");
+        let local_identity = x25519::Identity::generate();
+        let first = DeviceKeyStore::new(
+            &path,
+            Arc::new(LocalStoreKeys(local_identity.clone())),
+        )
+        .load_or_create()
+        .unwrap();
+        let enrollment = first.enrollment();
+        drop(first);
+
+        let ciphertext = fs::read(&path).unwrap();
+        assert!(!ciphertext
+            .windows(enrollment.device_id.len())
+            .any(|window| window == enrollment.device_id.as_bytes()));
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+
+        let reopened = DeviceKeyStore::new(
+            &path,
+            Arc::new(LocalStoreKeys(local_identity)),
+        )
+        .load_or_create()
+        .unwrap();
+        assert_eq!(reopened.enrollment(), enrollment);
+    }
+
+    #[test]
+    fn device_key_store_fails_closed_with_an_unrelated_local_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("replication/device.age");
+        DeviceKeyStore::new(
+            &path,
+            Arc::new(LocalStoreKeys(x25519::Identity::generate())),
+        )
+        .load_or_create()
+        .unwrap();
+
+        let error = match DeviceKeyStore::new(
+            &path,
+            Arc::new(LocalStoreKeys(x25519::Identity::generate())),
+        )
+        .load()
+        {
+            Ok(_) => panic!("unrelated local key unexpectedly decrypted Device identity"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("replication encryption failed"));
     }
 
     #[test]

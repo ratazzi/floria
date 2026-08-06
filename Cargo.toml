@@ -32,6 +32,7 @@ hmac = "0.12"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["clock"], default-features = false }
 age = { version = "0.10", features = ["ssh"] }
+getrandom = "0.2"
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 notify = "8.2"

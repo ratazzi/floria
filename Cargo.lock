@@ -976,6 +976,7 @@ dependencies = [
  "floria-integrity",
  "floria-store",
  "floria-surface",
+ "getrandom 0.2.17",
  "libc",
  "serde",
  "serde_json",
