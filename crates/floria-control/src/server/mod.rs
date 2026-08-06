@@ -131,6 +131,7 @@ pub trait RuntimeReplicationService: Send + Sync + 'static {
     fn sync(&self) -> Result<ReplicationStatus, String>;
     fn resolve_with_current(&self) -> Result<ReplicationStatus, String>;
     fn revoke_device(&self, device_id: &str) -> Result<ReplicationStatus, String>;
+    fn request_reenrollment(&self) -> Result<ReplicationStatus, String>;
     fn disable(&self) -> Result<ReplicationStatus, String>;
     fn enrollment(&self) -> Result<ReplicationEnrollment, String>;
     fn enroll(&self, enrollment: ReplicationEnrollment) -> Result<ReplicationStatus, String>;

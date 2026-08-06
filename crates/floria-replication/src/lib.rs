@@ -53,6 +53,8 @@ pub enum ReplicationError {
     Invalid(String),
     #[error("Device {device_id} is waiting for enrollment in this Vault")]
     EnrollmentRequired { device_id: String },
+    #[error("Device {device_id} was revoked at key generation {generation}")]
+    DeviceRevoked { device_id: String, generation: u32 },
     #[error("replication encoding failed: {0}")]
     Encoding(#[from] serde_json::Error),
     #[error("replication encryption failed: {0}")]
@@ -218,7 +220,22 @@ impl DeviceKeyStore {
         material
     }
 
+    /// Replace a revoked local identity with a fresh Device id and keypair. Callers must only
+    /// expose this after a signed Vault generation identifies the current identity as revoked.
+    pub fn rotate(&self) -> ReplicationResult<DeviceKeyMaterial> {
+        self.load()?;
+        let material = DeviceKeyMaterial::generate()?;
+        let ciphertext = self.encrypt_material(&material)?;
+        write_replace_atomic(&self.path, &ciphertext)?;
+        Ok(material)
+    }
+
     fn persist(&self, material: &DeviceKeyMaterial) -> ReplicationResult<()> {
+        let ciphertext = self.encrypt_material(material)?;
+        write_new_atomic(&self.path, &ciphertext)
+    }
+
+    fn encrypt_material(&self, material: &DeviceKeyMaterial) -> ReplicationResult<Vec<u8>> {
         let document = LocalDeviceSecretDocument {
             format_version: FORMAT_VERSION,
             device_id: material.device_id.clone(),
@@ -230,8 +247,7 @@ impl DeviceKeyStore {
                 .to_string(),
         };
         let plaintext = Zeroizing::new(serde_json::to_vec(&document)?);
-        let ciphertext = encrypt_with_provider(self.keys.as_ref(), &plaintext)?;
-        write_new_atomic(&self.path, &ciphertext)
+        encrypt_with_provider(self.keys.as_ref(), &plaintext)
     }
 }
 
@@ -2897,10 +2913,10 @@ fn load_package_metadata(
         ));
     }
     if let Some(generation) = expected.revoked_generation {
-        return Err(ReplicationError::Invalid(format!(
-            "Device {} was revoked at key generation {generation}",
-            device.device_id
-        )));
+        return Err(ReplicationError::DeviceRevoked {
+            device_id: device.device_id.clone(),
+            generation,
+        });
     }
     let current_generation = *generations
         .keys()
@@ -3446,6 +3462,39 @@ fn write_new_atomic(path: &Path, bytes: &[u8]) -> ReplicationResult<()> {
     File::open(parent)
         .and_then(|directory| directory.sync_all())
         .map_err(|source| io_error(parent, source))
+}
+
+fn write_replace_atomic(path: &Path, bytes: &[u8]) -> ReplicationResult<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|source| io_error(path, source))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ReplicationError::Invalid(format!(
+            "replacement path {} is not a regular file",
+            path.display()
+        )));
+    }
+    let parent = path.parent().ok_or_else(|| {
+        ReplicationError::Invalid(format!("{} has no parent directory", path.display()))
+    })?;
+    let temporary = parent.join(format!(".floria-{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temporary)
+            .map_err(|source| io_error(&temporary, source))?;
+        file.write_all(bytes).map_err(|source| io_error(&temporary, source))?;
+        file.sync_all().map_err(|source| io_error(&temporary, source))?;
+        fs::rename(&temporary, path).map_err(|source| io_error(path, source))?;
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| io_error(parent, source))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 fn canonical_object_id(path: &Path) -> Option<String> {
@@ -4554,6 +4603,29 @@ mod tests {
         .load_or_create()
         .unwrap();
         assert_eq!(reopened.enrollment(), enrollment);
+    }
+
+    #[test]
+    fn device_key_store_explicitly_rotates_a_revoked_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("replication/device.age");
+        let local_identity = x25519::Identity::generate();
+        let key_store = DeviceKeyStore::new(
+            &path,
+            Arc::new(LocalStoreKeys(local_identity.clone())),
+        );
+        let previous = key_store.load_or_create().unwrap().enrollment();
+
+        let replacement = key_store.rotate().unwrap().enrollment();
+
+        assert_ne!(replacement.device_id, previous.device_id);
+        assert_ne!(replacement.signing_public_key, previous.signing_public_key);
+        assert_ne!(replacement.wrapping_recipient, previous.wrapping_recipient);
+        let reopened = DeviceKeyStore::new(&path, Arc::new(LocalStoreKeys(local_identity)))
+            .load()
+            .unwrap();
+        assert_eq!(reopened.enrollment(), replacement);
+        assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     #[test]

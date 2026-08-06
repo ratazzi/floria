@@ -23,6 +23,7 @@ pub(super) fn dispatch_observed(
             | ControlCommand::ReplicationSync
             | ControlCommand::ReplicationResolveWithCurrent
             | ControlCommand::ReplicationRevokeDevice { .. }
+            | ControlCommand::ReplicationRequestReenrollment
             | ControlCommand::ReplicationDisable
             | ControlCommand::ReplicationEnroll { .. }
     );
@@ -159,6 +160,15 @@ fn dispatch_uncoordinated(
                 )
             })?
             .revoke_device(&device_id)
+            .map(ControlResult::ReplicationStatus)
+            .map_err(DispatchError::Replication),
+        ControlCommand::ReplicationRequestReenrollment => replication
+            .ok_or_else(|| {
+                DispatchError::Validation(
+                    "replication is unavailable on this control server".to_string(),
+                )
+            })?
+            .request_reenrollment()
             .map(ControlResult::ReplicationStatus)
             .map_err(DispatchError::Replication),
         ControlCommand::ReplicationDisable => replication

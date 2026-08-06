@@ -14,6 +14,7 @@ struct SyncView: View {
     @State private var pendingApproval: ReplicationEnrollment?
     @State private var showingApprovalConfirmation = false
     @State private var pendingDeviceRemoval: ReplicationDevice?
+    @State private var showingReenrollmentConfirmation = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -120,6 +121,18 @@ struct SyncView: View {
         } message: { device in
             Text(
                 "\(deviceDisplayName(device)) will lose access to future changes. Floria will rotate the sync-folder encryption key, and that Mac must request approval with a new identity to return."
+            )
+        }
+        .confirmationDialog(
+            "Request Access Again?", isPresented: $showingReenrollmentConfirmation
+        ) {
+            Button("Create New Approval Request") {
+                perform { try await store.requestReplicationReenrollment() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(
+                "Floria will replace this Mac’s revoked sync identity. Your local Library is not changed; the Mac that created this sync folder must approve the new identity."
             )
         }
     }
@@ -265,6 +278,26 @@ struct SyncView: View {
                     }
                     Button("Check Again", systemImage: "arrow.clockwise") {
                         perform { try await store.syncReplicationPackage() }
+                    }
+                }
+                .disabled(isWorking)
+            }
+
+        case .removed:
+            VStack(alignment: .leading, spacing: 12) {
+                Text(
+                    "This Mac can no longer decrypt future changes from this sync folder. Create a new identity, then approve it from the Mac that created this sync folder."
+                )
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 10) {
+                    Button("Request Access Again") {
+                        showingReenrollmentConfirmation = true
+                    }
+                    .buttonStyle(.borderedProminent)
+                    Button("Stop Syncing…", role: .destructive) {
+                        showingDisableConfirmation = true
                     }
                 }
                 .disabled(isWorking)
@@ -464,6 +497,7 @@ struct SyncView: View {
         case .off: "Sync is off"
         case .waitingForEnrollment: "Approval needed"
         case .active: "Sync is on"
+        case .removed: "This Mac was removed"
         case .fenced: "Sync stopped to protect your data"
         case .error: "Sync needs attention"
         }
@@ -476,7 +510,9 @@ struct SyncView: View {
         switch status.mode {
         case .off: return "Your Library stays only on this Mac."
         case .waitingForEnrollment:
-            return "An existing Mac must approve this Mac before it can sync."
+            return "The Mac that created this sync folder must approve this Mac before it can sync."
+        case .removed:
+            return "Create a new identity to request access again."
         case .active:
             if status.pending > 0 {
                 return "Waiting for \(status.pending) item\(status.pending == 1 ? "" : "s") to arrive."
@@ -493,6 +529,7 @@ struct SyncView: View {
         case .off: "icloud.slash"
         case .waitingForEnrollment: "person.badge.key"
         case .active: "checkmark.icloud"
+        case .removed: "laptopcomputer.slash"
         case .fenced: "hand.raised.fill"
         case .error: "exclamationmark.icloud"
         }
@@ -503,7 +540,7 @@ struct SyncView: View {
         return switch status.mode {
         case .active: .green
         case .off: .secondary
-        case .waitingForEnrollment, .fenced, .error: .orange
+        case .waitingForEnrollment, .removed, .fenced, .error: .orange
         }
     }
 

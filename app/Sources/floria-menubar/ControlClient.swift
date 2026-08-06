@@ -159,6 +159,10 @@ final class ControlClient: @unchecked Sendable {
         try await replicationStatusRequest(.replicationRevokeDevice(deviceID: deviceID))
     }
 
+    func requestReplicationReenrollment() async throws -> ReplicationStatus {
+        try await replicationStatusRequest(.replicationRequestReenrollment)
+    }
+
     func disableReplication() async throws -> ReplicationStatus {
         try await replicationStatusRequest(.replicationDisable)
     }

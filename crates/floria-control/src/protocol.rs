@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 const MAX_MSG: usize = 8 << 20;
-pub const CONTROL_PROTOCOL_VERSION: u32 = 7;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 8;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRequest {
@@ -74,6 +74,7 @@ pub enum ControlCommand {
     ReplicationSync,
     ReplicationResolveWithCurrent,
     ReplicationRevokeDevice { device_id: String },
+    ReplicationRequestReenrollment,
     ReplicationDisable,
     ReplicationEnrollment,
     ReplicationEnroll { enrollment: ReplicationEnrollment },
@@ -253,6 +254,7 @@ pub enum ReplicationMode {
     Off,
     WaitingForEnrollment,
     Active,
+    Removed,
     Fenced,
     Error,
 }
@@ -1011,6 +1013,13 @@ mod tests {
         .unwrap();
         assert_eq!(revoke["method"], "replication_revoke_device");
         assert_eq!(revoke["params"]["device_id"], "fixture-device");
+        let reenroll = serde_json::to_value(ControlRequest {
+            request_id: 28,
+            command: ControlCommand::ReplicationRequestReenrollment,
+        })
+        .unwrap();
+        assert_eq!(reenroll["method"], "replication_request_reenrollment");
+        assert!(reenroll.get("params").is_none());
 
         let status = serde_json::to_value(ControlResult::ReplicationStatus(
             ReplicationStatus {

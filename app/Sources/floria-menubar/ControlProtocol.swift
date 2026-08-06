@@ -1,6 +1,6 @@
 import Foundation
 
-let supportedControlProtocolVersion: UInt32 = 7
+let supportedControlProtocolVersion: UInt32 = 8
 
 struct ControlServerInfo: Decodable, Equatable, Sendable {
     let protocolVersion: UInt32?
@@ -965,6 +965,7 @@ enum ReplicationMode: String, Codable, Sendable {
     case off
     case waitingForEnrollment = "waiting_for_enrollment"
     case active
+    case removed
     case fenced
     case error
 }
@@ -1044,6 +1045,7 @@ enum ControlCommand: Sendable {
     case replicationSync
     case replicationResolveWithCurrent
     case replicationRevokeDevice(deviceID: String)
+    case replicationRequestReenrollment
     case replicationDisable
     case replicationEnrollment
     case replicationEnroll(ReplicationEnrollment)
@@ -1127,6 +1129,7 @@ enum ControlCommand: Sendable {
         case .replicationSync: "replication_sync"
         case .replicationResolveWithCurrent: "replication_resolve_with_current"
         case .replicationRevokeDevice: "replication_revoke_device"
+        case .replicationRequestReenrollment: "replication_request_reenrollment"
         case .replicationDisable: "replication_disable"
         case .replicationEnrollment: "replication_enrollment"
         case .replicationEnroll: "replication_enroll"
@@ -1181,7 +1184,7 @@ enum ControlCommand: Sendable {
         switch self {
         case .ping, .health, .policyModeGet, .grantList, .grantClear, .replicationStatus,
             .replicationSync, .replicationResolveWithCurrent, .replicationDisable,
-            .replicationEnrollment, .snapshot,
+            .replicationRequestReenrollment, .replicationEnrollment, .snapshot,
             .projectCheckoutInventory, .sshConfigStatus, .sshConfigInstall, .sshConfigRemove,
             .protectedFiles:
             return try encoder.encode(ControlRequestWithoutParams(requestID: requestID, method: method))
