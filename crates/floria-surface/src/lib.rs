@@ -36,7 +36,7 @@ pub use links::{
     SurfaceLinkState,
 };
 pub use lines::LINES_MAX_SIZE;
-pub use mutation::ManagedMutationCoordinator;
+pub use mutation::{ManagedMutationCoordinator, ManagedMutationObserver};
 pub use render::{
     renderer_for, RenderedSurface, Renderer, ResolvedBindingEntry, ResolvedDocument,
     ResolvedEntryMeta, ResolvedEnvironmentEntry,

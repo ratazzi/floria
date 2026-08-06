@@ -33,7 +33,7 @@ pub(super) fn dispatch_observed(
     };
     if mutating && !self_coordinated {
         if let Some(mutations) = services.mutations {
-            return mutations.run(operation);
+            return mutations.run_committed(operation);
         }
     }
     operation()

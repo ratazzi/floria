@@ -1847,10 +1847,17 @@ impl ReplicationEngine {
     }
 
     /// Stage one complete, portable Vault-state snapshot after the caller has serialized normal
-    /// catalog/store mutations through `ManagedMutationCoordinator`. Unchanged state and an
-    /// already-staged outbox are both idempotent no-ops.
+    /// catalog/store mutations through `ManagedMutationCoordinator`. Unchanged state is an
+    /// idempotent no-op; successive unsynchronized states form a durable parent chain.
     pub fn stage_current_snapshot(&self, created_at: &str) -> ReplicationResult<bool> {
         self.mutations.run(|| self.stage_current_snapshot_uncoordinated(created_at))
+    }
+
+    /// Checkpoint the exact state of a successful local mutation while its coordinator gate is
+    /// still held. Callers must only invoke this from `ManagedMutationObserver`; ordinary callers
+    /// use `stage_current_snapshot()` so the coordinator is acquired safely.
+    pub fn stage_committed_snapshot(&self, created_at: &str) -> ReplicationResult<bool> {
+        self.stage_current_snapshot_uncoordinated(created_at)
     }
 
     fn stage_current_snapshot_uncoordinated(&self, created_at: &str) -> ReplicationResult<bool> {
@@ -1859,9 +1866,7 @@ impl ReplicationEngine {
                 "replication snapshot creation time is empty".to_string(),
             ));
         }
-        if !self.catalog.replication_outbox()?.is_empty() {
-            return Ok(false);
-        }
+        let outbox = ordered_outbox(self.catalog.replication_outbox()?)?;
         let scan = self.package.scan()?;
         if !scan.pending.is_empty() || !scan.damaged.is_empty() || !scan.conflicts.is_empty() {
             return Err(ReplicationError::Invalid(
@@ -1869,13 +1874,19 @@ impl ReplicationEngine {
                     .to_string(),
             ));
         }
-        let latest = scan
+        let latest_pending = outbox.last();
+        let latest_published = scan
             .verified
             .iter()
             .rfind(|mutation| mutation.logical_id == VAULT_STATE_LOGICAL_ID);
-        let parents = latest
-            .map(|mutation| vec![mutation.operation_id.clone()])
-            .unwrap_or_default();
+        let parents = latest_pending.map_or_else(
+            || {
+                latest_published
+                    .map(|mutation| vec![mutation.operation_id.clone()])
+                    .unwrap_or_default()
+            },
+            |entry| vec![entry.intent_id.clone()],
+        );
         let projection = self.catalog.replicated_catalog()?;
         let catalog_payload = serde_json::to_vec(&projection)?;
         let secret_ids = projection
@@ -1913,7 +1924,12 @@ impl ReplicationEngine {
             created_at: created_at.to_string(),
         };
         let encoded = self.export_value(&entry)?;
-        if latest.is_some_and(|mutation| mutation.value.as_slice() == encoded.as_slice()) {
+        let unchanged = match latest_pending {
+            Some(entry) => self.export_value(entry)?.as_slice() == encoded.as_slice(),
+            None => latest_published
+                .is_some_and(|mutation| mutation.value.as_slice() == encoded.as_slice()),
+        };
+        if unchanged {
             return Ok(false);
         }
         self.intents.enqueue(ReplicationIntent::snapshot(
@@ -2042,7 +2058,7 @@ impl ReplicationEngine {
 
         let mut checkpoint = self.intents.device_sequence(self.package.device_id());
         let journal_entries = self.intents.entries();
-        let outbox = self.catalog.replication_outbox()?;
+        let outbox = ordered_outbox(self.catalog.replication_outbox()?)?;
         let local_verified = scan
             .verified
             .iter()
@@ -2371,6 +2387,59 @@ fn portable_store_label(origin: &SecretOrigin) -> String {
             .unwrap_or("Managed file")
             .to_string(),
     }
+}
+
+/// Return committed local publications in causal order.
+///
+/// Wall-clock timestamps are descriptive only: restored clocks and multiple mutations within one
+/// timestamp tick must not reorder signed history. A local outbox therefore has exactly one
+/// causal head, and its parent operation ids are the authority for publication order.
+fn ordered_outbox(
+    entries: Vec<ReplicationOutboxEntry>,
+) -> ReplicationResult<Vec<ReplicationOutboxEntry>> {
+    if entries.len() < 2 {
+        return Ok(entries);
+    }
+
+    let entry_ids = entries
+        .iter()
+        .map(|entry| entry.intent_id.clone())
+        .collect::<HashSet<_>>();
+    let internal_parents = entries
+        .iter()
+        .flat_map(|entry| entry.parents.iter().map(String::as_str))
+        .filter(|parent| entry_ids.contains(*parent))
+        .map(str::to_owned)
+        .collect::<HashSet<_>>();
+    let heads = entries
+        .iter()
+        .filter(|entry| !internal_parents.contains(entry.intent_id.as_str()))
+        .count();
+    if heads != 1 {
+        return Err(ReplicationError::Invalid(format!(
+            "replication outbox has {heads} causal heads; expected exactly one"
+        )));
+    }
+
+    let mut remaining = entries;
+    let mut emitted = HashSet::new();
+    let mut ordered = Vec::with_capacity(remaining.len());
+    while let Some(index) = remaining.iter().position(|entry| {
+        entry
+            .parents
+            .iter()
+            .all(|parent| !entry_ids.contains(parent.as_str()) || emitted.contains(parent))
+    }) {
+        let entry = remaining.remove(index);
+        emitted.insert(entry.intent_id.clone());
+        ordered.push(entry);
+    }
+    if !remaining.is_empty() {
+        return Err(ReplicationError::Invalid(
+            "replication outbox parent chain contains a cycle".to_string(),
+        ));
+    }
+    Ok(ordered)
 }
 
 fn validate_committed_intent(
@@ -4438,13 +4507,25 @@ mod tests {
         let source = ReplicationEngine::from_parts(
             package,
             source_intents,
-            source_catalog,
-            source_store,
+            Arc::clone(&source_catalog),
+            Arc::clone(&source_store),
         );
         assert!(source.stage_current_snapshot("2026-08-06T00:00:00Z").unwrap());
         assert!(!source.stage_current_snapshot("2026-08-06T00:00:01Z").unwrap());
-        assert_eq!(source.sync().unwrap().published, 1);
-        assert!(!source.stage_current_snapshot("2026-08-06T00:00:02Z").unwrap());
+        source_store
+            .append_version(&secret_id, b"fixture payload version two")
+            .unwrap();
+        assert!(source.stage_current_snapshot("2026-08-06T00:00:02Z").unwrap());
+        source_store
+            .append_version(&secret_id, b"fixture payload version three")
+            .unwrap();
+        assert!(source.stage_current_snapshot("2026-08-06T00:00:02Z").unwrap());
+        let queued = ordered_outbox(source_catalog.replication_outbox().unwrap()).unwrap();
+        assert_eq!(queued.len(), 3);
+        assert_eq!(queued[1].parents, vec![queued[0].intent_id.clone()]);
+        assert_eq!(queued[2].parents, vec![queued[1].intent_id.clone()]);
+        assert_eq!(source.sync().unwrap().published, 3);
+        assert!(!source.stage_current_snapshot("2026-08-06T00:00:03Z").unwrap());
 
         let restored_catalog = Arc::new(
             Catalog::open(directory.path().join("restored-catalog.sqlite")).unwrap(),
@@ -4474,11 +4555,11 @@ mod tests {
             Arc::clone(&restored_store),
         );
         let recovery = restored.sync().unwrap();
-        assert_eq!(recovery.recovered_local, 1);
+        assert_eq!(recovery.recovered_local, 3);
         assert!(!recovery.local_device_fenced);
         assert_eq!(
             restored_store.get(&secret_id).unwrap().as_slice(),
-            b"fixture payload, not a credential"
+            b"fixture payload version three"
         );
         assert_eq!(restored_catalog.replicated_catalog().unwrap(), projection(&secret_id));
 
@@ -4513,12 +4594,12 @@ mod tests {
         let first_sync = target.sync().unwrap();
         let second_sync = target.sync().unwrap();
 
-        assert_eq!(first_sync.imported, 1);
+        assert_eq!(first_sync.imported, 3);
         assert_eq!(second_sync.imported, 0);
 
         assert_eq!(
             target_store.get(&secret_id).unwrap().as_slice(),
-            b"fixture payload, not a credential"
+            b"fixture payload version three"
         );
         assert_eq!(target_catalog.replicated_catalog().unwrap(), projection(&secret_id));
     }

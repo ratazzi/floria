@@ -237,7 +237,7 @@ pub fn commit_secret_version(
     id: &SecretId,
     bytes: &[u8],
 ) -> SurfaceResult<u32> {
-    mutations.run(|| {
+    mutations.run_committed(|| {
         if let Some(catalog) = catalog {
             validate_secret_bytes(&catalog.snapshot()?, id.as_str(), bytes)?;
         } else {

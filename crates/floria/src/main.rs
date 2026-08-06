@@ -34,8 +34,8 @@ use floria_store::{
 use floria_surface::{
     ensure_file_surface_link_in_snapshot, file_surface_instances, protected_checkout_links,
     refresh_protected_checkout_links, release_protected_links_for_file_surfaces,
-    remove_file_surface_link, ProtectedCheckoutLink, SurfaceLinkRemoval, SurfaceLinkState,
-    SurfaceRegistry,
+    remove_file_surface_link, ManagedMutationObserver, ProtectedCheckoutLink,
+    SurfaceLinkRemoval, SurfaceLinkState, SurfaceRegistry,
 };
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -992,6 +992,8 @@ fn cmd_mount(config: &Path) -> Result<()> {
         )
         .context("starting replication runtime")?,
     );
+    let replication_mutation_observer: Arc<dyn ManagedMutationObserver> = replication.clone();
+    mutations.observe(Arc::downgrade(&replication_mutation_observer));
     if replication.status().mode == ReplicationMode::Active {
         match replication.sync() {
             Ok(status) => tracing::info!(
@@ -1640,6 +1642,21 @@ impl RuntimeReplicationService for DaemonReplicationService {
             })
             .map_err(|error| error.to_string())?;
         Ok(Self::status_from(&state))
+    }
+}
+
+impl ManagedMutationObserver for DaemonReplicationService {
+    fn managed_mutation_committed(&self) {
+        let mut state = self.state.lock().expect("replication runtime state poisoned");
+        if state.mode != ReplicationMode::Active {
+            return;
+        }
+        let Some(engine) = state.engine.as_ref() else { return };
+        if let Err(error) = engine.stage_committed_snapshot(&replication_timestamp()) {
+            tracing::error!(%error, "staging committed state for replication failed");
+            state.mode = ReplicationMode::Error;
+            state.message = Some(error.to_string());
+        }
     }
 }
 
