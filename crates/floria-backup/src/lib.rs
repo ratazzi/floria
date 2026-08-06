@@ -600,6 +600,17 @@ mod tests {
         .unwrap()
     }
 
+    /// The single digest-named version blob of a backup entry.
+    fn version_blob_in(entry_dir: &Path) -> PathBuf {
+        let vdir = entry_dir.join("v");
+        std::fs::read_dir(&vdir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "age"))
+            .expect("backup entry has a version blob")
+    }
+
     fn fixture_resource(secret_id: String) -> Resource {
         Resource {
             id: "fixture-resource".to_string(),
@@ -669,10 +680,7 @@ mod tests {
         let id = store.put(NewSecret::managed("Fixture"), b"fixture-value").unwrap();
         let destination = directory.path().join("backup");
         create(&catalog, &store, &destination).unwrap();
-        let blob = destination
-            .join(STORE_DIRECTORY)
-            .join(id.to_string())
-            .join("v/0001.age");
+        let blob = version_blob_in(&destination.join(STORE_DIRECTORY).join(id.to_string()));
         std::fs::write(&blob, b"tampered-ciphertext").unwrap();
 
         let error = verify(&destination, &store).unwrap_err();
@@ -869,10 +877,7 @@ mod tests {
         let id = store.put(NewSecret::managed("Fixture"), b"fixture-value").unwrap();
         let backup = directory.path().join("backup");
         create(&catalog, &store, &backup).unwrap();
-        let blob = backup
-            .join(STORE_DIRECTORY)
-            .join(id.to_string())
-            .join("v/0001.age");
+        let blob = version_blob_in(&backup.join(STORE_DIRECTORY).join(id.to_string()));
         std::fs::write(blob, b"tampered").unwrap();
         let destination = directory.path().join("restored");
 

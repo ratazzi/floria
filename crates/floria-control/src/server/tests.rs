@@ -2824,8 +2824,8 @@
                 daemon_version: env!("CARGO_PKG_VERSION").to_string(),
                 schema_version: 14,
                 minimum_schema_version: 14,
-                store_format_version: 3,
-                minimum_store_format_version: 1,
+                store_format_version: floria_store::STORE_FORMAT_VERSION,
+                minimum_store_format_version: floria_store::MIN_SUPPORTED_STORE_FORMAT_VERSION,
             }
         );
         client

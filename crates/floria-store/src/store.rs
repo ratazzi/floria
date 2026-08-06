@@ -1,10 +1,16 @@
 //! `SecretStore`: keep a secret blob confidential at rest, addressed by a stable id.
 //!
-//! [`AgeDirStore`] is the portable, sync/backup-friendly implementation: each secret is an
-//! age-encrypted blob under `<root>/<id>/secret.age` with a plaintext `<id>/meta.toml` sidecar.
-//! The id (a v4 UUID) is the identity; the original path is mutable metadata, not the key, so
-//! renaming/moving the source never desyncs the store. Plaintext exists only as
+//! [`AgeDirStore`] is the portable, sync/backup-friendly implementation: each secret version is
+//! an immutable age-encrypted blob under `<root>/<id>/v/<ciphertext-sha256>.age` with plaintext
+//! toml sidecars. The id (a v4 UUID) is the identity; the original path is mutable metadata, not
+//! the key, so renaming/moving the source never desyncs the store. Plaintext exists only as
 //! [`Zeroizing`] in memory and never touches disk here.
+//!
+//! Format 4 (see `docs/design/storage.md`): version files are named by their ciphertext digest
+//! (self-verifying, sync-conflict-free) and encrypted to a per-generation data key plus the
+//! recovery recipient — never to the device key directly. Device keys only unwrap the small
+//! envelopes under `<root>/keys/` ([`crate::generation`]), so version bytes are independent of
+//! the device set and can be replicated verbatim.
 
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
@@ -22,14 +28,17 @@ use floria_core::metadata::ItemMetadata;
 use floria_integrity::StateAuthenticator;
 
 use crate::error::{StoreError, StoreResult};
+use crate::generation::GenerationKeys;
 use crate::keys::KeyProvider;
 
-/// Current on-disk layout. Format 3 binds every encrypted payload to its secret id and version;
-/// opening an older store rewrites legacy ciphertext before returning it to callers.
-pub const STORE_FORMAT_VERSION: u32 = 3;
-pub const MIN_SUPPORTED_STORE_FORMAT_VERSION: u32 = 1;
+/// Current on-disk layout. Format 4 names version files by ciphertext digest, encrypts them to
+/// the generation data key (+ recovery recipient), and binds every payload to its secret id and
+/// a transport-stable version UUID. Older formats are rejected with a migrate-or-delete error;
+/// migration is a manual, one-time step during development.
+pub const STORE_FORMAT_VERSION: u32 = 4;
+pub const MIN_SUPPORTED_STORE_FORMAT_VERSION: u32 = 4;
 
-const PAYLOAD_MAGIC: &[u8; 8] = b"FLORIA\0\x03";
+const PAYLOAD_MAGIC: &[u8; 8] = b"FLORIA\0\x04";
 const INTEGRITY_DOMAIN: &str = "encrypted-store-security-state";
 
 /// Stable secret identifier (a v4 UUID string). Immutable for the life of an entry.
@@ -151,6 +160,31 @@ pub struct VersionRecord {
     pub mutation_id: Option<String>,
 }
 
+/// Lightweight reference to one immutable version (no ciphertext).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreVersionRef {
+    pub ordinal: u32,
+    pub version_uuid: String,
+    pub generation: u32,
+    /// Plaintext size as declared by the version sidecar.
+    pub size: u64,
+    /// On-disk ciphertext size of the blob file.
+    pub ciphertext_size: u64,
+    pub digest: String,
+}
+
+/// One immutable version exported verbatim for replication (`ciphertext` = the on-disk file).
+#[derive(Clone)]
+pub struct VersionExport {
+    pub ordinal: u32,
+    pub version_uuid: String,
+    pub generation: u32,
+    pub size: u64,
+    /// Lowercase hex sha256 of `ciphertext` — the blob's filename and its replication Object ID.
+    pub digest: String,
+    pub ciphertext: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreVerification {
     pub secrets: usize,
@@ -223,10 +257,16 @@ fn default_secret_enforcement() -> Enforcement {
     Enforcement::Prompt
 }
 
-/// On-disk `<id>/v/NNNN.toml`: immutable per-version metadata.
+/// On-disk `<id>/v/<digest>.toml`: immutable per-version metadata. The blob filename (the
+/// ciphertext sha256) is the content identity; `version` is the machine-local ordinal exposed
+/// through the public API, and `version_uuid` is the transport-stable identity bound into the
+/// encrypted payload (a local ordinal cannot travel between machines).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct VersionMetaFile {
     version: u32,
+    version_uuid: String,
+    /// Key generation the blob is encrypted under.
+    generation: u32,
     size: u64,
     created: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -239,6 +279,7 @@ struct VersionMetaFile {
 pub struct AgeDirStore {
     root: PathBuf,
     keys: Arc<dyn KeyProvider>,
+    generations: GenerationKeys,
     integrity: Option<StoreIntegrity>,
 }
 
@@ -252,6 +293,10 @@ struct StoreIntegrity {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoreSecuritySnapshot {
     entries: Vec<StoreSecurityEntry>,
+    /// `keys/` listing (name, sha256). Swapping a generation public key would silently redirect
+    /// future encryption, so key material files are part of the authenticated state.
+    #[serde(default)]
+    keys: Vec<(String, String)>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -285,6 +330,9 @@ impl StoreMaintenanceGuard {
 
 impl AgeDirStore {
     /// Open (creating the root directory, mode 0700, if needed).
+    ///
+    /// A store without generation keys gets generation 1 and the recovery recipient created on
+    /// first open — a solo machine is the degenerate single-device vault.
     pub fn open(root: PathBuf, keys: Arc<dyn KeyProvider>) -> StoreResult<Self> {
         if !root.exists() {
             std::fs::DirBuilder::new()
@@ -293,8 +341,12 @@ impl AgeDirStore {
                 .create(&root)
                 .map_err(|e| StoreError::io(&root, e))?;
         }
-        let store = AgeDirStore { root, keys, integrity: None };
-        store.migrate_context_binding()?;
+        let generations = GenerationKeys::open(&root);
+        let store = AgeDirStore { root, keys, generations, integrity: None };
+        {
+            let _lock = store.lock_exclusive()?;
+            store.generations.initialize_if_missing(&*store.keys)?;
+        }
         Ok(store)
     }
 
@@ -365,6 +417,7 @@ impl AgeDirStore {
         let restored = AgeDirStore {
             root: self.root.clone(),
             keys: Arc::clone(&self.keys),
+            generations: GenerationKeys::open(&self.root),
             integrity: None,
         };
         restored.verify_all()?;
@@ -397,24 +450,20 @@ impl AgeDirStore {
         let mut entries = Vec::with_capacity(ids.len());
         for id in ids {
             let meta = self.read_meta(&id)?;
+            let mut files = self.version_files(&id)?;
+            files.sort_by_key(|(_, vmeta)| vmeta.version);
             let mut versions = Vec::new();
-            for version in self.history_unverified(&id)? {
-                let ciphertext = self.read_version_ciphertext(&id, version.version)?;
+            for (digest, vmeta) in files {
+                let ciphertext = self.read_ciphertext_by_digest(&id, &digest)?;
                 versions.push(StoreSecurityVersion {
-                    meta: VersionMetaFile {
-                        version: version.version,
-                        size: version.size,
-                        created: version.created,
-                        note: version.note,
-                        mutation_id: version.mutation_id,
-                    },
+                    meta: vmeta,
                     ciphertext_sha256: base64::engine::general_purpose::URL_SAFE_NO_PAD
                         .encode(Sha256::digest(ciphertext)),
                 });
             }
             entries.push(StoreSecurityEntry { meta, versions });
         }
-        Ok(StoreSecuritySnapshot { entries })
+        Ok(StoreSecuritySnapshot { entries, keys: self.generations.snapshot_entries()? })
     }
 
     fn verify_security_state(&self) -> StoreResult<()> {
@@ -664,6 +713,7 @@ impl AgeDirStore {
         AgeDirStore {
             root: root.to_path_buf(),
             keys: Arc::clone(&self.keys),
+            generations: GenerationKeys::open(root),
             integrity: None,
         }
         .verify_all()
@@ -702,12 +752,77 @@ impl AgeDirStore {
         self.entry_dir(id).join("v")
     }
 
-    fn version_blob(&self, id: &SecretId, version: u32) -> PathBuf {
-        self.versions_dir(id).join(format!("{version:04}.age"))
+    fn version_blob_path(&self, id: &SecretId, digest: &str) -> PathBuf {
+        self.versions_dir(id).join(format!("{digest}.age"))
     }
 
-    fn version_meta_path(&self, id: &SecretId, version: u32) -> PathBuf {
-        self.versions_dir(id).join(format!("{version:04}.toml"))
+    fn version_meta_path(&self, id: &SecretId, digest: &str) -> PathBuf {
+        self.versions_dir(id).join(format!("{digest}.toml"))
+    }
+
+    /// All version sidecars of an entry as (ciphertext digest, metadata), unsorted.
+    fn version_files(&self, id: &SecretId) -> StoreResult<Vec<(String, VersionMetaFile)>> {
+        let vdir = self.versions_dir(id);
+        let rd = match std::fs::read_dir(&vdir) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(StoreError::io(&vdir, e)),
+        };
+        let mut out = Vec::new();
+        for entry in rd {
+            let entry = entry.map_err(|e| StoreError::io(&vdir, e))?;
+            let name = entry.file_name();
+            let Some(digest) = name.to_string_lossy().strip_suffix(".toml").map(str::to_owned)
+            else {
+                continue;
+            };
+            let path = entry.path();
+            let text = std::fs::read_to_string(&path).map_err(|e| StoreError::io(&path, e))?;
+            let vmeta: VersionMetaFile = toml::from_str(&text).map_err(|e| StoreError::Corrupt {
+                id: id.to_string(),
+                reason: format!("v/{digest}.toml: {e}"),
+            })?;
+            out.push((digest, vmeta));
+        }
+        Ok(out)
+    }
+
+    /// Resolve a machine-local ordinal to its blob digest and metadata. Two sidecars claiming
+    /// the same ordinal (e.g. a transplanted file) are corruption, not a silent pick.
+    fn find_version(&self, id: &SecretId, version: u32) -> StoreResult<(String, VersionMetaFile)> {
+        self.read_meta(id)?;
+        let mut matches = self
+            .version_files(id)?
+            .into_iter()
+            .filter(|(_, vmeta)| vmeta.version == version)
+            .collect::<Vec<_>>();
+        match matches.len() {
+            0 => Err(StoreError::NotFound(format!("{id}@v{version}"))),
+            1 => Ok(matches.remove(0)),
+            _ => Err(StoreError::Corrupt {
+                id: id.to_string(),
+                reason: format!("multiple version files claim ordinal v{version}"),
+            }),
+        }
+    }
+
+    /// Read a version blob and require its bytes to match the digest in its filename.
+    fn read_ciphertext_by_digest(&self, id: &SecretId, digest: &str) -> StoreResult<Vec<u8>> {
+        let path = self.version_blob_path(id, digest);
+        let ciphertext = std::fs::read(&path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StoreError::NotFound(format!("{id} blob {digest}"))
+            } else {
+                StoreError::io(&path, e)
+            }
+        })?;
+        if hex_sha256(&ciphertext) != digest {
+            return Err(StoreError::Corrupt {
+                id: id.to_string(),
+                reason: format!("v/{digest}.age does not match its declared digest"),
+            });
+        }
+        Ok(ciphertext)
     }
 
     fn read_meta(&self, id: &SecretId) -> StoreResult<MetaFile> {
@@ -733,8 +848,8 @@ impl AgeDirStore {
             return Err(StoreError::Corrupt {
                 id: id.to_string(),
                 reason: format!(
-                    "store format {} but this build supports 1 through {}; migrate or delete the entry",
-                    meta.format, STORE_FORMAT_VERSION
+                    "store format {} but this build supports {} through {}; migrate or delete the entry",
+                    meta.format, MIN_SUPPORTED_STORE_FORMAT_VERSION, STORE_FORMAT_VERSION
                 ),
             });
         }
@@ -757,68 +872,36 @@ impl AgeDirStore {
         write_private(&self.entry_dir(id).join("meta.toml"), text.as_bytes())
     }
 
-    fn read_version_meta(&self, id: &SecretId, version: u32) -> StoreResult<VersionMetaFile> {
-        let path = self.version_meta_path(id, version);
-        let text = std::fs::read_to_string(&path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                StoreError::NotFound(format!("{id}@v{version}"))
-            } else {
-                StoreError::io(&path, e)
-            }
-        })?;
-        toml::from_str(&text).map_err(|e| StoreError::Corrupt {
-            id: id.to_string(),
-            reason: format!("v/{version:04}.toml: {e}"),
-        })
-    }
-
     fn history_unverified(&self, id: &SecretId) -> StoreResult<Vec<VersionRecord>> {
         self.read_meta(id)?;
-        let vdir = self.versions_dir(id);
-        let rd = std::fs::read_dir(&vdir).map_err(|e| StoreError::io(&vdir, e))?;
-        let mut out = Vec::new();
-        for entry in rd {
-            let entry = entry.map_err(|e| StoreError::io(&vdir, e))?;
-            let name = entry.file_name();
-            if let Some(stem) = name.to_string_lossy().strip_suffix(".toml") {
-                if let Ok(v) = stem.parse::<u32>() {
-                    let vm = self.read_version_meta(id, v)?;
-                    out.push(VersionRecord {
-                        version: vm.version,
-                        size: vm.size,
-                        created: vm.created,
-                        note: vm.note,
-                        mutation_id: vm.mutation_id,
-                    });
-                }
-            }
-        }
+        let mut out = self
+            .version_files(id)?
+            .into_iter()
+            .map(|(_, vmeta)| VersionRecord {
+                version: vmeta.version,
+                size: vmeta.size,
+                created: vmeta.created,
+                note: vmeta.note,
+                mutation_id: vmeta.mutation_id,
+            })
+            .collect::<Vec<_>>();
         out.sort_by_key(|record| record.version);
         Ok(out)
     }
 
-    /// Highest existing version number for an entry (0 if none), used to pick the next on append.
+    /// Highest existing version ordinal for an entry (0 if none), used to pick the next on append.
     fn max_version(&self, id: &SecretId) -> StoreResult<u32> {
-        let vdir = self.versions_dir(id);
-        let rd = match std::fs::read_dir(&vdir) {
-            Ok(r) => r,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-            Err(e) => return Err(StoreError::io(&vdir, e)),
-        };
-        let mut max = 0u32;
-        for entry in rd {
-            let entry = entry.map_err(|e| StoreError::io(&vdir, e))?;
-            let name = entry.file_name();
-            if let Some(stem) = name.to_string_lossy().strip_suffix(".toml") {
-                if let Ok(v) = stem.parse::<u32>() {
-                    max = max.max(v);
-                }
-            }
-        }
-        Ok(max)
+        Ok(self
+            .version_files(id)?
+            .into_iter()
+            .map(|(_, vmeta)| vmeta.version)
+            .max()
+            .unwrap_or(0))
     }
 
-    /// Write one immutable version (ciphertext + metadata sidecar). Does not touch the head pointer.
+    /// Write one immutable version (ciphertext + metadata sidecar). Does not touch the head
+    /// pointer. The blob is published before its sidecar: a crash in between leaves an orphan
+    /// digest file that no metadata references — harmless, reported by GC later.
     fn write_version(
         &self,
         id: &SecretId,
@@ -827,11 +910,16 @@ impl AgeDirStore {
         note: Option<String>,
         mutation_id: Option<String>,
     ) -> StoreResult<()> {
-        let bound = encode_bound_payload(id, version, plaintext)?;
+        let version_uuid = uuid::Uuid::new_v4().to_string();
+        let generation = self.generations.encryption_generation()?;
+        let bound = encode_bound_payload(id, &version_uuid, plaintext)?;
         let ciphertext = self.encrypt(&bound)?;
-        write_private(&self.version_blob(id, version), &ciphertext)?;
+        let digest = hex_sha256(&ciphertext);
+        write_private(&self.version_blob_path(id, &digest), &ciphertext)?;
         let vmeta = VersionMetaFile {
             version,
+            version_uuid,
+            generation,
             size: plaintext.len() as u64,
             created: now_rfc3339(),
             note,
@@ -839,11 +927,11 @@ impl AgeDirStore {
         };
         let text = toml::to_string_pretty(&vmeta)
             .map_err(|e| StoreError::Crypto(format!("serialize version meta: {e}")))?;
-        write_private(&self.version_meta_path(id, version), text.as_bytes())
+        write_private(&self.version_meta_path(id, &digest), text.as_bytes())
     }
 
     fn encrypt(&self, plaintext: &[u8]) -> StoreResult<Vec<u8>> {
-        let recipients = self.keys.recipients()?;
+        let recipients = self.generations.recipients()?;
         let encryptor = age::Encryptor::with_recipients(recipients)
             .ok_or_else(|| StoreError::Crypto("no recipients configured".to_string()))?;
         let mut out = Vec::new();
@@ -884,138 +972,90 @@ impl AgeDirStore {
         Ok(out)
     }
 
-    fn read_version_ciphertext(&self, id: &SecretId, version: u32) -> StoreResult<Vec<u8>> {
-        let path = self.version_blob(id, version);
-        std::fs::read(&path).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                StoreError::NotFound(format!("{id}@v{version}"))
-            } else {
-                StoreError::io(&path, e)
-            }
-        })
-    }
-
-    fn decrypt_version_with_identity(
-        &self,
-        id: &SecretId,
-        version: u32,
-        identity: &dyn age::Identity,
-    ) -> StoreResult<Zeroizing<Vec<u8>>> {
-        let ciphertext = self.read_version_ciphertext(id, version)?;
-        let decrypted = self.decrypt_with_identity(&ciphertext, identity)?;
-        decode_bound_payload(id, version, decrypted)
-    }
-
-    fn migrate_context_binding(&self) -> StoreResult<()> {
-        let _lock = self.lock_exclusive()?;
-        let entries = match std::fs::read_dir(&self.root) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(StoreError::io(&self.root, error)),
-        };
-        let mut identity: Option<Box<dyn age::Identity>> = None;
-        for entry in entries {
-            let entry = entry.map_err(|error| StoreError::io(&self.root, error))?;
-            if !entry.path().is_dir() {
-                continue;
-            }
-            let Ok(id) = entry.file_name().to_string_lossy().parse::<SecretId>() else {
-                continue;
-            };
-            let mut meta = self.read_meta(&id)?;
-            if meta.format >= 3 {
-                continue;
-            }
-            if identity.is_none() {
-                identity = Some(self.keys.identity()?);
-            }
-            let identity = identity.as_ref().expect("initialized above");
-            for version in self.history(&id)? {
-                let ciphertext = self.read_version_ciphertext(&id, version.version)?;
-                let decrypted = self.decrypt_with_identity(&ciphertext, identity.as_ref())?;
-                if payload_is_bound(&id, version.version, &decrypted)? {
-                    continue;
-                }
-                let bound = encode_bound_payload(&id, version.version, &decrypted)?;
-                let ciphertext = self.encrypt(&bound)?;
-                write_private(&self.version_blob(&id, version.version), &ciphertext)?;
-            }
-            meta.format = STORE_FORMAT_VERSION;
-            self.write_meta(&id, &meta)?;
-        }
-        Ok(())
+    /// Decrypt one version by its machine-local ordinal: resolve the digest, verify the blob
+    /// against its filename, unwrap the right generation key, then check the payload binding.
+    fn decrypt_version(&self, id: &SecretId, version: u32) -> StoreResult<Zeroizing<Vec<u8>>> {
+        let (digest, vmeta) = self.find_version(id, version)?;
+        let ciphertext = self.read_ciphertext_by_digest(id, &digest)?;
+        let identity = self.generations.identity(vmeta.generation, &*self.keys)?;
+        let decrypted = self.decrypt_with_identity(&ciphertext, &identity)?;
+        decode_bound_payload(id, &vmeta.version_uuid, decrypted)
     }
 }
 
+/// Lowercase hex SHA-256 — the version blob filename and the replication Object ID share this
+/// exact encoding so store files and vault objects are byte- and name-identical.
+pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
+    Sha256::digest(bytes).iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Bind the payload to its secret id and transport-stable version UUID. A machine-local ordinal
+/// must not be bound here: the same blob bytes are replicated verbatim to machines that assign
+/// their own ordinals.
 fn encode_bound_payload(
     id: &SecretId,
-    version: u32,
+    version_uuid: &str,
     plaintext: &[u8],
 ) -> StoreResult<Zeroizing<Vec<u8>>> {
     let id_bytes = id.as_str().as_bytes();
     let id_len = u16::try_from(id_bytes.len())
         .map_err(|_| StoreError::Invalid("secret id is too long".to_string()))?;
+    let uuid_bytes = version_uuid.as_bytes();
+    let uuid_len = u16::try_from(uuid_bytes.len())
+        .map_err(|_| StoreError::Invalid("version uuid is too long".to_string()))?;
     let mut bound = Zeroizing::new(Vec::with_capacity(
-        PAYLOAD_MAGIC.len() + 2 + id_bytes.len() + 4 + plaintext.len(),
+        PAYLOAD_MAGIC.len() + 2 + id_bytes.len() + 2 + uuid_bytes.len() + plaintext.len(),
     ));
     bound.extend_from_slice(PAYLOAD_MAGIC);
     bound.extend_from_slice(&id_len.to_be_bytes());
     bound.extend_from_slice(id_bytes);
-    bound.extend_from_slice(&version.to_be_bytes());
+    bound.extend_from_slice(&uuid_len.to_be_bytes());
+    bound.extend_from_slice(uuid_bytes);
     bound.extend_from_slice(plaintext);
     Ok(bound)
 }
 
-fn payload_is_bound(id: &SecretId, version: u32, payload: &[u8]) -> StoreResult<bool> {
-    if !payload.starts_with(PAYLOAD_MAGIC) {
-        return Ok(false);
-    }
-    decode_bound_payload(id, version, Zeroizing::new(payload.to_vec())).map(|_| true)
-}
-
 fn decode_bound_payload(
     expected_id: &SecretId,
-    expected_version: u32,
+    expected_uuid: &str,
     payload: Zeroizing<Vec<u8>>,
 ) -> StoreResult<Zeroizing<Vec<u8>>> {
+    let corrupt = |reason: String| StoreError::Corrupt {
+        id: expected_id.to_string(),
+        reason,
+    };
     if !payload.starts_with(PAYLOAD_MAGIC) {
-        return Err(StoreError::Corrupt {
-            id: expected_id.to_string(),
-            reason: format!("v/{expected_version:04}.age has no authenticated context binding"),
-        });
+        return Err(corrupt("version blob has no authenticated context binding".to_string()));
     }
     let mut cursor = PAYLOAD_MAGIC.len();
     let id_len_bytes: [u8; 2] = payload
         .get(cursor..cursor + 2)
         .and_then(|bytes| bytes.try_into().ok())
-        .ok_or_else(|| StoreError::Corrupt {
-            id: expected_id.to_string(),
-            reason: format!("v/{expected_version:04}.age has a truncated context header"),
-        })?;
+        .ok_or_else(|| corrupt("version blob has a truncated context header".to_string()))?;
     cursor += 2;
     let id_len = u16::from_be_bytes(id_len_bytes) as usize;
-    let actual_id = payload.get(cursor..cursor + id_len).ok_or_else(|| StoreError::Corrupt {
-        id: expected_id.to_string(),
-        reason: format!("v/{expected_version:04}.age has a truncated secret id"),
-    })?;
+    let actual_id = payload
+        .get(cursor..cursor + id_len)
+        .ok_or_else(|| corrupt("version blob has a truncated secret id".to_string()))?
+        .to_vec();
     cursor += id_len;
-    let version_bytes: [u8; 4] = payload
-        .get(cursor..cursor + 4)
+    let uuid_len_bytes: [u8; 2] = payload
+        .get(cursor..cursor + 2)
         .and_then(|bytes| bytes.try_into().ok())
-        .ok_or_else(|| StoreError::Corrupt {
-            id: expected_id.to_string(),
-            reason: format!("v/{expected_version:04}.age has a truncated version"),
-        })?;
-    cursor += 4;
-    let actual_version = u32::from_be_bytes(version_bytes);
-    if actual_id != expected_id.as_str().as_bytes() || actual_version != expected_version {
-        return Err(StoreError::Corrupt {
-            id: expected_id.to_string(),
-            reason: format!(
-                "v/{expected_version:04}.age belongs to {}@v{actual_version}",
-                String::from_utf8_lossy(actual_id)
-            ),
-        });
+        .ok_or_else(|| corrupt("version blob has a truncated context header".to_string()))?;
+    cursor += 2;
+    let uuid_len = u16::from_be_bytes(uuid_len_bytes) as usize;
+    let actual_uuid = payload
+        .get(cursor..cursor + uuid_len)
+        .ok_or_else(|| corrupt("version blob has a truncated version uuid".to_string()))?
+        .to_vec();
+    cursor += uuid_len;
+    if actual_id != expected_id.as_str().as_bytes() || actual_uuid != expected_uuid.as_bytes() {
+        return Err(corrupt(format!(
+            "version blob belongs to {}@{}",
+            String::from_utf8_lossy(&actual_id),
+            String::from_utf8_lossy(&actual_uuid)
+        )));
     }
     Ok(Zeroizing::new(payload[cursor..].to_vec()))
 }
@@ -1080,23 +1120,18 @@ impl SecretStore for AgeDirStore {
 
     fn get_many(&self, ids: &[SecretId]) -> StoreResult<Vec<Zeroizing<Vec<u8>>>> {
         self.verify_security_state()?;
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-        let identity = self.keys.identity()?;
+        // The generation-key cache makes the device identity unwrap happen at most once here.
         ids.iter()
             .map(|id| {
                 let head = self.read_meta(id)?.current_version;
-                self.decrypt_version_with_identity(id, head, identity.as_ref())
+                self.decrypt_version(id, head)
             })
             .collect()
     }
 
     fn get_version(&self, id: &SecretId, version: u32) -> StoreResult<Zeroizing<Vec<u8>>> {
         self.verify_security_state()?;
-        self.read_meta(id)?;
-        let identity = self.keys.identity()?;
-        self.decrypt_version_with_identity(id, version, identity.as_ref())
+        self.decrypt_version(id, version)
     }
 
     fn append_version(&self, id: &SecretId, plaintext: &[u8]) -> StoreResult<u32> {
@@ -1112,9 +1147,7 @@ impl SecretStore for AgeDirStore {
         let _lock = self.lock_exclusive()?;
         self.verify_security_state()?;
         let mut meta = self.read_meta(id)?;
-        if !self.version_blob(id, version).exists() {
-            return Err(StoreError::NotFound(format!("{id}@v{version}")));
-        }
+        self.find_version(id, version)?;
         meta.current_version = version;
         self.write_meta(id, &meta)?;
         self.seal_security_state()
@@ -1127,7 +1160,7 @@ impl SecretStore for AgeDirStore {
             Err(StoreError::NotFound(_)) => return Ok(None),
             Err(e) => return Err(e),
         };
-        let vm = self.read_version_meta(id, meta.current_version)?;
+        let (_, vm) = self.find_version(id, meta.current_version)?;
         let origin = match (meta.source_path, meta.managed_label) {
             (Some(source_path), None) => {
                 SecretOrigin::File { source_path: PathBuf::from(source_path) }
@@ -1253,7 +1286,7 @@ fn validate_new_secret_origin(
 /// Write a file with mode 0600, atomically: write+fsync a `.tmp` sibling, then rename over the
 /// target. A crash mid-write leaves the old content intact (this guards the head pointer in
 /// `meta.toml`). Concurrent writers are serialized by the store lock, so the fixed temp name is safe.
-fn write_private(path: &Path, bytes: &[u8]) -> StoreResult<()> {
+pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> StoreResult<()> {
     static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let tmp = {
         let mut os = path.as_os_str().to_owned();
@@ -1342,9 +1375,81 @@ mod tests {
         let got = s.get(&id).unwrap();
         assert_eq!(&got[..], secret);
 
-        // ciphertext on disk must not contain the plaintext
-        let blob = std::fs::read(s.version_blob(&id, 1)).unwrap();
+        // ciphertext on disk must not contain the plaintext, and its filename is its digest
+        let (digest, _) = s.find_version(&id, 1).unwrap();
+        let blob = std::fs::read(s.version_blob_path(&id, &digest)).unwrap();
         assert!(!blob.windows(secret.len()).any(|w| w == secret));
+        assert_eq!(hex_sha256(&blob), digest);
+    }
+
+    #[test]
+    fn opening_a_store_creates_generation_and_recovery_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _s = store(tmp.path().to_path_buf());
+        for name in ["1.pub", "1.age", "recovery.pub", "recovery.age"] {
+            let path = tmp.path().join("keys").join(name);
+            assert!(path.is_file(), "missing {name}");
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{name} must be private");
+        }
+    }
+
+    #[test]
+    fn reopening_with_the_same_device_key_still_decrypts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let keys: Arc<dyn KeyProvider> =
+            Arc::new(X25519Keys(age::x25519::Identity::generate()));
+        let id = {
+            let s = AgeDirStore::open(tmp.path().to_path_buf(), Arc::clone(&keys)).unwrap();
+            s.put(NewSecret::managed("reopen fixture"), b"survives reopen").unwrap()
+        };
+        let reopened = AgeDirStore::open(tmp.path().to_path_buf(), keys).unwrap();
+        assert_eq!(reopened.get(&id).unwrap().as_slice(), b"survives reopen");
+    }
+
+    #[test]
+    fn recovery_identity_alone_decrypts_version_blobs() {
+        use age::secrecy::ExposeSecret as _;
+        use std::str::FromStr as _;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let device = age::x25519::Identity::generate();
+        let keys: Arc<dyn KeyProvider> = Arc::new(X25519Keys(device.clone()));
+        let s = AgeDirStore::open(tmp.path().to_path_buf(), keys).unwrap();
+        let id = s.put(NewSecret::managed("recovery fixture"), b"recoverable").unwrap();
+
+        // Unwrap the escrowed recovery identity with the device key, then decrypt a version
+        // blob using only the recovery identity — the path a total device-key loss would take.
+        let escrow = std::fs::read(tmp.path().join("keys/recovery.age")).unwrap();
+        let secret = s.decrypt_with_identity(&escrow, &device).unwrap();
+        let recovery =
+            age::x25519::Identity::from_str(std::str::from_utf8(&secret).unwrap().trim())
+                .unwrap();
+        assert_eq!(
+            recovery.to_public().to_string(),
+            std::fs::read_to_string(tmp.path().join("keys/recovery.pub")).unwrap().trim()
+        );
+        let _ = recovery.to_string().expose_secret(); // exercise the secrecy API shape
+
+        let (digest, vmeta) = s.find_version(&id, 1).unwrap();
+        let blob = std::fs::read(s.version_blob_path(&id, &digest)).unwrap();
+        let decrypted = s.decrypt_with_identity(&blob, &recovery).unwrap();
+        let plaintext = decode_bound_payload(&id, &vmeta.version_uuid, decrypted).unwrap();
+        assert_eq!(plaintext.as_slice(), b"recoverable");
+    }
+
+    #[test]
+    fn tampered_version_blob_fails_the_digest_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path().to_path_buf());
+        let id = s.put(NewSecret::managed("tamper fixture"), b"original").unwrap();
+        let (digest, _) = s.find_version(&id, 1).unwrap();
+        let path = s.version_blob_path(&id, &digest);
+        let mut blob = std::fs::read(&path).unwrap();
+        let last = blob.len() - 1;
+        blob[last] ^= 0x01;
+        std::fs::write(&path, &blob).unwrap();
+        assert!(matches!(s.get(&id), Err(StoreError::Corrupt { .. })));
     }
 
     #[test]
@@ -1426,7 +1531,22 @@ mod tests {
             .put(NewSecret::file(PathBuf::from("/x/second"), 0o600), b"second")
             .unwrap();
 
-        std::fs::copy(s.version_blob(&first, 1), s.version_blob(&second, 1)).unwrap();
+        // Transplant the whole version (blob + sidecar) from first into second: the payload
+        // binding pins the secret id, so decryption fails closed even though the digest matches.
+        let (first_digest, _) = s.find_version(&first, 1).unwrap();
+        let (second_digest, _) = s.find_version(&second, 1).unwrap();
+        std::fs::remove_file(s.version_blob_path(&second, &second_digest)).unwrap();
+        std::fs::remove_file(s.version_meta_path(&second, &second_digest)).unwrap();
+        std::fs::copy(
+            s.version_blob_path(&first, &first_digest),
+            s.version_blob_path(&second, &first_digest),
+        )
+        .unwrap();
+        std::fs::copy(
+            s.version_meta_path(&first, &first_digest),
+            s.version_meta_path(&second, &first_digest),
+        )
+        .unwrap();
         assert!(matches!(s.get(&second), Err(StoreError::Corrupt { .. })));
 
         let first_meta = std::fs::read(s.entry_dir(&first).join("meta.toml")).unwrap();
@@ -1666,7 +1786,7 @@ mod tests {
         // Simulate an entry written by a different (older/newer) layout.
         let meta_path = tmp.path().join(id.as_str()).join("meta.toml");
         let text = std::fs::read_to_string(&meta_path).unwrap();
-        std::fs::write(&meta_path, text.replace("format = 3", "format = 99")).unwrap();
+        std::fs::write(&meta_path, text.replace("format = 4", "format = 99")).unwrap();
 
         match s.get(&id) {
             Err(StoreError::Corrupt { reason, .. }) => assert!(reason.contains("format 99")),
@@ -1675,7 +1795,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_file_origin_metadata_remains_readable() {
+    fn older_formats_are_rejected_with_a_migrate_hint() {
         let tmp = tempfile::tempdir().unwrap();
         let s = store(tmp.path().to_path_buf());
         let id = s
@@ -1683,14 +1803,14 @@ mod tests {
             .unwrap();
         let meta_path = tmp.path().join(id.as_str()).join("meta.toml");
         let text = std::fs::read_to_string(&meta_path).unwrap();
-        std::fs::write(&meta_path, text.replace("format = 3", "format = 1")).unwrap();
+        std::fs::write(&meta_path, text.replace("format = 4", "format = 3")).unwrap();
 
-        assert_eq!(s.get(&id).unwrap().as_slice(), b"fixture-v1");
-        assert_eq!(s.append_version(&id, b"fixture-v2").unwrap(), 2);
-        assert_eq!(
-            s.record(&id).unwrap().unwrap().source_path(),
-            Some(Path::new("/fixture/project/.env"))
-        );
+        match s.get(&id) {
+            Err(StoreError::Corrupt { reason, .. }) => {
+                assert!(reason.contains("migrate or delete"), "unexpected reason: {reason}")
+            }
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
     }
 
     #[test]
