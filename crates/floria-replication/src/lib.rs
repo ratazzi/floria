@@ -1159,6 +1159,7 @@ impl ReplicationPackage {
 pub struct ReplicationReport {
     pub published: usize,
     pub imported: usize,
+    pub recovered_local: usize,
     pub observed: usize,
     pub pending: usize,
     pub damaged: usize,
@@ -1328,6 +1329,13 @@ impl ReplicationEngine {
 
         let mut checkpoint = self.intents.device_sequence(self.package.device_id());
         let journal_entries = self.intents.entries();
+        let outbox = self.catalog.replication_outbox()?;
+        let local_verified = scan
+            .verified
+            .iter()
+            .filter(|mutation| mutation.device_id == self.package.device_id())
+            .map(|mutation| (mutation.sequence, mutation))
+            .collect::<BTreeMap<_, _>>();
         for (sequence, operation_id) in local_observed.range((
             std::ops::Bound::Excluded(checkpoint),
             std::ops::Bound::Unbounded,
@@ -1341,19 +1349,40 @@ impl ReplicationEngine {
                     format!("the local Device history has a gap before sequence {sequence}"),
                 ));
             }
-            let Some(prepared) = journal_entries.iter().find_map(|intent| {
+            let prepared = journal_entries.iter().find_map(|intent| {
                 intent.prepared().filter(|prepared| {
                     prepared.sequence == *sequence && prepared.operation_id == *operation_id
                 })
-            }) else {
+            });
+            if let Some(prepared) = prepared {
+                self.package.publish(prepared)?;
+            } else if journal_entries.is_empty() && outbox.is_empty() {
+                let Some(mutation) = local_verified.get(sequence) else {
+                    return Ok(fence_report(
+                        report,
+                        format!(
+                            "the local Device is behind operation {sequence}, but its payload is not available"
+                        ),
+                    ));
+                };
+                if mutation.operation_id.as_str() != operation_id.as_str() {
+                    return Ok(fence_report(
+                        report,
+                        format!(
+                            "the local Device operation {sequence} does not match its verified payload"
+                        ),
+                    ));
+                }
+                self.apply_verified_mutation(mutation)?;
+                report.recovered_local += 1;
+            } else {
                 return Ok(fence_report(
                     report,
                     format!(
-                        "the local Device is behind signed operation {sequence} without matching recovery evidence"
+                        "the local Device is behind signed operation {sequence} while local mutations are pending"
                     ),
                 ));
-            };
-            self.package.publish(prepared)?;
+            }
             self.intents.accept_device_operation(
                 self.package.device_id(),
                 *sequence,
@@ -1362,7 +1391,6 @@ impl ReplicationEngine {
             checkpoint = *sequence;
         }
 
-        let outbox = self.catalog.replication_outbox()?;
         let outbox_ids = outbox
             .iter()
             .map(|entry| entry.intent_id.as_str())
@@ -2916,11 +2944,12 @@ mod tests {
     #[test]
     fn verified_commit_replays_into_an_empty_catalog_and_store() {
         let directory = tempfile::tempdir().unwrap();
+        let genesis_wrapping_identity = x25519::Identity::generate();
         let mut package = ReplicationPackage::create(
             directory.path().join("Personal.floriavault"),
             VAULT_ID,
             "2026-08-06T00:00:00Z",
-            keys(7, x25519::Identity::generate()),
+            keys(7, genesis_wrapping_identity.clone()),
         )
         .unwrap();
         let target_wrapping_identity = x25519::Identity::generate();
@@ -2991,6 +3020,43 @@ mod tests {
             source_store,
         );
         assert_eq!(source.sync().unwrap().published, 1);
+
+        let restored_catalog = Arc::new(
+            Catalog::open(directory.path().join("restored-catalog.sqlite")).unwrap(),
+        );
+        let restored_store = Arc::new(
+            AgeDirStore::open(
+                directory.path().join("restored-store"),
+                Arc::new(LocalStoreKeys(x25519::Identity::generate())),
+            )
+            .unwrap(),
+        );
+        let restored = ReplicationEngine::from_parts(
+            ReplicationPackage::open(
+                directory.path().join("Personal.floriavault"),
+                keys(7, genesis_wrapping_identity),
+            )
+            .unwrap(),
+            Arc::new(
+                ReplicationIntentJournal::open(
+                    directory.path().join("restored-intents.json"),
+                    VAULT_ID,
+                    Arc::new(StateAuthenticator::for_tests([78; 32])),
+                )
+                .unwrap(),
+            ),
+            Arc::clone(&restored_catalog),
+            Arc::clone(&restored_store),
+        );
+        let recovery = restored.sync().unwrap();
+        assert_eq!(recovery.recovered_local, 1);
+        assert!(!recovery.local_device_fenced);
+        assert_eq!(
+            restored_store.get(&secret_id).unwrap().as_slice(),
+            b"fixture payload, not a credential"
+        );
+        assert_eq!(restored_catalog.replicated_catalog().unwrap(), projection(&secret_id));
+
         let target_catalog = Arc::new(
             Catalog::open(directory.path().join("target-catalog.sqlite")).unwrap(),
         );
