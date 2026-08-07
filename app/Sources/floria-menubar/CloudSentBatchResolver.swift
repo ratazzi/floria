@@ -35,7 +35,9 @@ struct CloudSentBatchResolver {
 
         for (recordID, client) in expected {
             if let server = saved[recordID] {
-                if case .head(let entityID, let record) = try codec.decode(server) {
+                if server.recordType == CloudRecordCodec.RecordType.head,
+                   case .head(let entityID, let record) = try codec.decode(server)
+                {
                     acceptedHeads[entityID] = record
                 }
                 continue

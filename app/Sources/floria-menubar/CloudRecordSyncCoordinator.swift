@@ -89,6 +89,10 @@ actor CloudRecordSyncCoordinator {
         heads = fetched
     }
 
+    func mergeHeads(_ fetched: [String: CKRecord]) {
+        heads.merge(fetched) { _, remote in remote }
+    }
+
     func cachedHeads() -> [String: CKRecord] {
         heads
     }
