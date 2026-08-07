@@ -9,6 +9,7 @@
 pub mod entity_document;
 pub mod entity_state;
 pub mod local_projection;
+pub mod projection_applicator;
 pub mod record;
 pub mod record_crypto;
 pub mod record_journal;

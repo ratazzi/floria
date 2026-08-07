@@ -804,6 +804,44 @@ impl AgeDirStore {
         Ok(ordinal)
     }
 
+    /// Apply the portable descriptor of a replicated Secret while preserving machine-local
+    /// placement. A file-backed item keeps its local source path; a managed item adopts the
+    /// portable label. Content history and the current head are unchanged.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_replicated_settings(
+        &self,
+        id: &SecretId,
+        label: &str,
+        mode: u32,
+        metadata: ItemMetadata,
+        enforcement: Enforcement,
+        environment_ids: Option<Vec<String>>,
+    ) -> StoreResult<()> {
+        if label.trim().is_empty() || label.contains('\0') {
+            return Err(StoreError::Invalid(
+                "replicated secret label cannot be empty or contain NUL".to_string(),
+            ));
+        }
+        if mode & !0o777 != 0 {
+            return Err(StoreError::Invalid(format!(
+                "replicated secret mode must contain only permission bits: {mode:o}"
+            )));
+        }
+        metadata.validate().map_err(StoreError::Invalid)?;
+        let _lock = self.lock_exclusive()?;
+        self.verify_security_state()?;
+        let mut heads = self.read_heads(id)?;
+        heads.mode = mode;
+        if heads.source_path.is_none() {
+            heads.managed_label = Some(label.to_string());
+        }
+        heads.metadata = metadata;
+        heads.enforcement = enforcement;
+        heads.environment_ids = environment_ids;
+        self.write_heads(id, &heads)?;
+        self.seal_security_state()
+    }
+
     /// Remove the local head document for a replicated tombstone. Shared objects stay.
     pub fn remove_replicated_heads(&self, id: &SecretId) -> StoreResult<bool> {
         let _lock = self.lock_exclusive()?;
@@ -1926,6 +1964,48 @@ mod tests {
         assert_eq!(rec.enforcement, Enforcement::TouchId);
         assert_eq!(rec.environment_ids, Some(vec!["production".to_string()]));
         assert_eq!(rec.current_version, 1);
+    }
+
+    #[test]
+    fn replicated_settings_preserve_local_file_placement_and_update_managed_labels() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path().to_path_buf());
+        let file_id = store
+            .put(NewSecret::file(PathBuf::from("/local/.env"), 0o600), b"A=1")
+            .unwrap();
+        let managed_id = store
+            .put(NewSecret::managed("Old label"), b"fixture")
+            .unwrap();
+
+        store
+            .apply_replicated_settings(
+                &file_id,
+                "Portable file label",
+                0o640,
+                ItemMetadata::default(),
+                Enforcement::Allow,
+                None,
+            )
+            .unwrap();
+        store
+            .apply_replicated_settings(
+                &managed_id,
+                "New label",
+                0o400,
+                ItemMetadata::default(),
+                Enforcement::TouchId,
+                None,
+            )
+            .unwrap();
+
+        let file = store.record(&file_id).unwrap().unwrap();
+        assert_eq!(file.source_path(), Some(Path::new("/local/.env")));
+        assert_eq!(file.mode, 0o640);
+        assert_eq!(file.enforcement, Enforcement::Allow);
+        let managed = store.record(&managed_id).unwrap().unwrap();
+        assert_eq!(managed.display_name(), "New label");
+        assert_eq!(managed.mode, 0o400);
+        assert_eq!(managed.enforcement, Enforcement::TouchId);
     }
 
     #[test]
