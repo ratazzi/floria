@@ -6,22 +6,37 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use floria_catalog::{ReplicatedCatalog, ResourceSource};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::entity_document::{EntityLifecycle, ReplicatedEntityDocument};
-use crate::entity_state::CatalogEntitySet;
+use crate::entity_state::{CatalogEntityDocument, CatalogEntitySet};
 use crate::record::ImmutableObjectRef;
 use crate::record_crypto::RecordCryptor;
 use crate::record_journal::ProjectionRecords;
 use crate::secret_state::SecretEntityDocument;
 use crate::{ReplicationError, ReplicationResult};
 
+const LOCAL_PROJECTION_FORMAT_VERSION: u32 = 1;
+
+/// Canonical, portable input to a local projection attempt.
+///
+/// Derived catalog and object indexes are deliberately omitted. Decoding must rebuild them so a
+/// durable recovery intent cannot carry two disagreeing representations of desired state.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct LocalProjectionDocument {
+    format_version: u32,
+    head_revisions: BTreeMap<String, String>,
+    catalog_documents: Vec<CatalogEntityDocument>,
+    secrets: BTreeMap<String, SecretEntityDocument>,
+}
+
 /// Fully authenticated desired state with no machine-local placement decisions applied yet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LocalProjectionPlan {
-    head_revisions: BTreeMap<String, String>,
+    document: LocalProjectionDocument,
     catalog_entities: CatalogEntitySet,
     active_catalog: ReplicatedCatalog,
-    secrets: BTreeMap<String, SecretEntityDocument>,
     archived_entity_ids: BTreeSet<String>,
     object_refs: Vec<ImmutableObjectRef>,
 }
@@ -88,8 +103,6 @@ impl LocalProjectionPlan {
         let mut head_revisions = BTreeMap::new();
         let mut catalog_documents = Vec::new();
         let mut secrets = BTreeMap::new();
-        let mut archived_entity_ids = BTreeSet::new();
-        let mut objects = BTreeMap::<String, ImmutableObjectRef>::new();
         for revision_id in records.head_revision_ids() {
             let (entity_id, document) = documents.get(revision_id).ok_or_else(|| {
                 ReplicationError::Invalid(format!(
@@ -104,37 +117,118 @@ impl LocalProjectionPlan {
                     "projection contains multiple heads for entity {entity_id}"
                 )));
             }
-            if document.lifecycle() == EntityLifecycle::Archived {
-                archived_entity_ids.insert(entity_id.clone());
-            }
             match document {
                 ReplicatedEntityDocument::Catalog(document) => {
                     catalog_documents.push(document.clone())
                 }
                 ReplicatedEntityDocument::Secret(document) => {
-                    index_object(&mut objects, document.head().object())?;
                     secrets.insert(entity_id.clone(), document.clone());
                 }
             }
         }
 
-        let catalog_entities = CatalogEntitySet::from_documents(catalog_documents)?;
+        catalog_documents.sort_by(|left, right| left.entity_id().cmp(right.entity_id()));
+        Self::assemble(LocalProjectionDocument {
+            format_version: LOCAL_PROJECTION_FORMAT_VERSION,
+            head_revisions,
+            catalog_documents,
+            secrets,
+        })
+    }
+
+    /// Encode the exact, validated desired state for durable replay.
+    pub fn encode(&self) -> ReplicationResult<Vec<u8>> {
+        serde_json::to_vec(&self.document).map_err(ReplicationError::from)
+    }
+
+    /// Decode and revalidate every derived projection invariant.
+    pub fn decode(bytes: &[u8]) -> ReplicationResult<Self> {
+        let document = serde_json::from_slice(bytes)?;
+        Self::assemble(document)
+    }
+
+    /// Stable identity used to make preparing and completing a projection idempotent.
+    pub fn plan_id(&self) -> ReplicationResult<String> {
+        Ok(format!("{:x}", Sha256::digest(self.encode()?)))
+    }
+
+    fn assemble(document: LocalProjectionDocument) -> ReplicationResult<Self> {
+        if document.format_version != LOCAL_PROJECTION_FORMAT_VERSION {
+            return Err(ReplicationError::Invalid(format!(
+                "unsupported local projection format {}",
+                document.format_version
+            )));
+        }
+
+        let mut entity_ids = BTreeSet::new();
+        let mut previous_catalog_id = None;
+        for catalog_document in &document.catalog_documents {
+            catalog_document.validate()?;
+            let entity_id = catalog_document.entity_id();
+            if previous_catalog_id.is_some_and(|previous| previous >= entity_id) {
+                return Err(ReplicationError::Invalid(
+                    "local projection catalog documents must be sorted and unique".to_string(),
+                ));
+            }
+            previous_catalog_id = Some(entity_id);
+            entity_ids.insert(entity_id.to_string());
+        }
+        for (entity_id, secret) in &document.secrets {
+            secret.validate()?;
+            if secret.entity_id() != entity_id {
+                return Err(ReplicationError::Invalid(format!(
+                    "local projection secret key {entity_id} does not match document {}",
+                    secret.entity_id()
+                )));
+            }
+            if !entity_ids.insert(entity_id.clone()) {
+                return Err(ReplicationError::Invalid(format!(
+                    "local projection entity {entity_id} appears more than once"
+                )));
+            }
+        }
+        for (entity_id, revision_id) in &document.head_revisions {
+            require_uuid("local projection entity id", entity_id)?;
+            require_uuid("local projection head revision id", revision_id)?;
+        }
+        let head_entity_ids = document.head_revisions.keys().cloned().collect::<BTreeSet<_>>();
+        if head_entity_ids != entity_ids {
+            return Err(ReplicationError::Invalid(
+                "local projection heads do not match its entity documents".to_string(),
+            ));
+        }
+
+        let catalog_entities =
+            CatalogEntitySet::from_documents(document.catalog_documents.clone())?;
         let active_catalog = catalog_entities.active_catalog()?;
-        validate_secret_references(&active_catalog, &secrets)?;
-        validate_secret_environment_scopes(&active_catalog, &secrets)?;
+        validate_secret_references(&active_catalog, &document.secrets)?;
+        validate_secret_environment_scopes(&active_catalog, &document.secrets)?;
+
+        let mut archived_entity_ids = BTreeSet::new();
+        for catalog_document in &document.catalog_documents {
+            if catalog_document.lifecycle() == EntityLifecycle::Archived {
+                archived_entity_ids.insert(catalog_document.entity_id().to_string());
+            }
+        }
+        let mut objects = BTreeMap::<String, ImmutableObjectRef>::new();
+        for secret in document.secrets.values() {
+            if secret.lifecycle() == EntityLifecycle::Archived {
+                archived_entity_ids.insert(secret.entity_id().to_string());
+            }
+            index_object(&mut objects, secret.head().object())?;
+        }
 
         Ok(Self {
-            head_revisions,
+            document,
             catalog_entities,
             active_catalog,
-            secrets,
             archived_entity_ids,
             object_refs: objects.into_values().collect(),
         })
     }
 
     pub fn head_revisions(&self) -> &BTreeMap<String, String> {
-        &self.head_revisions
+        &self.document.head_revisions
     }
 
     pub fn catalog_entities(&self) -> &CatalogEntitySet {
@@ -147,7 +241,7 @@ impl LocalProjectionPlan {
 
     /// All current Secret heads, including archived entities retained for restoration.
     pub fn secrets(&self) -> &BTreeMap<String, SecretEntityDocument> {
-        &self.secrets
+        &self.document.secrets
     }
 
     pub fn archived_entity_ids(&self) -> &BTreeSet<String> {
@@ -157,6 +251,12 @@ impl LocalProjectionPlan {
     pub fn object_refs(&self) -> &[ImmutableObjectRef] {
         &self.object_refs
     }
+}
+
+fn require_uuid(label: &str, value: &str) -> ReplicationResult<()> {
+    uuid::Uuid::parse_str(value)
+        .map(|_| ())
+        .map_err(|_| ReplicationError::Invalid(format!("{label} is not a UUID: {value:?}")))
 }
 
 fn index_object(
@@ -343,6 +443,45 @@ mod tests {
         assert_eq!(plan.object_refs().len(), 1);
         assert_eq!(plan.head_revisions().len(), 2);
         assert!(plan.archived_entity_ids().is_empty());
+
+        let encoded = plan.encode().unwrap();
+        let decoded = LocalProjectionPlan::decode(&encoded).unwrap();
+        assert_eq!(decoded, plan);
+        assert_eq!(decoded.plan_id().unwrap(), plan.plan_id().unwrap());
+        assert_eq!(plan.plan_id().unwrap().len(), 64);
+        assert!(!String::from_utf8(encoded)
+            .unwrap()
+            .contains("private fixture"));
+    }
+
+    #[test]
+    fn decoding_rejects_a_projection_whose_heads_do_not_match_documents() {
+        let (_directory, store, cryptor, journal) = fixture();
+        let secret_id = store
+            .put(NewSecret::managed("Fixture"), b"private fixture")
+            .unwrap();
+        queue(
+            &cryptor,
+            &journal,
+            vec![ReplicatedEntityDocument::Secret(
+                SecretEntityDocument::from_store(
+                    &store,
+                    &secret_id,
+                    EntityLifecycle::Active,
+                )
+                .unwrap(),
+            )],
+        );
+        let plan =
+            LocalProjectionPlan::build(&cryptor, &journal.projection_records().unwrap()).unwrap();
+        let mut document = plan.document.clone();
+        document.head_revisions.clear();
+
+        let error = LocalProjectionPlan::decode(&serde_json::to_vec(&document).unwrap())
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("heads do not match its entity documents"));
     }
 
     #[test]

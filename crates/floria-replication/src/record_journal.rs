@@ -15,14 +15,16 @@ use floria_integrity::StateAuthenticator;
 use rusqlite::config::DbConfig;
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::record::{
     CommitReadiness, EntityRevision, RevisionAnalysis, RevisionCommit, RevisionSet,
 };
 use crate::{ReplicationError, ReplicationResult};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const INTEGRITY_DOMAIN_PREFIX: &str = "sync-record-journal";
+const MAX_PROJECTION_DOCUMENT_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OutboundCommit {
@@ -66,6 +68,62 @@ pub struct ProjectionRecords {
     commits: Vec<RevisionCommit>,
     revisions: Vec<EntityRevision>,
     head_revision_ids: Vec<String>,
+}
+
+/// Exact desired state that must be replayed before a newer projection can begin.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingProjection {
+    plan_id: String,
+    document: Vec<u8>,
+    head_revisions: BTreeMap<String, String>,
+    prepared_at: String,
+}
+
+impl PendingProjection {
+    pub fn plan_id(&self) -> &str {
+        &self.plan_id
+    }
+
+    pub fn document(&self) -> &[u8] {
+        &self.document
+    }
+
+    pub fn head_revisions(&self) -> &BTreeMap<String, String> {
+        &self.head_revisions
+    }
+
+    pub fn prepared_at(&self) -> &str {
+        &self.prepared_at
+    }
+}
+
+/// Last projection known to have crossed every machine-local persistence boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectionCheckpoint {
+    plan_id: String,
+    head_revisions: BTreeMap<String, String>,
+    applied_at: String,
+}
+
+impl ProjectionCheckpoint {
+    pub fn plan_id(&self) -> &str {
+        &self.plan_id
+    }
+
+    pub fn head_revisions(&self) -> &BTreeMap<String, String> {
+        &self.head_revisions
+    }
+
+    pub fn applied_at(&self) -> &str {
+        &self.applied_at
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProjectionPreparation {
+    Prepared,
+    AlreadyPrepared,
+    AlreadyApplied,
 }
 
 impl ProjectionRecords {
@@ -112,6 +170,8 @@ struct JournalSecuritySnapshot {
     commits: Vec<RevisionCommit>,
     outbound: Vec<OutboundCommit>,
     inbound: Vec<InboundCommit>,
+    pending_projection: Option<PendingProjection>,
+    projection_checkpoint: Option<ProjectionCheckpoint>,
 }
 
 struct JournalIntegrity {
@@ -319,6 +379,117 @@ impl RecordJournal {
         self.with_read(|_, snapshot| projection_records_from(snapshot))
     }
 
+    /// Durably fence one exact local projection before catalog or store writes begin.
+    pub fn prepare_projection(
+        &self,
+        plan_id: &str,
+        document: &[u8],
+        head_revisions: &BTreeMap<String, String>,
+        prepared_at: impl Into<String>,
+    ) -> ReplicationResult<ProjectionPreparation> {
+        require_projection_identity(plan_id, document)?;
+        validate_projection_heads(head_revisions)?;
+        let prepared_at = require_time("projection preparation time", prepared_at.into())?;
+        self.with_mutation(|tx| {
+            if let Some(checkpoint) = projection_checkpoint_from(tx)? {
+                if checkpoint.plan_id == plan_id && checkpoint.head_revisions == *head_revisions {
+                    return Ok(ProjectionPreparation::AlreadyApplied);
+                }
+                if checkpoint.head_revisions == *head_revisions {
+                    return Err(ReplicationError::Invalid(
+                        "projection heads already have a different completed plan".to_string(),
+                    ));
+                }
+            }
+
+            if let Some(pending) = pending_projection_from(tx)? {
+                if pending.plan_id == plan_id
+                    && pending.document == document
+                    && pending.head_revisions == *head_revisions
+                {
+                    return Ok(ProjectionPreparation::AlreadyPrepared);
+                }
+                return Err(ReplicationError::Invalid(format!(
+                    "projection {} must finish before preparing {plan_id}",
+                    pending.plan_id
+                )));
+            }
+
+            tx.execute(
+                "INSERT INTO record_projection_intent (
+                    singleton, plan_id, document, head_revisions_json, prepared_at
+                 ) VALUES (1, ?1, ?2, ?3, ?4)",
+                params![
+                    plan_id,
+                    document,
+                    serde_json::to_vec(head_revisions)?,
+                    prepared_at
+                ],
+            )?;
+            Ok(ProjectionPreparation::Prepared)
+        })
+    }
+
+    pub fn pending_projection(&self) -> ReplicationResult<Option<PendingProjection>> {
+        self.with_read(|_, snapshot| Ok(snapshot.pending_projection.clone()))
+    }
+
+    pub fn projection_checkpoint(&self) -> ReplicationResult<Option<ProjectionCheckpoint>> {
+        self.with_read(|_, snapshot| Ok(snapshot.projection_checkpoint.clone()))
+    }
+
+    /// Atomically replace the checkpoint and retire the matching durable intent.
+    ///
+    /// Returning `false` means this exact completion had already committed before a crash.
+    pub fn complete_projection(
+        &self,
+        plan_id: &str,
+        head_revisions: &BTreeMap<String, String>,
+        applied_at: impl Into<String>,
+    ) -> ReplicationResult<bool> {
+        require_plan_id(plan_id)?;
+        validate_projection_heads(head_revisions)?;
+        let applied_at = require_time("projection completion time", applied_at.into())?;
+        self.with_mutation(|tx| {
+            let pending = pending_projection_from(tx)?;
+            let Some(pending) = pending else {
+                return match projection_checkpoint_from(tx)? {
+                    Some(checkpoint)
+                        if checkpoint.plan_id == plan_id
+                            && checkpoint.head_revisions == *head_revisions =>
+                    {
+                        Ok(false)
+                    }
+                    _ => Err(ReplicationError::Invalid(format!(
+                        "projection {plan_id} has no matching durable intent"
+                    ))),
+                };
+            };
+            if pending.plan_id != plan_id || pending.head_revisions != *head_revisions {
+                return Err(ReplicationError::Invalid(format!(
+                    "projection {plan_id} does not match pending projection {}",
+                    pending.plan_id
+                )));
+            }
+
+            tx.execute(
+                "INSERT INTO record_projection_checkpoint (
+                    singleton, plan_id, head_revisions_json, applied_at
+                 ) VALUES (1, ?1, ?2, ?3)
+                 ON CONFLICT(singleton) DO UPDATE SET
+                    plan_id = excluded.plan_id,
+                    head_revisions_json = excluded.head_revisions_json,
+                    applied_at = excluded.applied_at",
+                params![plan_id, serde_json::to_vec(head_revisions)?, applied_at],
+            )?;
+            tx.execute(
+                "DELETE FROM record_projection_intent WHERE singleton = 1",
+                [],
+            )?;
+            Ok(true)
+        })
+    }
+
     fn with_read<T>(
         &self,
         operation: impl FnOnce(&Transaction<'_>, &JournalSecuritySnapshot) -> ReplicationResult<T>,
@@ -408,7 +579,22 @@ fn initialize_or_require_schema(conn: &mut Connection, created: bool) -> Replica
             CREATE INDEX record_inbox_received_idx
                 ON record_inbox(received_at, commit_id);
 
-            PRAGMA user_version = 2;",
+            CREATE TABLE record_projection_intent (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                plan_id TEXT NOT NULL,
+                document BLOB NOT NULL,
+                head_revisions_json BLOB NOT NULL,
+                prepared_at TEXT NOT NULL
+            );
+
+            CREATE TABLE record_projection_checkpoint (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                plan_id TEXT NOT NULL,
+                head_revisions_json BLOB NOT NULL,
+                applied_at TEXT NOT NULL
+            );
+
+            PRAGMA user_version = 3;",
         )?;
         tx.commit()?;
         return Ok(());
@@ -459,6 +645,8 @@ fn security_snapshot_from(conn: &Connection) -> ReplicationResult<JournalSecurit
     let commits = commits_from(conn)?;
     let outbound = outbound_from(conn)?;
     let inbound = inbound_from(conn)?;
+    let pending_projection = pending_projection_from(conn)?;
+    let projection_checkpoint = projection_checkpoint_from(conn)?;
     Ok(JournalSecuritySnapshot {
         schema_version,
         schema,
@@ -466,6 +654,8 @@ fn security_snapshot_from(conn: &Connection) -> ReplicationResult<JournalSecurit
         commits,
         outbound,
         inbound,
+        pending_projection,
+        projection_checkpoint,
     })
 }
 
@@ -520,6 +710,12 @@ fn validate_snapshot(snapshot: &JournalSecuritySnapshot) -> ReplicationResult<()
                 item.commit().commit_id()
             )));
         }
+    }
+    if let Some(pending) = &snapshot.pending_projection {
+        validate_pending_projection(pending)?;
+    }
+    if let Some(checkpoint) = &snapshot.projection_checkpoint {
+        validate_projection_checkpoint(checkpoint)?;
     }
     Ok(())
 }
@@ -923,6 +1119,62 @@ fn inbound_by_id(
         .find(|item| item.commit.commit_id() == commit_id))
 }
 
+fn pending_projection_from(
+    conn: &Connection,
+) -> ReplicationResult<Option<PendingProjection>> {
+    let row = conn
+        .query_row(
+            "SELECT plan_id, document, head_revisions_json, prepared_at
+             FROM record_projection_intent WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(|(plan_id, document, head_revisions_json, prepared_at)| {
+        Ok(PendingProjection {
+            plan_id,
+            document,
+            head_revisions: serde_json::from_slice(&head_revisions_json)?,
+            prepared_at,
+        })
+    })
+    .transpose()
+}
+
+fn projection_checkpoint_from(
+    conn: &Connection,
+) -> ReplicationResult<Option<ProjectionCheckpoint>> {
+    let row = conn
+        .query_row(
+            "SELECT plan_id, head_revisions_json, applied_at
+             FROM record_projection_checkpoint WHERE singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(|(plan_id, head_revisions_json, applied_at)| {
+        Ok(ProjectionCheckpoint {
+            plan_id,
+            head_revisions: serde_json::from_slice(&head_revisions_json)?,
+            applied_at,
+        })
+    })
+    .transpose()
+}
+
 fn revisions_for_commit(
     conn: &Connection,
     commit: &RevisionCommit,
@@ -1015,6 +1267,66 @@ fn require_uuid(label: &str, value: &str) -> ReplicationResult<()> {
     uuid::Uuid::parse_str(value)
         .map(|_| ())
         .map_err(|_| ReplicationError::Invalid(format!("{label} is not a UUID: {value:?}")))
+}
+
+fn require_plan_id(value: &str) -> ReplicationResult<()> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        Ok(())
+    } else {
+        Err(ReplicationError::Invalid(format!(
+            "projection plan id is not a lowercase SHA-256 digest: {value:?}"
+        )))
+    }
+}
+
+fn require_projection_document(document: &[u8]) -> ReplicationResult<()> {
+    if document.is_empty() || document.len() > MAX_PROJECTION_DOCUMENT_BYTES {
+        Err(ReplicationError::Invalid(format!(
+            "projection document must be 1..={MAX_PROJECTION_DOCUMENT_BYTES} bytes"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn require_projection_identity(plan_id: &str, document: &[u8]) -> ReplicationResult<()> {
+    require_plan_id(plan_id)?;
+    require_projection_document(document)?;
+    let expected = format!("{:x}", Sha256::digest(document));
+    if expected != plan_id {
+        return Err(ReplicationError::Invalid(
+            "projection plan id does not match its document".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_projection_heads(
+    head_revisions: &BTreeMap<String, String>,
+) -> ReplicationResult<()> {
+    for (entity_id, revision_id) in head_revisions {
+        require_uuid("projection entity id", entity_id)?;
+        require_uuid("projection head revision id", revision_id)?;
+    }
+    Ok(())
+}
+
+fn validate_pending_projection(pending: &PendingProjection) -> ReplicationResult<()> {
+    require_projection_identity(&pending.plan_id, &pending.document)?;
+    validate_projection_heads(&pending.head_revisions)?;
+    require_time("projection preparation time", pending.prepared_at.clone())?;
+    Ok(())
+}
+
+fn validate_projection_checkpoint(checkpoint: &ProjectionCheckpoint) -> ReplicationResult<()> {
+    require_plan_id(&checkpoint.plan_id)?;
+    validate_projection_heads(&checkpoint.head_revisions)?;
+    require_time("projection completion time", checkpoint.applied_at.clone())?;
+    Ok(())
 }
 
 fn require_time(label: &str, value: String) -> ReplicationResult<String> {
@@ -1137,6 +1449,112 @@ mod tests {
         assert!(!reopened.settle_outbound(&commit_id).unwrap());
         assert!(reopened.outbound().unwrap().is_empty());
         assert_eq!(reopened.analysis().unwrap().heads().len(), 2);
+    }
+
+    #[test]
+    fn projection_intent_and_checkpoint_are_durable_and_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault_id = id();
+        let authenticator = authenticator();
+        let document = b"canonical projection fixture".to_vec();
+        let plan_id = format!("{:x}", Sha256::digest(&document));
+        let heads = BTreeMap::from([(id(), id())]);
+        let journal = open(&directory, &vault_id, Arc::clone(&authenticator));
+
+        assert_eq!(
+            journal
+                .prepare_projection(
+                    &plan_id,
+                    &document,
+                    &heads,
+                    "2026-08-07T00:00:00Z",
+                )
+                .unwrap(),
+            ProjectionPreparation::Prepared
+        );
+        assert_eq!(
+            journal
+                .prepare_projection(
+                    &plan_id,
+                    &document,
+                    &heads,
+                    "2026-08-07T00:00:01Z",
+                )
+                .unwrap(),
+            ProjectionPreparation::AlreadyPrepared
+        );
+        drop(journal);
+
+        let reopened = open(&directory, &vault_id, Arc::clone(&authenticator));
+        let pending = reopened.pending_projection().unwrap().unwrap();
+        assert_eq!(pending.plan_id(), plan_id);
+        assert_eq!(pending.document(), document);
+        assert_eq!(pending.head_revisions(), &heads);
+        assert!(reopened
+            .complete_projection(&plan_id, &heads, "2026-08-07T00:00:02Z")
+            .unwrap());
+        assert!(reopened.pending_projection().unwrap().is_none());
+        drop(reopened);
+
+        let reopened = open(&directory, &vault_id, authenticator);
+        let checkpoint = reopened.projection_checkpoint().unwrap().unwrap();
+        assert_eq!(checkpoint.plan_id(), plan_id);
+        assert_eq!(checkpoint.head_revisions(), &heads);
+        assert_eq!(
+            reopened
+                .prepare_projection(
+                    &plan_id,
+                    &document,
+                    &heads,
+                    "2026-08-07T00:00:03Z",
+                )
+                .unwrap(),
+            ProjectionPreparation::AlreadyApplied
+        );
+        assert!(!reopened
+            .complete_projection(&plan_id, &heads, "2026-08-07T00:00:04Z")
+            .unwrap());
+    }
+
+    #[test]
+    fn projection_intent_rejects_mismatched_identity_and_parallel_plan() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault_id = id();
+        let journal = open(&directory, &vault_id, authenticator());
+        let document = b"first plan".to_vec();
+        let plan_id = format!("{:x}", Sha256::digest(&document));
+        let heads = BTreeMap::from([(id(), id())]);
+
+        assert!(journal
+            .prepare_projection(
+                &"00".repeat(32),
+                &document,
+                &heads,
+                "2026-08-07T00:00:00Z",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("does not match its document"));
+        journal
+            .prepare_projection(
+                &plan_id,
+                &document,
+                &heads,
+                "2026-08-07T00:00:00Z",
+            )
+            .unwrap();
+        let other_document = b"other plan".to_vec();
+        let other_plan_id = format!("{:x}", Sha256::digest(&other_document));
+        assert!(journal
+            .prepare_projection(
+                &other_plan_id,
+                &other_document,
+                &BTreeMap::from([(id(), id())]),
+                "2026-08-07T00:00:01Z",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("must finish before preparing"));
     }
 
     #[test]
