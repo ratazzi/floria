@@ -21,7 +21,7 @@ use floria_control::{
     RuntimeRecordSyncService, RuntimeReplicationService, SshIdentity, SshIdentityDiscovery,
     SyncDeliveryOutcome, SyncDomainStatus, SyncInboundBatch, SyncInboundReport,
     SyncEnrollmentPreparation, SyncEnrollmentReview, SyncOutboundBatch, SyncSettlementReport,
-    SyncVaultBootstrap,
+    SyncVaultActivation, SyncVaultBootstrap,
 };
 use floria_core::audit::{AuditAuthority, AuditCheckpoint, AuditLog};
 use floria_core::authz::{Authorizer, PolicyMode, PolicyModeStatus};
@@ -1308,6 +1308,29 @@ impl RuntimeRecordSyncService for DaemonRecordSyncService {
         })
     }
 
+    fn activate_vault(
+        &self,
+        bootstrap: SyncVaultBootstrap,
+    ) -> Result<SyncVaultActivation, String> {
+        let snapshot = self.catalog.snapshot().map_err(|error| error.to_string())?;
+        let local_items = self
+            .store
+            .list()
+            .map_err(|error| error.to_string())?
+            .len()
+            .saturating_add(snapshot.projects.len())
+            .saturating_add(snapshot.environments.len())
+            .saturating_add(snapshot.resources.len())
+            .saturating_add(snapshot.bindings.len())
+            .saturating_add(snapshot.surfaces.len());
+        self.mutations.run(|| {
+            self.with_journal(|journal| {
+                RecordSyncControl::new(journal, Arc::clone(&self.store))
+                    .activate_vault_bootstrap(bootstrap, local_items)
+            })
+        })
+    }
+
     fn next_outbound(&self, limit: usize) -> Result<SyncOutboundBatch, String> {
         self.with_captured_state(&self.catalog, |journal| {
             RecordSyncControl::new(journal, Arc::clone(&self.store)).next_outbound(limit)
@@ -2490,6 +2513,9 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
         }
         ControlResult::RecordSyncEnrollmentReviews(reviews) => {
             println!("{}", serde_json::to_string_pretty(&reviews)?);
+        }
+        ControlResult::RecordSyncVaultActivation(activation) => {
+            println!("{}", serde_json::to_string_pretty(&activation)?);
         }
         ControlResult::RecordSyncOutbound(batch) => {
             println!("{}", serde_json::to_string_pretty(&batch)?);

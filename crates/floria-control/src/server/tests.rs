@@ -139,6 +139,7 @@
         enrollment_preparation_calls: AtomicUsize,
         enrollment_review_calls: AtomicUsize,
         enrollment_approval_calls: AtomicUsize,
+        activation_calls: AtomicUsize,
         outbound_calls: AtomicUsize,
         settlement_calls: AtomicUsize,
         inbound_calls: AtomicUsize,
@@ -208,6 +209,18 @@
             self.enrollment_approval_calls
                 .fetch_add(1, Ordering::Relaxed);
             Ok(bootstrap)
+        }
+
+        fn activate_vault(
+            &self,
+            bootstrap: SyncVaultBootstrap,
+        ) -> Result<SyncVaultActivation, String> {
+            self.activation_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(SyncVaultActivation::Ready {
+                vault_id: bootstrap.vault_id().to_string(),
+                key_generation: 1,
+                restart_required: true,
+            })
         }
 
         fn next_outbound(&self, _limit: usize) -> Result<SyncOutboundBatch, String> {
@@ -3019,12 +3032,18 @@
         assert!(matches!(
             client
                 .request(ControlCommand::RecordSyncApproveVaultEnrollment {
-                    bootstrap,
+                    bootstrap: bootstrap.clone(),
                     device_id: "fixture-device".to_string(),
                     expected_fingerprint: "sha256:fixture".to_string(),
                 })
                 .unwrap(),
             ControlResult::RecordSyncVaultBootstrap(_)
+        ));
+        assert!(matches!(
+            client
+                .request(ControlCommand::RecordSyncActivateVault { bootstrap })
+                .unwrap(),
+            ControlResult::RecordSyncVaultActivation(_)
         ));
         assert!(matches!(
             client
@@ -3076,6 +3095,7 @@
             record_sync.enrollment_approval_calls.load(Ordering::Relaxed),
             1
         );
+        assert_eq!(record_sync.activation_calls.load(Ordering::Relaxed), 1);
         assert_eq!(record_sync.settlement_calls.load(Ordering::Relaxed), 1);
         assert_eq!(record_sync.inbound_calls.load(Ordering::Relaxed), 1);
     }
@@ -3342,11 +3362,14 @@
         ));
         assert!(!is_read_only(
             &ControlCommand::RecordSyncApproveVaultEnrollment {
-                bootstrap,
+                bootstrap: bootstrap.clone(),
                 device_id: "fixture-device".to_string(),
                 expected_fingerprint: "sha256:fixture".to_string(),
             }
         ));
+        assert!(!is_read_only(&ControlCommand::RecordSyncActivateVault {
+            bootstrap,
+        }));
         assert!(!command_allowed_for_peer(
             PeerAccess::ReadOnly,
             &ControlCommand::RecordSyncStatus,

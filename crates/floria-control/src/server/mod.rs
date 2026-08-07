@@ -45,7 +45,8 @@ use crate::protocol::{
     ProjectCheckoutInventory, ProtectedFile, ProtectedFileVersion, SecretValue, SshConfigStatus,
     RecoveryKeyReport, ReplicationEnrollment, ReplicationStatus, SshIdentity, WorkspaceSnapshot,
     SyncDeliveryOutcome, SyncDomainStatus, SyncInboundBatch, SyncInboundReport, SyncOutboundBatch,
-    SyncEnrollmentPreparation, SyncEnrollmentReview, SyncSettlementReport, SyncVaultBootstrap,
+    SyncEnrollmentPreparation, SyncEnrollmentReview, SyncSettlementReport, SyncVaultActivation,
+    SyncVaultBootstrap,
 };
 
 pub struct ControlServer {
@@ -170,6 +171,10 @@ pub trait RuntimeRecordSyncService: Send + Sync + 'static {
         device_id: &str,
         expected_fingerprint: &str,
     ) -> Result<SyncVaultBootstrap, String>;
+    fn activate_vault(
+        &self,
+        bootstrap: SyncVaultBootstrap,
+    ) -> Result<SyncVaultActivation, String>;
     fn next_outbound(&self, limit: usize) -> Result<SyncOutboundBatch, String>;
     fn settle_outbound(
         &self,

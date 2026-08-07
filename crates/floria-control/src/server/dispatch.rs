@@ -250,6 +250,11 @@ fn dispatch_uncoordinated(
             .approve_vault_enrollment(bootstrap, &device_id, &expected_fingerprint)
             .map(ControlResult::RecordSyncVaultBootstrap)
             .map_err(DispatchError::RecordSync),
+        ControlCommand::RecordSyncActivateVault { bootstrap } => record_sync
+            .ok_or_else(record_sync_unavailable)?
+            .activate_vault(bootstrap)
+            .map(ControlResult::RecordSyncVaultActivation)
+            .map_err(DispatchError::RecordSync),
         ControlCommand::RecordSyncNextOutbound { limit } => {
             let batch = record_sync
                 .ok_or_else(record_sync_unavailable)?

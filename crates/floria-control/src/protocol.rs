@@ -16,7 +16,7 @@ pub use floria_replication::sync_control::{
 };
 pub use floria_replication::sync_bootstrap::{
     SyncBootstrapDocument, SyncBootstrapEnvelope, SyncEnrollmentPreparation,
-    SyncEnrollmentReview, SyncVaultBootstrap,
+    SyncEnrollmentReview, SyncVaultActivation, SyncVaultBootstrap,
 };
 use floria_store::StoreError;
 use serde::de::DeserializeOwned;
@@ -25,7 +25,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 const MAX_MSG: usize = 8 << 20;
 pub(crate) const MAX_RECORD_SYNC_BATCH_BYTES: usize = 6 << 20;
-pub const CONTROL_PROTOCOL_VERSION: u32 = 14;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 15;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRequest {
@@ -110,6 +110,9 @@ pub enum ControlCommand {
         bootstrap: SyncVaultBootstrap,
         device_id: String,
         expected_fingerprint: String,
+    },
+    RecordSyncActivateVault {
+        bootstrap: SyncVaultBootstrap,
     },
     RecordSyncNextOutbound { limit: usize },
     RecordSyncSettleOutbound { outcomes: Vec<SyncDeliveryOutcome> },
@@ -262,6 +265,7 @@ pub enum ControlResult {
     RecordSyncVaultBootstrap(SyncVaultBootstrap),
     RecordSyncEnrollmentPreparation(SyncEnrollmentPreparation),
     RecordSyncEnrollmentReviews(Vec<SyncEnrollmentReview>),
+    RecordSyncVaultActivation(SyncVaultActivation),
     RecordSyncOutbound(SyncOutboundBatch),
     RecordSyncSettlement(SyncSettlementReport),
     RecordSyncInbound(SyncInboundReport),
@@ -1706,7 +1710,7 @@ mod tests {
         let approval_request = serde_json::to_value(ControlRequest {
             request_id: 48,
             command: ControlCommand::RecordSyncApproveVaultEnrollment {
-                bootstrap,
+                bootstrap: bootstrap.clone(),
                 device_id: "fixture-device".to_string(),
                 expected_fingerprint: "sha256:fixture".to_string(),
             },
@@ -1719,6 +1723,17 @@ mod tests {
         assert_eq!(
             approval_request["params"]["expected_fingerprint"],
             "sha256:fixture"
+        );
+
+        let activation_request = serde_json::to_value(ControlRequest {
+            request_id: 49,
+            command: ControlCommand::RecordSyncActivateVault { bootstrap },
+        })
+        .unwrap();
+        assert_eq!(activation_request["method"], "record_sync_activate_vault");
+        assert_eq!(
+            activation_request["params"]["bootstrap"]["vault_id"],
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         );
 
         let preparation: SyncEnrollmentPreparation =
@@ -1780,6 +1795,18 @@ mod tests {
         .unwrap();
         assert_eq!(result["type"], "record_sync_outbound");
         assert_eq!(result["value"]["commits"], serde_json::json!([]));
+
+        let activation = serde_json::to_value(ControlResult::RecordSyncVaultActivation(
+            SyncVaultActivation::Ready {
+                vault_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".to_string(),
+                key_generation: 2,
+                restart_required: true,
+            },
+        ))
+        .unwrap();
+        assert_eq!(activation["type"], "record_sync_vault_activation");
+        assert_eq!(activation["value"]["status"], "ready");
+        assert_eq!(activation["value"]["restart_required"], true);
     }
 
     #[test]

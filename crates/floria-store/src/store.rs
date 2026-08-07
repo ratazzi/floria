@@ -34,7 +34,7 @@ use crate::generations::GenerationAccess;
 use crate::keys::KeyProvider;
 use crate::vault::{
     self, ensure_private_directory, publish_immutable, read_untrusted_file, write_key_generation,
-    write_new_atomic, SharedLayout, VaultDocument,
+    write_new_atomic, write_replace_atomic, SharedLayout, VaultDocument,
 };
 
 /// Current on-disk layout. Format 5 stores version objects directly in the shared half and
@@ -595,6 +595,111 @@ impl AgeDirStore {
             let _ = std::fs::remove_dir_all(&old_default);
         }
         Ok(())
+    }
+
+    /// Activate an already materialized and authenticated Vault while preserving the previous
+    /// shared half for rollback. This Store must have no local heads: merging a populated Store
+    /// into another Vault is a separate copy-and-verify transaction.
+    ///
+    /// The target is treated as untrusted even when its transport already authenticated the
+    /// documents. Before changing the durable pointer this method revalidates the Vault,
+    /// requires an identity matching this installation's private Device keys, and unwraps every
+    /// reachable generation. No fallible work remains after the pointer is replaced.
+    pub fn activate_shared_location(
+        &self,
+        target: &Path,
+        expected_vault_id: &str,
+    ) -> StoreResult<PathBuf> {
+        let _lock = self.lock_exclusive()?;
+        self.verify_security_state()?;
+        if !self.heads_ids()?.is_empty() {
+            return Err(StoreError::Invalid(
+                "cannot activate another Vault: this Store already holds secrets".to_string(),
+            ));
+        }
+
+        let target = std::fs::canonicalize(target)
+            .map_err(|source| StoreError::io(target, source))?;
+        let layout = SharedLayout::new(&target);
+        let vault = vault::read_vault(&layout)?;
+        if vault.vault_id != expected_vault_id {
+            return Err(StoreError::Invalid(format!(
+                "staged Vault {} does not match selected Vault {expected_vault_id}",
+                vault.vault_id
+            )));
+        }
+        self.verify_device_access(&layout, &vault)?;
+
+        let device = self.device();
+        ensure_private_directory(&layout.envelopes_dir(device.device_id()))?;
+        ensure_private_directory(&layout.device_operations_dir(device.device_id()))?;
+        ensure_private_directory(&layout.device_checkpoints_dir(device.device_id()))?;
+
+        let previous = self.shared_root();
+        if previous == target {
+            self.generations.reset();
+            return Ok(previous);
+        }
+        replace_or_create_regular_file(
+            &self.root.join(SHARED_LOCATION_FILE),
+            target.to_string_lossy().as_bytes(),
+        )?;
+
+        let mut state = self.state.write().expect("shared state poisoned");
+        state.layout = layout;
+        state.vault = vault;
+        self.generations.reset();
+        Ok(previous)
+    }
+
+    /// Reload lifecycle documents added to the active Vault. Immutable writers publish external
+    /// envelopes before generation documents, so a newly visible generation is complete. The
+    /// Store nevertheless revalidates the full chain and unwraps every generation before making
+    /// the refreshed cache observable.
+    pub fn refresh_shared_lifecycle(&self, expected_vault_id: &str) -> StoreResult<u32> {
+        let _lock = self.lock_exclusive()?;
+        self.verify_security_state()?;
+        let layout = self.shared_layout();
+        let vault = vault::read_vault(&layout)?;
+        if vault.vault_id != expected_vault_id {
+            return Err(StoreError::Invalid(format!(
+                "active Vault {} does not match selected Vault {expected_vault_id}",
+                vault.vault_id
+            )));
+        }
+        let generation = self.verify_device_access(&layout, &vault)?;
+        self.generations.reset();
+        self.generations.refresh(&layout, &vault)?;
+        self.state.write().expect("shared state poisoned").vault = vault;
+        Ok(generation)
+    }
+
+    fn verify_device_access(
+        &self,
+        layout: &SharedLayout,
+        vault: &VaultDocument,
+    ) -> StoreResult<u32> {
+        let device = self.device();
+        let identity = vault::read_device_identity(
+            &layout.device_identity(device.device_id()),
+            vault,
+        )?;
+        let local = device.enrollment();
+        if identity.signing_public_key != local.signing_public_key
+            || identity.wrapping_recipient != local.wrapping_recipient
+        {
+            return Err(StoreError::Key(format!(
+                "Vault Device {} does not match this installation's private keys",
+                device.device_id()
+            )));
+        }
+
+        let access = GenerationAccess::new();
+        let current = access.current(layout, vault)?;
+        for generation in 1..=current {
+            access.identity(layout, vault, &device, generation)?;
+        }
+        Ok(current)
     }
 
     /// Create version 1 at a caller-selected stable Secret id bound to a durable mutation.
@@ -1599,6 +1704,22 @@ fn read_shared_location(root: &Path) -> StoreResult<Option<PathBuf>> {
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(StoreError::io(&path, error)),
+    }
+}
+
+fn replace_or_create_regular_file(path: &Path, bytes: &[u8]) -> StoreResult<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Err(StoreError::Invalid(format!(
+                "replacement path {} is not a regular file",
+                path.display()
+            )))
+        }
+        Ok(_) => write_replace_atomic(path, bytes),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            write_new_atomic(path, bytes)
+        }
+        Err(source) => Err(StoreError::io(path, source)),
     }
 }
 

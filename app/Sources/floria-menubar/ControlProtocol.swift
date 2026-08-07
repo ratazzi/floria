@@ -1,6 +1,6 @@
 import Foundation
 
-let supportedControlProtocolVersion: UInt32 = 14
+let supportedControlProtocolVersion: UInt32 = 15
 
 struct ControlServerInfo: Decodable, Equatable, Sendable {
     let protocolVersion: UInt32?
@@ -1308,6 +1308,42 @@ struct SyncEnrollmentReview: Decodable, Equatable, Sendable {
     }
 }
 
+enum SyncVaultActivation: Decodable, Equatable, Sendable {
+    case ready(vaultID: String, keyGeneration: UInt32, restartRequired: Bool)
+    case mergeRequired(currentVaultID: String, targetVaultID: String, localItems: Int)
+
+    private enum CodingKeys: String, CodingKey {
+        case status
+        case vaultID = "vault_id"
+        case keyGeneration = "key_generation"
+        case restartRequired = "restart_required"
+        case currentVaultID = "current_vault_id"
+        case targetVaultID = "target_vault_id"
+        case localItems = "local_items"
+    }
+
+    private enum Status: String, Decodable {
+        case ready
+        case mergeRequired = "merge_required"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(Status.self, forKey: .status) {
+        case .ready:
+            self = .ready(
+                vaultID: try container.decode(String.self, forKey: .vaultID),
+                keyGeneration: try container.decode(UInt32.self, forKey: .keyGeneration),
+                restartRequired: try container.decode(Bool.self, forKey: .restartRequired))
+        case .mergeRequired:
+            self = .mergeRequired(
+                currentVaultID: try container.decode(String.self, forKey: .currentVaultID),
+                targetVaultID: try container.decode(String.self, forKey: .targetVaultID),
+                localItems: try container.decode(Int.self, forKey: .localItems))
+        }
+    }
+}
+
 enum ControlCommand: Sendable {
     case ping
     case health
@@ -1340,6 +1376,7 @@ enum ControlCommand: Sendable {
     case recordSyncReviewVaultEnrollments(bootstrap: SyncVaultBootstrap)
     case recordSyncApproveVaultEnrollment(
         bootstrap: SyncVaultBootstrap, deviceID: String, expectedFingerprint: String)
+    case recordSyncActivateVault(bootstrap: SyncVaultBootstrap)
     case recordSyncNextOutbound(limit: Int)
     case recordSyncSettleOutbound(outcomes: [SyncDeliveryOutcome])
     case recordSyncApplyInbound(batch: SyncInboundBatch, observedAt: String)
@@ -1434,6 +1471,7 @@ enum ControlCommand: Sendable {
         case .recordSyncPrepareVaultEnrollment: "record_sync_prepare_vault_enrollment"
         case .recordSyncReviewVaultEnrollments: "record_sync_review_vault_enrollments"
         case .recordSyncApproveVaultEnrollment: "record_sync_approve_vault_enrollment"
+        case .recordSyncActivateVault: "record_sync_activate_vault"
         case .recordSyncNextOutbound: "record_sync_next_outbound"
         case .recordSyncSettleOutbound: "record_sync_settle_outbound"
         case .recordSyncApplyInbound: "record_sync_apply_inbound"
@@ -1575,6 +1613,11 @@ enum ControlCommand: Sendable {
                     params: RecordSyncApproveVaultEnrollmentParams(
                         bootstrap: bootstrap, deviceID: deviceID,
                         expectedFingerprint: expectedFingerprint)))
+        case .recordSyncActivateVault(let bootstrap):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: RecordSyncActivateVaultParams(bootstrap: bootstrap)))
         case .recordSyncNextOutbound(let limit):
             return try encoder.encode(
                 ControlRequest(
@@ -1817,6 +1860,9 @@ private struct RecordSyncApproveVaultEnrollmentParams: Encodable {
     let bootstrap: SyncVaultBootstrap
     let deviceID: String
     let expectedFingerprint: String
+}
+private struct RecordSyncActivateVaultParams: Encodable {
+    let bootstrap: SyncVaultBootstrap
 }
 private struct RecordSyncSettleOutboundParams: Encodable {
     let outcomes: [SyncDeliveryOutcome]

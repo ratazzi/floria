@@ -19,7 +19,7 @@ use crate::record::{EntityRevision, ImmutableObjectRef, RevisionCommit, RECORD_F
 use crate::record_crypto::RecordCryptor;
 use crate::record_journal::{OutboundCommit, RecordJournal};
 use crate::sync_bootstrap::{
-    SyncEnrollmentPreparation, SyncEnrollmentReview, SyncVaultBootstrap,
+    SyncEnrollmentPreparation, SyncEnrollmentReview, SyncVaultActivation, SyncVaultBootstrap,
 };
 use crate::{ReplicationError, ReplicationResult};
 
@@ -470,6 +470,16 @@ impl<'a> RecordSyncControl<'a> {
             device_id,
             expected_fingerprint,
         )
+    }
+
+    /// Explicitly activate a downloaded, approved Vault. The caller supplies the complete count
+    /// of local shared entities so a non-empty different Vault is routed to copy-and-verify.
+    pub fn activate_vault_bootstrap(
+        &self,
+        bootstrap: SyncVaultBootstrap,
+        local_items: usize,
+    ) -> ReplicationResult<SyncVaultActivation> {
+        bootstrap.activate(std::sync::Arc::clone(&self.store), local_items)
     }
 
     /// Return oldest durable publications without changing retry state.

@@ -29,6 +29,14 @@ protocol VaultEnrollmentControlling: Sendable {
 
 extension ControlClient: VaultEnrollmentControlling {}
 
+protocol VaultActivationControlling: Sendable {
+    func activateRecordSyncVault(
+        bootstrap: SyncVaultBootstrap
+    ) async throws -> SyncVaultActivation
+}
+
+extension ControlClient: VaultActivationControlling {}
+
 /// Accumulates one CloudKit lifecycle fetch without letting partial security state enter Rust's
 /// entity pipeline. Only a complete candidate accepted by Rust becomes the next checkpoint.
 actor CloudVaultBootstrapCoordinator {

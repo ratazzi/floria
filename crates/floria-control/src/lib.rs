@@ -18,7 +18,7 @@ pub use protocol::{
     RecoveryKeyReport, ReplicationDevice, ReplicationEnrollment, ReplicationMode,
     ReplicationPendingEnrollment, ReplicationStatus, SecretValue,
     SyncBootstrapDocument, SyncBootstrapEnvelope, SyncEnrollmentPreparation,
-    SyncEnrollmentReview,
+    SyncEnrollmentReview, SyncVaultActivation,
     SyncDeliveryDisposition, SyncDeliveryOutcome, SyncDomainStatus, SyncInboundBatch,
     SyncInboundManifest, SyncInboundObject, SyncInboundReport, SyncInboundRevision,
     SyncObjectAsset, SyncOutboundBatch, SyncOutboundCommit, SyncOutboundRevision,

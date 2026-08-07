@@ -39,6 +39,13 @@ impl GenerationAccess {
         self.cache.lock().expect("generation cache poisoned").identities.clear();
     }
 
+    /// Forget every document and unwrapped identity after the Store changes its shared root.
+    /// Generation numbers are only meaningful inside one Vault, so retaining either cache
+    /// across a Vault switch could return another Vault's generation key.
+    pub(crate) fn reset(&self) {
+        *self.cache.lock().expect("generation cache poisoned") = GenerationCache::default();
+    }
+
     /// Reload the signed generation chain from the shared half.
     pub(crate) fn refresh(
         &self,
@@ -180,6 +187,18 @@ impl GenerationAccess {
         let identity = x25519::Identity::from_str(text.trim()).map_err(|error| {
             StoreError::Key(format!("parse generation {generation} identity: {error}"))
         })?;
+        let expected_public = document
+            .as_ref()
+            .ok_or_else(|| {
+                StoreError::Key(format!("missing signed key generation {generation}"))
+            })?
+            .generation_public
+            .trim();
+        if identity.to_public().to_string() != expected_public {
+            return Err(StoreError::Key(format!(
+                "generation {generation} envelope does not match its signed public key"
+            )));
+        }
         self.cache
             .lock()
             .expect("generation cache poisoned")

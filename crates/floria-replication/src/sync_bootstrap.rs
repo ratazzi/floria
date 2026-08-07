@@ -8,7 +8,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
+use std::str::FromStr;
 
+use age::x25519;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine;
 use floria_store::vault::{
@@ -93,6 +95,22 @@ pub struct SyncEnrollmentReview {
     fingerprint: String,
 }
 
+/// Result of explicitly activating an authenticated, enrolled Vault candidate.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SyncVaultActivation {
+    Ready {
+        vault_id: String,
+        key_generation: u32,
+        restart_required: bool,
+    },
+    MergeRequired {
+        current_vault_id: String,
+        target_vault_id: String,
+        local_items: usize,
+    },
+}
+
 impl SyncEnrollmentReview {
     pub fn device_id(&self) -> &str {
         &self.device_id
@@ -133,6 +151,7 @@ struct ValidatedBootstrap {
     vault: vault::VaultDocument,
     identities: BTreeMap<String, DeviceDocument>,
     requests: BTreeMap<String, EnrollmentRequestDocument>,
+    generations: BTreeMap<u32, KeyGenerationDocument>,
 }
 
 impl SyncVaultBootstrap {
@@ -336,6 +355,7 @@ impl SyncVaultBootstrap {
             vault,
             identities,
             requests,
+            generations,
         })
     }
 
@@ -451,6 +471,194 @@ impl SyncVaultBootstrap {
         package.enroll_device(request.enrollment())?;
         SyncVaultBootstrap::capture(&store)
     }
+
+    /// Materialize and activate this authenticated lifecycle snapshot for the local Device.
+    /// Swift/CloudKit remains an opaque transport; Rust owns every validation and the durable
+    /// Store switch. A populated different Vault is reported for copy-and-verify instead.
+    pub fn activate(
+        &self,
+        store: std::sync::Arc<AgeDirStore>,
+        local_items: usize,
+    ) -> ReplicationResult<SyncVaultActivation> {
+        let validated = self.validated(&self.vault_id)?;
+        let current_vault_id = store.vault_document().vault_id;
+        if current_vault_id != validated.vault.vault_id && local_items > 0 {
+            return Ok(SyncVaultActivation::MergeRequired {
+                current_vault_id,
+                target_vault_id: validated.vault.vault_id,
+                local_items,
+            });
+        }
+
+        let device = store.device();
+        verify_local_device_access(self, &validated, &device)?;
+        let key_generation = *validated.generations.keys().next_back().ok_or_else(|| {
+            ReplicationError::Invalid("Vault bootstrap has no key generation".to_string())
+        })?;
+        let switching_vault = current_vault_id != validated.vault.vault_id;
+        let target = if switching_vault {
+            store
+                .root()
+                .join("cloudkit-vaults")
+                .join(&validated.vault.vault_id)
+                .join("shared")
+        } else {
+            store.shared_root()
+        };
+        materialize_lifecycle(self, &target)?;
+
+        if switching_vault {
+            store.activate_shared_location(&target, &validated.vault.vault_id)?;
+        } else {
+            store.refresh_shared_lifecycle(&validated.vault.vault_id)?;
+        }
+        Ok(SyncVaultActivation::Ready {
+            vault_id: validated.vault.vault_id,
+            key_generation,
+            restart_required: switching_vault,
+        })
+    }
+}
+
+fn verify_local_device_access(
+    bootstrap: &SyncVaultBootstrap,
+    validated: &ValidatedBootstrap,
+    device: &DeviceKeyMaterial,
+) -> ReplicationResult<()> {
+    let identity = validated.identities.get(device.device_id()).ok_or_else(|| {
+        ReplicationError::Invalid(format!(
+            "Device {} has not been approved for Vault {}",
+            device.device_id(), validated.vault.vault_id
+        ))
+    })?;
+    let local = device.enrollment();
+    if identity.signing_public_key != local.signing_public_key
+        || identity.wrapping_recipient != local.wrapping_recipient
+    {
+        return Err(ReplicationError::Invalid(format!(
+            "approved Device {} does not match this installation's private keys",
+            device.device_id()
+        )));
+    }
+
+    let external = bootstrap
+        .generation_envelopes
+        .iter()
+        .filter(|envelope| envelope.device_id == device.device_id())
+        .map(|envelope| ((envelope.device_id.as_str(), envelope.generation), envelope))
+        .collect::<BTreeMap<_, _>>();
+    for (generation, document) in &validated.generations {
+        let ciphertext = match document.envelopes.get(device.device_id()) {
+            Some(encoded) => vault::decode("Vault key envelope", encoded)?,
+            None => {
+                let envelope = external
+                    .get(&(device.device_id(), *generation))
+                    .ok_or_else(|| {
+                        ReplicationError::Invalid(format!(
+                            "Device {} has no envelope for key generation {generation}",
+                            device.device_id()
+                        ))
+                    })?;
+                decode_bounded(
+                    &envelope.ciphertext_base64,
+                    "generation envelope",
+                    MAX_DESCRIPTOR_BYTES as usize,
+                )?
+            }
+        };
+        let plaintext = vault::decrypt_with_identity(device.wrapping_identity(), &ciphertext)?;
+        let text = std::str::from_utf8(&plaintext).map_err(|_| {
+            ReplicationError::Invalid(format!(
+                "generation {generation} envelope is not text"
+            ))
+        })?;
+        let generation_identity = x25519::Identity::from_str(text.trim()).map_err(|error| {
+            ReplicationError::Invalid(format!(
+                "parse generation {generation} identity: {error}"
+            ))
+        })?;
+        if generation_identity.to_public().to_string() != document.generation_public {
+            return Err(ReplicationError::Invalid(format!(
+                "generation {generation} envelope does not match its signed public key"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn materialize_lifecycle(
+    bootstrap: &SyncVaultBootstrap,
+    target: &std::path::Path,
+) -> ReplicationResult<()> {
+    let layout = vault::SharedLayout::new(target);
+    vault::ensure_private_directory(layout.root())?;
+    vault::ensure_private_directory(&layout.objects_dir())?;
+    vault::ensure_private_directory(&layout.devices_dir())?;
+    vault::ensure_private_directory(&layout.generations_dir())?;
+    vault::ensure_private_directory(&layout.operations_dir())?;
+    vault::ensure_private_directory(&layout.checkpoints_dir())?;
+
+    vault::publish_immutable(
+        &layout.vault_json(),
+        &decode_bounded(
+            &bootstrap.vault_document_base64,
+            "Vault bootstrap document",
+            MAX_DESCRIPTOR_BYTES as usize,
+        )?,
+    )?;
+    for routed in &bootstrap.device_identities {
+        vault::ensure_private_directory(&layout.device_dir(&routed.route))?;
+        vault::publish_immutable(
+            &layout.device_identity(&routed.route),
+            &decode_bounded(
+                &routed.document_base64,
+                "Device identity",
+                MAX_DESCRIPTOR_BYTES as usize,
+            )?,
+        )?;
+    }
+    for routed in &bootstrap.enrollment_requests {
+        vault::ensure_private_directory(&layout.device_dir(&routed.route))?;
+        vault::publish_immutable(
+            &layout.enrollment_request(&routed.route),
+            &decode_bounded(
+                &routed.document_base64,
+                "enrollment request",
+                MAX_DESCRIPTOR_BYTES as usize,
+            )?,
+        )?;
+    }
+
+    // External envelopes must be visible before their generation document. A concurrent reader
+    // therefore observes either the old complete chain or the new complete chain.
+    for envelope in &bootstrap.generation_envelopes {
+        vault::ensure_private_directory(&layout.envelopes_dir(&envelope.device_id))?;
+        vault::publish_immutable(
+            &layout.envelope(&envelope.device_id, envelope.generation),
+            &decode_bounded(
+                &envelope.ciphertext_base64,
+                "generation envelope",
+                MAX_DESCRIPTOR_BYTES as usize,
+            )?,
+        )?;
+    }
+    for routed in &bootstrap.key_generations {
+        let generation = routed.route.parse::<u32>().map_err(|_| {
+            ReplicationError::Invalid(format!(
+                "key generation route {} is not an integer",
+                routed.route
+            ))
+        })?;
+        vault::publish_immutable(
+            &layout.generation_document(generation),
+            &decode_bounded(
+                &routed.document_base64,
+                "key generation",
+                MAX_DESCRIPTOR_BYTES as usize,
+            )?,
+        )?;
+    }
+    Ok(())
 }
 
 fn enrollment_request_transport(
@@ -597,8 +805,9 @@ fn replication_io(path: impl Into<std::path::PathBuf>, source: io::Error) -> Rep
 mod tests {
     use std::sync::Arc;
 
+    use age::secrecy::ExposeSecret;
     use age::x25519;
-    use floria_store::{KeyProvider, StoreResult};
+    use floria_store::{KeyProvider, NewSecret, SecretStore, StoreResult};
 
     use super::*;
 
@@ -622,6 +831,34 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    fn approved_bootstrap(
+        genesis: &Arc<AgeDirStore>,
+        joining: &Arc<AgeDirStore>,
+    ) -> SyncVaultBootstrap {
+        let mut bootstrap = SyncVaultBootstrap::capture(genesis).unwrap();
+        let SyncEnrollmentPreparation::Request(request) = bootstrap
+            .prepare_enrollment(
+                &joining.device(),
+                Some("Joining Mac".to_string()),
+                "2026-08-08T00:00:00Z",
+            )
+            .unwrap()
+        else {
+            panic!("joining Device unexpectedly enrolled")
+        };
+        bootstrap.enrollment_requests.push(SyncBootstrapDocument {
+            route: request.device_id.clone(),
+            document_base64: request.document_base64.clone(),
+        });
+        bootstrap
+            .approve_enrollment(
+                Arc::clone(genesis),
+                joining.device().device_id(),
+                request.fingerprint(),
+            )
+            .unwrap()
     }
 
     #[test]
@@ -808,5 +1045,136 @@ mod tests {
             )
             .unwrap();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn activates_an_approved_vault_and_preserves_the_previous_shared_half() {
+        let directory = tempfile::tempdir().unwrap();
+        let genesis = Arc::new(
+            AgeDirStore::open(
+                directory.path().join("genesis"),
+                Arc::new(LocalKeys(x25519::Identity::generate())),
+            )
+            .unwrap(),
+        );
+        let joining = Arc::new(
+            AgeDirStore::open(
+                directory.path().join("joining"),
+                Arc::new(LocalKeys(x25519::Identity::generate())),
+            )
+            .unwrap(),
+        );
+        let previous_shared = joining.shared_root();
+        let previous_vault_id = joining.vault_document().vault_id;
+        let approved = approved_bootstrap(&genesis, &joining);
+
+        let result = approved.activate(Arc::clone(&joining), 0).unwrap();
+
+        assert_eq!(
+            result,
+            SyncVaultActivation::Ready {
+                vault_id: genesis.vault_document().vault_id.clone(),
+                key_generation: 1,
+                restart_required: true,
+            }
+        );
+        assert_eq!(joining.vault_document().vault_id, genesis.vault_document().vault_id);
+        assert_ne!(joining.shared_root(), previous_shared);
+        assert_eq!(
+            vault::read_vault(&vault::SharedLayout::new(&previous_shared))
+                .unwrap()
+                .vault_id,
+            previous_vault_id,
+            "activation must retain the previous Vault as rollback evidence"
+        );
+        assert_eq!(
+            joining.generation_identity(1).unwrap().to_public().to_string(),
+            genesis.generation_identity(1).unwrap().to_public().to_string()
+        );
+
+        assert_eq!(
+            approved.activate(Arc::clone(&joining), 0).unwrap(),
+            SyncVaultActivation::Ready {
+                vault_id: genesis.vault_document().vault_id,
+                key_generation: 1,
+                restart_required: false,
+            }
+        );
+    }
+
+    #[test]
+    fn populated_different_vault_requires_merge_without_changing_the_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let genesis = Arc::new(
+            AgeDirStore::open(
+                directory.path().join("genesis"),
+                Arc::new(LocalKeys(x25519::Identity::generate())),
+            )
+            .unwrap(),
+        );
+        let joining = Arc::new(
+            AgeDirStore::open(
+                directory.path().join("joining"),
+                Arc::new(LocalKeys(x25519::Identity::generate())),
+            )
+            .unwrap(),
+        );
+        joining
+            .put(NewSecret::managed("Local item"), b"fixture payload")
+            .unwrap();
+        let current_vault_id = joining.vault_document().vault_id;
+        let current_shared = joining.shared_root();
+        let approved = approved_bootstrap(&genesis, &joining);
+
+        assert_eq!(
+            approved.activate(Arc::clone(&joining), 1).unwrap(),
+            SyncVaultActivation::MergeRequired {
+                current_vault_id: current_vault_id.clone(),
+                target_vault_id: genesis.vault_document().vault_id,
+                local_items: 1,
+            }
+        );
+        assert_eq!(joining.vault_document().vault_id, current_vault_id);
+        assert_eq!(joining.shared_root(), current_shared);
+        assert!(!joining.root().join("cloudkit-vaults").exists());
+    }
+
+    #[test]
+    fn rejects_an_envelope_that_does_not_match_the_signed_generation_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let genesis = Arc::new(
+            AgeDirStore::open(
+                directory.path().join("genesis"),
+                Arc::new(LocalKeys(x25519::Identity::generate())),
+            )
+            .unwrap(),
+        );
+        let joining = Arc::new(
+            AgeDirStore::open(
+                directory.path().join("joining"),
+                Arc::new(LocalKeys(x25519::Identity::generate())),
+            )
+            .unwrap(),
+        );
+        let mut approved = approved_bootstrap(&genesis, &joining);
+        let wrong = x25519::Identity::generate();
+        let ciphertext = vault::encrypt_to_recipient(
+            &joining.device().wrapping_identity().to_public(),
+            wrong.to_string().expose_secret().as_bytes(),
+        )
+        .unwrap();
+        let envelope = approved
+            .generation_envelopes
+            .iter_mut()
+            .find(|envelope| envelope.device_id == joining.device().device_id())
+            .unwrap();
+        envelope.ciphertext_base64 = BASE64.encode(ciphertext);
+
+        let error = approved.activate(Arc::clone(&joining), 0).unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("does not match its signed public key"));
+        assert_ne!(joining.vault_document().vault_id, genesis.vault_document().vault_id);
     }
 }

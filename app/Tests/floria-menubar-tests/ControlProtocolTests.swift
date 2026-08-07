@@ -15,7 +15,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertNil(request["params"])
 
         let response = Data(
-            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":14,"daemon_version":"0.1.0","schema_version":14,"minimum_schema_version":14,"store_format_version":5,"minimum_store_format_version":5}}}"#.utf8)
+            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":15,"daemon_version":"0.1.0","schema_version":14,"minimum_schema_version":14,"store_format_version":5,"minimum_store_format_version":5}}}"#.utf8)
         let decoded = try JSONDecoder().decode(
             ControlResponseEnvelope<ControlServerInfo>.self, from: response)
         let info = try XCTUnwrap(decoded.result?.value)
@@ -203,6 +203,18 @@ final class ControlProtocolTests: XCTestCase {
             approvalParams["expected_fingerprint"] as? String,
             "sha256:fixture")
 
+        let activationData = try ControlCommand.recordSyncActivateVault(bootstrap: candidate)
+            .requestData(requestID: 77, encoder: encoder)
+        let activationRequest = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: activationData) as? [String: Any])
+        XCTAssertEqual(
+            activationRequest["method"] as? String,
+            "record_sync_activate_vault")
+        XCTAssertEqual(
+            ((activationRequest["params"] as? [String: Any])?["bootstrap"]
+                as? [String: Any])?["vault_id"] as? String,
+            candidate.vaultID)
+
         let outboundData = try ControlCommand.recordSyncNextOutbound(limit: 12)
             .requestData(requestID: 70, encoder: encoder)
         let outboundRequest = try XCTUnwrap(
@@ -278,6 +290,17 @@ final class ControlProtocolTests: XCTestCase {
             from: reviewsResponse)
         XCTAssertEqual(decodedReviews.result?.value?.first?.deviceName, "Studio")
         XCTAssertEqual(decodedReviews.result?.value?.first?.fingerprint, "sha256:fixture")
+
+        let activationResponse = Data(
+            #"{"request_id":77,"status":"ok","result":{"type":"record_sync_vault_activation","value":{"status":"ready","vault_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","key_generation":2,"restart_required":true}}}"#.utf8)
+        let decodedActivation = try JSONDecoder().decode(
+            ControlResponseEnvelope<SyncVaultActivation>.self,
+            from: activationResponse)
+        XCTAssertEqual(
+            decodedActivation.result?.value,
+            .ready(
+                vaultID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                keyGeneration: 2, restartRequired: true))
 
         let response = Data(
             #"{"request_id":70,"status":"ok","result":{"type":"record_sync_outbound","value":{"commits":[{"commit_id":"commit-1","manifest_base64":"bWFuaWZlc3Q=","revisions":[{"entity_id":"entity-1","revision_id":"revision-1","expected_head_revision_id":null,"envelope_base64":"cmV2aXNpb24="}],"created_at":"2026-08-07T12:00:00Z"}],"objects":[{"digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ciphertext_size":9,"file":"/tmp/floria-sync-object"}]}}}"#.utf8)

@@ -279,6 +279,19 @@ final class ControlClient: @unchecked Sendable {
         return approved
     }
 
+    func activateRecordSyncVault(
+        bootstrap: SyncVaultBootstrap
+    ) async throws -> SyncVaultActivation {
+        guard let activation: SyncVaultActivation = try await request(
+            .recordSyncActivateVault(bootstrap: bootstrap),
+            expecting: "record_sync_vault_activation",
+            as: SyncVaultActivation.self)
+        else {
+            throw ControlClientError.missingResult("record_sync_vault_activation")
+        }
+        return activation
+    }
+
     func nextRecordSyncOutbound(limit: Int) async throws -> SyncOutboundBatch {
         guard let batch: SyncOutboundBatch = try await request(
             .recordSyncNextOutbound(limit: limit), expecting: "record_sync_outbound",
