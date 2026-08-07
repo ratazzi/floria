@@ -95,6 +95,60 @@ final class CloudVaultBootstrapCoordinatorTests: XCTestCase {
         XCTAssertEqual(captureCount, 1)
     }
 
+    func testRemoteNewerGenerationRequiresActivationBeforeEntityImport() async throws {
+        let local = fixtureBootstrap()
+        let remote = SyncVaultBootstrap(
+            vaultID: local.vaultID,
+            vaultDocumentBase64: local.vaultDocumentBase64,
+            deviceIdentities: local.deviceIdentities,
+            enrollmentRequests: local.enrollmentRequests,
+            keyGenerations: local.keyGenerations + [
+                SyncBootstrapDocument(
+                    route: "2", documentBase64: encoded("signed generation 2"))
+            ],
+            generationEnvelopes: local.generationEnvelopes)
+        let control = VaultBootstrapControlStub(bootstrap: local)
+        let coordinator = try CloudVaultBootstrapCoordinator(
+            control: control, vaultID: vaultID)
+
+        do {
+            try await coordinator.ensureReadableByLocalStore(remote)
+            XCTFail("Expected a newer remote key generation to require activation")
+        } catch let error as CloudVaultBootstrapCoordinatorError {
+            XCTAssertEqual(
+                error,
+                .newerGenerationRequiresActivation(local: 1, remote: 2))
+        }
+    }
+
+    func testRemoteLifecycleMustShareTheLocalImmutableHistory() async throws {
+        let local = fixtureBootstrap()
+        let remote = SyncVaultBootstrap(
+            vaultID: local.vaultID,
+            vaultDocumentBase64: local.vaultDocumentBase64,
+            deviceIdentities: local.deviceIdentities,
+            enrollmentRequests: local.enrollmentRequests,
+            keyGenerations: [
+                SyncBootstrapDocument(
+                    route: "1", documentBase64: encoded("different generation 1"))
+            ],
+            generationEnvelopes: local.generationEnvelopes)
+        let control = VaultBootstrapControlStub(bootstrap: local)
+        let coordinator = try CloudVaultBootstrapCoordinator(
+            control: control, vaultID: vaultID)
+        let codec = try CloudVaultBootstrapCodec(vaultID: vaultID)
+        let generationID = try XCTUnwrap(try codec.records(for: local).first {
+            $0.recordType == CloudVaultBootstrapCodec.RecordType.generation
+        }).recordID
+
+        do {
+            try await coordinator.ensureReadableByLocalStore(remote)
+            XCTFail("Expected divergent immutable lifecycle history")
+        } catch let error as CloudVaultBootstrapCoordinatorError {
+            XCTAssertEqual(error, .lifecycleRecordChanged(generationID.recordName))
+        }
+    }
+
     private func fixtureBootstrap() -> SyncVaultBootstrap {
         SyncVaultBootstrap(
             vaultID: vaultID,

@@ -108,6 +108,34 @@ actor CloudVaultBootstrapCoordinator {
         acceptedBootstrap
     }
 
+    /// Authentication proves that a remote lifecycle snapshot is internally valid. It does not
+    /// prove that the current Store has the key generation needed to decrypt records published by
+    /// that snapshot. Shared deterministic records must also agree byte-for-byte with local state.
+    func ensureReadableByLocalStore(_ remote: SyncVaultBootstrap) async throws {
+        let local = try await control.recordSyncVaultBootstrap()
+        let localRecords = Dictionary(
+            uniqueKeysWithValues: try codec.records(for: local).map { ($0.recordID, $0) })
+        let remoteRecords = Dictionary(
+            uniqueKeysWithValues: try codec.records(for: remote).map { ($0.recordID, $0) })
+
+        for recordID in Set(localRecords.keys).intersection(remoteRecords.keys) {
+            guard let localRecord = localRecords[recordID],
+                  let remoteRecord = remoteRecords[recordID],
+                  try codec.equivalent(localRecord, remoteRecord)
+            else {
+                throw CloudVaultBootstrapCoordinatorError.lifecycleRecordChanged(
+                    recordID.recordName)
+            }
+        }
+
+        let localGeneration = latestGeneration(in: local)
+        let remoteGeneration = latestGeneration(in: remote)
+        guard remoteGeneration <= localGeneration else {
+            throw CloudVaultBootstrapCoordinatorError.newerGenerationRequiresActivation(
+                local: localGeneration, remote: remoteGeneration)
+        }
+    }
+
     func resetTransportCache() {
         acceptedBootstrap = nil
         fetchedRecords.removeAll()
@@ -119,6 +147,10 @@ actor CloudVaultBootstrapCoordinator {
         try await control.validateRecordSyncVaultBootstrap(
             bootstrap, expectedVaultID: codec.recordCodec.vaultID)
     }
+
+    private func latestGeneration(in bootstrap: SyncVaultBootstrap) -> UInt32 {
+        bootstrap.keyGenerations.compactMap { UInt32($0.route) }.max() ?? 0
+    }
 }
 
 struct CloudVaultFetchPartition {
@@ -129,4 +161,5 @@ struct CloudVaultFetchPartition {
 enum CloudVaultBootstrapCoordinatorError: Error, Equatable {
     case lifecycleRecordDeleted(String)
     case lifecycleRecordChanged(String)
+    case newerGenerationRequiresActivation(local: UInt32, remote: UInt32)
 }
