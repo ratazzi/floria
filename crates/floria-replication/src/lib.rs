@@ -6,6 +6,8 @@
 //! enrollment — on top of the store's documents. Nothing here copies a version byte: an operation
 //! only names the object the store already wrote.
 
+pub mod record;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
