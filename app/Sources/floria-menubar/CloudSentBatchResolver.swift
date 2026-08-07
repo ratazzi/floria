@@ -138,8 +138,12 @@ enum CloudSendPhase {
     }
 
     var atomicByZone: Bool {
-        if case .commit = self { return true }
-        return false
+        switch self {
+        case .bootstrap, .commit:
+            return true
+        case .objects:
+            return false
+        }
     }
 }
 

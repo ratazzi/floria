@@ -158,8 +158,19 @@ struct CloudVaultFetchPartition {
     let domainDeletedRecordIDs: [CKRecord.ID]
 }
 
-enum CloudVaultBootstrapCoordinatorError: Error, Equatable {
+enum CloudVaultBootstrapCoordinatorError: Error, Equatable, LocalizedError {
     case lifecycleRecordDeleted(String)
     case lifecycleRecordChanged(String)
     case newerGenerationRequiresActivation(local: UInt32, remote: UInt32)
+
+    var errorDescription: String? {
+        switch self {
+        case .lifecycleRecordDeleted(let name):
+            "CloudKit deleted immutable Vault lifecycle record \(name)"
+        case .lifecycleRecordChanged(let name):
+            "CloudKit changed immutable Vault lifecycle record \(name)"
+        case .newerGenerationRequiresActivation(let local, let remote):
+            "Vault key generation \(remote) must be activated before this Mac can read it (current generation: \(local))"
+        }
+    }
 }
