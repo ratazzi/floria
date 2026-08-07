@@ -379,6 +379,41 @@ impl RecordJournal {
         })
     }
 
+    /// Atomically retire complete inbound transaction barriers after their state is projected.
+    pub fn settle_inbound_batch(
+        &self,
+        commit_ids: &BTreeSet<String>,
+    ) -> ReplicationResult<usize> {
+        if commit_ids.is_empty() {
+            return Ok(0);
+        }
+        for commit_id in commit_ids {
+            require_uuid("inbound commit id", commit_id)?;
+        }
+        self.with_mutation(|tx| {
+            for commit_id in commit_ids {
+                let item = inbound_by_id(tx, commit_id)?.ok_or_else(|| {
+                    ReplicationError::Invalid(format!(
+                        "cannot settle inbound commit {commit_id} because it is not pending"
+                    ))
+                })?;
+                if !item.readiness().is_ready() {
+                    return Err(ReplicationError::Invalid(format!(
+                        "inbound commit {commit_id} is still missing revisions"
+                    )));
+                }
+            }
+            let mut settled = 0;
+            for commit_id in commit_ids {
+                settled += tx.execute(
+                    "DELETE FROM record_inbox WHERE commit_id = ?1",
+                    params![commit_id],
+                )?;
+            }
+            Ok(settled)
+        })
+    }
+
     pub fn outbound(&self) -> ReplicationResult<Vec<OutboundCommit>> {
         self.with_read(|_, snapshot| Ok(snapshot.outbound.clone()))
     }
@@ -395,6 +430,32 @@ impl RecordJournal {
                 .filter(|item| item.readiness().is_ready())
                 .cloned()
                 .collect())
+        })
+    }
+
+    /// Number of distinct transaction barriers that cannot yet participate in projection.
+    /// This includes revisions that arrived before their owning manifest.
+    pub fn pending_transactions(&self) -> ReplicationResult<usize> {
+        self.with_read(|_, snapshot| {
+            let known_commits = snapshot
+                .commits
+                .iter()
+                .map(|commit| commit.commit_id())
+                .collect::<BTreeSet<_>>();
+            let mut pending = snapshot
+                .revisions
+                .iter()
+                .filter(|revision| !known_commits.contains(revision.commit_id()))
+                .map(|revision| revision.commit_id().to_string())
+                .collect::<BTreeSet<_>>();
+            pending.extend(
+                snapshot
+                    .inbound
+                    .iter()
+                    .filter(|item| !item.readiness().is_ready())
+                    .map(|item| item.commit().commit_id().to_string()),
+            );
+            Ok(pending.len())
         })
     }
 
@@ -794,10 +855,9 @@ fn projection_records_from(
         .filter_map(|(entity_id, heads)| (heads.len() > 1).then_some(entity_id.clone()))
         .collect::<Vec<_>>();
     if !conflicts.is_empty() {
-        return Err(ReplicationError::Invalid(format!(
-            "local projection is blocked by conflicting entities: {}",
-            conflicts.join(", ")
-        )));
+        return Err(ReplicationError::ProjectionConflict {
+            entity_ids: conflicts,
+        });
     }
     let head_revision_ids = analysis
         .heads()

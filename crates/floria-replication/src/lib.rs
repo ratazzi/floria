@@ -90,6 +90,8 @@ pub enum ReplicationError {
     Store(#[from] floria_store::StoreError),
     #[error("replication record database failed: {0}")]
     Sqlite(#[from] rusqlite::Error),
+    #[error("local projection is blocked by conflicting entities: {entity_ids:?}")]
+    ProjectionConflict { entity_ids: Vec<String> },
 }
 
 pub type ReplicationResult<T> = Result<T, ReplicationError>;
