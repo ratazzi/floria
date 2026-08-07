@@ -40,13 +40,13 @@ extension ControlClient: VaultActivationControlling {}
 /// Accumulates one CloudKit lifecycle fetch without letting partial security state enter Rust's
 /// entity pipeline. Only a complete candidate accepted by Rust becomes the next checkpoint.
 actor CloudVaultBootstrapCoordinator {
-    private let control: any VaultBootstrapControlling
+    private let control: any VaultBootstrapControlling & VaultActivationControlling
     private let codec: CloudVaultBootstrapCodec
     private var acceptedBootstrap: SyncVaultBootstrap?
     private var fetchedRecords = [CKRecord.ID: CKRecord]()
 
     init(
-        control: any VaultBootstrapControlling,
+        control: any VaultBootstrapControlling & VaultActivationControlling,
         vaultID: String,
         restoredBootstrap: SyncVaultBootstrap? = nil
     ) throws {
@@ -156,9 +156,21 @@ actor CloudVaultBootstrapCoordinator {
 
         let localGeneration = latestGeneration(in: local)
         let remoteGeneration = latestGeneration(in: remote)
-        guard remoteGeneration <= localGeneration else {
-            throw CloudVaultBootstrapCoordinatorError.newerGenerationRequiresActivation(
-                local: localGeneration, remote: remoteGeneration)
+        guard remoteGeneration > localGeneration else { return }
+
+        switch try await control.activateRecordSyncVault(bootstrap: remote) {
+        case .ready(let vaultID, let keyGeneration, let restartRequired):
+            guard vaultID == remote.vaultID,
+                  keyGeneration >= remoteGeneration,
+                  !restartRequired
+            else {
+                throw CloudVaultBootstrapCoordinatorError.activationDidNotApply(
+                    vaultID: remote.vaultID, generation: remoteGeneration)
+            }
+
+        case .mergeRequired:
+            throw CloudVaultBootstrapCoordinatorError.activationDidNotApply(
+                vaultID: remote.vaultID, generation: remoteGeneration)
         }
     }
 
@@ -185,18 +197,18 @@ struct CloudVaultFetchPartition {
 }
 
 enum CloudVaultBootstrapCoordinatorError: Error, Equatable, LocalizedError {
+    case activationDidNotApply(vaultID: String, generation: UInt32)
     case lifecycleRecordDeleted(String)
     case lifecycleRecordChanged(String)
-    case newerGenerationRequiresActivation(local: UInt32, remote: UInt32)
 
     var errorDescription: String? {
         switch self {
+        case .activationDidNotApply(let vaultID, let generation):
+            "Vault \(vaultID) generation \(generation) could not be activated for import"
         case .lifecycleRecordDeleted(let name):
             "CloudKit deleted immutable Vault lifecycle record \(name)"
         case .lifecycleRecordChanged(let name):
             "CloudKit changed immutable Vault lifecycle record \(name)"
-        case .newerGenerationRequiresActivation(let local, let remote):
-            "Vault key generation \(remote) must be activated before this Mac can read it (current generation: \(local))"
         }
     }
 }

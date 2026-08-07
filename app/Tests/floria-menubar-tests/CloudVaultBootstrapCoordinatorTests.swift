@@ -95,7 +95,7 @@ final class CloudVaultBootstrapCoordinatorTests: XCTestCase {
         XCTAssertEqual(captureCount, 1)
     }
 
-    func testRemoteNewerGenerationRequiresActivationBeforeEntityImport() async throws {
+    func testRemoteNewerGenerationIsActivatedBeforeEntityImport() async throws {
         let local = fixtureBootstrap()
         let remote = SyncVaultBootstrap(
             vaultID: local.vaultID,
@@ -111,14 +111,9 @@ final class CloudVaultBootstrapCoordinatorTests: XCTestCase {
         let coordinator = try CloudVaultBootstrapCoordinator(
             control: control, vaultID: vaultID)
 
-        do {
-            try await coordinator.ensureReadableByLocalStore(remote)
-            XCTFail("Expected a newer remote key generation to require activation")
-        } catch let error as CloudVaultBootstrapCoordinatorError {
-            XCTAssertEqual(
-                error,
-                .newerGenerationRequiresActivation(local: 1, remote: 2))
-        }
+        try await coordinator.ensureReadableByLocalStore(remote)
+        let activated = await control.activatedCandidates
+        XCTAssertEqual(activated, [remote])
     }
 
     func testRemoteLifecycleMustShareTheLocalImmutableHistory() async throws {
@@ -183,10 +178,11 @@ final class CloudVaultBootstrapCoordinatorTests: XCTestCase {
     }
 }
 
-private actor VaultBootstrapControlStub: VaultBootstrapControlling {
-    private let bootstrap: SyncVaultBootstrap
+private actor VaultBootstrapControlStub: VaultBootstrapControlling, VaultActivationControlling {
+    private var bootstrap: SyncVaultBootstrap
     private(set) var captureCount = 0
     private(set) var validatedCandidates = [SyncVaultBootstrap]()
+    private(set) var activatedCandidates = [SyncVaultBootstrap]()
 
     init(bootstrap: SyncVaultBootstrap) {
         self.bootstrap = bootstrap
@@ -207,5 +203,16 @@ private actor VaultBootstrapControlStub: VaultBootstrapControlling {
         }
         validatedCandidates.append(candidate)
         return candidate
+    }
+
+    func activateRecordSyncVault(
+        bootstrap candidate: SyncVaultBootstrap
+    ) async throws -> SyncVaultActivation {
+        activatedCandidates.append(candidate)
+        bootstrap = candidate
+        return .ready(
+            vaultID: candidate.vaultID,
+            keyGeneration: candidate.keyGenerations.compactMap { UInt32($0.route) }.max() ?? 0,
+            restartRequired: false)
     }
 }

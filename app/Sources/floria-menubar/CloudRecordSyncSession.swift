@@ -189,7 +189,7 @@ final class CloudRecordSyncSession: NSObject, CKSyncEngineDelegate, @unchecked S
             await sessionState.record(error)
         } catch let error as CloudVaultBootstrapCoordinatorError {
             switch error {
-            case .newerGenerationRequiresActivation:
+            case .activationDidNotApply:
                 await sessionState.record(.activationRequired(error.localizedDescription))
             case .lifecycleRecordDeleted, .lifecycleRecordChanged:
                 await sessionState.record(.damaged(error.localizedDescription))

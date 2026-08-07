@@ -2,7 +2,7 @@ import CloudKit
 import Foundation
 
 protocol CloudSyncControlling: RecordSyncControlling, VaultBootstrapControlling,
-    VaultEnrollmentControlling
+    VaultEnrollmentControlling, VaultActivationControlling
 {
     func recordSyncStatus() async throws -> SyncDomainStatus
 }
@@ -40,7 +40,7 @@ struct CloudSyncPreferences: Sendable {
 }
 
 /// Explicit opt-in boundary for CloudKit. Constructing this service and reading its disabled
-/// state are local-only; the container factory is called solely from `syncNow()` after opt-in.
+/// state are local-only; CloudKit dependencies are created only by an explicit user operation.
 actor CloudSyncService {
     typealias SessionFactory = @Sendable (
         _ control: any CloudSyncControlling,
@@ -64,6 +64,7 @@ actor CloudSyncService {
     private var discovery: (any CloudVaultDiscovering)?
     private var lifecycleLoader: (any CloudVaultLifecycleLoading)?
     private var enrollmentPublisher: (any CloudVaultEnrollmentPublishing)?
+    private var pendingRestartVaultID: String?
 
     init(
         control: any CloudSyncControlling,
@@ -187,6 +188,31 @@ actor CloudSyncService {
             requestedAt: requestedAt ?? Self.timestamp())
     }
 
+    /// Activate one Rust-authenticated lifecycle snapshot. A different populated Vault is
+    /// prepared durably by the daemon and becomes active only after that daemon restarts.
+    @discardableResult
+    func activateVault(_ bootstrap: SyncVaultBootstrap) async throws -> SyncVaultActivation {
+        guard preferences.isEnabled else { throw CloudSyncServiceError.disabled }
+        let activation = try await control.activateRecordSyncVault(bootstrap: bootstrap)
+        switch activation {
+        case .ready(let vaultID, _, let restartRequired):
+            guard vaultID == bootstrap.vaultID else {
+                throw CloudSyncServiceError.unexpectedActivatedVault(
+                    expected: bootstrap.vaultID, actual: vaultID)
+            }
+            session = nil
+            sessionVaultID = nil
+            pendingRestartVaultID = restartRequired ? vaultID : nil
+            return activation
+
+        case .mergeRequired(let currentVaultID, let targetVaultID, let localItems):
+            throw CloudSyncServiceError.mergeRequired(
+                currentVaultID: currentVaultID,
+                targetVaultID: targetVaultID,
+                localItems: localItems)
+        }
+    }
+
     func localStatus() async throws -> SyncDomainStatus? {
         guard preferences.isEnabled else { return nil }
         return try await control.recordSyncStatus()
@@ -196,6 +222,12 @@ actor CloudSyncService {
     func syncNow() async throws -> SyncDomainStatus {
         guard preferences.isEnabled else { throw CloudSyncServiceError.disabled }
         let before = try await control.recordSyncStatus()
+        if let pendingRestartVaultID {
+            guard before.vaultID == pendingRestartVaultID else {
+                throw CloudSyncServiceError.restartRequired(vaultID: pendingRestartVaultID)
+            }
+            self.pendingRestartVaultID = nil
+        }
         let activeSession: any CloudSyncSessionRunning
         if let session, sessionVaultID == before.vaultID {
             activeSession = session
@@ -218,12 +250,21 @@ actor CloudSyncService {
 
 enum CloudSyncServiceError: Error, Equatable, LocalizedError {
     case disabled
+    case mergeRequired(currentVaultID: String, targetVaultID: String, localItems: Int)
+    case restartRequired(vaultID: String)
+    case unexpectedActivatedVault(expected: String, actual: String)
     case unconfiguredTestDependency
 
     var errorDescription: String? {
         switch self {
         case .disabled:
             "iCloud Sync is off. Enable it before using iCloud."
+        case .mergeRequired(let currentVaultID, let targetVaultID, let localItems):
+            "Could not prepare \(localItems) local items from Vault \(currentVaultID) for Vault \(targetVaultID)."
+        case .restartRequired(let vaultID):
+            "Restart the Floria daemon to finish activating Vault \(vaultID)."
+        case .unexpectedActivatedVault(let expected, let actual):
+            "Floria activated Vault \(actual) instead of authenticated Vault \(expected)."
         case .unconfiguredTestDependency:
             "Cloud sync test dependency is not configured."
         }

@@ -172,6 +172,61 @@ final class CloudSyncServiceTests: XCTestCase {
         XCTAssertEqual(request.deviceName, "Studio")
     }
 
+    func testDifferentVaultActivationBlocksSyncUntilDaemonReportsTheTargetVault() async throws {
+        let suiteName = "floria-cloud-sync-tests-\(UUID().uuidString)"
+        let preferences = CloudSyncPreferences(suiteName: suiteName)
+        preferences.setEnabled(true)
+        let targetVaultID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        let control = CloudSyncControlStub(
+            status: status(),
+            activation: .ready(
+                vaultID: targetVaultID, keyGeneration: 2, restartRequired: true))
+        let session = CloudSyncSessionStub()
+        let factory = CloudSyncFactoryProbe(session: session)
+        let service = CloudSyncService(
+            control: control,
+            supportDirectory: FileManager.default.temporaryDirectory,
+            preferences: preferences,
+            sessionFactory: { control, supportDirectory, vaultID in
+                try factory.make(
+                    control: control,
+                    supportDirectory: supportDirectory,
+                    vaultID: vaultID)
+            })
+        let bootstrap = SyncVaultBootstrap(
+            vaultID: targetVaultID,
+            vaultDocumentBase64: "dmF1bHQ=",
+            deviceIdentities: [], enrollmentRequests: [], keyGenerations: [],
+            generationEnvelopes: [])
+        defer { UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName) }
+
+        let activation = try await service.activateVault(bootstrap)
+        XCTAssertEqual(
+            activation,
+            .ready(vaultID: targetVaultID, keyGeneration: 2, restartRequired: true))
+
+        do {
+            _ = try await service.syncNow()
+            XCTFail("Expected sync to wait for daemon restart")
+        } catch let error as CloudSyncServiceError {
+            XCTAssertEqual(error, .restartRequired(vaultID: targetVaultID))
+        }
+        XCTAssertEqual(factory.count, 0)
+
+        await control.setStatus(
+            SyncDomainStatus(
+                vaultID: targetVaultID,
+                keyGeneration: 2,
+                outboundTransactions: 0,
+                inboundTransactions: 0,
+                pendingTransactions: 0,
+                conflictingEntities: 0,
+                projectionPending: false))
+        let status = try await service.syncNow()
+        XCTAssertEqual(status.vaultID, targetVaultID)
+        XCTAssertEqual(factory.vaultIDs, [targetVaultID])
+    }
+
     private func status() -> SyncDomainStatus {
         SyncDomainStatus(
             vaultID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -188,6 +243,7 @@ private final class CloudSyncFactoryProbe: @unchecked Sendable {
     private let lock = NSLock()
     private let session: any CloudSyncSessionRunning
     private var constructions = 0
+    private var constructedVaultIDs = [String]()
 
     init(session: any CloudSyncSessionRunning) {
         self.session = session
@@ -197,12 +253,19 @@ private final class CloudSyncFactoryProbe: @unchecked Sendable {
         lock.withLock { constructions }
     }
 
+    var vaultIDs: [String] {
+        lock.withLock { constructedVaultIDs }
+    }
+
     func make(
         control _: any CloudSyncControlling,
         supportDirectory _: URL,
-        vaultID _: String
+        vaultID: String
     ) throws -> any CloudSyncSessionRunning {
-        lock.withLock { constructions += 1 }
+        lock.withLock {
+            constructions += 1
+            constructedVaultIDs.append(vaultID)
+        }
         return session
     }
 }
@@ -216,10 +279,22 @@ private actor CloudSyncSessionStub: CloudSyncSessionRunning {
 }
 
 private actor CloudSyncControlStub: CloudSyncControlling {
-    private let status: SyncDomainStatus
+    private var status: SyncDomainStatus
+    private let activation: SyncVaultActivation
     private(set) var statusCount = 0
 
-    init(status: SyncDomainStatus) {
+    init(
+        status: SyncDomainStatus,
+        activation: SyncVaultActivation? = nil
+    ) {
+        self.status = status
+        self.activation = activation ?? .ready(
+            vaultID: status.vaultID,
+            keyGeneration: status.keyGeneration,
+            restartRequired: false)
+    }
+
+    func setStatus(_ status: SyncDomainStatus) {
         self.status = status
     }
 
@@ -265,6 +340,12 @@ private actor CloudSyncControlStub: CloudSyncControlling {
         expectedFingerprint _: String
     ) async throws -> SyncVaultBootstrap {
         bootstrap
+    }
+
+    func activateRecordSyncVault(
+        bootstrap _: SyncVaultBootstrap
+    ) async throws -> SyncVaultActivation {
+        activation
     }
 
     func nextRecordSyncOutbound(limit _: Int) async throws -> SyncOutboundBatch {
