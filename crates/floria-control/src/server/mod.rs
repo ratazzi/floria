@@ -44,6 +44,8 @@ use crate::protocol::{
     ManagedLinkStatus, ProjectCheckoutCandidate, ProjectCheckoutDiscovery,
     ProjectCheckoutInventory, ProtectedFile, ProtectedFileVersion, SecretValue, SshConfigStatus,
     RecoveryKeyReport, ReplicationEnrollment, ReplicationStatus, SshIdentity, WorkspaceSnapshot,
+    SyncDeliveryOutcome, SyncDomainStatus, SyncInboundBatch, SyncInboundReport, SyncOutboundBatch,
+    SyncSettlementReport,
 };
 
 pub struct ControlServer {
@@ -139,6 +141,26 @@ pub trait RuntimeReplicationService: Send + Sync + 'static {
     fn approve(&self, device_id: &str) -> Result<ReplicationStatus, String>;
 }
 
+/// Account-independent encrypted-record seam for a platform transport such as CloudKit.
+///
+/// Implementations own the authenticated record journal and all projection rules. The local
+/// control socket carries only opaque envelopes, verified ciphertext paths, and delivery results;
+/// Swift never receives Catalog or Store authority through this interface.
+pub trait RuntimeRecordSyncService: Send + Sync + 'static {
+    fn status(&self) -> Result<SyncDomainStatus, String>;
+    fn next_outbound(&self, limit: usize) -> Result<SyncOutboundBatch, String>;
+    fn settle_outbound(
+        &self,
+        outcomes: &[SyncDeliveryOutcome],
+    ) -> Result<SyncSettlementReport, String>;
+    fn apply_inbound(
+        &self,
+        catalog: &Catalog,
+        batch: SyncInboundBatch,
+        observed_at: &str,
+    ) -> Result<SyncInboundReport, String>;
+}
+
 pub struct ControlRuntimeServices {
     pub mutations: Arc<ManagedMutationCoordinator>,
     pub observer: Arc<dyn CatalogObserver>,
@@ -151,6 +173,7 @@ pub struct ControlRuntimeServices {
     pub health: Arc<dyn RuntimeHealthReporter>,
     pub diagnostics: Arc<dyn RuntimeDiagnosticsExporter>,
     pub replication: Arc<dyn RuntimeReplicationService>,
+    pub record_sync: Option<Arc<dyn RuntimeRecordSyncService>>,
     pub audit_log: Arc<AuditLog>,
     pub peer_verifier: Arc<dyn SocketPeerVerifier>,
 }
@@ -170,6 +193,7 @@ struct ControlDependencies {
     health: Option<Arc<dyn RuntimeHealthReporter>>,
     diagnostics: Option<Arc<dyn RuntimeDiagnosticsExporter>>,
     replication: Option<Arc<dyn RuntimeReplicationService>>,
+    record_sync: Option<Arc<dyn RuntimeRecordSyncService>>,
     audit_log: Option<Arc<AuditLog>>,
     discovery_jobs: Option<Arc<DiscoveryJobManager>>,
 }
@@ -267,6 +291,7 @@ impl ControlServer {
                 health: Some(services.health),
                 diagnostics: Some(services.diagnostics),
                 replication: Some(services.replication),
+                record_sync: services.record_sync,
                 audit_log: Some(services.audit_log),
                 discovery_jobs: None,
             },
@@ -401,6 +426,7 @@ fn handle_connection(
                 health: dependencies.health.as_deref(),
                 diagnostics: dependencies.diagnostics.as_deref(),
                 replication: dependencies.replication.as_deref(),
+                record_sync: dependencies.record_sync.as_deref(),
                 checkout_monitor: dependencies.checkout_monitor.as_deref(),
                 audit_log: dependencies.audit_log.as_deref(),
                 discovery_jobs: dependencies.discovery_jobs.as_deref(),
@@ -469,6 +495,8 @@ fn is_read_only(command: &ControlCommand) -> bool {
             | ControlCommand::RecoveryKeyExport { .. }
             | ControlCommand::ReplicationStatus
             | ControlCommand::ReplicationEnrollment
+            | ControlCommand::RecordSyncStatus
+            | ControlCommand::RecordSyncNextOutbound { .. }
             | ControlCommand::Snapshot
             | ControlCommand::Discover { .. }
             | ControlCommand::DiscoverStart { .. }
@@ -506,6 +534,7 @@ enum DispatchError {
     RecoveryKey(String),
     Diagnostics(String),
     Replication(String),
+    RecordSync(String),
     Validation(String),
     StoreUnavailable,
 }
@@ -529,6 +558,7 @@ struct DispatchServices<'a> {
     health: Option<&'a dyn RuntimeHealthReporter>,
     diagnostics: Option<&'a dyn RuntimeDiagnosticsExporter>,
     replication: Option<&'a dyn RuntimeReplicationService>,
+    record_sync: Option<&'a dyn RuntimeRecordSyncService>,
     checkout_monitor: Option<&'a GitCheckoutMonitor>,
     audit_log: Option<&'a AuditLog>,
     discovery_jobs: Option<&'a DiscoveryJobManager>,
@@ -581,6 +611,10 @@ impl DispatchError {
             },
             DispatchError::Replication(message) => ControlErrorBody {
                 code: "replication".to_string(),
+                message: message.clone(),
+            },
+            DispatchError::RecordSync(message) => ControlErrorBody {
+                code: "record_sync".to_string(),
                 message: message.clone(),
             },
             DispatchError::StoreUnavailable => ControlErrorBody {

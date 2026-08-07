@@ -1142,6 +1142,7 @@ fn cmd_mount(config: &Path) -> Result<()> {
             health,
             diagnostics,
             replication,
+            record_sync: None,
             audit_log: Arc::clone(&audit),
             peer_verifier: control_peer_verifier,
         },
@@ -2276,6 +2277,18 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
         }
         ControlResult::ReplicationEnrollment(enrollment) => {
             println!("{}", serde_json::to_string_pretty(&enrollment)?);
+        }
+        ControlResult::RecordSyncStatus(status) => {
+            println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        ControlResult::RecordSyncOutbound(batch) => {
+            println!("{}", serde_json::to_string_pretty(&batch)?);
+        }
+        ControlResult::RecordSyncSettlement(report) => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+        ControlResult::RecordSyncInbound(report) => {
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
         ControlResult::Snapshot(snapshot) => {
             println!("{}", serde_json::to_string_pretty(&snapshot)?);

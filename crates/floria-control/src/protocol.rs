@@ -8,13 +8,20 @@ use floria_catalog::{
 };
 use floria_core::authz::{Enforcement, PolicyEvaluation, PolicyMode, PolicyModeStatus};
 use floria_discover::DiscoveryPlan;
+pub use floria_replication::sync_control::{
+    SyncDeliveryDisposition, SyncDeliveryOutcome, SyncDomainStatus, SyncInboundBatch,
+    SyncInboundManifest, SyncInboundObject, SyncInboundReport, SyncInboundRevision,
+    SyncObjectAsset, SyncOutboundBatch, SyncOutboundCommit, SyncOutboundRevision,
+    SyncProjectionDisposition, SyncSettlementReport,
+};
 use floria_store::StoreError;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 const MAX_MSG: usize = 8 << 20;
-pub const CONTROL_PROTOCOL_VERSION: u32 = 10;
+pub(crate) const MAX_RECORD_SYNC_BATCH_BYTES: usize = 6 << 20;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 11;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRequest {
@@ -81,6 +88,10 @@ pub enum ControlCommand {
     /// Approve a pending enrollment request that arrived through the sync directory. The GUI
     /// must have shown the request's key fingerprint for out-of-band comparison first.
     ReplicationApprove { device_id: String },
+    RecordSyncStatus,
+    RecordSyncNextOutbound { limit: usize },
+    RecordSyncSettleOutbound { outcomes: Vec<SyncDeliveryOutcome> },
+    RecordSyncApplyInbound { batch: SyncInboundBatch, observed_at: String },
     Snapshot,
     Discover { paths: Vec<PathBuf> },
     DiscoverStart { paths: Vec<PathBuf> },
@@ -225,6 +236,10 @@ pub enum ControlResult {
     Diagnostics(DiagnosticsReport),
     ReplicationStatus(ReplicationStatus),
     ReplicationEnrollment(ReplicationEnrollment),
+    RecordSyncStatus(SyncDomainStatus),
+    RecordSyncOutbound(SyncOutboundBatch),
+    RecordSyncSettlement(SyncSettlementReport),
+    RecordSyncInbound(SyncInboundReport),
     Snapshot(WorkspaceSnapshot),
     Discovery(DiscoveryReviewPlan),
     DiscoveryJob(DiscoveryJobStatus),
@@ -777,6 +792,9 @@ impl From<&StoreError> for ControlErrorBody {
 
 pub(crate) fn write_msg<W: Write>(writer: &mut W, value: &impl Serialize) -> io::Result<()> {
     let body = Zeroizing::new(serde_json::to_vec(value)?);
+    if body.len() > MAX_MSG {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "control frame too large"));
+    }
     let len = u32::try_from(body.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "control message too large"))?;
     writer.write_all(&len.to_be_bytes())?;
@@ -1591,6 +1609,55 @@ mod tests {
         let wire = serde_json::to_string(&value).unwrap();
         assert_eq!(wire, "\"fixture-secret-value\"");
         assert_eq!(serde_json::from_str::<SecretValue>(&wire).unwrap(), value);
+    }
+
+    #[test]
+    fn coordinated_record_sync_wire_is_opaque_and_transport_neutral() {
+        let request = ControlRequest {
+            request_id: 42,
+            command: ControlCommand::RecordSyncApplyInbound {
+                batch: SyncInboundBatch::new(
+                    vec![SyncInboundManifest::new("commit-1", "bWFuaWZlc3Q=")],
+                    vec![SyncInboundRevision::new(
+                        "entity-1",
+                        "revision-1",
+                        "cmV2aXNpb24=",
+                    )],
+                    vec![SyncInboundObject::new(
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        9,
+                        PathBuf::from("/tmp/floria-sync-object"),
+                    )],
+                ),
+                observed_at: "2026-08-07T12:00:00Z".to_string(),
+            },
+        };
+        let value = serde_json::to_value(request).unwrap();
+
+        assert_eq!(value["method"], "record_sync_apply_inbound");
+        assert_eq!(value["params"]["batch"]["manifests"][0]["commit_id"], "commit-1");
+        assert_eq!(
+            value["params"]["batch"]["objects"][0]["file"],
+            "/tmp/floria-sync-object"
+        );
+        assert_eq!(value["params"]["observed_at"], "2026-08-07T12:00:00Z");
+        assert!(!value.to_string().contains("plaintext"));
+
+        let result = serde_json::to_value(ControlResult::RecordSyncOutbound(
+            SyncOutboundBatch::default(),
+        ))
+        .unwrap();
+        assert_eq!(result["type"], "record_sync_outbound");
+        assert_eq!(result["value"]["commits"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn writer_rejects_frames_that_the_reader_would_refuse() {
+        let mut wire = Vec::new();
+        let error = write_msg(&mut wire, &"x".repeat(MAX_MSG)).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(wire.is_empty());
     }
 
 }

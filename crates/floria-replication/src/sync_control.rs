@@ -218,11 +218,38 @@ impl SyncInboundBatch {
             objects,
         }
     }
+
+    pub fn manifests(&self) -> &[SyncInboundManifest] {
+        &self.manifests
+    }
+
+    pub fn revisions(&self) -> &[SyncInboundRevision] {
+        &self.revisions
+    }
+
+    pub fn objects(&self) -> &[SyncInboundObject] {
+        &self.objects
+    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+impl SyncInboundObject {
+    pub fn digest(&self) -> &str {
+        &self.digest
+    }
+
+    pub fn ciphertext_size(&self) -> u64 {
+        self.ciphertext_size
+    }
+
+    pub fn file(&self) -> &Path {
+        &self.file
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SyncProjectionDisposition {
+    #[default]
     Unchanged,
     Pending,
     Conflict,
@@ -230,7 +257,7 @@ pub enum SyncProjectionDisposition {
     AlreadyApplied,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncInboundReport {
     manifests_received: usize,
     revisions_received: usize,

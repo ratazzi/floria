@@ -17,12 +17,17 @@ pub use protocol::{
     ProjectCheckoutDiscovery, ProjectCheckoutInventory, ProtectedFile, ProtectedFileVersion,
     RecoveryKeyReport, ReplicationDevice, ReplicationEnrollment, ReplicationMode,
     ReplicationPendingEnrollment, ReplicationStatus, SecretValue,
+    SyncDeliveryDisposition, SyncDeliveryOutcome, SyncDomainStatus, SyncInboundBatch,
+    SyncInboundManifest, SyncInboundObject, SyncInboundReport, SyncInboundRevision,
+    SyncObjectAsset, SyncOutboundBatch, SyncOutboundCommit, SyncOutboundRevision,
+    SyncProjectionDisposition, SyncSettlementReport,
     SshConfigState, SshConfigStatus, SshIdentity,
     CONTROL_PROTOCOL_VERSION,
 };
 pub use server::{
     BackupService, CatalogObserver, ControlRuntimeServices, ControlServer,
     RecoveryKeyExporter, RuntimeDiagnosticsExporter, RuntimeHealthReporter,
-    RuntimePolicyController, RuntimeReplicationService, SshConfigManager, SshIdentityDiscovery,
+    RuntimePolicyController, RuntimeRecordSyncService, RuntimeReplicationService, SshConfigManager,
+    SshIdentityDiscovery,
 };
 pub use ssh_config::ManagedSshConfig;

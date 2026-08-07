@@ -9,6 +9,7 @@ floria-catalog = { workspace = true }
 floria-core = { workspace = true }
 floria-discover = { workspace = true }
 floria-platform = { workspace = true }
+floria-replication = { workspace = true }
 floria-store = { workspace = true }
 floria-surface = { workspace = true }
 floria-ssh = { workspace = true }

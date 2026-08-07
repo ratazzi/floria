@@ -199,6 +199,49 @@ final class ControlClient: @unchecked Sendable {
         return status
     }
 
+    func recordSyncStatus() async throws -> SyncDomainStatus {
+        guard let status: SyncDomainStatus = try await request(
+            .recordSyncStatus, expecting: "record_sync_status", as: SyncDomainStatus.self)
+        else {
+            throw ControlClientError.missingResult("record_sync_status")
+        }
+        return status
+    }
+
+    func nextRecordSyncOutbound(limit: Int) async throws -> SyncOutboundBatch {
+        guard let batch: SyncOutboundBatch = try await request(
+            .recordSyncNextOutbound(limit: limit), expecting: "record_sync_outbound",
+            as: SyncOutboundBatch.self)
+        else {
+            throw ControlClientError.missingResult("record_sync_outbound")
+        }
+        return batch
+    }
+
+    func settleRecordSyncOutbound(_ outcomes: [SyncDeliveryOutcome]) async throws
+        -> SyncSettlementReport
+    {
+        guard let report: SyncSettlementReport = try await request(
+            .recordSyncSettleOutbound(outcomes: outcomes),
+            expecting: "record_sync_settlement", as: SyncSettlementReport.self)
+        else {
+            throw ControlClientError.missingResult("record_sync_settlement")
+        }
+        return report
+    }
+
+    func applyRecordSyncInbound(_ batch: SyncInboundBatch, observedAt: String) async throws
+        -> SyncInboundReport
+    {
+        guard let report: SyncInboundReport = try await request(
+            .recordSyncApplyInbound(batch: batch, observedAt: observedAt),
+            expecting: "record_sync_inbound", as: SyncInboundReport.self)
+        else {
+            throw ControlClientError.missingResult("record_sync_inbound")
+        }
+        return report
+    }
+
     func snapshot() async throws -> CatalogSnapshot {
         guard let snapshot: CatalogSnapshot = try await request(
             .snapshot, expecting: "snapshot", as: CatalogSnapshot.self)

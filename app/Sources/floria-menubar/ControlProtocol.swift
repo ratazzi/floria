@@ -1,6 +1,6 @@
 import Foundation
 
-let supportedControlProtocolVersion: UInt32 = 10
+let supportedControlProtocolVersion: UInt32 = 11
 
 struct ControlServerInfo: Decodable, Equatable, Sendable {
     let protocolVersion: UInt32?
@@ -1052,6 +1052,160 @@ struct ReplicationEnrollment: Codable, Equatable, Sendable {
     }
 }
 
+// MARK: - Coordinated encrypted-record sync
+
+struct SyncObjectAsset: Codable, Equatable, Sendable {
+    let digest: String
+    let ciphertextSize: UInt64
+    let file: String
+
+    enum CodingKeys: String, CodingKey {
+        case digest, file
+        case ciphertextSize = "ciphertext_size"
+    }
+}
+
+struct SyncOutboundRevision: Codable, Equatable, Sendable {
+    let entityID: String
+    let revisionID: String
+    let expectedHeadRevisionID: String?
+    let envelopeBase64: String
+
+    enum CodingKeys: String, CodingKey {
+        case entityID = "entity_id"
+        case revisionID = "revision_id"
+        case expectedHeadRevisionID = "expected_head_revision_id"
+        case envelopeBase64 = "envelope_base64"
+    }
+}
+
+struct SyncOutboundCommit: Codable, Equatable, Sendable {
+    let commitID: String
+    let manifestBase64: String
+    let revisions: [SyncOutboundRevision]
+    let createdAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case revisions
+        case commitID = "commit_id"
+        case manifestBase64 = "manifest_base64"
+        case createdAt = "created_at"
+    }
+}
+
+struct SyncOutboundBatch: Codable, Equatable, Sendable {
+    let commits: [SyncOutboundCommit]
+    let objects: [SyncObjectAsset]
+}
+
+struct SyncInboundManifest: Codable, Equatable, Sendable {
+    let commitID: String
+    let manifestBase64: String
+
+    enum CodingKeys: String, CodingKey {
+        case commitID = "commit_id"
+        case manifestBase64 = "manifest_base64"
+    }
+}
+
+struct SyncInboundRevision: Codable, Equatable, Sendable {
+    let entityID: String
+    let revisionID: String
+    let envelopeBase64: String
+
+    enum CodingKeys: String, CodingKey {
+        case entityID = "entity_id"
+        case revisionID = "revision_id"
+        case envelopeBase64 = "envelope_base64"
+    }
+}
+
+struct SyncInboundObject: Codable, Equatable, Sendable {
+    let digest: String
+    let ciphertextSize: UInt64
+    let file: String
+
+    enum CodingKeys: String, CodingKey {
+        case digest, file
+        case ciphertextSize = "ciphertext_size"
+    }
+}
+
+struct SyncInboundBatch: Codable, Equatable, Sendable {
+    let manifests: [SyncInboundManifest]
+    let revisions: [SyncInboundRevision]
+    let objects: [SyncInboundObject]
+}
+
+enum SyncProjectionDisposition: String, Codable, Sendable {
+    case unchanged
+    case pending
+    case conflict
+    case applied
+    case alreadyApplied = "already_applied"
+}
+
+struct SyncInboundReport: Codable, Equatable, Sendable {
+    let manifestsReceived: Int
+    let revisionsReceived: Int
+    let objectsInstalled: Int
+    let objectsAlreadyPresent: Int
+    let inboundSettled: Int
+    let pendingTransactions: Int
+    let conflictingEntities: Int
+    let projection: SyncProjectionDisposition
+
+    enum CodingKeys: String, CodingKey {
+        case projection
+        case manifestsReceived = "manifests_received"
+        case revisionsReceived = "revisions_received"
+        case objectsInstalled = "objects_installed"
+        case objectsAlreadyPresent = "objects_already_present"
+        case inboundSettled = "inbound_settled"
+        case pendingTransactions = "pending_transactions"
+        case conflictingEntities = "conflicting_entities"
+    }
+}
+
+enum SyncDeliveryDisposition: String, Codable, Sendable {
+    case accepted
+    case retry
+    case conflict
+}
+
+struct SyncDeliveryOutcome: Codable, Equatable, Sendable {
+    let commitID: String
+    let disposition: SyncDeliveryDisposition
+
+    enum CodingKeys: String, CodingKey {
+        case disposition
+        case commitID = "commit_id"
+    }
+}
+
+struct SyncSettlementReport: Codable, Equatable, Sendable {
+    let accepted: Int
+    let conflicts: Int
+    let retrying: Int
+    let settled: Int
+}
+
+struct SyncDomainStatus: Codable, Equatable, Sendable {
+    let outboundTransactions: Int
+    let inboundTransactions: Int
+    let pendingTransactions: Int
+    let conflictingEntities: Int
+    let projectionPending: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case outboundTransactions = "outbound_transactions"
+        case inboundTransactions = "inbound_transactions"
+        case pendingTransactions = "pending_transactions"
+        case conflictingEntities = "conflicting_entities"
+        case projectionPending = "projection_pending"
+    }
+}
+
 enum ControlCommand: Sendable {
     case ping
     case health
@@ -1076,6 +1230,10 @@ enum ControlCommand: Sendable {
     case replicationEnrollment
     case replicationEnroll(ReplicationEnrollment)
     case replicationApprove(deviceID: String)
+    case recordSyncStatus
+    case recordSyncNextOutbound(limit: Int)
+    case recordSyncSettleOutbound(outcomes: [SyncDeliveryOutcome])
+    case recordSyncApplyInbound(batch: SyncInboundBatch, observedAt: String)
     case snapshot
     case discover(paths: [String])
     case discoverStart(paths: [String])
@@ -1161,6 +1319,10 @@ enum ControlCommand: Sendable {
         case .replicationEnrollment: "replication_enrollment"
         case .replicationEnroll: "replication_enroll"
         case .replicationApprove: "replication_approve"
+        case .recordSyncStatus: "record_sync_status"
+        case .recordSyncNextOutbound: "record_sync_next_outbound"
+        case .recordSyncSettleOutbound: "record_sync_settle_outbound"
+        case .recordSyncApplyInbound: "record_sync_apply_inbound"
         case .snapshot: "snapshot"
         case .discover: "discover"
         case .discoverStart: "discover_start"
@@ -1212,7 +1374,7 @@ enum ControlCommand: Sendable {
         switch self {
         case .ping, .health, .policyModeGet, .grantList, .grantClear, .replicationStatus,
             .replicationSync, .replicationResolveWithCurrent, .replicationDisable,
-            .replicationRequestReenrollment, .replicationEnrollment, .snapshot,
+            .replicationRequestReenrollment, .replicationEnrollment, .recordSyncStatus, .snapshot,
             .projectCheckoutInventory, .sshConfigStatus, .sshConfigInstall, .sshConfigRemove,
             .protectedFiles:
             return try encoder.encode(ControlRequestWithoutParams(requestID: requestID, method: method))
@@ -1273,6 +1435,22 @@ enum ControlCommand: Sendable {
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: ReplicationRevokeDeviceParams(deviceID: deviceID)))
+        case .recordSyncNextOutbound(let limit):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: RecordSyncNextOutboundParams(limit: limit)))
+        case .recordSyncSettleOutbound(let outcomes):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: RecordSyncSettleOutboundParams(outcomes: outcomes)))
+        case .recordSyncApplyInbound(let batch, let observedAt):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: RecordSyncApplyInboundParams(
+                        batch: batch, observedAt: observedAt)))
         case .discover(let paths):
             return try encoder.encode(
                 ControlRequest(
@@ -1481,6 +1659,14 @@ private struct ReplicationRevokeDeviceParams: Encodable {
     let deviceID: String
 
     enum CodingKeys: String, CodingKey { case deviceID = "device_id" }
+}
+private struct RecordSyncNextOutboundParams: Encodable { let limit: Int }
+private struct RecordSyncSettleOutboundParams: Encodable {
+    let outcomes: [SyncDeliveryOutcome]
+}
+private struct RecordSyncApplyInboundParams: Encodable {
+    let batch: SyncInboundBatch
+    let observedAt: String
 }
 private struct DiscoverParams: Encodable { let paths: [String] }
 private struct DiscoveryJobIDParams: Encodable { let id: String }

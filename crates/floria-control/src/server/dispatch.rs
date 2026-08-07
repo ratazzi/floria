@@ -61,6 +61,7 @@ fn dispatch_uncoordinated(
         health,
         diagnostics,
         replication,
+        record_sync,
         checkout_monitor,
         audit_log,
         discovery_jobs,
@@ -208,6 +209,43 @@ fn dispatch_uncoordinated(
             .approve(&device_id)
             .map(ControlResult::ReplicationStatus)
             .map_err(DispatchError::Replication),
+        ControlCommand::RecordSyncStatus => record_sync
+            .ok_or_else(record_sync_unavailable)?
+            .status()
+            .map(ControlResult::RecordSyncStatus)
+            .map_err(DispatchError::RecordSync),
+        ControlCommand::RecordSyncNextOutbound { limit } => {
+            let batch = record_sync
+                .ok_or_else(record_sync_unavailable)?
+                .next_outbound(limit)
+                .map_err(DispatchError::RecordSync)?;
+            let encoded_size = serde_json::to_vec(&batch)
+                .map_err(|error| DispatchError::RecordSync(error.to_string()))?
+                .len();
+            if encoded_size > crate::protocol::MAX_RECORD_SYNC_BATCH_BYTES {
+                return Err(DispatchError::Validation(format!(
+                    "outbound record sync batch is {encoded_size} bytes; retry with a smaller limit"
+                )));
+            }
+            Ok(ControlResult::RecordSyncOutbound(batch))
+        }
+        ControlCommand::RecordSyncSettleOutbound { outcomes } => record_sync
+            .ok_or_else(record_sync_unavailable)?
+            .settle_outbound(&outcomes)
+            .map(ControlResult::RecordSyncSettlement)
+            .map_err(DispatchError::RecordSync),
+        ControlCommand::RecordSyncApplyInbound { batch, observed_at } => {
+            if batch.objects().iter().any(|object| !object.file().is_absolute()) {
+                return Err(DispatchError::Validation(
+                    "inbound record sync object paths must be absolute".to_string(),
+                ));
+            }
+            record_sync
+                .ok_or_else(record_sync_unavailable)?
+                .apply_inbound(catalog, batch, &observed_at)
+                .map(ControlResult::RecordSyncInbound)
+                .map_err(DispatchError::RecordSync)
+        }
         ControlCommand::PolicyModeGet => policy
             .map(|controller| ControlResult::PolicyMode(controller.policy_mode()))
             .ok_or_else(|| {
@@ -702,4 +740,10 @@ fn dispatch_uncoordinated(
             Ok(ControlResult::Empty)
         }
     }
+}
+
+fn record_sync_unavailable() -> DispatchError {
+    DispatchError::Validation(
+        "coordinated record sync is unavailable on this control server".to_string(),
+    )
 }

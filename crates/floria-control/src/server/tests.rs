@@ -131,6 +131,44 @@
         }
     }
 
+    #[derive(Default)]
+    struct FixtureRecordSyncService {
+        status_calls: AtomicUsize,
+        outbound_calls: AtomicUsize,
+        settlement_calls: AtomicUsize,
+        inbound_calls: AtomicUsize,
+    }
+
+    impl RuntimeRecordSyncService for FixtureRecordSyncService {
+        fn status(&self) -> Result<SyncDomainStatus, String> {
+            self.status_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(SyncDomainStatus::default())
+        }
+
+        fn next_outbound(&self, _limit: usize) -> Result<SyncOutboundBatch, String> {
+            self.outbound_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(SyncOutboundBatch::default())
+        }
+
+        fn settle_outbound(
+            &self,
+            _outcomes: &[SyncDeliveryOutcome],
+        ) -> Result<SyncSettlementReport, String> {
+            self.settlement_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(SyncSettlementReport::default())
+        }
+
+        fn apply_inbound(
+            &self,
+            _catalog: &Catalog,
+            _batch: SyncInboundBatch,
+            _observed_at: &str,
+        ) -> Result<SyncInboundReport, String> {
+            self.inbound_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(SyncInboundReport::default())
+        }
+    }
+
     const FIXTURE_SECRET_ID: &str = "00000000-0000-0000-0000-000000000101";
 
     struct FixtureSecretMetadata {
@@ -2859,6 +2897,91 @@
     }
 
     #[test]
+    fn platform_adapter_crosses_the_real_control_frame_without_domain_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let socket = dir.path().join("control.sock");
+        let record_sync = Arc::new(FixtureRecordSyncService::default());
+        let _server = ControlServer::start_inner(
+            &socket,
+            catalog,
+            ControlDependencies {
+                record_sync: Some(Arc::clone(&record_sync) as Arc<dyn RuntimeRecordSyncService>),
+                ..ControlDependencies::default()
+            },
+            test_peer_verifier(),
+        )
+        .unwrap();
+        let mut client = ControlClient::connect(&socket).unwrap();
+
+        assert!(matches!(
+            client.request(ControlCommand::RecordSyncStatus).unwrap(),
+            ControlResult::RecordSyncStatus(_)
+        ));
+        assert!(matches!(
+            client
+                .request(ControlCommand::RecordSyncNextOutbound { limit: 10 })
+                .unwrap(),
+            ControlResult::RecordSyncOutbound(_)
+        ));
+        assert!(matches!(
+            client
+                .request(ControlCommand::RecordSyncSettleOutbound {
+                    outcomes: vec![SyncDeliveryOutcome::new(
+                        "commit-1",
+                        crate::protocol::SyncDeliveryDisposition::Accepted,
+                    )],
+                })
+                .unwrap(),
+            ControlResult::RecordSyncSettlement(_)
+        ));
+        assert!(matches!(
+            client
+                .request(ControlCommand::RecordSyncApplyInbound {
+                    batch: SyncInboundBatch::default(),
+                    observed_at: "2026-08-07T12:00:00Z".to_string(),
+                })
+                .unwrap(),
+            ControlResult::RecordSyncInbound(_)
+        ));
+
+        assert_eq!(record_sync.status_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(record_sync.outbound_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(record_sync.settlement_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(record_sync.inbound_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn record_sync_rejects_relative_asset_paths_before_the_runtime_reads_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let record_sync = FixtureRecordSyncService::default();
+        let error = dispatch(
+            &catalog,
+            DispatchServices {
+                record_sync: Some(&record_sync),
+                ..DispatchServices::default()
+            },
+            ControlCommand::RecordSyncApplyInbound {
+                batch: SyncInboundBatch::new(
+                    Vec::new(),
+                    Vec::new(),
+                    vec![crate::protocol::SyncInboundObject::new(
+                        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        9,
+                        PathBuf::from("relative-object.age"),
+                    )],
+                ),
+                observed_at: "2026-08-07T12:00:00Z".to_string(),
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.body().message.contains("must be absolute"));
+        assert_eq!(record_sync.inbound_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn untrusted_client_cannot_issue_control_commands() {
         let dir = tempfile::tempdir().unwrap();
         let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
@@ -3063,6 +3186,11 @@
     #[test]
     fn observer_classification_defaults_head_changes_to_mutating() {
         assert!(is_read_only(&ControlCommand::Snapshot));
+        assert!(is_read_only(&ControlCommand::RecordSyncStatus));
+        assert!(!command_allowed_for_peer(
+            PeerAccess::ReadOnly,
+            &ControlCommand::RecordSyncStatus,
+        ));
         assert!(is_read_only(&ControlCommand::ProtectedFileHistory {
             id: "fixture".to_string(),
         }));

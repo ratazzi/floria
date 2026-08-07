@@ -15,7 +15,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertNil(request["params"])
 
         let response = Data(
-            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":10,"daemon_version":"0.1.0","schema_version":14,"minimum_schema_version":14,"store_format_version":5,"minimum_store_format_version":5}}}"#.utf8)
+            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":11,"daemon_version":"0.1.0","schema_version":14,"minimum_schema_version":14,"store_format_version":5,"minimum_store_format_version":5}}}"#.utf8)
         let decoded = try JSONDecoder().decode(
             ControlResponseEnvelope<ControlServerInfo>.self, from: response)
         let info = try XCTUnwrap(decoded.result?.value)
@@ -134,6 +134,58 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(status.keyGeneration, 2)
         XCTAssertEqual(status.pending, 1)
         XCTAssertEqual(status.damagedFiles, ["objects/damaged.age"])
+    }
+
+    func testCoordinatedRecordSyncCommandsKeepPayloadsOpaque() throws {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+
+        let outboundData = try ControlCommand.recordSyncNextOutbound(limit: 12)
+            .requestData(requestID: 70, encoder: encoder)
+        let outboundRequest = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: outboundData) as? [String: Any])
+        XCTAssertEqual(outboundRequest["method"] as? String, "record_sync_next_outbound")
+        XCTAssertEqual((outboundRequest["params"] as? [String: Any])?["limit"] as? Int, 12)
+
+        let outcome = SyncDeliveryOutcome(commitID: "commit-1", disposition: .accepted)
+        let settlementData = try ControlCommand.recordSyncSettleOutbound(outcomes: [outcome])
+            .requestData(requestID: 71, encoder: encoder)
+        let settlement = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: settlementData) as? [String: Any])
+        let outcomes = try XCTUnwrap(
+            (settlement["params"] as? [String: Any])?["outcomes"] as? [[String: Any]])
+        XCTAssertEqual(outcomes.first?["commit_id"] as? String, "commit-1")
+        XCTAssertEqual(outcomes.first?["disposition"] as? String, "accepted")
+
+        let inbound = SyncInboundBatch(
+            manifests: [SyncInboundManifest(commitID: "commit-1", manifestBase64: "bWFuaWZlc3Q=")],
+            revisions: [
+                SyncInboundRevision(
+                    entityID: "entity-1", revisionID: "revision-1",
+                    envelopeBase64: "cmV2aXNpb24=")
+            ],
+            objects: [
+                SyncInboundObject(
+                    digest: String(repeating: "a", count: 64), ciphertextSize: 9,
+                    file: "/tmp/floria-sync-object")
+            ])
+        let inboundData = try ControlCommand.recordSyncApplyInbound(
+            batch: inbound, observedAt: "2026-08-07T12:00:00Z"
+        ).requestData(requestID: 72, encoder: encoder)
+        let inboundRequest = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: inboundData) as? [String: Any])
+        let inboundParams = try XCTUnwrap(inboundRequest["params"] as? [String: Any])
+        XCTAssertEqual(inboundRequest["method"] as? String, "record_sync_apply_inbound")
+        XCTAssertEqual(inboundParams["observed_at"] as? String, "2026-08-07T12:00:00Z")
+        XCTAssertFalse(String(decoding: inboundData, as: UTF8.self).contains("plaintext"))
+
+        let response = Data(
+            #"{"request_id":70,"status":"ok","result":{"type":"record_sync_outbound","value":{"commits":[{"commit_id":"commit-1","manifest_base64":"bWFuaWZlc3Q=","revisions":[{"entity_id":"entity-1","revision_id":"revision-1","expected_head_revision_id":null,"envelope_base64":"cmV2aXNpb24="}],"created_at":"2026-08-07T12:00:00Z"}],"objects":[{"digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ciphertext_size":9,"file":"/tmp/floria-sync-object"}]}}}"#.utf8)
+        let decoded = try JSONDecoder().decode(
+            ControlResponseEnvelope<SyncOutboundBatch>.self, from: response)
+        let batch = try XCTUnwrap(decoded.result?.value)
+        XCTAssertEqual(batch.commits.first?.revisions.first?.entityID, "entity-1")
+        XCTAssertEqual(batch.objects.first?.ciphertextSize, 9)
     }
 
     func testRecoveryKeyExportMatchesRustWireShape() throws {

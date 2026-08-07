@@ -870,6 +870,7 @@ dependencies = [
  "floria-core",
  "floria-discover",
  "floria-platform",
+ "floria-replication",
  "floria-ssh",
  "floria-store",
  "floria-surface",
