@@ -20,6 +20,19 @@ struct CloudRecordCodec {
             zoneName: "\(Self.zoneNamePrefix)\(canonicalVaultID)")
     }
 
+    /// Decode the canonical Vault UUID carried by a Floria private-zone name.
+    /// Unrelated CloudKit zones are ignored. A zone claiming this namespace must
+    /// use the one canonical lowercase spelling or it is treated as damaged.
+    static func vaultID(from zoneID: CKRecordZone.ID) throws -> String? {
+        guard zoneID.zoneName.hasPrefix(zoneNamePrefix) else { return nil }
+        let suffix = String(zoneID.zoneName.dropFirst(zoneNamePrefix.count))
+        let canonical = try validatedUUID(suffix, field: "zoneVaultID")
+        guard suffix == canonical else {
+            throw CloudRecordCodecError.noncanonicalVaultZone(zoneID.zoneName)
+        }
+        return canonical
+    }
+
     enum RecordType {
         static let object = "FloriaObjectV1"
         static let revision = "FloriaRevisionV1"
@@ -329,6 +342,7 @@ enum CloudRecordCodecError: Error, Equatable, LocalizedError {
     case headIdentityMismatch(String)
     case recordIdentityMismatch(recordType: String, stableID: String)
     case cannotCopyHead(String)
+    case noncanonicalVaultZone(String)
 
     var errorDescription: String? {
         switch self {
@@ -360,6 +374,8 @@ enum CloudRecordCodecError: Error, Equatable, LocalizedError {
             return "CloudKit \(recordType) record ID does not match \(stableID)"
         case .cannotCopyHead(let entityID):
             return "CloudKit head for entity \(entityID) could not be copied"
+        case .noncanonicalVaultZone(let zone):
+            return "Floria CloudKit zone is not canonical: \(zone)"
         }
     }
 }
