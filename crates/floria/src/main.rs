@@ -20,7 +20,8 @@ use floria_control::{
     ReplicationEnrollment as ControlReplicationEnrollment, ReplicationMode, ReplicationStatus,
     RuntimeRecordSyncService, RuntimeReplicationService, SshIdentity, SshIdentityDiscovery,
     SyncDeliveryOutcome, SyncDomainStatus, SyncInboundBatch, SyncInboundReport,
-    SyncOutboundBatch, SyncSettlementReport, SyncVaultBootstrap,
+    SyncEnrollmentPreparation, SyncEnrollmentReview, SyncOutboundBatch, SyncSettlementReport,
+    SyncVaultBootstrap,
 };
 use floria_core::audit::{AuditAuthority, AuditCheckpoint, AuditLog};
 use floria_core::authz::{Authorizer, PolicyMode, PolicyModeStatus};
@@ -1271,6 +1272,42 @@ impl RuntimeRecordSyncService for DaemonRecordSyncService {
         })
     }
 
+    fn prepare_vault_enrollment(
+        &self,
+        bootstrap: SyncVaultBootstrap,
+        device_name: Option<String>,
+        requested_at: &str,
+    ) -> Result<SyncEnrollmentPreparation, String> {
+        self.with_journal(|journal| {
+            RecordSyncControl::new(journal, Arc::clone(&self.store))
+                .prepare_vault_enrollment(bootstrap, device_name, requested_at)
+        })
+    }
+
+    fn review_vault_enrollments(
+        &self,
+        bootstrap: SyncVaultBootstrap,
+    ) -> Result<Vec<SyncEnrollmentReview>, String> {
+        self.with_journal(|journal| {
+            RecordSyncControl::new(journal, Arc::clone(&self.store))
+                .review_vault_enrollments(bootstrap)
+        })
+    }
+
+    fn approve_vault_enrollment(
+        &self,
+        bootstrap: SyncVaultBootstrap,
+        device_id: &str,
+        expected_fingerprint: &str,
+    ) -> Result<SyncVaultBootstrap, String> {
+        self.mutations.run(|| {
+            self.with_journal(|journal| {
+                RecordSyncControl::new(journal, Arc::clone(&self.store))
+                    .approve_vault_enrollment(bootstrap, device_id, expected_fingerprint)
+            })
+        })
+    }
+
     fn next_outbound(&self, limit: usize) -> Result<SyncOutboundBatch, String> {
         self.with_captured_state(&self.catalog, |journal| {
             RecordSyncControl::new(journal, Arc::clone(&self.store)).next_outbound(limit)
@@ -2447,6 +2484,12 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
         }
         ControlResult::RecordSyncVaultBootstrap(bootstrap) => {
             println!("{}", serde_json::to_string_pretty(&bootstrap)?);
+        }
+        ControlResult::RecordSyncEnrollmentPreparation(preparation) => {
+            println!("{}", serde_json::to_string_pretty(&preparation)?);
+        }
+        ControlResult::RecordSyncEnrollmentReviews(reviews) => {
+            println!("{}", serde_json::to_string_pretty(&reviews)?);
         }
         ControlResult::RecordSyncOutbound(batch) => {
             println!("{}", serde_json::to_string_pretty(&batch)?);

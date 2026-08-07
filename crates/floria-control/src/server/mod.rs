@@ -45,7 +45,7 @@ use crate::protocol::{
     ProjectCheckoutInventory, ProtectedFile, ProtectedFileVersion, SecretValue, SshConfigStatus,
     RecoveryKeyReport, ReplicationEnrollment, ReplicationStatus, SshIdentity, WorkspaceSnapshot,
     SyncDeliveryOutcome, SyncDomainStatus, SyncInboundBatch, SyncInboundReport, SyncOutboundBatch,
-    SyncSettlementReport, SyncVaultBootstrap,
+    SyncEnrollmentPreparation, SyncEnrollmentReview, SyncSettlementReport, SyncVaultBootstrap,
 };
 
 pub struct ControlServer {
@@ -153,6 +153,22 @@ pub trait RuntimeRecordSyncService: Send + Sync + 'static {
         &self,
         expected_vault_id: &str,
         bootstrap: SyncVaultBootstrap,
+    ) -> Result<SyncVaultBootstrap, String>;
+    fn prepare_vault_enrollment(
+        &self,
+        bootstrap: SyncVaultBootstrap,
+        device_name: Option<String>,
+        requested_at: &str,
+    ) -> Result<SyncEnrollmentPreparation, String>;
+    fn review_vault_enrollments(
+        &self,
+        bootstrap: SyncVaultBootstrap,
+    ) -> Result<Vec<SyncEnrollmentReview>, String>;
+    fn approve_vault_enrollment(
+        &self,
+        bootstrap: SyncVaultBootstrap,
+        device_id: &str,
+        expected_fingerprint: &str,
     ) -> Result<SyncVaultBootstrap, String>;
     fn next_outbound(&self, limit: usize) -> Result<SyncOutboundBatch, String>;
     fn settle_outbound(
@@ -504,6 +520,8 @@ fn is_read_only(command: &ControlCommand) -> bool {
             | ControlCommand::RecordSyncStatus
             | ControlCommand::RecordSyncVaultBootstrap
             | ControlCommand::RecordSyncValidateVaultBootstrap { .. }
+            | ControlCommand::RecordSyncPrepareVaultEnrollment { .. }
+            | ControlCommand::RecordSyncReviewVaultEnrollments { .. }
             | ControlCommand::RecordSyncNextOutbound { .. }
             | ControlCommand::Snapshot
             | ControlCommand::Discover { .. }

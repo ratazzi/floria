@@ -136,6 +136,9 @@
         status_calls: AtomicUsize,
         bootstrap_calls: AtomicUsize,
         bootstrap_validation_calls: AtomicUsize,
+        enrollment_preparation_calls: AtomicUsize,
+        enrollment_review_calls: AtomicUsize,
+        enrollment_approval_calls: AtomicUsize,
         outbound_calls: AtomicUsize,
         settlement_calls: AtomicUsize,
         inbound_calls: AtomicUsize,
@@ -170,6 +173,40 @@
             if bootstrap.vault_id() != expected_vault_id {
                 return Err("fixture Vault route mismatch".to_string());
             }
+            Ok(bootstrap)
+        }
+
+        fn prepare_vault_enrollment(
+            &self,
+            _bootstrap: SyncVaultBootstrap,
+            _device_name: Option<String>,
+            _requested_at: &str,
+        ) -> Result<SyncEnrollmentPreparation, String> {
+            self.enrollment_preparation_calls
+                .fetch_add(1, Ordering::Relaxed);
+            Ok(serde_json::from_value(serde_json::json!({
+                "status": "already_enrolled",
+                "device_id": "fixture-device"
+            }))
+            .expect("fixture enrollment preparation"))
+        }
+
+        fn review_vault_enrollments(
+            &self,
+            _bootstrap: SyncVaultBootstrap,
+        ) -> Result<Vec<SyncEnrollmentReview>, String> {
+            self.enrollment_review_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Vec::new())
+        }
+
+        fn approve_vault_enrollment(
+            &self,
+            bootstrap: SyncVaultBootstrap,
+            _device_id: &str,
+            _expected_fingerprint: &str,
+        ) -> Result<SyncVaultBootstrap, String> {
+            self.enrollment_approval_calls
+                .fetch_add(1, Ordering::Relaxed);
             Ok(bootstrap)
         }
 
@@ -2956,7 +2993,35 @@
             client
                 .request(ControlCommand::RecordSyncValidateVaultBootstrap {
                     expected_vault_id: bootstrap.vault_id().to_string(),
+                    bootstrap: bootstrap.clone(),
+                })
+                .unwrap(),
+            ControlResult::RecordSyncVaultBootstrap(_)
+        ));
+        assert!(matches!(
+            client
+                .request(ControlCommand::RecordSyncPrepareVaultEnrollment {
+                    bootstrap: bootstrap.clone(),
+                    device_name: Some("Studio".to_string()),
+                    requested_at: "2026-08-08T12:00:00Z".to_string(),
+                })
+                .unwrap(),
+            ControlResult::RecordSyncEnrollmentPreparation(_)
+        ));
+        assert!(matches!(
+            client
+                .request(ControlCommand::RecordSyncReviewVaultEnrollments {
+                    bootstrap: bootstrap.clone(),
+                })
+                .unwrap(),
+            ControlResult::RecordSyncEnrollmentReviews(_)
+        ));
+        assert!(matches!(
+            client
+                .request(ControlCommand::RecordSyncApproveVaultEnrollment {
                     bootstrap,
+                    device_id: "fixture-device".to_string(),
+                    expected_fingerprint: "sha256:fixture".to_string(),
                 })
                 .unwrap(),
             ControlResult::RecordSyncVaultBootstrap(_)
@@ -2997,6 +3062,20 @@
             1
         );
         assert_eq!(record_sync.outbound_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            record_sync
+                .enrollment_preparation_calls
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            record_sync.enrollment_review_calls.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            record_sync.enrollment_approval_calls.load(Ordering::Relaxed),
+            1
+        );
         assert_eq!(record_sync.settlement_calls.load(Ordering::Relaxed), 1);
         assert_eq!(record_sync.inbound_calls.load(Ordering::Relaxed), 1);
     }
@@ -3244,6 +3323,28 @@
                 bootstrap: FixtureRecordSyncService::default()
                     .vault_bootstrap()
                     .unwrap(),
+            }
+        ));
+        let bootstrap = FixtureRecordSyncService::default()
+            .vault_bootstrap()
+            .unwrap();
+        assert!(is_read_only(
+            &ControlCommand::RecordSyncPrepareVaultEnrollment {
+                bootstrap: bootstrap.clone(),
+                device_name: None,
+                requested_at: "2026-08-08T12:00:00Z".to_string(),
+            }
+        ));
+        assert!(is_read_only(
+            &ControlCommand::RecordSyncReviewVaultEnrollments {
+                bootstrap: bootstrap.clone(),
+            }
+        ));
+        assert!(!is_read_only(
+            &ControlCommand::RecordSyncApproveVaultEnrollment {
+                bootstrap,
+                device_id: "fixture-device".to_string(),
+                expected_fingerprint: "sha256:fixture".to_string(),
             }
         ));
         assert!(!command_allowed_for_peer(

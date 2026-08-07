@@ -15,7 +15,8 @@ pub use floria_replication::sync_control::{
     SyncProjectionDisposition, SyncSettlementReport,
 };
 pub use floria_replication::sync_bootstrap::{
-    SyncBootstrapDocument, SyncBootstrapEnvelope, SyncVaultBootstrap,
+    SyncBootstrapDocument, SyncBootstrapEnvelope, SyncEnrollmentPreparation,
+    SyncEnrollmentReview, SyncVaultBootstrap,
 };
 use floria_store::StoreError;
 use serde::de::DeserializeOwned;
@@ -24,7 +25,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 const MAX_MSG: usize = 8 << 20;
 pub(crate) const MAX_RECORD_SYNC_BATCH_BYTES: usize = 6 << 20;
-pub const CONTROL_PROTOCOL_VERSION: u32 = 13;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 14;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRequest {
@@ -96,6 +97,19 @@ pub enum ControlCommand {
     RecordSyncValidateVaultBootstrap {
         expected_vault_id: String,
         bootstrap: SyncVaultBootstrap,
+    },
+    RecordSyncPrepareVaultEnrollment {
+        bootstrap: SyncVaultBootstrap,
+        device_name: Option<String>,
+        requested_at: String,
+    },
+    RecordSyncReviewVaultEnrollments {
+        bootstrap: SyncVaultBootstrap,
+    },
+    RecordSyncApproveVaultEnrollment {
+        bootstrap: SyncVaultBootstrap,
+        device_id: String,
+        expected_fingerprint: String,
     },
     RecordSyncNextOutbound { limit: usize },
     RecordSyncSettleOutbound { outcomes: Vec<SyncDeliveryOutcome> },
@@ -246,6 +260,8 @@ pub enum ControlResult {
     ReplicationEnrollment(ReplicationEnrollment),
     RecordSyncStatus(SyncDomainStatus),
     RecordSyncVaultBootstrap(SyncVaultBootstrap),
+    RecordSyncEnrollmentPreparation(SyncEnrollmentPreparation),
+    RecordSyncEnrollmentReviews(Vec<SyncEnrollmentReview>),
     RecordSyncOutbound(SyncOutboundBatch),
     RecordSyncSettlement(SyncSettlementReport),
     RecordSyncInbound(SyncInboundReport),
@@ -1643,7 +1659,7 @@ mod tests {
             request_id: 45,
             command: ControlCommand::RecordSyncValidateVaultBootstrap {
                 expected_vault_id: bootstrap.vault_id().to_string(),
-                bootstrap,
+                bootstrap: bootstrap.clone(),
             },
         })
         .unwrap();
@@ -1658,6 +1674,74 @@ mod tests {
         assert_eq!(
             validation_request["params"]["bootstrap"]["vault_id"],
             "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        );
+
+        let preparation_request = serde_json::to_value(ControlRequest {
+            request_id: 46,
+            command: ControlCommand::RecordSyncPrepareVaultEnrollment {
+                bootstrap: bootstrap.clone(),
+                device_name: Some("Studio".to_string()),
+                requested_at: "2026-08-08T12:00:00Z".to_string(),
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            preparation_request["method"],
+            "record_sync_prepare_vault_enrollment"
+        );
+        assert_eq!(preparation_request["params"]["device_name"], "Studio");
+
+        let review_request = serde_json::to_value(ControlRequest {
+            request_id: 47,
+            command: ControlCommand::RecordSyncReviewVaultEnrollments {
+                bootstrap: bootstrap.clone(),
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            review_request["method"],
+            "record_sync_review_vault_enrollments"
+        );
+
+        let approval_request = serde_json::to_value(ControlRequest {
+            request_id: 48,
+            command: ControlCommand::RecordSyncApproveVaultEnrollment {
+                bootstrap,
+                device_id: "fixture-device".to_string(),
+                expected_fingerprint: "sha256:fixture".to_string(),
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            approval_request["method"],
+            "record_sync_approve_vault_enrollment"
+        );
+        assert_eq!(
+            approval_request["params"]["expected_fingerprint"],
+            "sha256:fixture"
+        );
+
+        let preparation: SyncEnrollmentPreparation =
+            serde_json::from_value(serde_json::json!({
+                "status": "request",
+                "device_id": "fixture-device",
+                "device_name": "Studio",
+                "requested_at": "2026-08-08T12:00:00Z",
+                "fingerprint": "sha256:fixture",
+                "document_base64": "cmVxdWVzdA=="
+            }))
+            .unwrap();
+        let preparation_result = serde_json::to_value(
+            ControlResult::RecordSyncEnrollmentPreparation(preparation),
+        )
+        .unwrap();
+        assert_eq!(
+            preparation_result["value"]["status"],
+            "request"
+        );
+        assert_eq!(
+            preparation_result["value"]["fingerprint"],
+            "sha256:fixture"
         );
 
         let request = ControlRequest {

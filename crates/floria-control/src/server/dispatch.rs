@@ -227,6 +227,29 @@ fn dispatch_uncoordinated(
             .validate_vault_bootstrap(&expected_vault_id, bootstrap)
             .map(ControlResult::RecordSyncVaultBootstrap)
             .map_err(DispatchError::RecordSync),
+        ControlCommand::RecordSyncPrepareVaultEnrollment {
+            bootstrap,
+            device_name,
+            requested_at,
+        } => record_sync
+            .ok_or_else(record_sync_unavailable)?
+            .prepare_vault_enrollment(bootstrap, device_name, &requested_at)
+            .map(ControlResult::RecordSyncEnrollmentPreparation)
+            .map_err(DispatchError::RecordSync),
+        ControlCommand::RecordSyncReviewVaultEnrollments { bootstrap } => record_sync
+            .ok_or_else(record_sync_unavailable)?
+            .review_vault_enrollments(bootstrap)
+            .map(ControlResult::RecordSyncEnrollmentReviews)
+            .map_err(DispatchError::RecordSync),
+        ControlCommand::RecordSyncApproveVaultEnrollment {
+            bootstrap,
+            device_id,
+            expected_fingerprint,
+        } => record_sync
+            .ok_or_else(record_sync_unavailable)?
+            .approve_vault_enrollment(bootstrap, &device_id, &expected_fingerprint)
+            .map(ControlResult::RecordSyncVaultBootstrap)
+            .map_err(DispatchError::RecordSync),
         ControlCommand::RecordSyncNextOutbound { limit } => {
             let batch = record_sync
                 .ok_or_else(record_sync_unavailable)?

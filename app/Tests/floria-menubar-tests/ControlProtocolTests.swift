@@ -15,7 +15,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertNil(request["params"])
 
         let response = Data(
-            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":13,"daemon_version":"0.1.0","schema_version":14,"minimum_schema_version":14,"store_format_version":5,"minimum_store_format_version":5}}}"#.utf8)
+            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":14,"daemon_version":"0.1.0","schema_version":14,"minimum_schema_version":14,"store_format_version":5,"minimum_store_format_version":5}}}"#.utf8)
         let decoded = try JSONDecoder().decode(
             ControlResponseEnvelope<ControlServerInfo>.self, from: response)
         let info = try XCTUnwrap(decoded.result?.value)
@@ -168,6 +168,41 @@ final class ControlProtocolTests: XCTestCase {
             (validationParams["bootstrap"] as? [String: Any])?["vault_id"] as? String,
             candidate.vaultID)
 
+        let preparationData = try ControlCommand.recordSyncPrepareVaultEnrollment(
+            bootstrap: candidate, deviceName: "Studio", requestedAt: "2026-08-08T12:00:00Z"
+        ).requestData(requestID: 74, encoder: encoder)
+        let preparationRequest = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: preparationData) as? [String: Any])
+        let preparationParams = try XCTUnwrap(
+            preparationRequest["params"] as? [String: Any])
+        XCTAssertEqual(
+            preparationRequest["method"] as? String,
+            "record_sync_prepare_vault_enrollment")
+        XCTAssertEqual(preparationParams["device_name"] as? String, "Studio")
+
+        let reviewData = try ControlCommand.recordSyncReviewVaultEnrollments(
+            bootstrap: candidate
+        ).requestData(requestID: 75, encoder: encoder)
+        let reviewRequest = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: reviewData) as? [String: Any])
+        XCTAssertEqual(
+            reviewRequest["method"] as? String,
+            "record_sync_review_vault_enrollments")
+
+        let approvalData = try ControlCommand.recordSyncApproveVaultEnrollment(
+            bootstrap: candidate, deviceID: "fixture-device",
+            expectedFingerprint: "sha256:fixture"
+        ).requestData(requestID: 76, encoder: encoder)
+        let approvalRequest = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: approvalData) as? [String: Any])
+        let approvalParams = try XCTUnwrap(approvalRequest["params"] as? [String: Any])
+        XCTAssertEqual(
+            approvalRequest["method"] as? String,
+            "record_sync_approve_vault_enrollment")
+        XCTAssertEqual(
+            approvalParams["expected_fingerprint"] as? String,
+            "sha256:fixture")
+
         let outboundData = try ControlCommand.recordSyncNextOutbound(limit: 12)
             .requestData(requestID: 70, encoder: encoder)
         let outboundRequest = try XCTUnwrap(
@@ -222,6 +257,27 @@ final class ControlProtocolTests: XCTestCase {
             ControlResponseEnvelope<SyncVaultBootstrap>.self, from: bootstrapResponse)
         XCTAssertEqual(decodedBootstrap.result?.value?.deviceIdentities.first?.route, "device-1")
         XCTAssertEqual(decodedBootstrap.result?.value?.generationEnvelopes.first?.generation, 1)
+
+        let preparationResponse = Data(
+            #"{"request_id":74,"status":"ok","result":{"type":"record_sync_enrollment_preparation","value":{"status":"request","device_id":"fixture-device","device_name":"Studio","requested_at":"2026-08-08T12:00:00Z","fingerprint":"sha256:fixture","document_base64":"cmVxdWVzdA=="}}}"#.utf8)
+        let decodedPreparation = try JSONDecoder().decode(
+            ControlResponseEnvelope<SyncEnrollmentPreparation>.self,
+            from: preparationResponse)
+        XCTAssertEqual(
+            decodedPreparation.result?.value,
+            .request(
+                SyncEnrollmentRequest(
+                    deviceID: "fixture-device", deviceName: "Studio",
+                    requestedAt: "2026-08-08T12:00:00Z",
+                    fingerprint: "sha256:fixture", documentBase64: "cmVxdWVzdA==")))
+
+        let reviewsResponse = Data(
+            #"{"request_id":75,"status":"ok","result":{"type":"record_sync_enrollment_reviews","value":[{"device_id":"fixture-device","device_name":"Studio","requested_at":"2026-08-08T12:00:00Z","fingerprint":"sha256:fixture"}]}}"#.utf8)
+        let decodedReviews = try JSONDecoder().decode(
+            ControlResponseEnvelope<[SyncEnrollmentReview]>.self,
+            from: reviewsResponse)
+        XCTAssertEqual(decodedReviews.result?.value?.first?.deviceName, "Studio")
+        XCTAssertEqual(decodedReviews.result?.value?.first?.fingerprint, "sha256:fixture")
 
         let response = Data(
             #"{"request_id":70,"status":"ok","result":{"type":"record_sync_outbound","value":{"commits":[{"commit_id":"commit-1","manifest_base64":"bWFuaWZlc3Q=","revisions":[{"entity_id":"entity-1","revision_id":"revision-1","expected_head_revision_id":null,"envelope_base64":"cmV2aXNpb24="}],"created_at":"2026-08-07T12:00:00Z"}],"objects":[{"digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ciphertext_size":9,"file":"/tmp/floria-sync-object"}]}}}"#.utf8)

@@ -233,6 +233,52 @@ final class ControlClient: @unchecked Sendable {
         return validated
     }
 
+    func prepareRecordSyncVaultEnrollment(
+        bootstrap: SyncVaultBootstrap,
+        deviceName: String?,
+        requestedAt: String
+    ) async throws -> SyncEnrollmentPreparation {
+        guard let preparation: SyncEnrollmentPreparation = try await request(
+            .recordSyncPrepareVaultEnrollment(
+                bootstrap: bootstrap, deviceName: deviceName, requestedAt: requestedAt),
+            expecting: "record_sync_enrollment_preparation",
+            as: SyncEnrollmentPreparation.self)
+        else {
+            throw ControlClientError.missingResult("record_sync_enrollment_preparation")
+        }
+        return preparation
+    }
+
+    func reviewRecordSyncVaultEnrollments(
+        bootstrap: SyncVaultBootstrap
+    ) async throws -> [SyncEnrollmentReview] {
+        guard let reviews: [SyncEnrollmentReview] = try await request(
+            .recordSyncReviewVaultEnrollments(bootstrap: bootstrap),
+            expecting: "record_sync_enrollment_reviews",
+            as: [SyncEnrollmentReview].self)
+        else {
+            throw ControlClientError.missingResult("record_sync_enrollment_reviews")
+        }
+        return reviews
+    }
+
+    func approveRecordSyncVaultEnrollment(
+        bootstrap: SyncVaultBootstrap,
+        deviceID: String,
+        expectedFingerprint: String
+    ) async throws -> SyncVaultBootstrap {
+        guard let approved: SyncVaultBootstrap = try await request(
+            .recordSyncApproveVaultEnrollment(
+                bootstrap: bootstrap, deviceID: deviceID,
+                expectedFingerprint: expectedFingerprint),
+            expecting: "record_sync_vault_bootstrap",
+            as: SyncVaultBootstrap.self)
+        else {
+            throw ControlClientError.missingResult("record_sync_vault_bootstrap")
+        }
+        return approved
+    }
+
     func nextRecordSyncOutbound(limit: Int) async throws -> SyncOutboundBatch {
         guard let batch: SyncOutboundBatch = try await request(
             .recordSyncNextOutbound(limit: limit), expecting: "record_sync_outbound",

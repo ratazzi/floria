@@ -1,6 +1,6 @@
 import Foundation
 
-let supportedControlProtocolVersion: UInt32 = 13
+let supportedControlProtocolVersion: UInt32 = 14
 
 struct ControlServerInfo: Decodable, Equatable, Sendable {
     let protocolVersion: UInt32?
@@ -1252,6 +1252,62 @@ struct SyncVaultBootstrap: Codable, Equatable, Sendable {
     }
 }
 
+struct SyncEnrollmentRequest: Decodable, Equatable, Sendable {
+    let deviceID: String
+    let deviceName: String?
+    let requestedAt: String
+    let fingerprint: String
+    let documentBase64: String
+
+    enum CodingKeys: String, CodingKey {
+        case deviceID = "device_id"
+        case deviceName = "device_name"
+        case requestedAt = "requested_at"
+        case fingerprint
+        case documentBase64 = "document_base64"
+    }
+}
+
+enum SyncEnrollmentPreparation: Decodable, Equatable, Sendable {
+    case alreadyEnrolled(deviceID: String)
+    case request(SyncEnrollmentRequest)
+
+    private enum CodingKeys: String, CodingKey {
+        case status
+        case deviceID = "device_id"
+    }
+
+    private enum Status: String, Decodable {
+        case alreadyEnrolled = "already_enrolled"
+        case request
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        switch try container.decode(Status.self, forKey: .status) {
+        case .alreadyEnrolled:
+            self = .alreadyEnrolled(
+                deviceID: try container.decode(String.self, forKey: .deviceID))
+        case .request:
+            self = .request(try SyncEnrollmentRequest(from: decoder))
+        }
+    }
+}
+
+struct SyncEnrollmentReview: Decodable, Equatable, Sendable {
+    let deviceID: String
+    let deviceName: String?
+    let requestedAt: String
+    let fingerprint: String
+
+    enum CodingKeys: String, CodingKey {
+        case deviceID = "device_id"
+        case deviceName = "device_name"
+        case requestedAt = "requested_at"
+        case fingerprint
+    }
+}
+
 enum ControlCommand: Sendable {
     case ping
     case health
@@ -1279,6 +1335,11 @@ enum ControlCommand: Sendable {
     case recordSyncStatus
     case recordSyncVaultBootstrap
     case recordSyncValidateVaultBootstrap(expectedVaultID: String, bootstrap: SyncVaultBootstrap)
+    case recordSyncPrepareVaultEnrollment(
+        bootstrap: SyncVaultBootstrap, deviceName: String?, requestedAt: String)
+    case recordSyncReviewVaultEnrollments(bootstrap: SyncVaultBootstrap)
+    case recordSyncApproveVaultEnrollment(
+        bootstrap: SyncVaultBootstrap, deviceID: String, expectedFingerprint: String)
     case recordSyncNextOutbound(limit: Int)
     case recordSyncSettleOutbound(outcomes: [SyncDeliveryOutcome])
     case recordSyncApplyInbound(batch: SyncInboundBatch, observedAt: String)
@@ -1370,6 +1431,9 @@ enum ControlCommand: Sendable {
         case .recordSyncStatus: "record_sync_status"
         case .recordSyncVaultBootstrap: "record_sync_vault_bootstrap"
         case .recordSyncValidateVaultBootstrap: "record_sync_validate_vault_bootstrap"
+        case .recordSyncPrepareVaultEnrollment: "record_sync_prepare_vault_enrollment"
+        case .recordSyncReviewVaultEnrollments: "record_sync_review_vault_enrollments"
+        case .recordSyncApproveVaultEnrollment: "record_sync_approve_vault_enrollment"
         case .recordSyncNextOutbound: "record_sync_next_outbound"
         case .recordSyncSettleOutbound: "record_sync_settle_outbound"
         case .recordSyncApplyInbound: "record_sync_apply_inbound"
@@ -1492,6 +1556,25 @@ enum ControlCommand: Sendable {
                     requestID: requestID, method: method,
                     params: RecordSyncValidateVaultBootstrapParams(
                         expectedVaultID: expectedVaultID, bootstrap: bootstrap)))
+        case .recordSyncPrepareVaultEnrollment(let bootstrap, let deviceName, let requestedAt):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: RecordSyncPrepareVaultEnrollmentParams(
+                        bootstrap: bootstrap, deviceName: deviceName, requestedAt: requestedAt)))
+        case .recordSyncReviewVaultEnrollments(let bootstrap):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: RecordSyncReviewVaultEnrollmentsParams(bootstrap: bootstrap)))
+        case .recordSyncApproveVaultEnrollment(
+            let bootstrap, let deviceID, let expectedFingerprint):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: RecordSyncApproveVaultEnrollmentParams(
+                        bootstrap: bootstrap, deviceID: deviceID,
+                        expectedFingerprint: expectedFingerprint)))
         case .recordSyncNextOutbound(let limit):
             return try encoder.encode(
                 ControlRequest(
@@ -1721,6 +1804,19 @@ private struct RecordSyncNextOutboundParams: Encodable { let limit: Int }
 private struct RecordSyncValidateVaultBootstrapParams: Encodable {
     let expectedVaultID: String
     let bootstrap: SyncVaultBootstrap
+}
+private struct RecordSyncPrepareVaultEnrollmentParams: Encodable {
+    let bootstrap: SyncVaultBootstrap
+    let deviceName: String?
+    let requestedAt: String
+}
+private struct RecordSyncReviewVaultEnrollmentsParams: Encodable {
+    let bootstrap: SyncVaultBootstrap
+}
+private struct RecordSyncApproveVaultEnrollmentParams: Encodable {
+    let bootstrap: SyncVaultBootstrap
+    let deviceID: String
+    let expectedFingerprint: String
 }
 private struct RecordSyncSettleOutboundParams: Encodable {
     let outcomes: [SyncDeliveryOutcome]
