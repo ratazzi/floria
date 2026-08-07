@@ -9,12 +9,14 @@
 pub mod entity_document;
 pub mod entity_state;
 pub mod local_projection;
+mod object_file;
 pub mod projection_applicator;
 pub mod record;
 pub mod record_crypto;
 pub mod record_journal;
 pub mod record_transaction;
 pub mod secret_state;
+pub mod sync_control;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};

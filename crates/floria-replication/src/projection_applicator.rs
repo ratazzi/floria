@@ -4,13 +4,12 @@
 //! transaction. This applicator makes their composition recoverable by replaying one exact durable
 //! [`crate::record_journal::PendingProjection`] until every idempotent step has completed.
 
-use std::fs;
-
 use floria_catalog::Catalog;
 use floria_store::{AgeDirStore, NewSecret, SecretId, SecretOrigin};
 
 use crate::entity_document::EntityLifecycle;
 use crate::local_projection::LocalProjectionPlan;
+use crate::object_file::verify_object_file;
 use crate::record_journal::{ProjectionPreparation, RecordJournal};
 use crate::{ReplicationError, ReplicationResult};
 
@@ -109,24 +108,7 @@ impl<'a> ProjectionApplicator<'a> {
         let layout = self.store.shared_layout();
         for object in plan.object_refs() {
             let path = layout.object(object.digest());
-            let metadata = fs::symlink_metadata(&path).map_err(|source| ReplicationError::Io {
-                path: path.clone(),
-                source,
-            })?;
-            if !metadata.file_type().is_file() {
-                return Err(ReplicationError::Invalid(format!(
-                    "projection object {} is not a regular file",
-                    path.display()
-                )));
-            }
-            if metadata.len() != object.ciphertext_size() {
-                return Err(ReplicationError::Invalid(format!(
-                    "projection object {} has {} bytes, expected {}",
-                    object.digest(),
-                    metadata.len(),
-                    object.ciphertext_size()
-                )));
-            }
+            verify_object_file(&path, object.digest(), object.ciphertext_size())?;
         }
         Ok(())
     }

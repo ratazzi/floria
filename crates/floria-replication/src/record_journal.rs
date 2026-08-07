@@ -329,6 +329,37 @@ impl RecordJournal {
         })
     }
 
+    /// Atomically acknowledge a transport batch. A repeated acknowledgement of immutable
+    /// history is harmless, but an id never observed by this journal is rejected.
+    pub fn settle_outbound_batch(
+        &self,
+        commit_ids: &BTreeSet<String>,
+    ) -> ReplicationResult<usize> {
+        if commit_ids.is_empty() {
+            return Ok(0);
+        }
+        for commit_id in commit_ids {
+            require_uuid("outbound commit id", commit_id)?;
+        }
+        self.with_mutation(|tx| {
+            for commit_id in commit_ids {
+                if commit_by_id(tx, commit_id)?.is_none() {
+                    return Err(ReplicationError::Invalid(format!(
+                        "cannot settle unknown commit {commit_id}"
+                    )));
+                }
+            }
+            let mut settled = 0;
+            for commit_id in commit_ids {
+                settled += tx.execute(
+                    "DELETE FROM record_outbox WHERE commit_id = ?1",
+                    params![commit_id],
+                )?;
+            }
+            Ok(settled)
+        })
+    }
+
     /// Settle only a complete transaction so projection cannot acknowledge partial state.
     pub fn settle_inbound(&self, commit_id: &str) -> ReplicationResult<bool> {
         require_uuid("inbound commit id", commit_id)?;
