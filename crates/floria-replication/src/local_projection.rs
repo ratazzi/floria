@@ -121,6 +121,7 @@ impl LocalProjectionPlan {
         let catalog_entities = CatalogEntitySet::from_documents(catalog_documents)?;
         let active_catalog = catalog_entities.active_catalog()?;
         validate_secret_references(&active_catalog, &secrets)?;
+        validate_secret_environment_scopes(&active_catalog, &secrets)?;
 
         Ok(Self {
             head_revisions,
@@ -194,6 +195,34 @@ fn validate_secret_references(
                 "active resource {} references archived secret {secret_id}",
                 resource.id
             )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_secret_environment_scopes(
+    catalog: &ReplicatedCatalog,
+    secrets: &BTreeMap<String, SecretEntityDocument>,
+) -> ReplicationResult<()> {
+    let environment_ids = catalog
+        .environments
+        .iter()
+        .map(|environment| environment.id.as_str())
+        .collect::<BTreeSet<_>>();
+    for secret in secrets.values() {
+        if secret.lifecycle() != EntityLifecycle::Active {
+            continue;
+        }
+        let Some(scope) = secret.descriptor().environment_ids() else {
+            continue;
+        };
+        for environment_id in scope {
+            if !environment_ids.contains(environment_id.as_str()) {
+                return Err(ReplicationError::Invalid(format!(
+                    "active secret {} references missing environment {environment_id}",
+                    secret.entity_id()
+                )));
+            }
         }
     }
     Ok(())
