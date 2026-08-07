@@ -28,7 +28,7 @@ final class CloudRecordSyncSession: NSObject, CKSyncEngineDelegate, @unchecked S
 
     init(
         database: CKDatabase,
-        control: any RecordSyncControlling & VaultBootstrapControlling,
+        control: any CloudSyncControlling,
         supportDirectory: URL,
         vaultID: String
     ) throws {
