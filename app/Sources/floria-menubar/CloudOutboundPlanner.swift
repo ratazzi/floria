@@ -7,6 +7,8 @@ import Foundation
 /// remain in Rust's durable outbox and are considered one at a time, preserving
 /// their local order and atomic head CAS boundary.
 struct CloudOutboundPlanner {
+    static let cloudKitRecordLimit = 250
+
     let codec: CloudRecordCodec
 
     func nextAction(
@@ -20,11 +22,17 @@ struct CloudOutboundPlanner {
             !verifiedObjectDigests.contains($0.digest)
         }
         if !missingObjects.isEmpty {
-            return .saveObjects(try missingObjects.map(codec.objectRecord))
+            return .saveObjects(
+                try missingObjects.prefix(Self.cloudKitRecordLimit).map(codec.objectRecord))
         }
 
         switch try codec.planCommit(commit, cachedHeads: cachedHeads) {
         case .ready(let records):
+            guard records.count <= Self.cloudKitRecordLimit else {
+                throw CloudOutboundPlanningError.commitExceedsCloudKitRecordLimit(
+                    commitID: commit.commitID,
+                    records: records.count)
+            }
             return .saveCommit(commitID: commit.commitID, records: records)
         case .needsHeadFetch(let entityIDs):
             return .fetchHeads(
@@ -44,6 +52,10 @@ enum CloudOutboundAction {
     case fetchHeads(commitID: String, recordIDs: [CKRecord.ID])
     case settleConflict(commitID: String, entityIDs: [String])
     case saveCommit(commitID: String, records: [CKRecord])
+}
+
+enum CloudOutboundPlanningError: Error, Equatable {
+    case commitExceedsCloudKitRecordLimit(commitID: String, records: Int)
 }
 
 /// Interprets `serverRecordChanged` without turning every create-only retry into

@@ -45,6 +45,55 @@ final class CloudOutboundPlannerTests: XCTestCase {
         ])
     }
 
+    func testObjectUploadsAreBoundedByCloudKitRequestLimit() throws {
+        let objects = (0...CloudOutboundPlanner.cloudKitRecordLimit).map { index in
+            SyncObjectAsset(
+                digest: String(format: "%064x", index),
+                ciphertextSize: 1,
+                file: "/tmp/\(index)")
+        }
+
+        guard case .saveObjects(let records) = try CloudOutboundPlanner(codec: codec)
+            .nextAction(
+                batch: SyncOutboundBatch(
+                    commits: [commit(expectedHead: nil)], objects: objects),
+                verifiedObjectDigests: [],
+                cachedHeads: [:])
+        else {
+            return XCTFail("Expected an object batch")
+        }
+
+        XCTAssertEqual(records.count, CloudOutboundPlanner.cloudKitRecordLimit)
+    }
+
+    func testAtomicCommitCannotBeSplitAcrossCloudKitRequests() throws {
+        let revisions = (0..<CloudOutboundPlanner.cloudKitRecordLimit / 2).map { index in
+            SyncOutboundRevision(
+                entityID: uuid(index * 2 + 1),
+                revisionID: uuid(index * 2 + 2),
+                expectedHeadRevisionID: nil,
+                envelopeBase64: Data("revision".utf8).base64EncodedString())
+        }
+        let oversized = SyncOutboundCommit(
+            commitID: commitID,
+            manifestBase64: Data("manifest".utf8).base64EncodedString(),
+            revisions: revisions,
+            createdAt: "2026-08-07T12:00:00Z")
+
+        XCTAssertThrowsError(
+            try CloudOutboundPlanner(codec: codec).nextAction(
+                batch: SyncOutboundBatch(commits: [oversized], objects: []),
+                verifiedObjectDigests: [],
+                cachedHeads: [:])
+        ) {
+            XCTAssertEqual(
+                $0 as? CloudOutboundPlanningError,
+                .commitExceedsCloudKitRecordLimit(
+                    commitID: commitID,
+                    records: 1 + revisions.count * 2))
+        }
+    }
+
     func testMissingAndChangedHeadsNeverBecomeBlindCreates() throws {
         let batch = SyncOutboundBatch(
             commits: [commit(expectedHead: oldRevisionID)],
@@ -150,5 +199,9 @@ final class CloudOutboundPlannerTests: XCTestCase {
         record[CloudRecordCodec.Field.entityID] = entityID as NSString
         record[CloudRecordCodec.Field.revisionID] = revisionID as NSString
         return record
+    }
+
+    private func uuid(_ index: Int) -> String {
+        String(format: "00000000-0000-4000-8000-%012x", index)
     }
 }
