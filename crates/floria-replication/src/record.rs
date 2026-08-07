@@ -20,7 +20,7 @@ pub enum RecordError {
     InvalidUuid { field: &'static str, value: String },
     #[error("entity revision ciphertext cannot be empty")]
     EmptyCiphertext,
-    #[error("entity revision key generation must start at 1")]
+    #[error("record key generation must start at 1")]
     InvalidKeyGeneration,
     #[error("revision {revision_id} cannot name itself as a parent")]
     SelfParent { revision_id: String },
@@ -48,6 +48,8 @@ pub enum RecordError {
     Cycle { revision_id: String },
     #[error("revision commit must contain at least one revision")]
     EmptyCommit,
+    #[error("revision commit ciphertext cannot be empty")]
+    EmptyCommitCiphertext,
     #[error("commit {commit_id} names revision {revision_id} more than once")]
     DuplicateCommitRevision {
         commit_id: String,
@@ -227,18 +229,24 @@ impl EntityRevision {
 pub struct RevisionCommit {
     format_version: u32,
     commit_id: String,
+    key_generation: u32,
     revision_ids: Vec<String>,
+    ciphertext: Vec<u8>,
 }
 
 impl RevisionCommit {
     pub fn new(
         commit_id: impl Into<String>,
+        key_generation: u32,
         revision_ids: Vec<String>,
+        ciphertext: Vec<u8>,
     ) -> RecordResult<Self> {
         let mut commit = Self {
             format_version: RECORD_FORMAT_VERSION,
             commit_id: commit_id.into(),
+            key_generation,
             revision_ids,
+            ciphertext,
         };
         commit.canonicalize();
         commit.validate()?;
@@ -253,8 +261,16 @@ impl RevisionCommit {
         &self.commit_id
     }
 
+    pub fn key_generation(&self) -> u32 {
+        self.key_generation
+    }
+
     pub fn revision_ids(&self) -> &[String] {
         &self.revision_ids
+    }
+
+    pub fn ciphertext(&self) -> &[u8] {
+        &self.ciphertext
     }
 
     pub(crate) fn canonicalize(&mut self) {
@@ -266,8 +282,14 @@ impl RevisionCommit {
             return Err(RecordError::UnsupportedFormat(self.format_version));
         }
         validate_uuid("commit_id", &self.commit_id)?;
+        if self.key_generation == 0 {
+            return Err(RecordError::InvalidKeyGeneration);
+        }
         if self.revision_ids.is_empty() {
             return Err(RecordError::EmptyCommit);
+        }
+        if self.ciphertext.is_empty() {
+            return Err(RecordError::EmptyCommitCiphertext);
         }
         let mut revisions = BTreeSet::new();
         for revision_id in &self.revision_ids {
@@ -723,7 +745,9 @@ mod tests {
         let entity_id = id();
         let root_id = id();
         let child_id = id();
-        let commit = RevisionCommit::new(id(), vec![child_id.clone()]).unwrap();
+        let commit =
+            RevisionCommit::new(id(), 1, vec![child_id.clone()], b"encrypted-commit".to_vec())
+                .unwrap();
         let mut set = RevisionSet::new();
 
         assert_eq!(
@@ -751,8 +775,13 @@ mod tests {
         let first_id = id();
         let second_id = id();
         let commit_id = id();
-        let commit =
-            RevisionCommit::new(&commit_id, vec![first_id.clone(), second_id.clone()]).unwrap();
+        let commit = RevisionCommit::new(
+            &commit_id,
+            1,
+            vec![first_id.clone(), second_id.clone()],
+            b"encrypted-commit".to_vec(),
+        )
+        .unwrap();
         let mut set = RevisionSet::new();
         set.insert(revision(&entity_id, &first_id, Vec::new()))
             .unwrap();

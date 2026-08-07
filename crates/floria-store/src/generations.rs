@@ -88,6 +88,16 @@ impl GenerationAccess {
         layout: &SharedLayout,
         vault: &VaultDocument,
     ) -> StoreResult<Vec<Box<dyn age::Recipient + Send>>> {
+        self.current_recipients(layout, vault)
+            .map(|(_, recipients)| recipients)
+    }
+
+    /// Return the generation label and its recipients from the same signed document.
+    pub(crate) fn current_recipients(
+        &self,
+        layout: &SharedLayout,
+        vault: &VaultDocument,
+    ) -> StoreResult<(u32, Vec<Box<dyn age::Recipient + Send>>)> {
         self.with_current(layout, vault, |document| {
             let generation = x25519::Recipient::from_str(document.generation_public.trim())
                 .map_err(|error| {
@@ -97,10 +107,13 @@ impl GenerationAccess {
                 .map_err(|error| {
                     StoreError::Invalid(format!("invalid recovery recipient: {error}"))
                 })?;
-            Ok(vec![
-                Box::new(generation) as Box<dyn age::Recipient + Send>,
-                Box::new(recovery) as Box<dyn age::Recipient + Send>,
-            ])
+            Ok((
+                document.generation,
+                vec![
+                    Box::new(generation) as Box<dyn age::Recipient + Send>,
+                    Box::new(recovery) as Box<dyn age::Recipient + Send>,
+                ],
+            ))
         })
     }
 

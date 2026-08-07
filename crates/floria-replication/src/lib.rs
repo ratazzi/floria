@@ -7,6 +7,7 @@
 //! only names the object the store already wrote.
 
 pub mod record;
+pub mod record_crypto;
 pub mod record_journal;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -994,8 +995,7 @@ impl ReplicationPackage {
         }
         // Encrypt to the same generation the store writes under, so both halves of a device's
         // output name one key domain.
-        let current_generation = self.store.current_generation()?;
-        let recipients = self.store.generation_recipients()?;
+        let (current_generation, recipients) = self.store.current_generation_recipients()?;
         let payload = OperationPayload {
             format_version: PAYLOAD_FORMAT_VERSION,
             entities: mutation.entities.to_vec(),

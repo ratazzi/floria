@@ -486,6 +486,15 @@ impl AgeDirStore {
         self.generations.recipients(&state.layout, &state.vault)
     }
 
+    /// The exact signed generation and recipients used for one new encrypted record.
+    pub fn current_generation_recipients(
+        &self,
+    ) -> StoreResult<(u32, Vec<Box<dyn age::Recipient + Send>>)> {
+        let state = self.state.read().expect("shared state poisoned");
+        self.generations
+            .current_recipients(&state.layout, &state.vault)
+    }
+
     /// Replace a revoked device identity with a fresh keypair and id. Callers must only expose
     /// this after a signed Vault generation identifies the current identity as revoked.
     ///

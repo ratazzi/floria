@@ -969,10 +969,12 @@ mod tests {
     fn commit(revisions: &[EntityRevision]) -> RevisionCommit {
         RevisionCommit::new(
             id(),
+            1,
             revisions
                 .iter()
                 .map(|revision| revision.revision_id().to_string())
                 .collect(),
+            b"encrypted-commit-fixture".to_vec(),
         )
         .unwrap()
     }
