@@ -29,6 +29,22 @@ struct CloudVaultBootstrapCodec {
         recordCodec = try CloudRecordCodec(vaultID: vaultID)
     }
 
+    func owns(_ record: CKRecord) -> Bool {
+        Self.recordTypes.contains(record.recordType)
+    }
+
+    func owns(_ recordID: CKRecord.ID) -> Bool {
+        guard recordID.zoneID == recordCodec.zoneID else { return false }
+        return Self.recordNamePrefixes.contains { recordID.recordName.hasPrefix($0) }
+    }
+
+    func equivalent(_ left: CKRecord, _ right: CKRecord) throws -> Bool {
+        guard left.recordID == right.recordID, left.recordType == right.recordType else {
+            return false
+        }
+        return try decode(left) == decode(right)
+    }
+
     func records(for bootstrap: SyncVaultBootstrap) throws -> [CKRecord] {
         guard bootstrap.vaultID.lowercased() == recordCodec.vaultID else {
             throw CloudVaultBootstrapCodecError.vaultMismatch(
@@ -154,6 +170,7 @@ struct CloudVaultBootstrapCodec {
         try validateCommonFields(record)
         switch record.recordType {
         case RecordType.vault:
+            try validateFields(record, allowed: [Field.schemaVersion, Field.vaultID, Field.payload])
             let vaultID = try stringField(Field.vaultID, in: record)
             guard vaultID == recordCodec.vaultID else {
                 throw CloudVaultBootstrapCodecError.vaultMismatch(
@@ -163,18 +180,22 @@ struct CloudVaultBootstrapCodec {
             return .vault(documentBase64: try payloadBase64(record))
 
         case RecordType.device:
+            try validateFields(record, allowed: [Field.schemaVersion, Field.deviceID, Field.payload])
             let deviceID = try validatedDeviceID(try stringField(Field.deviceID, in: record))
             try validateRecordID(record, prefix: "device", stableID: deviceID)
             return .device(
                 SyncBootstrapDocument(route: deviceID, documentBase64: try payloadBase64(record)))
 
         case RecordType.enrollmentRequest:
+            try validateFields(record, allowed: [Field.schemaVersion, Field.deviceID, Field.payload])
             let deviceID = try validatedDeviceID(try stringField(Field.deviceID, in: record))
             try validateRecordID(record, prefix: "enrollment", stableID: deviceID)
             return .enrollmentRequest(
                 SyncBootstrapDocument(route: deviceID, documentBase64: try payloadBase64(record)))
 
         case RecordType.generation:
+            try validateFields(
+                record, allowed: [Field.schemaVersion, Field.generation, Field.payload])
             let generation = try generationField(record)
             try validateRecordID(record, prefix: "generation", stableID: String(generation))
             return .generation(
@@ -182,6 +203,11 @@ struct CloudVaultBootstrapCodec {
                     route: String(generation), documentBase64: try payloadBase64(record)))
 
         case RecordType.generationEnvelope:
+            try validateFields(
+                record,
+                allowed: [
+                    Field.schemaVersion, Field.deviceID, Field.generation, Field.payload,
+                ])
             let deviceID = try validatedDeviceID(try stringField(Field.deviceID, in: record))
             let generation = try generationField(record)
             try validateRecordID(
@@ -235,6 +261,12 @@ struct CloudVaultBootstrapCodec {
         }
         guard version.int64Value == CloudRecordCodec.schemaVersion else {
             throw CloudVaultBootstrapCodecError.unsupportedSchemaVersion(version.int64Value)
+        }
+    }
+
+    private func validateFields(_ record: CKRecord, allowed: Set<String>) throws {
+        if let unexpected = Set(record.allKeys()).subtracting(allowed).sorted().first {
+            throw CloudVaultBootstrapCodecError.unexpectedField(unexpected)
         }
     }
 
@@ -301,9 +333,22 @@ struct CloudVaultBootstrapCodec {
         guard value > 0 else { throw CloudVaultBootstrapCodecError.invalidGeneration }
         return value
     }
+
+
+    private static let recordTypes = Set([
+        RecordType.vault,
+        RecordType.device,
+        RecordType.enrollmentRequest,
+        RecordType.generation,
+        RecordType.generationEnvelope,
+    ])
+
+    private static let recordNamePrefixes = [
+        "vault-", "device-", "enrollment-", "generation-", "envelope-",
+    ]
 }
 
-enum CloudDecodedBootstrapRecord {
+enum CloudDecodedBootstrapRecord: Equatable {
     case vault(documentBase64: String)
     case device(SyncBootstrapDocument)
     case enrollmentRequest(SyncBootstrapDocument)
@@ -326,6 +371,7 @@ enum CloudVaultBootstrapCodecError: Error, Equatable, LocalizedError {
     case unknownRecordType(String)
     case missingField(String)
     case recordIdentityMismatch(String)
+    case unexpectedField(String)
 
     var errorDescription: String? {
         switch self {
@@ -357,6 +403,8 @@ enum CloudVaultBootstrapCodecError: Error, Equatable, LocalizedError {
             return "Vault bootstrap record is missing \(field)"
         case .recordIdentityMismatch(let name):
             return "Vault bootstrap record ID does not match its route: \(name)"
+        case .unexpectedField(let field):
+            return "Vault bootstrap record contains unexpected field \(field)"
         }
     }
 }

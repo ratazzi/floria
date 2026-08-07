@@ -71,6 +71,14 @@ final class CloudVaultBootstrapCodecTests: XCTestCase {
                 $0 as? CloudVaultBootstrapCodecError,
                 .recordIdentityMismatch(substituted.recordID.recordName))
         }
+
+        let injected = try XCTUnwrap(device.copy() as? CKRecord)
+        injected["plaintext"] = "must not cross this boundary" as NSString
+        XCTAssertThrowsError(try codec.decode(injected)) {
+            XCTAssertEqual(
+                $0 as? CloudVaultBootstrapCodecError,
+                .unexpectedField("plaintext"))
+        }
     }
 
     func testRejectsInvalidGenerationRoutesAndOversizedPayloads() throws {
