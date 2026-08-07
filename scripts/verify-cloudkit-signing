@@ -1,0 +1,105 @@
+#!/bin/bash
+set -euo pipefail
+
+EXPECTED_TEAM_ID="${FLORIA_SIGNING_TEAM_ID:?FLORIA_SIGNING_TEAM_ID is required}"
+EXPECTED_BUNDLE_ID="floria.hola.ac"
+EXPECTED_CONTAINER_ID="iCloud.floria.hola.ac"
+WORK_DIRECTORY="$(mktemp -d "${TMPDIR:-/private/tmp}/floria-cloudkit-signing.XXXXXX")"
+
+cleanup() {
+    rm -rf "${WORK_DIRECTORY}"
+}
+trap cleanup EXIT INT TERM
+
+fail() {
+    echo "CloudKit signing verification failed: $*" >&2
+    exit 1
+}
+
+plist_value() {
+    /usr/libexec/PlistBuddy -c "Print :$2" "$1" 2>/dev/null || true
+}
+
+plist_array_contains() {
+    local plist="$1"
+    local key="$2"
+    local expected="$3"
+    local values
+    values="$(plist_value "${plist}" "${key}")"
+    grep -Fxq "    ${expected}" <<<"${values}"
+}
+
+case "${1:-}" in
+    --profile)
+        [[ $# -eq 2 ]] || fail "usage: scripts/verify-cloudkit-signing --profile /path/to/profile"
+        APP_BUNDLE=""
+        PROFILE_PATH="$2"
+        ;;
+    --app)
+        [[ $# -eq 2 ]] || fail "usage: scripts/verify-cloudkit-signing --app /path/to/Floria.app"
+        APP_BUNDLE="$2"
+        PROFILE_PATH="${APP_BUNDLE}/Contents/embedded.provisionprofile"
+        [[ -d "${APP_BUNDLE}" ]] || fail "app bundle does not exist: ${APP_BUNDLE}"
+        ;;
+    *)
+        fail "usage: scripts/verify-cloudkit-signing (--profile /path/to/profile | --app /path/to/Floria.app)"
+        ;;
+esac
+
+[[ -f "${PROFILE_PATH}" ]] || fail "provisioning profile is missing: ${PROFILE_PATH}"
+
+PROFILE_PLIST="${WORK_DIRECTORY}/profile.plist"
+security cms -D -i "${PROFILE_PATH}" >"${PROFILE_PLIST}" ||
+    fail "embedded provisioning profile cannot be decoded"
+
+PROFILE_APP_ID="$(plist_value "${PROFILE_PLIST}" "Entitlements:com.apple.application-identifier")"
+PROFILE_TEAM_ID="$(plist_value "${PROFILE_PLIST}" "Entitlements:com.apple.developer.team-identifier")"
+PROFILE_ENVIRONMENT="$(plist_value "${PROFILE_PLIST}" "Entitlements:com.apple.developer.icloud-container-environment")"
+
+[[ "${PROFILE_APP_ID}" == "${EXPECTED_TEAM_ID}.${EXPECTED_BUNDLE_ID}" ]] ||
+    fail "profile application identifier is ${PROFILE_APP_ID:-missing}; expected ${EXPECTED_TEAM_ID}.${EXPECTED_BUNDLE_ID}"
+[[ "${PROFILE_TEAM_ID}" == "${EXPECTED_TEAM_ID}" ]] ||
+    fail "profile Team ID is ${PROFILE_TEAM_ID:-missing}; expected ${EXPECTED_TEAM_ID}"
+[[ "${PROFILE_ENVIRONMENT}" == "Production" ]] ||
+    fail "profile CloudKit environment is ${PROFILE_ENVIRONMENT:-missing}; expected Production"
+plist_array_contains \
+    "${PROFILE_PLIST}" \
+    "Entitlements:com.apple.developer.icloud-container-identifiers" \
+    "${EXPECTED_CONTAINER_ID}" ||
+    fail "profile does not authorize ${EXPECTED_CONTAINER_ID}"
+plist_array_contains \
+    "${PROFILE_PLIST}" \
+    "Entitlements:com.apple.developer.icloud-services" \
+    "CloudKit" ||
+    fail "profile does not authorize CloudKit"
+
+if [[ -z "${APP_BUNDLE}" ]]; then
+    echo "==> Verified CloudKit provisioning profile for ${EXPECTED_BUNDLE_ID} (${EXPECTED_CONTAINER_ID})"
+    exit 0
+fi
+
+SIGNED_ENTITLEMENTS="${WORK_DIRECTORY}/signed-entitlements.plist"
+codesign -d --entitlements - "${APP_BUNDLE}" >"${SIGNED_ENTITLEMENTS}" 2>/dev/null ||
+    fail "app entitlements cannot be read"
+SIGNED_APP_ID="$(plist_value "${SIGNED_ENTITLEMENTS}" "com.apple.application-identifier")"
+SIGNED_TEAM_ID="$(plist_value "${SIGNED_ENTITLEMENTS}" "com.apple.developer.team-identifier")"
+SIGNED_ENVIRONMENT="$(plist_value "${SIGNED_ENTITLEMENTS}" "com.apple.developer.icloud-container-environment")"
+
+[[ "${SIGNED_APP_ID}" == "${EXPECTED_TEAM_ID}.${EXPECTED_BUNDLE_ID}" ]] ||
+    fail "signed application identifier is ${SIGNED_APP_ID:-missing}; expected ${EXPECTED_TEAM_ID}.${EXPECTED_BUNDLE_ID}"
+[[ "${SIGNED_TEAM_ID}" == "${EXPECTED_TEAM_ID}" ]] ||
+    fail "signed Team ID is ${SIGNED_TEAM_ID:-missing}; expected ${EXPECTED_TEAM_ID}"
+[[ "${SIGNED_ENVIRONMENT}" == "Production" ]] ||
+    fail "signed CloudKit environment is ${SIGNED_ENVIRONMENT:-missing}; expected Production"
+plist_array_contains \
+    "${SIGNED_ENTITLEMENTS}" \
+    "com.apple.developer.icloud-container-identifiers" \
+    "${EXPECTED_CONTAINER_ID}" ||
+    fail "signed app does not claim ${EXPECTED_CONTAINER_ID}"
+plist_array_contains \
+    "${SIGNED_ENTITLEMENTS}" \
+    "com.apple.developer.icloud-services" \
+    "CloudKit" ||
+    fail "signed app does not claim CloudKit"
+
+echo "==> Verified CloudKit signing for ${EXPECTED_BUNDLE_ID} (${EXPECTED_CONTAINER_ID})"
