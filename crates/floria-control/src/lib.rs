@@ -17,10 +17,11 @@ pub use protocol::{
     ProjectCheckoutDiscovery, ProjectCheckoutInventory, ProtectedFile, ProtectedFileVersion,
     RecoveryKeyReport, ReplicationDevice, ReplicationEnrollment, ReplicationMode,
     ReplicationPendingEnrollment, ReplicationStatus, SecretValue,
+    SyncBootstrapDocument, SyncBootstrapEnvelope,
     SyncDeliveryDisposition, SyncDeliveryOutcome, SyncDomainStatus, SyncInboundBatch,
     SyncInboundManifest, SyncInboundObject, SyncInboundReport, SyncInboundRevision,
     SyncObjectAsset, SyncOutboundBatch, SyncOutboundCommit, SyncOutboundRevision,
-    SyncProjectionDisposition, SyncSettlementReport,
+    SyncProjectionDisposition, SyncSettlementReport, SyncVaultBootstrap,
     SshConfigState, SshConfigStatus, SshIdentity,
     CONTROL_PROTOCOL_VERSION,
 };

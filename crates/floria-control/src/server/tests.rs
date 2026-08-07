@@ -134,6 +134,7 @@
     #[derive(Default)]
     struct FixtureRecordSyncService {
         status_calls: AtomicUsize,
+        bootstrap_calls: AtomicUsize,
         outbound_calls: AtomicUsize,
         settlement_calls: AtomicUsize,
         inbound_calls: AtomicUsize,
@@ -143,6 +144,19 @@
         fn status(&self) -> Result<SyncDomainStatus, String> {
             self.status_calls.fetch_add(1, Ordering::Relaxed);
             Ok(SyncDomainStatus::default())
+        }
+
+        fn vault_bootstrap(&self) -> Result<SyncVaultBootstrap, String> {
+            self.bootstrap_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(serde_json::from_value(serde_json::json!({
+                "vault_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "vault_document_base64": "dmF1bHQ=",
+                "device_identities": [],
+                "enrollment_requests": [],
+                "key_generations": [],
+                "generation_envelopes": []
+            }))
+            .expect("fixture Vault bootstrap"))
         }
 
         fn next_outbound(&self, _limit: usize) -> Result<SyncOutboundBatch, String> {
@@ -2920,6 +2934,12 @@
         ));
         assert!(matches!(
             client
+                .request(ControlCommand::RecordSyncVaultBootstrap)
+                .unwrap(),
+            ControlResult::RecordSyncVaultBootstrap(_)
+        ));
+        assert!(matches!(
+            client
                 .request(ControlCommand::RecordSyncNextOutbound { limit: 10 })
                 .unwrap(),
             ControlResult::RecordSyncOutbound(_)
@@ -2946,6 +2966,7 @@
         ));
 
         assert_eq!(record_sync.status_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(record_sync.bootstrap_calls.load(Ordering::Relaxed), 1);
         assert_eq!(record_sync.outbound_calls.load(Ordering::Relaxed), 1);
         assert_eq!(record_sync.settlement_calls.load(Ordering::Relaxed), 1);
         assert_eq!(record_sync.inbound_calls.load(Ordering::Relaxed), 1);
@@ -3187,9 +3208,14 @@
     fn observer_classification_defaults_head_changes_to_mutating() {
         assert!(is_read_only(&ControlCommand::Snapshot));
         assert!(is_read_only(&ControlCommand::RecordSyncStatus));
+        assert!(is_read_only(&ControlCommand::RecordSyncVaultBootstrap));
         assert!(!command_allowed_for_peer(
             PeerAccess::ReadOnly,
             &ControlCommand::RecordSyncStatus,
+        ));
+        assert!(!command_allowed_for_peer(
+            PeerAccess::ReadOnly,
+            &ControlCommand::RecordSyncVaultBootstrap,
         ));
         assert!(is_read_only(&ControlCommand::ProtectedFileHistory {
             id: "fixture".to_string(),

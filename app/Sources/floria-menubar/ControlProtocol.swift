@@ -1,6 +1,6 @@
 import Foundation
 
-let supportedControlProtocolVersion: UInt32 = 11
+let supportedControlProtocolVersion: UInt32 = 12
 
 struct ControlServerInfo: Decodable, Equatable, Sendable {
     let protocolVersion: UInt32?
@@ -1210,6 +1210,48 @@ struct SyncDomainStatus: Codable, Equatable, Sendable {
     }
 }
 
+struct SyncBootstrapDocument: Codable, Equatable, Sendable {
+    let route: String
+    let documentBase64: String
+
+    enum CodingKeys: String, CodingKey {
+        case route
+        case documentBase64 = "document_base64"
+    }
+}
+
+struct SyncBootstrapEnvelope: Codable, Equatable, Sendable {
+    let deviceID: String
+    let generation: UInt32
+    let ciphertextBase64: String
+
+    enum CodingKeys: String, CodingKey {
+        case deviceID = "device_id"
+        case generation
+        case ciphertextBase64 = "ciphertext_base64"
+    }
+}
+
+/// Opaque authenticated material for Vault discovery and enrollment. Swift routes these payloads
+/// into CloudKit records but never parses or decides the signed JSON inside them.
+struct SyncVaultBootstrap: Codable, Equatable, Sendable {
+    let vaultID: String
+    let vaultDocumentBase64: String
+    let deviceIdentities: [SyncBootstrapDocument]
+    let enrollmentRequests: [SyncBootstrapDocument]
+    let keyGenerations: [SyncBootstrapDocument]
+    let generationEnvelopes: [SyncBootstrapEnvelope]
+
+    enum CodingKeys: String, CodingKey {
+        case vaultID = "vault_id"
+        case vaultDocumentBase64 = "vault_document_base64"
+        case deviceIdentities = "device_identities"
+        case enrollmentRequests = "enrollment_requests"
+        case keyGenerations = "key_generations"
+        case generationEnvelopes = "generation_envelopes"
+    }
+}
+
 enum ControlCommand: Sendable {
     case ping
     case health
@@ -1235,6 +1277,7 @@ enum ControlCommand: Sendable {
     case replicationEnroll(ReplicationEnrollment)
     case replicationApprove(deviceID: String)
     case recordSyncStatus
+    case recordSyncVaultBootstrap
     case recordSyncNextOutbound(limit: Int)
     case recordSyncSettleOutbound(outcomes: [SyncDeliveryOutcome])
     case recordSyncApplyInbound(batch: SyncInboundBatch, observedAt: String)
@@ -1324,6 +1367,7 @@ enum ControlCommand: Sendable {
         case .replicationEnroll: "replication_enroll"
         case .replicationApprove: "replication_approve"
         case .recordSyncStatus: "record_sync_status"
+        case .recordSyncVaultBootstrap: "record_sync_vault_bootstrap"
         case .recordSyncNextOutbound: "record_sync_next_outbound"
         case .recordSyncSettleOutbound: "record_sync_settle_outbound"
         case .recordSyncApplyInbound: "record_sync_apply_inbound"
@@ -1379,6 +1423,7 @@ enum ControlCommand: Sendable {
         case .ping, .health, .policyModeGet, .grantList, .grantClear, .replicationStatus,
             .replicationSync, .replicationResolveWithCurrent, .replicationDisable,
             .replicationRequestReenrollment, .replicationEnrollment, .recordSyncStatus, .snapshot,
+            .recordSyncVaultBootstrap,
             .projectCheckoutInventory, .sshConfigStatus, .sshConfigInstall, .sshConfigRemove,
             .protectedFiles:
             return try encoder.encode(ControlRequestWithoutParams(requestID: requestID, method: method))

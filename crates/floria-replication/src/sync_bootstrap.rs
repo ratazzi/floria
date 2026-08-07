@@ -23,6 +23,8 @@ use crate::{ReplicationError, ReplicationResult};
 const MAX_BOOTSTRAP_DEVICES: usize = 64;
 const MAX_BOOTSTRAP_GENERATIONS: usize = 64;
 const MAX_BOOTSTRAP_ENVELOPES: usize = MAX_BOOTSTRAP_DEVICES * MAX_BOOTSTRAP_GENERATIONS;
+/// Leaves two MiB for the control response envelope beneath its eight MiB frame limit.
+const MAX_BOOTSTRAP_WIRE_BYTES: usize = 6 * 1024 * 1024;
 
 /// One signed JSON document with a transport-visible stable route and opaque payload.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,6 +185,12 @@ impl SyncVaultBootstrap {
     /// Validate an untrusted transport snapshot and bind it to the selected Vault zone. Passing
     /// establishes internal authenticity, not user intent to join that Vault.
     pub fn validate_for_vault(&self, expected_vault_id: &str) -> ReplicationResult<()> {
+        let wire_size = serde_json::to_vec(self)?.len();
+        if wire_size > MAX_BOOTSTRAP_WIRE_BYTES {
+            return Err(ReplicationError::Invalid(format!(
+                "Vault bootstrap is {wire_size} bytes, maximum is {MAX_BOOTSTRAP_WIRE_BYTES}"
+            )));
+        }
         require_count("Device identities", self.device_identities.len(), MAX_BOOTSTRAP_DEVICES)?;
         require_count("enrollment requests", self.enrollment_requests.len(), MAX_BOOTSTRAP_DEVICES)?;
         require_count("key generations", self.key_generations.len(), MAX_BOOTSTRAP_GENERATIONS)?;
@@ -515,5 +523,19 @@ mod tests {
         let mut tampered = snapshot.clone();
         tampered.vault_document_base64 = BASE64.encode(bytes);
         assert!(tampered.validate_for_vault(snapshot.vault_id()).is_err());
+    }
+
+    #[test]
+    fn rejects_a_snapshot_that_cannot_fit_one_control_frame() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = store(&directory);
+        let mut snapshot = SyncVaultBootstrap::capture(&store).unwrap();
+        snapshot.vault_document_base64 = "A".repeat(MAX_BOOTSTRAP_WIRE_BYTES);
+
+        assert!(snapshot
+            .validate_for_vault(snapshot.vault_id())
+            .unwrap_err()
+            .to_string()
+            .contains("maximum"));
     }
 }

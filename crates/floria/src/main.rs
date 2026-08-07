@@ -20,7 +20,7 @@ use floria_control::{
     ReplicationEnrollment as ControlReplicationEnrollment, ReplicationMode, ReplicationStatus,
     RuntimeRecordSyncService, RuntimeReplicationService, SshIdentity, SshIdentityDiscovery,
     SyncDeliveryOutcome, SyncDomainStatus, SyncInboundBatch, SyncInboundReport,
-    SyncOutboundBatch, SyncSettlementReport,
+    SyncOutboundBatch, SyncSettlementReport, SyncVaultBootstrap,
 };
 use floria_core::audit::{AuditAuthority, AuditCheckpoint, AuditLog};
 use floria_core::authz::{Authorizer, PolicyMode, PolicyModeStatus};
@@ -1254,6 +1254,12 @@ impl RuntimeRecordSyncService for DaemonRecordSyncService {
         })
     }
 
+    fn vault_bootstrap(&self) -> Result<SyncVaultBootstrap, String> {
+        self.with_journal(|journal| {
+            RecordSyncControl::new(journal, Arc::clone(&self.store)).vault_bootstrap()
+        })
+    }
+
     fn next_outbound(&self, limit: usize) -> Result<SyncOutboundBatch, String> {
         self.with_captured_state(&self.catalog, |journal| {
             RecordSyncControl::new(journal, Arc::clone(&self.store)).next_outbound(limit)
@@ -2427,6 +2433,9 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
         }
         ControlResult::RecordSyncStatus(status) => {
             println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        ControlResult::RecordSyncVaultBootstrap(bootstrap) => {
+            println!("{}", serde_json::to_string_pretty(&bootstrap)?);
         }
         ControlResult::RecordSyncOutbound(batch) => {
             println!("{}", serde_json::to_string_pretty(&batch)?);

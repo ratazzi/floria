@@ -214,6 +214,11 @@ fn dispatch_uncoordinated(
             .status()
             .map(ControlResult::RecordSyncStatus)
             .map_err(DispatchError::RecordSync),
+        ControlCommand::RecordSyncVaultBootstrap => record_sync
+            .ok_or_else(record_sync_unavailable)?
+            .vault_bootstrap()
+            .map(ControlResult::RecordSyncVaultBootstrap)
+            .map_err(DispatchError::RecordSync),
         ControlCommand::RecordSyncNextOutbound { limit } => {
             let batch = record_sync
                 .ok_or_else(record_sync_unavailable)?

@@ -208,6 +208,16 @@ final class ControlClient: @unchecked Sendable {
         return status
     }
 
+    func recordSyncVaultBootstrap() async throws -> SyncVaultBootstrap {
+        guard let bootstrap: SyncVaultBootstrap = try await request(
+            .recordSyncVaultBootstrap, expecting: "record_sync_vault_bootstrap",
+            as: SyncVaultBootstrap.self)
+        else {
+            throw ControlClientError.missingResult("record_sync_vault_bootstrap")
+        }
+        return bootstrap
+    }
+
     func nextRecordSyncOutbound(limit: Int) async throws -> SyncOutboundBatch {
         guard let batch: SyncOutboundBatch = try await request(
             .recordSyncNextOutbound(limit: limit), expecting: "record_sync_outbound",

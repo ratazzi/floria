@@ -14,6 +14,9 @@ pub use floria_replication::sync_control::{
     SyncObjectAsset, SyncOutboundBatch, SyncOutboundCommit, SyncOutboundRevision,
     SyncProjectionDisposition, SyncSettlementReport,
 };
+pub use floria_replication::sync_bootstrap::{
+    SyncBootstrapDocument, SyncBootstrapEnvelope, SyncVaultBootstrap,
+};
 use floria_store::StoreError;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -21,7 +24,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 const MAX_MSG: usize = 8 << 20;
 pub(crate) const MAX_RECORD_SYNC_BATCH_BYTES: usize = 6 << 20;
-pub const CONTROL_PROTOCOL_VERSION: u32 = 11;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 12;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRequest {
@@ -89,6 +92,7 @@ pub enum ControlCommand {
     /// must have shown the request's key fingerprint for out-of-band comparison first.
     ReplicationApprove { device_id: String },
     RecordSyncStatus,
+    RecordSyncVaultBootstrap,
     RecordSyncNextOutbound { limit: usize },
     RecordSyncSettleOutbound { outcomes: Vec<SyncDeliveryOutcome> },
     RecordSyncApplyInbound { batch: SyncInboundBatch, observed_at: String },
@@ -237,6 +241,7 @@ pub enum ControlResult {
     ReplicationStatus(ReplicationStatus),
     ReplicationEnrollment(ReplicationEnrollment),
     RecordSyncStatus(SyncDomainStatus),
+    RecordSyncVaultBootstrap(SyncVaultBootstrap),
     RecordSyncOutbound(SyncOutboundBatch),
     RecordSyncSettlement(SyncSettlementReport),
     RecordSyncInbound(SyncInboundReport),
@@ -1613,6 +1618,14 @@ mod tests {
 
     #[test]
     fn coordinated_record_sync_wire_is_opaque_and_transport_neutral() {
+        let bootstrap_request = serde_json::to_value(ControlRequest {
+            request_id: 41,
+            command: ControlCommand::RecordSyncVaultBootstrap,
+        })
+        .unwrap();
+        assert_eq!(bootstrap_request["method"], "record_sync_vault_bootstrap");
+        assert!(bootstrap_request.get("params").is_none());
+
         let request = ControlRequest {
             request_id: 42,
             command: ControlCommand::RecordSyncApplyInbound {

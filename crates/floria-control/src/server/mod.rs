@@ -45,7 +45,7 @@ use crate::protocol::{
     ProjectCheckoutInventory, ProtectedFile, ProtectedFileVersion, SecretValue, SshConfigStatus,
     RecoveryKeyReport, ReplicationEnrollment, ReplicationStatus, SshIdentity, WorkspaceSnapshot,
     SyncDeliveryOutcome, SyncDomainStatus, SyncInboundBatch, SyncInboundReport, SyncOutboundBatch,
-    SyncSettlementReport,
+    SyncSettlementReport, SyncVaultBootstrap,
 };
 
 pub struct ControlServer {
@@ -148,6 +148,7 @@ pub trait RuntimeReplicationService: Send + Sync + 'static {
 /// Swift never receives Catalog or Store authority through this interface.
 pub trait RuntimeRecordSyncService: Send + Sync + 'static {
     fn status(&self) -> Result<SyncDomainStatus, String>;
+    fn vault_bootstrap(&self) -> Result<SyncVaultBootstrap, String>;
     fn next_outbound(&self, limit: usize) -> Result<SyncOutboundBatch, String>;
     fn settle_outbound(
         &self,
@@ -496,6 +497,7 @@ fn is_read_only(command: &ControlCommand) -> bool {
             | ControlCommand::ReplicationStatus
             | ControlCommand::ReplicationEnrollment
             | ControlCommand::RecordSyncStatus
+            | ControlCommand::RecordSyncVaultBootstrap
             | ControlCommand::RecordSyncNextOutbound { .. }
             | ControlCommand::Snapshot
             | ControlCommand::Discover { .. }

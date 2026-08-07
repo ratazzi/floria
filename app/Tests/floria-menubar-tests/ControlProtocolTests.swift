@@ -15,7 +15,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertNil(request["params"])
 
         let response = Data(
-            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":11,"daemon_version":"0.1.0","schema_version":14,"minimum_schema_version":14,"store_format_version":5,"minimum_store_format_version":5}}}"#.utf8)
+            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":12,"daemon_version":"0.1.0","schema_version":14,"minimum_schema_version":14,"store_format_version":5,"minimum_store_format_version":5}}}"#.utf8)
         let decoded = try JSONDecoder().decode(
             ControlResponseEnvelope<ControlServerInfo>.self, from: response)
         let info = try XCTUnwrap(decoded.result?.value)
@@ -140,6 +140,14 @@ final class ControlProtocolTests: XCTestCase {
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase
 
+        let bootstrapData = try ControlCommand.recordSyncVaultBootstrap
+            .requestData(requestID: 69, encoder: encoder)
+        let bootstrapRequest = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: bootstrapData) as? [String: Any])
+        XCTAssertEqual(
+            bootstrapRequest["method"] as? String, "record_sync_vault_bootstrap")
+        XCTAssertNil(bootstrapRequest["params"])
+
         let outboundData = try ControlCommand.recordSyncNextOutbound(limit: 12)
             .requestData(requestID: 70, encoder: encoder)
         let outboundRequest = try XCTUnwrap(
@@ -187,6 +195,13 @@ final class ControlProtocolTests: XCTestCase {
             decodedStatus.result?.value?.vaultID,
             "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
         XCTAssertEqual(decodedStatus.result?.value?.keyGeneration, 2)
+
+        let bootstrapResponse = Data(
+            #"{"request_id":69,"status":"ok","result":{"type":"record_sync_vault_bootstrap","value":{"vault_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","vault_document_base64":"dmF1bHQ=","device_identities":[{"route":"device-1","document_base64":"ZGV2aWNl"}],"enrollment_requests":[],"key_generations":[{"route":"1","document_base64":"Z2VuZXJhdGlvbg=="}],"generation_envelopes":[{"device_id":"device-1","generation":1,"ciphertext_base64":"ZW52ZWxvcGU="}]}}}"#.utf8)
+        let decodedBootstrap = try JSONDecoder().decode(
+            ControlResponseEnvelope<SyncVaultBootstrap>.self, from: bootstrapResponse)
+        XCTAssertEqual(decodedBootstrap.result?.value?.deviceIdentities.first?.route, "device-1")
+        XCTAssertEqual(decodedBootstrap.result?.value?.generationEnvelopes.first?.generation, 1)
 
         let response = Data(
             #"{"request_id":70,"status":"ok","result":{"type":"record_sync_outbound","value":{"commits":[{"commit_id":"commit-1","manifest_base64":"bWFuaWZlc3Q=","revisions":[{"entity_id":"entity-1","revision_id":"revision-1","expected_head_revision_id":null,"envelope_base64":"cmV2aXNpb24="}],"created_at":"2026-08-07T12:00:00Z"}],"objects":[{"digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ciphertext_size":9,"file":"/tmp/floria-sync-object"}]}}}"#.utf8)
