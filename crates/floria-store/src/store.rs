@@ -661,22 +661,40 @@ impl AgeDirStore {
             .collect()
     }
 
-    /// The transport-stable identity of the head version.
-    pub fn head_version_uuid(&self, id: &SecretId) -> StoreResult<String> {
+    /// The complete immutable reference for the current head, read from one authenticated head
+    /// document so replication cannot combine metadata from different concurrent versions.
+    pub fn head_version_ref(&self, id: &SecretId) -> StoreResult<StoreVersionRef> {
         self.verify_security_state()?;
         let heads = self.read_heads(id)?;
-        heads
+        let version = heads
             .versions
             .iter()
             .find(|version| version.version == heads.current_version)
-            .map(|version| version.version_uuid.clone())
             .ok_or_else(|| StoreError::Corrupt {
                 id: id.to_string(),
                 reason: format!(
                     "head version {} is missing from the version table",
                     heads.current_version
                 ),
-            })
+            })?;
+        let state = self.state.read().expect("shared state poisoned");
+        let object = state.layout.object(&version.digest);
+        let ciphertext_size = std::fs::metadata(&object)
+            .map_err(|error| StoreError::io(&object, error))?
+            .len();
+        Ok(StoreVersionRef {
+            ordinal: version.version,
+            version_uuid: version.version_uuid.clone(),
+            generation: version.generation,
+            size: version.size,
+            ciphertext_size,
+            digest: version.digest.clone(),
+        })
+    }
+
+    /// The transport-stable identity of the head version.
+    pub fn head_version_uuid(&self, id: &SecretId) -> StoreResult<String> {
+        Ok(self.head_version_ref(id)?.version_uuid)
     }
 
     /// Point the head at the version carrying `version_uuid`; returns its local ordinal.

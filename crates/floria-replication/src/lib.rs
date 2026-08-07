@@ -6,10 +6,13 @@
 //! enrollment — on top of the store's documents. Nothing here copies a version byte: an operation
 //! only names the object the store already wrote.
 
+pub mod entity_document;
+pub mod entity_state;
 pub mod record;
 pub mod record_crypto;
 pub mod record_journal;
-pub mod entity_state;
+pub mod record_transaction;
+pub mod secret_state;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};

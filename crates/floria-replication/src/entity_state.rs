@@ -13,21 +13,11 @@ use floria_catalog::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::entity_document::EntityLifecycle;
 use crate::{ReplicationError, ReplicationResult};
 
 const ENTITY_STATE_FORMAT_VERSION: u32 = 1;
 const CATALOG_ENTITY_NAMESPACE: Uuid = Uuid::from_u128(0x87f289e7_9cbf_4ede_bca2_1f320e99a975);
-
-/// Whether an entity participates in the current local projection.
-///
-/// Archiving retains the last complete encrypted state so a later revision can restore it without
-/// resurrecting deleted transport records or plaintext.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum EntityLifecycle {
-    Active,
-    Archived,
-}
 
 /// One complete portable catalog row.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,7 +112,7 @@ impl CatalogEntityDocument {
         Ok(document)
     }
 
-    fn validate(&self) -> ReplicationResult<()> {
+    pub(crate) fn validate(&self) -> ReplicationResult<()> {
         if self.format_version != ENTITY_STATE_FORMAT_VERSION {
             return Err(ReplicationError::Invalid(format!(
                 "unsupported catalog entity state format {}",

@@ -10,6 +10,7 @@ use floria_store::AgeDirStore;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::entity_document::ReplicatedEntityDocument;
 use crate::record::{EntityRevision, ImmutableObjectRef, RevisionCommit, RECORD_FORMAT_VERSION};
 use crate::{ReplicationError, ReplicationResult};
 
@@ -23,6 +24,46 @@ pub struct RecordCryptor {
 impl RecordCryptor {
     pub fn new(store: Arc<AgeDirStore>) -> Self {
         Self { store }
+    }
+
+    /// Seal one complete entity document. Its type tag stays encrypted and its reachable objects
+    /// are derived from the document rather than supplied independently by the caller.
+    pub fn seal_entity_revision(
+        &self,
+        document: &ReplicatedEntityDocument,
+        revision_id: impl Into<String>,
+        parents: Vec<String>,
+    ) -> ReplicationResult<EntityRevision> {
+        document.validate()?;
+        let state = Zeroizing::new(serde_json::to_vec(document)?);
+        self.seal_revision(
+            document.entity_id(),
+            revision_id,
+            parents,
+            &state,
+            document.object_refs(),
+        )
+    }
+
+    /// Open, type-dispatch, and validate one complete entity document. A state cannot be
+    /// transplanted into another entity or attached to a different reachable object set.
+    pub fn open_entity_revision(
+        &self,
+        revision: &EntityRevision,
+    ) -> ReplicationResult<ReplicatedEntityDocument> {
+        let state = self.open_revision(revision)?;
+        let document: ReplicatedEntityDocument = serde_json::from_slice(&state)?;
+        document.validate()?;
+        if document.entity_id() != revision.entity_id()
+            || revision.object_refs() != document.object_refs()
+        {
+            return Err(ReplicationError::Invalid(format!(
+                "entity {} does not match revision {} metadata",
+                document.entity_id(),
+                revision.revision_id()
+            )));
+        }
+        Ok(document)
     }
 
     pub fn seal_revision(
@@ -249,7 +290,12 @@ fn canonical_commit(
 mod tests {
     use super::*;
     use age::x25519;
+    use floria_catalog::ReplicatedProject;
     use floria_store::{KeyProvider, StoreResult};
+
+    use crate::entity_document::EntityLifecycle;
+    use crate::entity_state::{CatalogEntityDocument, CatalogEntityState};
+    use crate::secret_state::SecretEntityDocument;
 
     struct LocalKeys(x25519::Identity);
 
@@ -331,5 +377,46 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("does not match its encrypted binding"));
+    }
+
+    #[test]
+    fn catalog_entity_round_trip_binds_state_identity_to_revision() {
+        let (_directory, cryptor) = cryptor();
+        let document = CatalogEntityDocument::active(CatalogEntityState::Project(
+            ReplicatedProject {
+                id: "project-11111111-1111-4111-8111-111111111111".to_string(),
+                name: "Fixture".to_string(),
+                default_environment_id: None,
+            },
+        ));
+        let entity = ReplicatedEntityDocument::Catalog(document.clone());
+        let revision = cryptor.seal_entity_revision(&entity, id(), Vec::new()).unwrap();
+
+        assert_eq!(cryptor.open_entity_revision(&revision).unwrap(), entity);
+        assert_eq!(revision.entity_id(), document.entity_id());
+    }
+
+    #[test]
+    fn secret_entity_round_trip_binds_the_reachable_object() {
+        use floria_store::{NewSecret, SecretStore};
+
+        let (_directory, cryptor) = cryptor();
+        let store = cryptor.store.as_ref();
+        let secret_id = store
+            .put(NewSecret::managed("Fixture"), b"private fixture")
+            .unwrap();
+        let document = SecretEntityDocument::from_store(
+            store,
+            &secret_id,
+            EntityLifecycle::Active,
+        )
+        .unwrap();
+        let entity = ReplicatedEntityDocument::Secret(document.clone());
+        let revision = cryptor
+            .seal_entity_revision(&entity, id(), Vec::new())
+            .unwrap();
+
+        assert_eq!(cryptor.open_entity_revision(&revision).unwrap(), entity);
+        assert_eq!(revision.object_refs(), [document.head().object().clone()]);
     }
 }
