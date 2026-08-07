@@ -18,7 +18,9 @@ use floria_control::{
     RecoveryKeyExporter, RuntimeHealthReporter, RuntimePolicyController, SshConfigManager,
     ReplicationDevice as ControlReplicationDevice,
     ReplicationEnrollment as ControlReplicationEnrollment, ReplicationMode, ReplicationStatus,
-    RuntimeReplicationService, SshIdentity, SshIdentityDiscovery,
+    RuntimeRecordSyncService, RuntimeReplicationService, SshIdentity, SshIdentityDiscovery,
+    SyncDeliveryOutcome, SyncDomainStatus, SyncInboundBatch, SyncInboundReport,
+    SyncOutboundBatch, SyncSettlementReport,
 };
 use floria_core::audit::{AuditAuthority, AuditCheckpoint, AuditLog};
 use floria_core::authz::{Authorizer, PolicyMode, PolicyModeStatus};
@@ -29,6 +31,9 @@ use floria_replication::{
     DeviceEnrollment, ReplicationEngine, ReplicationError, ReplicationReport,
     ReplicationRuntime,
 };
+use floria_replication::record_journal::RecordJournal;
+use floria_replication::record_publisher::RecordPublisher;
+use floria_replication::sync_control::RecordSyncControl;
 use floria_store::{
     AgeDirStore, KeychainKeyProvider, SecretId, SecretRecord, SecretStore, SshKeyProvider,
 };
@@ -1001,6 +1006,16 @@ fn cmd_mount(config: &Path) -> Result<()> {
     );
     let replication_mutation_observer: Arc<dyn ManagedMutationObserver> = replication.clone();
     mutations.observe(Arc::downgrade(&replication_mutation_observer));
+    let record_sync = Arc::new(DaemonRecordSyncService::new(
+        support_dir.join("record-sync/records.sqlite"),
+        concrete_store.vault_document().vault_id.clone(),
+        Arc::clone(&state_authenticator),
+        catalog.clone(),
+        Arc::clone(&concrete_store),
+        Arc::clone(&mutations),
+    ));
+    let record_sync_mutation_observer: Arc<dyn ManagedMutationObserver> = record_sync.clone();
+    mutations.observe(Arc::downgrade(&record_sync_mutation_observer));
     if replication.status().mode == ReplicationMode::Active {
         match replication.sync() {
             Ok(status) => tracing::info!(
@@ -1142,7 +1157,7 @@ fn cmd_mount(config: &Path) -> Result<()> {
             health,
             diagnostics,
             replication,
-            record_sync: None,
+            record_sync: Some(record_sync as Arc<dyn RuntimeRecordSyncService>),
             audit_log: Arc::clone(&audit),
             peer_verifier: control_peer_verifier,
         },
@@ -1159,6 +1174,138 @@ fn cmd_mount(config: &Path) -> Result<()> {
         mutations,
     )
     .context("mount failed")
+}
+
+/// Lazily activates the coordinated-record journal when the opted-in Swift adapter first asks.
+/// Normal daemon startup and local file access never create or open this database.
+struct DaemonRecordSyncService {
+    path: PathBuf,
+    vault_id: String,
+    authenticator: Arc<floria_integrity::StateAuthenticator>,
+    catalog: Catalog,
+    store: Arc<AgeDirStore>,
+    mutations: Arc<floria_surface::ManagedMutationCoordinator>,
+    journal: Mutex<Option<RecordJournal>>,
+}
+
+impl DaemonRecordSyncService {
+    fn new(
+        path: PathBuf,
+        vault_id: String,
+        authenticator: Arc<floria_integrity::StateAuthenticator>,
+        catalog: Catalog,
+        store: Arc<AgeDirStore>,
+        mutations: Arc<floria_surface::ManagedMutationCoordinator>,
+    ) -> Self {
+        Self {
+            path,
+            vault_id,
+            authenticator,
+            catalog,
+            store,
+            mutations,
+            journal: Mutex::new(None),
+        }
+    }
+
+    fn with_journal<T>(
+        &self,
+        operation: impl FnOnce(&RecordJournal) -> floria_replication::ReplicationResult<T>,
+    ) -> Result<T, String> {
+        let mut journal = self
+            .journal
+            .lock()
+            .map_err(|_| "record sync journal lock is poisoned".to_string())?;
+        if journal.is_none() {
+            *journal = Some(
+                RecordJournal::open(
+                    &self.path,
+                    &self.vault_id,
+                    Arc::clone(&self.authenticator),
+                )
+                .map_err(|error| error.to_string())?,
+            );
+        }
+        operation(journal.as_ref().expect("record journal initialized"))
+            .map_err(|error| error.to_string())
+    }
+
+    fn with_captured_state<T>(
+        &self,
+        catalog: &Catalog,
+        operation: impl FnOnce(&RecordJournal) -> floria_replication::ReplicationResult<T>,
+    ) -> Result<T, String> {
+        self.mutations.run(|| {
+            self.with_journal(|journal| {
+                RecordPublisher::new(journal, Arc::clone(&self.store)).capture(
+                    catalog,
+                    replication_timestamp(),
+                )?;
+                operation(journal)
+            })
+        })
+    }
+}
+
+impl RuntimeRecordSyncService for DaemonRecordSyncService {
+    fn status(&self) -> Result<SyncDomainStatus, String> {
+        self.with_captured_state(&self.catalog, |journal| {
+            RecordSyncControl::new(journal, Arc::clone(&self.store)).status()
+        })
+    }
+
+    fn next_outbound(&self, limit: usize) -> Result<SyncOutboundBatch, String> {
+        self.with_captured_state(&self.catalog, |journal| {
+            RecordSyncControl::new(journal, Arc::clone(&self.store)).next_outbound(limit)
+        })
+    }
+
+    fn settle_outbound(
+        &self,
+        outcomes: &[SyncDeliveryOutcome],
+    ) -> Result<SyncSettlementReport, String> {
+        self.with_journal(|journal| {
+            RecordSyncControl::new(journal, Arc::clone(&self.store))
+                .settle_outbound(outcomes)
+        })
+    }
+
+    fn apply_inbound(
+        &self,
+        catalog: &Catalog,
+        batch: SyncInboundBatch,
+        observed_at: &str,
+    ) -> Result<SyncInboundReport, String> {
+        self.with_captured_state(catalog, |journal| {
+            RecordSyncControl::new(journal, Arc::clone(&self.store))
+                .apply_inbound(catalog, batch, observed_at)
+        })
+    }
+}
+
+impl ManagedMutationObserver for DaemonRecordSyncService {
+    fn managed_mutation_committed(&self) {
+        let journal = match self.journal.lock() {
+            Ok(journal) => journal,
+            Err(_) => {
+                tracing::error!("record sync journal lock is poisoned");
+                return;
+            }
+        };
+        let Some(journal) = journal.as_ref() else {
+            return;
+        };
+        match RecordPublisher::new(journal, Arc::clone(&self.store))
+            .capture(&self.catalog, replication_timestamp())
+        {
+            Ok(report) if report.queued_transaction() => tracing::debug!(
+                changed_entities = report.changed_entities(),
+                "queued committed local state for coordinated sync"
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::error!(%error, "failed to queue committed local sync state"),
+        }
+    }
 }
 
 struct AgentPolicyController {
@@ -3051,6 +3198,50 @@ mod tests {
         assert_eq!(reopened.mode, ReplicationMode::Active);
         assert_eq!(reopened.directory.as_deref(), Some(package.as_path()));
         assert_eq!(service.sync().unwrap().mode, ReplicationMode::Active);
+    }
+
+    #[test]
+    fn coordinated_record_sync_is_lazy_then_observes_committed_mutations() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            AgeDirStore::open(
+                directory.path().join("store"),
+                test_store_key(directory.path()),
+            )
+            .unwrap(),
+        );
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite")).unwrap();
+        let mutations = Arc::new(floria_surface::ManagedMutationCoordinator::new());
+        let records_path = directory.path().join("record-sync/records.sqlite");
+        let service = Arc::new(DaemonRecordSyncService::new(
+            records_path.clone(),
+            store.vault_document().vault_id.clone(),
+            Arc::new(floria_integrity::StateAuthenticator::for_tests([94; 32])),
+            catalog,
+            Arc::clone(&store),
+            Arc::clone(&mutations),
+        ));
+        let observer: Arc<dyn ManagedMutationObserver> = service.clone();
+        mutations.observe(Arc::downgrade(&observer));
+
+        let secret_id = mutations
+            .run_committed(|| {
+                store.put(
+                    floria_store::NewSecret::managed("local fixture"),
+                    b"first payload",
+                )
+            })
+            .unwrap();
+        assert!(!records_path.exists());
+
+        assert_eq!(service.status().unwrap().outbound_transactions(), 1);
+        assert!(records_path.exists());
+
+        mutations
+            .run_committed(|| store.append_version(&secret_id, b"second payload"))
+            .unwrap();
+        let journal = service.journal.lock().unwrap();
+        assert_eq!(journal.as_ref().unwrap().outbound().unwrap().len(), 2);
     }
 
     #[test]
