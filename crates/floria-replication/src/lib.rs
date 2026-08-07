@@ -7,6 +7,7 @@
 //! only names the object the store already wrote.
 
 pub mod record;
+pub mod record_journal;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
@@ -79,6 +80,8 @@ pub enum ReplicationError {
     Catalog(#[from] floria_catalog::CatalogError),
     #[error("replication local store failed: {0}")]
     Store(#[from] floria_store::StoreError),
+    #[error("replication record database failed: {0}")]
+    Sqlite(#[from] rusqlite::Error),
 }
 
 pub type ReplicationResult<T> = Result<T, ReplicationError>;

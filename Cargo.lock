@@ -981,6 +981,7 @@ dependencies = [
  "floria-store",
  "floria-surface",
  "libc",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
