@@ -101,19 +101,21 @@ impl SealedRecordTransaction {
             ));
         }
 
+        let commit_id = uuid::Uuid::new_v4().to_string();
         let mut revisions = Vec::with_capacity(changes_by_entity.len());
         let mut expected_heads = BTreeMap::new();
         for (entity_id, change) in changes_by_entity {
             let revision = cryptor.seal_entity_revision(
                 &change.document,
                 uuid::Uuid::new_v4().to_string(),
+                &commit_id,
                 change.parents,
             )?;
             expected_heads.insert(entity_id, change.expected_head);
             revisions.push(revision);
         }
         let commit = cryptor.seal_commit(
-            uuid::Uuid::new_v4().to_string(),
+            commit_id,
             revisions
                 .iter()
                 .map(|revision| revision.revision_id().to_string())

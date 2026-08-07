@@ -32,6 +32,7 @@ impl RecordCryptor {
         &self,
         document: &ReplicatedEntityDocument,
         revision_id: impl Into<String>,
+        commit_id: impl Into<String>,
         parents: Vec<String>,
     ) -> ReplicationResult<EntityRevision> {
         document.validate()?;
@@ -39,6 +40,7 @@ impl RecordCryptor {
         self.seal_revision(
             document.entity_id(),
             revision_id,
+            commit_id,
             parents,
             &state,
             document.object_refs(),
@@ -70,6 +72,7 @@ impl RecordCryptor {
         &self,
         entity_id: impl Into<String>,
         revision_id: impl Into<String>,
+        commit_id: impl Into<String>,
         parents: Vec<String>,
         state: &[u8],
         object_refs: Vec<ImmutableObjectRef>,
@@ -81,11 +84,13 @@ impl RecordCryptor {
         }
         let entity_id = entity_id.into();
         let revision_id = revision_id.into();
+        let commit_id = commit_id.into();
         let vault_id = self.store.vault_document().vault_id;
         let (key_generation, recipients) = self.store.current_generation_recipients()?;
         let template = canonical_revision(
             entity_id,
             revision_id,
+            commit_id,
             key_generation,
             parents,
             vec![0],
@@ -97,6 +102,7 @@ impl RecordCryptor {
             vault_id,
             entity_id: template.entity_id().to_string(),
             revision_id: template.revision_id().to_string(),
+            commit_id: template.commit_id().to_string(),
             key_generation,
             parents: template.parents().to_vec(),
             object_refs: template.object_refs().to_vec(),
@@ -107,6 +113,7 @@ impl RecordCryptor {
         canonical_revision(
             binding.entity_id,
             binding.revision_id,
+            binding.commit_id,
             key_generation,
             binding.parents,
             ciphertext,
@@ -167,6 +174,7 @@ struct RevisionBinding {
     vault_id: String,
     entity_id: String,
     revision_id: String,
+    commit_id: String,
     key_generation: u32,
     parents: Vec<String>,
     object_refs: Vec<ImmutableObjectRef>,
@@ -180,6 +188,7 @@ impl RevisionBinding {
             || self.vault_id != vault_id
             || self.entity_id != outer.entity_id()
             || self.revision_id != outer.revision_id()
+            || self.commit_id != outer.commit_id()
             || self.key_generation != outer.key_generation()
             || self.parents != outer.parents()
             || self.object_refs != outer.object_refs()
@@ -260,6 +269,7 @@ impl Drop for SensitiveBytes {
 fn canonical_revision(
     entity_id: String,
     revision_id: String,
+    commit_id: String,
     key_generation: u32,
     parents: Vec<String>,
     ciphertext: Vec<u8>,
@@ -268,6 +278,7 @@ fn canonical_revision(
     EntityRevision::new(
         entity_id,
         revision_id,
+        commit_id,
         key_generation,
         parents,
         ciphertext,
@@ -325,12 +336,14 @@ mod tests {
         let (_directory, cryptor) = cryptor();
         let entity_id = id();
         let revision_id = id();
+        let commit_id = id();
         let state = br#"{"name":"private fixture"}"#;
         let object = ImmutableObjectRef::new("ab".repeat(32), 41).unwrap();
         let revision = cryptor
             .seal_revision(
                 &entity_id,
                 &revision_id,
+                &commit_id,
                 Vec::new(),
                 state,
                 vec![object.clone()],
@@ -346,6 +359,7 @@ mod tests {
         let tampered = EntityRevision::new(
             id(),
             revision_id,
+            commit_id,
             revision.key_generation(),
             Vec::new(),
             revision.ciphertext().to_vec(),
@@ -390,7 +404,9 @@ mod tests {
             },
         ));
         let entity = ReplicatedEntityDocument::Catalog(document.clone());
-        let revision = cryptor.seal_entity_revision(&entity, id(), Vec::new()).unwrap();
+        let revision = cryptor
+            .seal_entity_revision(&entity, id(), id(), Vec::new())
+            .unwrap();
 
         assert_eq!(cryptor.open_entity_revision(&revision).unwrap(), entity);
         assert_eq!(revision.entity_id(), document.entity_id());
@@ -413,7 +429,7 @@ mod tests {
         .unwrap();
         let entity = ReplicatedEntityDocument::Secret(document.clone());
         let revision = cryptor
-            .seal_entity_revision(&entity, id(), Vec::new())
+            .seal_entity_revision(&entity, id(), id(), Vec::new())
             .unwrap();
 
         assert_eq!(cryptor.open_entity_revision(&revision).unwrap(), entity);

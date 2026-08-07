@@ -441,7 +441,7 @@ fn validate_snapshot(snapshot: &JournalSecuritySnapshot) -> ReplicationResult<()
     set.analyze()
         .map_err(|error| ReplicationError::Invalid(error.to_string()))?;
     for commit in &snapshot.commits {
-        set.commit_readiness(commit)
+        set.commit_readiness(commit, &snapshot.commits)
             .map_err(|error| ReplicationError::Invalid(error.to_string()))?;
     }
     for item in &snapshot.outbound {
@@ -457,7 +457,7 @@ fn validate_snapshot(snapshot: &JournalSecuritySnapshot) -> ReplicationResult<()
         }
         validate_complete_commit(item.commit(), item.revisions(), item.expected_heads())?;
         if !set
-            .commit_readiness(item.commit())
+            .commit_readiness(item.commit(), &snapshot.commits)
             .map_err(|error| ReplicationError::Invalid(error.to_string()))?
             .is_ready()
         {
@@ -479,7 +479,7 @@ fn validate_snapshot(snapshot: &JournalSecuritySnapshot) -> ReplicationResult<()
             )));
         }
         let expected = set
-            .commit_readiness(item.commit())
+            .commit_readiness(item.commit(), &snapshot.commits)
             .map_err(|error| ReplicationError::Invalid(error.to_string()))?;
         if expected != *item.readiness() {
             return Err(ReplicationError::Invalid(format!(
@@ -584,6 +584,14 @@ fn validate_complete_commit(
 
     let mut entities = BTreeSet::new();
     for revision in revisions {
+        if revision.commit_id() != commit.commit_id() {
+            return Err(ReplicationError::Invalid(format!(
+                "revision {} declares commit {}, not {}",
+                revision.revision_id(),
+                revision.commit_id(),
+                commit.commit_id()
+            )));
+        }
         if !entities.insert(revision.entity_id().to_string()) {
             return Err(ReplicationError::Invalid(format!(
                 "commit {} contains more than one revision for entity {}",
@@ -792,6 +800,7 @@ fn outbound_by_id(
 fn inbound_from(conn: &Connection) -> ReplicationResult<Vec<InboundCommit>> {
     let revisions = revisions_from(conn)?;
     let set = revision_set_from(&revisions)?;
+    let commits = commits_from(conn)?;
     let mut statement = conn.prepare(
         "SELECT commit_id, received_at
          FROM record_inbox ORDER BY received_at, commit_id",
@@ -806,7 +815,7 @@ fn inbound_from(conn: &Connection) -> ReplicationResult<Vec<InboundCommit>> {
             ReplicationError::Invalid(format!("inbox commit {commit_id} is missing"))
         })?;
         let readiness = set
-            .commit_readiness(&commit)
+            .commit_readiness(&commit, &commits)
             .map_err(|error| ReplicationError::Invalid(error.to_string()))?;
         items.push(InboundCommit {
             commit,
@@ -937,10 +946,16 @@ mod tests {
         uuid::Uuid::new_v4().to_string()
     }
 
-    fn revision(entity_id: &str, revision_id: &str, parents: Vec<String>) -> EntityRevision {
+    fn revision(
+        entity_id: &str,
+        revision_id: &str,
+        commit_id: &str,
+        parents: Vec<String>,
+    ) -> EntityRevision {
         EntityRevision::new(
             entity_id,
             revision_id,
+            commit_id,
             1,
             parents,
             b"encrypted-record-fixture".to_vec(),
@@ -966,9 +981,9 @@ mod tests {
         .unwrap()
     }
 
-    fn commit(revisions: &[EntityRevision]) -> RevisionCommit {
+    fn make_commit(commit_id: &str, revisions: &[EntityRevision]) -> RevisionCommit {
         RevisionCommit::new(
-            id(),
+            commit_id,
             1,
             revisions
                 .iter()
@@ -999,11 +1014,11 @@ mod tests {
         let vault_id = id();
         let first_entity = id();
         let second_entity = id();
-        let first = revision(&first_entity, &id(), Vec::new());
-        let second = revision(&second_entity, &id(), Vec::new());
+        let commit_id = id();
+        let first = revision(&first_entity, &id(), &commit_id, Vec::new());
+        let second = revision(&second_entity, &id(), &commit_id, Vec::new());
         let revisions = vec![first, second];
-        let commit = commit(&revisions);
-        let commit_id = commit.commit_id().to_string();
+        let commit = make_commit(&commit_id, &revisions);
         let expected_heads = expected_heads(&revisions);
         let authenticator = authenticator();
         let journal = open(&directory, &vault_id, Arc::clone(&authenticator));
@@ -1043,9 +1058,15 @@ mod tests {
         let entity_id = id();
         let root_id = id();
         let child_id = id();
-        let child = revision(&entity_id, &child_id, vec![root_id.clone()]);
-        let commit = commit(std::slice::from_ref(&child));
-        let commit_id = commit.commit_id().to_string();
+        let root_commit_id = id();
+        let commit_id = id();
+        let child = revision(
+            &entity_id,
+            &child_id,
+            &commit_id,
+            vec![root_id.clone()],
+        );
+        let commit = make_commit(&commit_id, std::slice::from_ref(&child));
         let journal = open(&directory, &vault_id, authenticator());
 
         journal
@@ -1058,15 +1079,21 @@ mod tests {
         assert_eq!(journal.inbound().unwrap().len(), 1);
         assert!(journal.ready_inbound().unwrap().is_empty());
         assert!(journal.settle_inbound(&commit_id).is_err());
+        let root = revision(&entity_id, &root_id, &root_commit_id, Vec::new());
+        let root_commit = make_commit(&root_commit_id, std::slice::from_ref(&root));
         journal
             .receive_inbound(
-                Vec::new(),
-                vec![revision(&entity_id, &root_id, Vec::new())],
+                vec![root_commit],
+                vec![root],
                 "2026-08-07T00:00:02Z",
             )
             .unwrap();
         assert_eq!(journal.analysis().unwrap().heads_for(&entity_id), &[child_id]);
-        assert_eq!(journal.ready_inbound().unwrap().len(), 1);
+        let ready = journal.ready_inbound().unwrap();
+        assert_eq!(ready.len(), 2);
+        assert!(ready
+            .iter()
+            .any(|item| item.commit().commit_id() == commit_id));
         assert!(journal.settle_inbound(&commit_id).unwrap());
     }
 
@@ -1077,8 +1104,9 @@ mod tests {
         let entity_id = id();
         let revision_id = id();
         let unrelated = id();
-        let revision = revision(&entity_id, &revision_id, Vec::new());
-        let commit = commit(std::slice::from_ref(&revision));
+        let commit_id = id();
+        let revision = revision(&entity_id, &revision_id, &commit_id, Vec::new());
+        let commit = make_commit(&commit_id, std::slice::from_ref(&revision));
         let journal = open(&directory, &vault_id, authenticator());
 
         let error = journal
@@ -1101,9 +1129,9 @@ mod tests {
         let vault_id = id();
         let entity_id = id();
         let revision_id = id();
-        let revision = revision(&entity_id, &revision_id, Vec::new());
-        let commit = commit(std::slice::from_ref(&revision));
-        let commit_id = commit.commit_id().to_string();
+        let commit_id = id();
+        let revision = revision(&entity_id, &revision_id, &commit_id, Vec::new());
+        let commit = make_commit(&commit_id, std::slice::from_ref(&revision));
         let path = directory.path().join("records.sqlite");
         let journal = open(&directory, &vault_id, authenticator());
         journal

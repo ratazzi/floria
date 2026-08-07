@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub const RECORD_FORMAT_VERSION: u32 = 1;
+pub const RECORD_FORMAT_VERSION: u32 = 2;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum RecordError {
@@ -60,6 +60,23 @@ pub enum RecordError {
         commit_id: String,
         entity_id: String,
     },
+    #[error(
+        "revision {revision_id} declares commit {declared_commit_id}, but manifest {manifest_commit_id} contains it"
+    )]
+    RevisionCommitMismatch {
+        revision_id: String,
+        declared_commit_id: String,
+        manifest_commit_id: String,
+    },
+    #[error("revision {revision_id} declares commit {commit_id}, but that manifest does not contain it")]
+    RevisionMissingFromCommit {
+        revision_id: String,
+        commit_id: String,
+    },
+    #[error("commit id {commit_id} was reused for different content")]
+    CommitCollision { commit_id: String },
+    #[error("commit graph contains a cycle at {commit_id}")]
+    CommitCycle { commit_id: String },
 }
 
 pub type RecordResult<T> = Result<T, RecordError>;
@@ -112,6 +129,7 @@ pub struct EntityRevision {
     format_version: u32,
     entity_id: String,
     revision_id: String,
+    commit_id: String,
     key_generation: u32,
     parents: Vec<String>,
     ciphertext: Vec<u8>,
@@ -122,6 +140,7 @@ impl EntityRevision {
     pub fn new(
         entity_id: impl Into<String>,
         revision_id: impl Into<String>,
+        commit_id: impl Into<String>,
         key_generation: u32,
         parents: Vec<String>,
         ciphertext: Vec<u8>,
@@ -131,6 +150,7 @@ impl EntityRevision {
             format_version: RECORD_FORMAT_VERSION,
             entity_id: entity_id.into(),
             revision_id: revision_id.into(),
+            commit_id: commit_id.into(),
             key_generation,
             parents,
             ciphertext,
@@ -151,6 +171,10 @@ impl EntityRevision {
 
     pub fn revision_id(&self) -> &str {
         &self.revision_id
+    }
+
+    pub fn commit_id(&self) -> &str {
+        &self.commit_id
     }
 
     pub fn key_generation(&self) -> u32 {
@@ -184,6 +208,7 @@ impl EntityRevision {
         }
         validate_uuid("entity_id", &self.entity_id)?;
         validate_uuid("revision_id", &self.revision_id)?;
+        validate_uuid("commit_id", &self.commit_id)?;
         if self.key_generation == 0 {
             return Err(RecordError::InvalidKeyGeneration);
         }
@@ -309,7 +334,10 @@ impl RevisionCommit {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CommitReadiness {
     Ready,
-    Pending { missing_revisions: Vec<String> },
+    Pending {
+        missing_revisions: Vec<String>,
+        missing_commits: Vec<String>,
+    },
 }
 
 impl CommitReadiness {
@@ -320,7 +348,18 @@ impl CommitReadiness {
     pub fn missing_revisions(&self) -> &[String] {
         match self {
             Self::Ready => &[],
-            Self::Pending { missing_revisions } => missing_revisions,
+            Self::Pending {
+                missing_revisions, ..
+            } => missing_revisions,
+        }
+    }
+
+    pub fn missing_commits(&self) -> &[String] {
+        match self {
+            Self::Ready => &[],
+            Self::Pending {
+                missing_commits, ..
+            } => missing_commits,
         }
     }
 }
@@ -477,38 +516,157 @@ impl RevisionSet {
         Ok(RevisionAnalysis { heads, pending })
     }
 
-    pub fn commit_readiness(&self, commit: &RevisionCommit) -> RecordResult<CommitReadiness> {
+    /// Require a commit, all member revisions, and every ancestor transaction to be complete.
+    ///
+    /// A parent revision is not committed merely because its envelope arrived: its owning commit
+    /// may contain sibling entity changes. Following `commit_id` through every parent preserves
+    /// those transaction barriers across arbitrary transport arrival order.
+    pub fn commit_readiness(
+        &self,
+        commit: &RevisionCommit,
+        known_commits: &[RevisionCommit],
+    ) -> RecordResult<CommitReadiness> {
         commit.validate()?;
-        let mut visits = BTreeMap::new();
-        let mut missing = BTreeSet::new();
-        let mut entities = BTreeSet::new();
-
-        for revision_id in commit.revision_ids() {
-            let Some(revision) = self.revisions.get(revision_id) else {
-                missing.insert(revision_id.clone());
-                continue;
-            };
-            if !entities.insert(revision.entity_id()) {
-                return Err(RecordError::CommitDuplicateEntity {
-                    commit_id: commit.commit_id.clone(),
-                    entity_id: revision.entity_id.clone(),
-                });
-            }
-            if let Visit::Pending(ancestors) =
-                visit_revision(revision_id, &self.revisions, &mut visits)?
-            {
-                missing.extend(ancestors);
+        let mut commits = BTreeMap::from([(commit.commit_id.clone(), commit.clone())]);
+        for known in known_commits {
+            known.validate()?;
+            match commits.get(known.commit_id()) {
+                Some(existing) if existing == known => {}
+                Some(_) => {
+                    return Err(RecordError::CommitCollision {
+                        commit_id: known.commit_id().to_string(),
+                    })
+                }
+                None => {
+                    commits.insert(known.commit_id().to_string(), known.clone());
+                }
             }
         }
 
-        if missing.is_empty() {
+        let mut visits = BTreeMap::new();
+        let readiness = visit_commit(
+            commit.commit_id(),
+            &self.revisions,
+            &commits,
+            &mut visits,
+        )?;
+        if readiness.missing_revisions.is_empty() && readiness.missing_commits.is_empty() {
             Ok(CommitReadiness::Ready)
         } else {
             Ok(CommitReadiness::Pending {
-                missing_revisions: missing.into_iter().collect(),
+                missing_revisions: readiness.missing_revisions.into_iter().collect(),
+                missing_commits: readiness.missing_commits.into_iter().collect(),
             })
         }
     }
+}
+
+#[derive(Clone, Debug, Default)]
+struct MissingRecords {
+    missing_revisions: BTreeSet<String>,
+    missing_commits: BTreeSet<String>,
+}
+
+impl MissingRecords {
+    fn merge(&mut self, other: Self) {
+        self.missing_revisions.extend(other.missing_revisions);
+        self.missing_commits.extend(other.missing_commits);
+    }
+}
+
+#[derive(Clone, Debug)]
+enum CommitVisit {
+    Visiting,
+    Complete,
+    Pending(MissingRecords),
+}
+
+fn visit_commit(
+    commit_id: &str,
+    revisions: &BTreeMap<String, EntityRevision>,
+    commits: &BTreeMap<String, RevisionCommit>,
+    visits: &mut BTreeMap<String, CommitVisit>,
+) -> RecordResult<MissingRecords> {
+    if let Some(visit) = visits.get(commit_id) {
+        return match visit {
+            CommitVisit::Visiting => Err(RecordError::CommitCycle {
+                commit_id: commit_id.to_string(),
+            }),
+            CommitVisit::Complete => Ok(MissingRecords::default()),
+            CommitVisit::Pending(missing) => Ok(missing.clone()),
+        };
+    }
+
+    let commit = commits
+        .get(commit_id)
+        .expect("only known commits are visited");
+    visits.insert(commit_id.to_string(), CommitVisit::Visiting);
+    let mut missing = MissingRecords::default();
+    let mut entities = BTreeSet::new();
+    for revision_id in commit.revision_ids() {
+        let Some(revision) = revisions.get(revision_id) else {
+            missing.missing_revisions.insert(revision_id.clone());
+            continue;
+        };
+        if revision.commit_id() != commit_id {
+            return Err(RecordError::RevisionCommitMismatch {
+                revision_id: revision_id.clone(),
+                declared_commit_id: revision.commit_id().to_string(),
+                manifest_commit_id: commit_id.to_string(),
+            });
+        }
+        if !entities.insert(revision.entity_id()) {
+            return Err(RecordError::CommitDuplicateEntity {
+                commit_id: commit_id.to_string(),
+                entity_id: revision.entity_id().to_string(),
+            });
+        }
+        for parent_id in revision.parents() {
+            let Some(parent) = revisions.get(parent_id) else {
+                missing.missing_revisions.insert(parent_id.clone());
+                continue;
+            };
+            if parent.entity_id() != revision.entity_id() {
+                return Err(RecordError::ParentEntityMismatch {
+                    revision_id: revision.revision_id().to_string(),
+                    entity_id: revision.entity_id().to_string(),
+                    parent_id: parent.revision_id().to_string(),
+                    parent_entity_id: parent.entity_id().to_string(),
+                });
+            }
+            let parent_commit_id = parent.commit_id();
+            let Some(parent_commit) = commits.get(parent_commit_id) else {
+                missing
+                    .missing_commits
+                    .insert(parent_commit_id.to_string());
+                continue;
+            };
+            if !parent_commit
+                .revision_ids()
+                .iter()
+                .any(|member| member == parent_id)
+            {
+                return Err(RecordError::RevisionMissingFromCommit {
+                    revision_id: parent_id.clone(),
+                    commit_id: parent_commit_id.to_string(),
+                });
+            }
+            missing.merge(visit_commit(
+                parent_commit_id,
+                revisions,
+                commits,
+                visits,
+            )?);
+        }
+    }
+
+    let visit = if missing.missing_revisions.is_empty() && missing.missing_commits.is_empty() {
+        CommitVisit::Complete
+    } else {
+        CommitVisit::Pending(missing.clone())
+    };
+    visits.insert(commit_id.to_string(), visit);
+    Ok(missing)
 }
 
 #[derive(Clone, Debug)]
@@ -582,9 +740,19 @@ mod tests {
     }
 
     fn revision(entity_id: &str, revision_id: &str, parents: Vec<String>) -> EntityRevision {
+        revision_in_commit(entity_id, revision_id, &id(), parents)
+    }
+
+    fn revision_in_commit(
+        entity_id: &str,
+        revision_id: &str,
+        commit_id: &str,
+        parents: Vec<String>,
+    ) -> EntityRevision {
         EntityRevision::new(
             entity_id,
             revision_id,
+            commit_id,
             1,
             parents,
             b"encrypted-fixture-state".to_vec(),
@@ -622,6 +790,7 @@ mod tests {
         let collision = EntityRevision::new(
             entity_id,
             revision_id.clone(),
+            id(),
             1,
             Vec::new(),
             b"different-encrypted-state".to_vec(),
@@ -745,28 +914,60 @@ mod tests {
         let entity_id = id();
         let root_id = id();
         let child_id = id();
-        let commit =
-            RevisionCommit::new(id(), 1, vec![child_id.clone()], b"encrypted-commit".to_vec())
-                .unwrap();
+        let root_commit_id = id();
+        let child_commit_id = id();
+        let commit = RevisionCommit::new(
+            &child_commit_id,
+            1,
+            vec![child_id.clone()],
+            b"encrypted-commit".to_vec(),
+        )
+        .unwrap();
         let mut set = RevisionSet::new();
 
         assert_eq!(
-            set.commit_readiness(&commit).unwrap().missing_revisions(),
+            set.commit_readiness(&commit, &[])
+                .unwrap()
+                .missing_revisions(),
             std::slice::from_ref(&child_id)
         );
-        set.insert(revision(
+        set.insert(revision_in_commit(
             &entity_id,
             &child_id,
+            &child_commit_id,
             vec![root_id.clone()],
         ))
         .unwrap();
         assert_eq!(
-            set.commit_readiness(&commit).unwrap().missing_revisions(),
+            set.commit_readiness(&commit, &[])
+                .unwrap()
+                .missing_revisions(),
             std::slice::from_ref(&root_id)
         );
-        set.insert(revision(&entity_id, &root_id, Vec::new()))
+        set.insert(revision_in_commit(
+            &entity_id,
+            &root_id,
+            &root_commit_id,
+            Vec::new(),
+        ))
             .unwrap();
-        assert_eq!(set.commit_readiness(&commit).unwrap(), CommitReadiness::Ready);
+        assert_eq!(
+            set.commit_readiness(&commit, &[])
+                .unwrap()
+                .missing_commits(),
+            std::slice::from_ref(&root_commit_id)
+        );
+        let root_commit = RevisionCommit::new(
+            root_commit_id,
+            1,
+            vec![root_id],
+            b"encrypted-root-commit".to_vec(),
+        )
+        .unwrap();
+        assert_eq!(
+            set.commit_readiness(&commit, &[root_commit]).unwrap(),
+            CommitReadiness::Ready
+        );
     }
 
     #[test]
@@ -783,17 +984,86 @@ mod tests {
         )
         .unwrap();
         let mut set = RevisionSet::new();
-        set.insert(revision(&entity_id, &first_id, Vec::new()))
+        set.insert(revision_in_commit(
+            &entity_id,
+            &first_id,
+            &commit_id,
+            Vec::new(),
+        ))
             .unwrap();
-        set.insert(revision(&entity_id, &second_id, Vec::new()))
+        set.insert(revision_in_commit(
+            &entity_id,
+            &second_id,
+            &commit_id,
+            Vec::new(),
+        ))
             .unwrap();
 
         assert_eq!(
-            set.commit_readiness(&commit),
+            set.commit_readiness(&commit, &[]),
             Err(RecordError::CommitDuplicateEntity {
                 commit_id,
                 entity_id,
             })
+        );
+    }
+
+    #[test]
+    fn parent_transaction_waits_for_sibling_entities_before_projection() {
+        let root_entity = id();
+        let sibling_entity = id();
+        let root_id = id();
+        let sibling_id = id();
+        let child_id = id();
+        let root_commit_id = id();
+        let child_commit_id = id();
+        let root = revision_in_commit(
+            &root_entity,
+            &root_id,
+            &root_commit_id,
+            Vec::new(),
+        );
+        let sibling = revision_in_commit(
+            &sibling_entity,
+            &sibling_id,
+            &root_commit_id,
+            Vec::new(),
+        );
+        let child = revision_in_commit(
+            &root_entity,
+            &child_id,
+            &child_commit_id,
+            vec![root_id.clone()],
+        );
+        let root_commit = RevisionCommit::new(
+            root_commit_id,
+            1,
+            vec![root_id, sibling_id.clone()],
+            b"encrypted-root-commit".to_vec(),
+        )
+        .unwrap();
+        let child_commit = RevisionCommit::new(
+            child_commit_id,
+            1,
+            vec![child_id],
+            b"encrypted-child-commit".to_vec(),
+        )
+        .unwrap();
+        let mut set = RevisionSet::new();
+        set.insert(root).unwrap();
+        set.insert(child).unwrap();
+
+        assert_eq!(
+            set.commit_readiness(&child_commit, std::slice::from_ref(&root_commit))
+                .unwrap()
+                .missing_revisions(),
+            std::slice::from_ref(&sibling_id)
+        );
+
+        set.insert(sibling).unwrap();
+        assert_eq!(
+            set.commit_readiness(&child_commit, &[root_commit]).unwrap(),
+            CommitReadiness::Ready
         );
     }
 }
