@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use age::x25519;
@@ -16,7 +17,7 @@ use base64::Engine;
 use floria_store::vault::{
     self, DeviceDocument, EnrollmentRequestDocument, KeyGenerationDocument, MAX_DESCRIPTOR_BYTES,
 };
-use floria_store::{AgeDirStore, DeviceKeyMaterial};
+use floria_store::{AgeDirStore, DeviceKeyMaterial, StoreVerification};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -109,6 +110,40 @@ pub enum SyncVaultActivation {
         target_vault_id: String,
         local_items: usize,
     },
+}
+
+/// A verified, disposable Store snapshot re-encrypted into an enrolled target Vault.
+///
+/// This is intentionally not a wire type. The daemon consumes it immediately to create a
+/// durable activation package; dropping it removes the plaintext-free staging directory.
+pub struct PreparedVaultMerge {
+    vault_id: String,
+    store: AgeDirStore,
+    verification: StoreVerification,
+}
+
+impl PreparedVaultMerge {
+    pub fn vault_id(&self) -> &str {
+        &self.vault_id
+    }
+
+    pub fn store(&self) -> &AgeDirStore {
+        &self.store
+    }
+
+    pub fn verification(&self) -> &StoreVerification {
+        &self.verification
+    }
+
+    pub fn root(&self) -> &Path {
+        self.store.root()
+    }
+}
+
+impl Drop for PreparedVaultMerge {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(self.store.root());
+    }
 }
 
 impl SyncEnrollmentReview {
@@ -517,6 +552,50 @@ impl SyncVaultBootstrap {
             key_generation,
             restart_required: switching_vault,
         })
+    }
+
+    /// Re-encrypt the complete local Store into an isolated target-Vault snapshot.
+    ///
+    /// The live Store is never changed. The caller supplies a new sibling path, consumes the
+    /// returned Store to build a durable activation package, then lets the staging directory be
+    /// removed on drop.
+    pub fn prepare_merge(
+        &self,
+        store: std::sync::Arc<AgeDirStore>,
+        target_root: PathBuf,
+    ) -> ReplicationResult<PreparedVaultMerge> {
+        let validated = self.validated(&self.vault_id)?;
+        let current_vault_id = store.vault_document().vault_id;
+        if current_vault_id == validated.vault.vault_id {
+            return Err(ReplicationError::Invalid(
+                "Vault merge requires a different target Vault".to_string(),
+            ));
+        }
+        if target_root.exists() {
+            return Err(ReplicationError::Invalid(format!(
+                "Vault merge staging path already exists: {}",
+                target_root.display()
+            )));
+        }
+        verify_local_device_access(self, &validated, &store.device())?;
+
+        let result = (|| {
+            materialize_lifecycle(self, &target_root.join("shared"))?;
+            let target = store.open_migration_target(
+                target_root.clone(),
+                &validated.vault.vault_id,
+            )?;
+            let verification = store.copy_logical_contents_to(&target)?;
+            Ok(PreparedVaultMerge {
+                vault_id: validated.vault.vault_id.clone(),
+                store: target,
+                verification,
+            })
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&target_root);
+        }
+        result
     }
 }
 
@@ -1137,6 +1216,65 @@ mod tests {
         assert_eq!(joining.vault_document().vault_id, current_vault_id);
         assert_eq!(joining.shared_root(), current_shared);
         assert!(!joining.root().join("cloudkit-vaults").exists());
+    }
+
+    #[test]
+    fn prepares_and_verifies_a_populated_store_without_changing_the_live_vault() {
+        let directory = tempfile::tempdir().unwrap();
+        let genesis = Arc::new(
+            AgeDirStore::open(
+                directory.path().join("genesis"),
+                Arc::new(LocalKeys(x25519::Identity::generate())),
+            )
+            .unwrap(),
+        );
+        let joining = Arc::new(
+            AgeDirStore::open(
+                directory.path().join("joining"),
+                Arc::new(LocalKeys(x25519::Identity::generate())),
+            )
+            .unwrap(),
+        );
+        let id = joining
+            .put(NewSecret::managed("Local item"), b"first fixture")
+            .unwrap();
+        joining.append_version(&id, b"second fixture").unwrap();
+        joining.set_head(&id, 1).unwrap();
+        let source_versions = joining.version_refs(&id).unwrap();
+        let current_vault_id = joining.vault_document().vault_id;
+        let approved = approved_bootstrap(&genesis, &joining);
+        let staging = directory.path().join("merge-staging");
+
+        {
+            let prepared = approved
+                .prepare_merge(Arc::clone(&joining), staging.clone())
+                .unwrap();
+
+            assert_eq!(prepared.vault_id(), genesis.vault_document().vault_id);
+            assert_eq!(prepared.verification().secrets, 1);
+            assert_eq!(prepared.verification().versions, 2);
+            assert_eq!(prepared.store().get(&id).unwrap().as_slice(), b"first fixture");
+            let target_versions = prepared.store().version_refs(&id).unwrap();
+            assert_eq!(
+                target_versions
+                    .iter()
+                    .map(|version| &version.version_uuid)
+                    .collect::<Vec<_>>(),
+                source_versions
+                    .iter()
+                    .map(|version| &version.version_uuid)
+                    .collect::<Vec<_>>()
+            );
+            assert!(target_versions
+                .iter()
+                .zip(&source_versions)
+                .all(|(target, source)| target.digest != source.digest));
+            assert_eq!(joining.vault_document().vault_id, current_vault_id);
+            assert_eq!(joining.get(&id).unwrap().as_slice(), b"first fixture");
+            assert!(staging.is_dir());
+        }
+
+        assert!(!staging.exists(), "dropping a prepared merge must remove staging");
     }
 
     #[test]

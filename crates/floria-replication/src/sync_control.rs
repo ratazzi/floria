@@ -19,7 +19,8 @@ use crate::record::{EntityRevision, ImmutableObjectRef, RevisionCommit, RECORD_F
 use crate::record_crypto::RecordCryptor;
 use crate::record_journal::{OutboundCommit, RecordJournal};
 use crate::sync_bootstrap::{
-    SyncEnrollmentPreparation, SyncEnrollmentReview, SyncVaultActivation, SyncVaultBootstrap,
+    PreparedVaultMerge, SyncEnrollmentPreparation, SyncEnrollmentReview, SyncVaultActivation,
+    SyncVaultBootstrap,
 };
 use crate::{ReplicationError, ReplicationResult};
 
@@ -480,6 +481,15 @@ impl<'a> RecordSyncControl<'a> {
         local_items: usize,
     ) -> ReplicationResult<SyncVaultActivation> {
         bootstrap.activate(std::sync::Arc::clone(&self.store), local_items)
+    }
+
+    /// Build a disposable, fully verified Store in another Vault without changing live state.
+    pub fn prepare_vault_merge(
+        &self,
+        bootstrap: SyncVaultBootstrap,
+        target_root: PathBuf,
+    ) -> ReplicationResult<PreparedVaultMerge> {
+        bootstrap.prepare_merge(std::sync::Arc::clone(&self.store), target_root)
     }
 
     /// Return oldest durable publications without changing retry state.
