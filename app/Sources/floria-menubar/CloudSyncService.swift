@@ -1,7 +1,9 @@
 import CloudKit
 import Foundation
 
-protocol CloudSyncControlling: RecordSyncControlling, VaultBootstrapControlling {
+protocol CloudSyncControlling: RecordSyncControlling, VaultBootstrapControlling,
+    VaultEnrollmentControlling
+{
     func recordSyncStatus() async throws -> SyncDomainStatus
 }
 
@@ -47,6 +49,8 @@ actor CloudSyncService {
     ) throws -> any CloudSyncSessionRunning
     typealias DiscoveryFactory = @Sendable () throws -> any CloudVaultDiscovering
     typealias LifecycleLoaderFactory = @Sendable () throws -> any CloudVaultLifecycleLoading
+    typealias EnrollmentPublisherFactory =
+        @Sendable () throws -> any CloudVaultEnrollmentPublishing
 
     private let control: any CloudSyncControlling
     private let supportDirectory: URL
@@ -54,10 +58,12 @@ actor CloudSyncService {
     private let sessionFactory: SessionFactory
     private let discoveryFactory: DiscoveryFactory
     private let lifecycleLoaderFactory: LifecycleLoaderFactory
+    private let enrollmentPublisherFactory: EnrollmentPublisherFactory
     private var session: (any CloudSyncSessionRunning)?
     private var sessionVaultID: String?
     private var discovery: (any CloudVaultDiscovering)?
     private var lifecycleLoader: (any CloudVaultLifecycleLoading)?
+    private var enrollmentPublisher: (any CloudVaultEnrollmentPublishing)?
 
     init(
         control: any CloudSyncControlling,
@@ -89,6 +95,11 @@ actor CloudSyncService {
                 query: CloudKitVaultLifecycleQuery(database: container.privateCloudDatabase),
                 control: control)
         }
+        enrollmentPublisherFactory = {
+            let container = CKContainer(
+                identifier: ProductIdentity.cloudKitContainerIdentifier)
+            return CloudKitVaultEnrollmentPublisher(database: container.privateCloudDatabase)
+        }
     }
 
     init(
@@ -101,6 +112,9 @@ actor CloudSyncService {
         },
         lifecycleLoaderFactory: @escaping LifecycleLoaderFactory = {
             throw CloudSyncServiceError.unconfiguredTestDependency
+        },
+        enrollmentPublisherFactory: @escaping EnrollmentPublisherFactory = {
+            throw CloudSyncServiceError.unconfiguredTestDependency
         }
     ) {
         self.control = control
@@ -109,6 +123,7 @@ actor CloudSyncService {
         self.sessionFactory = sessionFactory
         self.discoveryFactory = discoveryFactory
         self.lifecycleLoaderFactory = lifecycleLoaderFactory
+        self.enrollmentPublisherFactory = enrollmentPublisherFactory
     }
 
     func isEnabled() -> Bool {
@@ -123,6 +138,7 @@ actor CloudSyncService {
             sessionVaultID = nil
             discovery = nil
             lifecycleLoader = nil
+            enrollmentPublisher = nil
         }
     }
 
@@ -150,6 +166,27 @@ actor CloudSyncService {
         return try await activeLoader.loadAndAuthenticate(vaultID: vaultID)
     }
 
+    func requestEnrollment(
+        in bootstrap: SyncVaultBootstrap,
+        deviceName: String?,
+        requestedAt: String? = nil
+    ) async throws -> SyncEnrollmentPreparation {
+        guard preferences.isEnabled else { throw CloudSyncServiceError.disabled }
+        let activePublisher: any CloudVaultEnrollmentPublishing
+        if let enrollmentPublisher {
+            activePublisher = enrollmentPublisher
+        } else {
+            activePublisher = try enrollmentPublisherFactory()
+            enrollmentPublisher = activePublisher
+        }
+        return try await CloudVaultEnrollmentCoordinator(
+            control: control, publisher: activePublisher
+        ).requestEnrollment(
+            in: bootstrap,
+            deviceName: deviceName,
+            requestedAt: requestedAt ?? Self.timestamp())
+    }
+
     func localStatus() async throws -> SyncDomainStatus? {
         guard preferences.isEnabled else { return nil }
         return try await control.recordSyncStatus()
@@ -169,6 +206,12 @@ actor CloudSyncService {
         }
         try await activeSession.syncNow()
         return try await control.recordSyncStatus()
+    }
+
+    private static func timestamp() -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter.string(from: Date())
     }
 
 }

@@ -46,6 +46,10 @@ struct CloudVaultBootstrapCodec {
         return try decode(left) == decode(right)
     }
 
+    func enrollmentRecord(for request: SyncEnrollmentRequest) throws -> CKRecord {
+        try enrollmentRecord(deviceID: request.deviceID, payloadBase64: request.documentBase64)
+    }
+
     func records(for bootstrap: SyncVaultBootstrap) throws -> [CKRecord] {
         guard bootstrap.vaultID.lowercased() == recordCodec.vaultID else {
             throw CloudVaultBootstrapCodecError.vaultMismatch(
@@ -77,14 +81,9 @@ struct CloudVaultBootstrapCodec {
                 recordNames: &recordNames)
         }
         for document in bootstrap.enrollmentRequests {
-            let deviceID = try validatedDeviceID(document.route)
             try append(
-                record(
-                    type: RecordType.enrollmentRequest,
-                    prefix: "enrollment",
-                    stableID: deviceID,
-                    routeFields: [Field.deviceID: deviceID as NSString],
-                    payloadBase64: document.documentBase64),
+                enrollmentRecord(
+                    deviceID: document.route, payloadBase64: document.documentBase64),
                 to: &records,
                 recordNames: &recordNames)
         }
@@ -240,6 +239,19 @@ struct CloudVaultBootstrapCodec {
         }
         record[Field.payload] = try payloadData(payloadBase64) as NSData
         return record
+    }
+
+    private func enrollmentRecord(
+        deviceID: String,
+        payloadBase64: String
+    ) throws -> CKRecord {
+        let deviceID = try validatedDeviceID(deviceID)
+        return try record(
+            type: RecordType.enrollmentRequest,
+            prefix: "enrollment",
+            stableID: deviceID,
+            routeFields: [Field.deviceID: deviceID as NSString],
+            payloadBase64: payloadBase64)
     }
 
     private func append(

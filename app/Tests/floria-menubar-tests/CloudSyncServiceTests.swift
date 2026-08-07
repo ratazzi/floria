@@ -1,3 +1,4 @@
+import CloudKit
 import Foundation
 import XCTest
 
@@ -140,6 +141,37 @@ final class CloudSyncServiceTests: XCTestCase {
         XCTAssertEqual(factory.count, 0)
     }
 
+    func testEnrollmentRequestIsExplicitAndUsesTheAuthenticatedTargetVault() async throws {
+        let suiteName = "floria-cloud-sync-tests-\(UUID().uuidString)"
+        let preferences = CloudSyncPreferences(suiteName: suiteName)
+        preferences.setEnabled(true)
+        let control = CloudSyncControlStub(status: status())
+        let publisher = CloudSyncEnrollmentPublisherStub()
+        let factory = CloudEnrollmentPublisherFactoryProbe(publisher: publisher)
+        let bootstrap = SyncVaultBootstrap(
+            vaultID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            vaultDocumentBase64: "dmF1bHQ=", deviceIdentities: [], enrollmentRequests: [],
+            keyGenerations: [], generationEnvelopes: [])
+        let service = CloudSyncService(
+            control: control,
+            supportDirectory: FileManager.default.temporaryDirectory,
+            preferences: preferences,
+            sessionFactory: { _, _, _ in CloudSyncSessionStub() },
+            enrollmentPublisherFactory: { try factory.make() })
+        defer { UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName) }
+
+        XCTAssertEqual(factory.count, 0)
+        let result = try await service.requestEnrollment(
+            in: bootstrap, deviceName: "Studio", requestedAt: "2026-08-08T12:00:00Z")
+        guard case .request(let request) = result else {
+            return XCTFail("Expected an enrollment request")
+        }
+        let record = await publisher.record
+        XCTAssertEqual(factory.count, 1)
+        XCTAssertEqual(record?.recordID.zoneID, try CloudRecordCodec(vaultID: bootstrap.vaultID).zoneID)
+        XCTAssertEqual(request.deviceName, "Studio")
+    }
+
     private func status() -> SyncDomainStatus {
         SyncDomainStatus(
             vaultID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -207,6 +239,34 @@ private actor CloudSyncControlStub: CloudSyncControlling {
         throw CloudSyncServiceError.disabled
     }
 
+    func prepareRecordSyncVaultEnrollment(
+        bootstrap _: SyncVaultBootstrap,
+        deviceName: String?,
+        requestedAt: String
+    ) async throws -> SyncEnrollmentPreparation {
+        .request(
+            SyncEnrollmentRequest(
+                deviceID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                deviceName: deviceName,
+                requestedAt: requestedAt,
+                fingerprint: "sha256:fixture",
+                documentBase64: "cmVxdWVzdA=="))
+    }
+
+    func reviewRecordSyncVaultEnrollments(
+        bootstrap _: SyncVaultBootstrap
+    ) async throws -> [SyncEnrollmentReview] {
+        []
+    }
+
+    func approveRecordSyncVaultEnrollment(
+        bootstrap: SyncVaultBootstrap,
+        deviceID _: String,
+        expectedFingerprint _: String
+    ) async throws -> SyncVaultBootstrap {
+        bootstrap
+    }
+
     func nextRecordSyncOutbound(limit _: Int) async throws -> SyncOutboundBatch {
         throw CloudSyncServiceError.disabled
     }
@@ -221,6 +281,32 @@ private actor CloudSyncControlStub: CloudSyncControlling {
         -> SyncInboundReport
     {
         throw CloudSyncServiceError.disabled
+    }
+}
+
+private actor CloudSyncEnrollmentPublisherStub: CloudVaultEnrollmentPublishing {
+    private(set) var record: CKRecord?
+
+    func create(_ record: CKRecord) async throws -> CloudVaultEnrollmentCreateResult {
+        self.record = record
+        return .saved(record)
+    }
+}
+
+private final class CloudEnrollmentPublisherFactoryProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private let publisher: any CloudVaultEnrollmentPublishing
+    private var constructions = 0
+
+    init(publisher: any CloudVaultEnrollmentPublishing) {
+        self.publisher = publisher
+    }
+
+    var count: Int { lock.withLock { constructions } }
+
+    func make() throws -> any CloudVaultEnrollmentPublishing {
+        lock.withLock { constructions += 1 }
+        return publisher
     }
 }
 
