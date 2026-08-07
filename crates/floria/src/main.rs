@@ -2,7 +2,7 @@ use std::ffi::{CStr, CString, OsString};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{mpsc, Arc, Mutex};
@@ -963,7 +963,7 @@ fn cmd_mount(config: &Path) -> Result<()> {
     initialize_store_key_if_needed(&cfg)?;
     recover_stale_mount(&cfg.mount_path)?;
     let catalog_path = support_dir.join("catalog.sqlite");
-    let (store, key_provider) = open_store_with_provider(&cfg)?;
+    let (mut store, key_provider) = open_store_with_provider(&cfg)?;
     let state_authenticator = Arc::new(
         floria_integrity::StateAuthenticator::keychain()
             .context("opening the Keychain security-state authority")?,
@@ -981,6 +981,23 @@ fn cmd_mount(config: &Path) -> Result<()> {
                 safety_backup = %report.safety_backup.path.display(),
                 "finished an interrupted data restore"
             );
+            store = AgeDirStore::open(cfg.store_root.clone(), Arc::clone(&key_provider))
+                .context("reopening the Store after interrupted activation recovery")?;
+        }
+        if let Some(report) = floria_backup::activate_scheduled_data(
+            &support_dir.join("vault-activation.json"),
+            &catalog_path,
+            &store,
+            Arc::clone(&state_authenticator),
+        )
+        .context("activating the scheduled CloudKit Vault migration")?
+        {
+            tracing::warn!(
+                safety_backup = %report.safety_backup.path.display(),
+                "activated a scheduled CloudKit Vault migration"
+            );
+            store = AgeDirStore::open(cfg.store_root.clone(), Arc::clone(&key_provider))
+                .context("reopening the Store after scheduled Vault activation")?;
         }
     }
     let (agent_peer_verifier, control_peer_verifier) = local_peer_verifiers()?;
@@ -1246,6 +1263,85 @@ impl DaemonRecordSyncService {
             })
         })
     }
+
+    fn schedule_populated_vault_merge(
+        &self,
+        bootstrap: SyncVaultBootstrap,
+        target_vault_id: &str,
+    ) -> Result<SyncVaultActivation, String> {
+        let support_dir = self
+            .path
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| "record sync database has no support directory".to_string())?;
+        let migration_id = uuid::Uuid::new_v4().to_string();
+        let migration_root = support_dir.join("cloudkit-migrations").join(&migration_id);
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(&migration_root)
+            .map_err(|error| {
+                format!(
+                    "create CloudKit Vault migration workspace {}: {error}",
+                    migration_root.display()
+                )
+            })?;
+
+        let result = (|| {
+            let prepared = self.with_journal(|journal| {
+                RecordSyncControl::new(journal, Arc::clone(&self.store)).prepare_vault_merge(
+                    bootstrap,
+                    migration_root.join("store-stage"),
+                )
+            })?;
+            let key_generation = prepared
+                .store()
+                .current_generation()
+                .map_err(|error| error.to_string())?;
+            let backup = migration_root.join("backup");
+            floria_backup::create(&self.catalog, prepared.store(), &backup)
+                .map_err(|error| error.to_string())?;
+            let restored = migration_root.join("restored");
+            floria_backup::restore(&backup, &self.store, &restored)
+                .map_err(|error| error.to_string())?;
+            let safety_dir = support_dir.join("vault-safety");
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&safety_dir)
+                .map_err(|error| {
+                    format!(
+                        "create Vault safety directory {}: {error}",
+                        safety_dir.display()
+                    )
+                })?;
+            let source_vault_id = self.store.vault_document().vault_id;
+            let safety_backup = safety_dir.join(format!(
+                "{}-to-{}-{}",
+                source_vault_id, target_vault_id, migration_id
+            ));
+            floria_backup::schedule_cross_vault_activation(
+                &support_dir.join("vault-activation.json"),
+                &restored,
+                self.catalog.path(),
+                &self.store,
+                &safety_backup,
+                target_vault_id,
+                &self.authenticator,
+            )
+            .map_err(|error| error.to_string())?;
+            let _ = std::fs::remove_dir_all(&backup);
+            Ok(SyncVaultActivation::Ready {
+                vault_id: target_vault_id.to_string(),
+                key_generation,
+                restart_required: true,
+            })
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_dir_all(&migration_root);
+        }
+        result
+    }
 }
 
 impl RuntimeRecordSyncService for DaemonRecordSyncService {
@@ -1324,10 +1420,20 @@ impl RuntimeRecordSyncService for DaemonRecordSyncService {
             .saturating_add(snapshot.bindings.len())
             .saturating_add(snapshot.surfaces.len());
         self.mutations.run(|| {
-            self.with_journal(|journal| {
+            let merge_bootstrap = bootstrap.clone();
+            let activation = self.with_journal(|journal| {
                 RecordSyncControl::new(journal, Arc::clone(&self.store))
                     .activate_vault_bootstrap(bootstrap, local_items)
-            })
+            })?;
+            match activation {
+                SyncVaultActivation::MergeRequired { target_vault_id, .. } => {
+                    self.schedule_populated_vault_merge(
+                        merge_bootstrap,
+                        &target_vault_id,
+                    )
+                }
+                ready => Ok(ready),
+            }
         })
     }
 

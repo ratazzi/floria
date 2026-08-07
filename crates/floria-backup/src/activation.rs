@@ -214,6 +214,11 @@ pub fn activate_scheduled_data(
         generation,
         &ScheduledActivationState { pending: None },
     )?;
+    if std::fs::remove_dir_all(&pending.restored).is_ok() {
+        if let Some(parent) = pending.restored.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
     Ok(Some(report))
 }
 
