@@ -20,7 +20,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub use activation::{
-    activate_restored_data, recover_interrupted_activation, ActivationReport,
+    activate_restored_data, activate_scheduled_data, recover_interrupted_activation,
+    schedule_cross_vault_activation, ActivationReport, ScheduledActivationReport,
 };
 
 const BACKUP_FORMAT: u32 = 1;

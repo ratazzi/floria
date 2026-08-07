@@ -8,16 +8,19 @@ use floria_catalog::Catalog;
 use floria_integrity::StateAuthenticator;
 use floria_store::AgeDirStore;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::{
-    copy_private_directory, copy_private_file, create_with_locked_store,
-    validate_catalog_store_references, verify, verify_restored_data, BackupError, BackupReport,
-    BackupResult, CATALOG_FILE, STORE_DIRECTORY,
+    copy_private_directory, copy_private_file, create_with_locked_store, inventory_files,
+    normalized_new_destination, validate_catalog_store_references, verify, verify_restored_data,
+    BackupError, BackupReport, BackupResult, CATALOG_FILE, STORE_DIRECTORY,
 };
 
 const ACTIVATION_FORMAT: u32 = 1;
 const ACTIVATION_JOURNAL: &str = ".restore-state.json";
 const RESTORE_STATE_DOMAIN: &str = "backup-restore-transaction";
+const SCHEDULED_ACTIVATION_FORMAT: u32 = 1;
+const SCHEDULED_ACTIVATION_DOMAIN: &str = "scheduled-cross-vault-activation";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivationReport {
@@ -48,6 +51,170 @@ struct ActivationJournal {
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct RestoreTransactionState {
     transaction: Option<ActivationJournal>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ScheduledActivation {
+    format: u32,
+    source_vault_id: String,
+    target_vault_id: String,
+    restored: PathBuf,
+    restored_fingerprint: String,
+    active_catalog: PathBuf,
+    active_store: PathBuf,
+    safety_backup: PathBuf,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct ScheduledActivationState {
+    pending: Option<ScheduledActivation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledActivationReport {
+    pub source_vault_id: String,
+    pub target_vault_id: String,
+    pub restored: PathBuf,
+    pub safety_backup: PathBuf,
+}
+
+/// Persist a verified cross-Vault activation for the next daemon start.
+///
+/// The authenticated intent binds both configured live paths, both Vault ids, the exact restored
+/// tree, and the safety-backup destination. Merely placing a restore directory on disk can never
+/// schedule it.
+#[allow(clippy::too_many_arguments)]
+pub fn schedule_cross_vault_activation(
+    request_path: &Path,
+    restored: &Path,
+    active_catalog: &Path,
+    store: &AgeDirStore,
+    safety_backup: &Path,
+    expected_target_vault_id: &str,
+    authenticator: &StateAuthenticator,
+) -> BackupResult<ScheduledActivationReport> {
+    let restored_report = verify_restored_data(restored, store)?;
+    let restored_store = AgeDirStore::open(
+        restored_report.path.join(STORE_DIRECTORY),
+        store.device_key_provider(),
+    )?;
+    let target_vault_id = restored_store.vault_document().vault_id;
+    if target_vault_id != expected_target_vault_id {
+        return Err(BackupError::Manifest(format!(
+            "restored Vault {target_vault_id} does not match selected Vault {expected_target_vault_id}"
+        )));
+    }
+    let source_vault_id = store.vault_document().vault_id;
+    if source_vault_id == target_vault_id {
+        return Err(BackupError::Manifest(
+            "scheduled activation requires a different target Vault".to_string(),
+        ));
+    }
+    let active_catalog = canonical_existing_file(active_catalog)?;
+    let active_store = canonical_existing_directory(store.root())?;
+    let safety_backup = normalized_new_destination(safety_backup)?;
+    if safety_backup.exists() {
+        return Err(BackupError::Manifest(format!(
+            "safety backup already exists: {}",
+            safety_backup.display()
+        )));
+    }
+    let pending = ScheduledActivation {
+        format: SCHEDULED_ACTIVATION_FORMAT,
+        source_vault_id: source_vault_id.clone(),
+        target_vault_id: target_vault_id.clone(),
+        restored: restored_report.path,
+        restored_fingerprint: restored_tree_fingerprint(restored)?,
+        active_catalog,
+        active_store,
+        safety_backup: safety_backup.clone(),
+    };
+    let (state, generation) = load_scheduled_activation(request_path, authenticator)?;
+    match state.pending {
+        Some(existing) if existing == pending => {}
+        Some(_) => {
+            return Err(BackupError::Manifest(
+                "another cross-Vault activation is already scheduled".to_string(),
+            ))
+        }
+        None => {
+            authenticator.persist(
+                request_path,
+                SCHEDULED_ACTIVATION_DOMAIN,
+                generation,
+                &ScheduledActivationState {
+                    pending: Some(pending.clone()),
+                },
+            )?;
+        }
+    }
+    Ok(ScheduledActivationReport {
+        source_vault_id,
+        target_vault_id,
+        restored: pending.restored,
+        safety_backup,
+    })
+}
+
+/// Execute a scheduled activation before the daemon opens authenticated live state or mounts.
+///
+/// A crash after the underlying swap but before clearing this intent is idempotent: the next
+/// start proves that both active components carry valid authenticated checkpoints for the target
+/// Vault, verifies the retained safety backup, then clears the intent without swapping again.
+pub fn activate_scheduled_data(
+    request_path: &Path,
+    active_catalog: &Path,
+    store: &AgeDirStore,
+    authenticator: Arc<StateAuthenticator>,
+) -> BackupResult<Option<ActivationReport>> {
+    let (state, generation) = load_scheduled_activation(request_path, &authenticator)?;
+    let Some(pending) = state.pending else { return Ok(None) };
+    validate_scheduled_activation(&pending, active_catalog, store)?;
+    if restored_tree_fingerprint(&pending.restored)? != pending.restored_fingerprint {
+        return Err(BackupError::Manifest(
+            "scheduled restore changed after it was authenticated".to_string(),
+        ));
+    }
+
+    let current_vault_id = store.vault_document().vault_id;
+    let report = if current_vault_id == pending.target_vault_id {
+        Catalog::open_authenticated(&pending.active_catalog, Arc::clone(&authenticator))?;
+        let authenticated_store = AgeDirStore::open_authenticated(
+            pending.active_store.clone(),
+            store.device_key_provider(),
+            Arc::clone(&authenticator),
+        )?;
+        let expected = verify_restored_data(&pending.restored, &authenticated_store)?;
+        let active = verify_components(
+            &pending.active_catalog,
+            &pending.active_store,
+            &authenticated_store,
+        )?;
+        ensure_same_data(&expected, &active)?;
+        let safety_backup = verify(&pending.safety_backup, &authenticated_store)?;
+        ActivationReport { active, safety_backup }
+    } else if current_vault_id == pending.source_vault_id {
+        activate_restored_data(
+            &pending.restored,
+            &pending.active_catalog,
+            store,
+            &pending.safety_backup,
+            Arc::clone(&authenticator),
+        )?
+    } else {
+        return Err(BackupError::Manifest(format!(
+            "scheduled activation expected source Vault {} or target Vault {}, found {}",
+            pending.source_vault_id, pending.target_vault_id, current_vault_id
+        )));
+    };
+
+    authenticator.persist(
+        request_path,
+        SCHEDULED_ACTIVATION_DOMAIN,
+        generation,
+        &ScheduledActivationState { pending: None },
+    )?;
+    Ok(Some(report))
 }
 
 /// Replace the inactive catalog and encrypted store with a verified standalone restore.
@@ -190,6 +357,61 @@ pub fn recover_interrupted_activation(
             }
         }
     }
+}
+
+fn load_scheduled_activation(
+    path: &Path,
+    authenticator: &StateAuthenticator,
+) -> BackupResult<(ScheduledActivationState, u64)> {
+    let loaded = authenticator.load::<ScheduledActivationState>(
+        path,
+        SCHEDULED_ACTIVATION_DOMAIN,
+    )?;
+    let state = match loaded.value {
+        Some(state) => state,
+        None if loaded.generation == 0 => ScheduledActivationState::default(),
+        None => {
+            return Err(BackupError::Manifest(format!(
+                "scheduled activation state is missing at authenticated generation {}",
+                loaded.generation
+            )))
+        }
+    };
+    if let Some(pending) = &state.pending {
+        if pending.format != SCHEDULED_ACTIVATION_FORMAT {
+            return Err(BackupError::Manifest(format!(
+                "scheduled activation format {} is unsupported",
+                pending.format
+            )));
+        }
+    }
+    Ok((state, loaded.generation))
+}
+
+fn validate_scheduled_activation(
+    pending: &ScheduledActivation,
+    active_catalog: &Path,
+    store: &AgeDirStore,
+) -> BackupResult<()> {
+    let active_catalog = canonical_existing_file(active_catalog)?;
+    let active_store = canonical_existing_directory(store.root())?;
+    if pending.active_catalog != active_catalog || pending.active_store != active_store {
+        return Err(BackupError::Manifest(
+            "scheduled activation does not match the configured active data".to_string(),
+        ));
+    }
+    if pending.source_vault_id == pending.target_vault_id {
+        return Err(BackupError::Manifest(
+            "scheduled activation source and target Vaults are identical".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn restored_tree_fingerprint(root: &Path) -> BackupResult<String> {
+    let inventory = inventory_files(root)?;
+    let bytes = serde_json::to_vec(&inventory)?;
+    Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
 fn finish_activation(
@@ -616,7 +838,7 @@ mod tests {
 
     use floria_catalog::Project;
     use floria_store::{
-        KeyProvider, NewSecret, SecretStore, StoreResult,
+        KeyProvider, NewSecret, SecretId, SecretStore, StoreResult,
     };
 
     use super::*;
@@ -697,6 +919,76 @@ mod tests {
             active_store,
             restored,
             safety_backup,
+        }
+    }
+
+    struct ScheduledFixture {
+        _directory: tempfile::TempDir,
+        authenticator: Arc<StateAuthenticator>,
+        keys: Arc<dyn KeyProvider>,
+        active_catalog: PathBuf,
+        active_store: AgeDirStore,
+        restored: PathBuf,
+        safety_backup: PathBuf,
+        request_path: PathBuf,
+        target_vault_id: String,
+        secret_id: SecretId,
+    }
+
+    fn scheduled_fixture() -> ScheduledFixture {
+        let directory = tempfile::tempdir().unwrap();
+        let keys: Arc<dyn KeyProvider> =
+            Arc::new(TestKeys(age::x25519::Identity::generate()));
+        let authenticator = Arc::new(StateAuthenticator::for_tests([55; 32]));
+        let support = directory.path().join("support");
+        std::fs::create_dir_all(&support).unwrap();
+        let active_catalog = support.join("catalog.sqlite");
+        let catalog = Catalog::open_authenticated(
+            &active_catalog,
+            Arc::clone(&authenticator),
+        )
+        .unwrap();
+        catalog
+            .upsert_project(&project("local-project", directory.path()))
+            .unwrap();
+        let active_store = open_store(&support.join("store"), &keys)
+            .authenticate(Arc::clone(&authenticator))
+            .unwrap();
+        let secret_id = active_store
+            .put(NewSecret::managed("Local secret"), b"local fixture")
+            .unwrap();
+        active_store
+            .append_version(&secret_id, b"second fixture")
+            .unwrap();
+        active_store.set_head(&secret_id, 1).unwrap();
+
+        let target_root = directory.path().join("target-store");
+        std::fs::create_dir(&target_root).unwrap();
+        copy_private_file(
+            &support.join("store/device.age"),
+            &target_root.join("device.age"),
+        )
+        .unwrap();
+        let target_store = open_store(&target_root, &keys);
+        let target_vault_id = target_store.vault_document().vault_id;
+        assert_ne!(target_vault_id, active_store.vault_document().vault_id);
+        active_store.copy_logical_contents_to(&target_store).unwrap();
+
+        let backup = directory.path().join("target-backup");
+        create(&catalog, &target_store, &backup).unwrap();
+        let restored = directory.path().join("target-restored");
+        restore(&backup, &active_store, &restored).unwrap();
+        ScheduledFixture {
+            _directory: directory,
+            authenticator,
+            keys,
+            active_catalog,
+            active_store,
+            restored,
+            safety_backup: support.join("vault-migration-safety"),
+            request_path: support.join("vault-migration.json"),
+            target_vault_id,
+            secret_id,
         }
     }
 
@@ -858,5 +1150,130 @@ mod tests {
                 .id,
             "old-project"
         );
+    }
+
+    #[test]
+    fn scheduled_cross_vault_activation_runs_once_and_keeps_the_old_vault() {
+        let fixture = scheduled_fixture();
+        let scheduled = schedule_cross_vault_activation(
+            &fixture.request_path,
+            &fixture.restored,
+            &fixture.active_catalog,
+            &fixture.active_store,
+            &fixture.safety_backup,
+            &fixture.target_vault_id,
+            &fixture.authenticator,
+        )
+        .unwrap();
+        assert_eq!(scheduled.target_vault_id, fixture.target_vault_id);
+
+        let report = activate_scheduled_data(
+            &fixture.request_path,
+            &fixture.active_catalog,
+            &fixture.active_store,
+            Arc::clone(&fixture.authenticator),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(report.active.secrets, 1);
+        assert_eq!(report.safety_backup.secrets, 1);
+
+        let reopened = AgeDirStore::open_authenticated(
+            fixture.active_store.root().to_path_buf(),
+            Arc::clone(&fixture.keys),
+            Arc::clone(&fixture.authenticator),
+        )
+        .unwrap();
+        assert_eq!(reopened.vault_document().vault_id, fixture.target_vault_id);
+        assert_eq!(reopened.get(&fixture.secret_id).unwrap().as_slice(), b"local fixture");
+        assert!(fixture.safety_backup.is_dir());
+        assert!(activate_scheduled_data(
+            &fixture.request_path,
+            &fixture.active_catalog,
+            &reopened,
+            Arc::clone(&fixture.authenticator),
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn scheduled_activation_recovers_a_crash_after_swap_before_intent_clear() {
+        let fixture = scheduled_fixture();
+        schedule_cross_vault_activation(
+            &fixture.request_path,
+            &fixture.restored,
+            &fixture.active_catalog,
+            &fixture.active_store,
+            &fixture.safety_backup,
+            &fixture.target_vault_id,
+            &fixture.authenticator,
+        )
+        .unwrap();
+        activate_restored_data(
+            &fixture.restored,
+            &fixture.active_catalog,
+            &fixture.active_store,
+            &fixture.safety_backup,
+            Arc::clone(&fixture.authenticator),
+        )
+        .unwrap();
+        let reopened = AgeDirStore::open(
+            fixture.active_store.root().to_path_buf(),
+            Arc::clone(&fixture.keys),
+        )
+        .unwrap();
+
+        let recovered = activate_scheduled_data(
+            &fixture.request_path,
+            &fixture.active_catalog,
+            &reopened,
+            Arc::clone(&fixture.authenticator),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(recovered.active.secrets, 1);
+        assert!(activate_scheduled_data(
+            &fixture.request_path,
+            &fixture.active_catalog,
+            &reopened,
+            fixture.authenticator,
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
+    fn scheduled_activation_rejects_a_changed_restore_before_touching_live_data() {
+        let fixture = scheduled_fixture();
+        let source_vault_id = fixture.active_store.vault_document().vault_id;
+        schedule_cross_vault_activation(
+            &fixture.request_path,
+            &fixture.restored,
+            &fixture.active_catalog,
+            &fixture.active_store,
+            &fixture.safety_backup,
+            &fixture.target_vault_id,
+            &fixture.authenticator,
+        )
+        .unwrap();
+        std::fs::write(fixture.restored.join(CATALOG_FILE), b"tampered").unwrap();
+
+        let error = activate_scheduled_data(
+            &fixture.request_path,
+            &fixture.active_catalog,
+            &fixture.active_store,
+            Arc::clone(&fixture.authenticator),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("changed after it was authenticated"));
+        assert_eq!(fixture.active_store.vault_document().vault_id, source_vault_id);
+        assert_eq!(
+            fixture.active_store.get(&fixture.secret_id).unwrap().as_slice(),
+            b"local fixture"
+        );
+        assert!(!fixture.safety_backup.exists());
     }
 }
