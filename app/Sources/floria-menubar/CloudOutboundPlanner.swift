@@ -1,5 +1,4 @@
 import CloudKit
-import CryptoKit
 import Foundation
 
 /// Pure planning for one manual CloudKit send cycle.
@@ -107,24 +106,10 @@ struct CloudRecordCollisionResolver {
     }
 
     private func assetMatches(file: String, size: UInt64, digest: String) throws -> Bool {
-        let url = URL(fileURLWithPath: file)
-        let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
-        guard let fileSize = attributes[.size] as? NSNumber,
-              fileSize.uint64Value == size
-        else {
-            return false
-        }
-
-        let handle = try FileHandle(forReadingFrom: url)
-        defer { try? handle.close() }
-        var hasher = SHA256()
-        while true {
-            let chunk = try handle.read(upToCount: 1024 * 1024) ?? Data()
-            if chunk.isEmpty { break }
-            hasher.update(data: chunk)
-        }
-        let actual = hasher.finalize().map { String(format: "%02x", $0) }.joined()
-        return actual == digest
+        try CloudAssetFile.matches(
+            URL(fileURLWithPath: file),
+            expectedSize: size,
+            expectedDigest: digest)
     }
 }
 
