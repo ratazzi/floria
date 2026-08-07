@@ -3,6 +3,12 @@ import Foundation
 
 struct CloudSentBatchResolver {
     let codec: CloudRecordCodec
+    let bootstrapCodec: CloudVaultBootstrapCodec?
+
+    init(codec: CloudRecordCodec, bootstrapCodec: CloudVaultBootstrapCodec? = nil) {
+        self.codec = codec
+        self.bootstrapCodec = bootstrapCodec
+    }
 
     func resolve(
         phase: CloudSendPhase,
@@ -35,6 +41,12 @@ struct CloudSentBatchResolver {
 
         for (recordID, client) in expected {
             if let server = saved[recordID] {
+                if case .bootstrap = phase {
+                    guard try bootstrapMatches(client: client, server: server) else {
+                        return .damaged(
+                            "CloudKit lifecycle record \(recordID.recordName) changed unexpectedly")
+                    }
+                }
                 if server.recordType == CloudRecordCodec.RecordType.head,
                    case .head(let entityID, let record) = try codec.decode(server)
                 {
@@ -52,6 +64,13 @@ struct CloudSentBatchResolver {
                 guard let server = failure.serverRecord else {
                     return .damaged(
                         "CloudKit omitted the server record for \(recordID.recordName)")
+                }
+                if case .bootstrap = phase {
+                    guard try bootstrapMatches(client: client, server: server) else {
+                        return .damaged(
+                            "CloudKit lifecycle record \(recordID.recordName) changed unexpectedly")
+                    }
+                    continue
                 }
                 switch try CloudRecordCollisionResolver(codec: codec).classify(
                     client: client, server: server)
@@ -88,21 +107,32 @@ struct CloudSentBatchResolver {
         if hasRetry { return .retry }
 
         switch phase {
+        case .bootstrap:
+            return .bootstrapAccepted
         case .objects(let records):
             return .objectsVerified(records)
         case .commit(let commitID, _):
             return .commitAccepted(commitID: commitID, heads: acceptedHeads)
         }
     }
+
+    private func bootstrapMatches(client: CKRecord, server: CKRecord) throws -> Bool {
+        guard let bootstrapCodec,
+              bootstrapCodec.owns(client),
+              bootstrapCodec.owns(server)
+        else { return false }
+        return try bootstrapCodec.equivalent(client, server)
+    }
 }
 
 enum CloudSendPhase {
+    case bootstrap([CKRecord])
     case objects([CKRecord])
     case commit(commitID: String, records: [CKRecord])
 
     var records: [CKRecord] {
         switch self {
-        case .objects(let records), .commit(_, let records):
+        case .bootstrap(let records), .objects(let records), .commit(_, let records):
             records
         }
     }
@@ -120,6 +150,7 @@ struct CloudRecordSaveFailure {
 }
 
 enum CloudSentBatchResolution {
+    case bootstrapAccepted
     case objectsVerified([CKRecord])
     case commitAccepted(commitID: String, heads: [String: CKRecord])
     case commitConflict(commitID: String, entityIDs: [String])

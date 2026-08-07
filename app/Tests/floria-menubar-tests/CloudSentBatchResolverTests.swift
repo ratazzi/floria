@@ -108,6 +108,62 @@ final class CloudSentBatchResolverTests: XCTestCase {
         XCTAssertTrue(message.contains(client.recordID.recordName))
     }
 
+    func testBootstrapCollisionIsAcceptedOnlyWhenLifecycleBytesMatch() throws {
+        let bootstrapCodec = try CloudVaultBootstrapCodec(vaultID: codec.vaultID)
+        let client = try XCTUnwrap(
+            try bootstrapCodec.records(for: bootstrap()).first)
+        let exact = try XCTUnwrap(client.copy() as? CKRecord)
+        let lifecycleResolver = CloudSentBatchResolver(
+            codec: codec, bootstrapCodec: bootstrapCodec)
+
+        let accepted = try lifecycleResolver.resolve(
+            phase: .bootstrap([client]),
+            savedRecords: [],
+            failures: [
+                CloudRecordSaveFailure(
+                    record: client,
+                    code: .serverRecordChanged,
+                    serverRecord: exact)
+            ])
+        guard case .bootstrapAccepted = accepted else {
+            return XCTFail("Expected an idempotent lifecycle save")
+        }
+
+        let changed = try XCTUnwrap(client.copy() as? CKRecord)
+        changed[CloudVaultBootstrapCodec.Field.payload] = Data("changed".utf8) as NSData
+        let damaged = try lifecycleResolver.resolve(
+            phase: .bootstrap([client]),
+            savedRecords: [],
+            failures: [
+                CloudRecordSaveFailure(
+                    record: client,
+                    code: .serverRecordChanged,
+                    serverRecord: changed)
+            ])
+        guard case .damaged(let message) = damaged else {
+            return XCTFail("Expected changed lifecycle bytes to be damage")
+        }
+        XCTAssertTrue(message.contains(client.recordID.recordName))
+    }
+
+    func testBootstrapSavedResultMustStillMatchTheRequestedRecord() throws {
+        let bootstrapCodec = try CloudVaultBootstrapCodec(vaultID: codec.vaultID)
+        let client = try XCTUnwrap(
+            try bootstrapCodec.records(for: bootstrap()).first)
+        let changed = try XCTUnwrap(client.copy() as? CKRecord)
+        changed[CloudVaultBootstrapCodec.Field.payload] = Data("changed".utf8) as NSData
+        let lifecycleResolver = CloudSentBatchResolver(
+            codec: codec, bootstrapCodec: bootstrapCodec)
+
+        let result = try lifecycleResolver.resolve(
+            phase: .bootstrap([client]),
+            savedRecords: [changed],
+            failures: [])
+        guard case .damaged = result else {
+            return XCTFail("Expected a mismatched saved lifecycle record to be damage")
+        }
+    }
+
     private var resolver: CloudSentBatchResolver {
         CloudSentBatchResolver(codec: codec)
     }
@@ -135,5 +191,15 @@ final class CloudSentBatchResolverTests: XCTestCase {
         record[CloudRecordCodec.Field.entityID] = entityID as NSString
         record[CloudRecordCodec.Field.revisionID] = revisionID as NSString
         return record
+    }
+
+    private func bootstrap() -> SyncVaultBootstrap {
+        SyncVaultBootstrap(
+            vaultID: codec.vaultID,
+            vaultDocumentBase64: Data("signed Vault".utf8).base64EncodedString(),
+            deviceIdentities: [],
+            enrollmentRequests: [],
+            keyGenerations: [],
+            generationEnvelopes: [])
     }
 }

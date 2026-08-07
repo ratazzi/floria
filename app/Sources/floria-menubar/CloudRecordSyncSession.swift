@@ -193,6 +193,9 @@ final class CloudRecordSyncSession: NSObject, CKSyncEngineDelegate, @unchecked S
             failures: failures)
 
         switch resolution {
+        case .bootstrapAccepted:
+            await finish(phase, syncEngine: syncEngine)
+
         case .objectsVerified(let records):
             try await coordinator.markObjectsVerified(records)
             await finish(phase, syncEngine: syncEngine)
