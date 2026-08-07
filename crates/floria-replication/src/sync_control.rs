@@ -18,6 +18,7 @@ use crate::projection_applicator::{ProjectionApplicator, ProjectionApplyOutcome}
 use crate::record::{EntityRevision, ImmutableObjectRef, RevisionCommit, RECORD_FORMAT_VERSION};
 use crate::record_crypto::RecordCryptor;
 use crate::record_journal::{OutboundCommit, RecordJournal};
+use crate::sync_bootstrap::SyncVaultBootstrap;
 use crate::{ReplicationError, ReplicationResult};
 
 const MAX_OUTBOUND_COMMITS: usize = 100;
@@ -412,6 +413,13 @@ pub struct RecordSyncControl<'a> {
 impl<'a> RecordSyncControl<'a> {
     pub fn new(journal: &'a RecordJournal, store: std::sync::Arc<AgeDirStore>) -> Self {
         Self { journal, store }
+    }
+
+    /// Export authenticated Vault identity, Device membership, key-generation documents, and
+    /// opaque historical envelopes for a platform bootstrap adapter. This never activates an
+    /// imported Vault or exposes private Device/generation keys.
+    pub fn vault_bootstrap(&self) -> ReplicationResult<SyncVaultBootstrap> {
+        SyncVaultBootstrap::capture(&self.store)
     }
 
     /// Return oldest durable publications without changing retry state.
@@ -947,6 +955,8 @@ mod tests {
         let status = fixture.control().status().unwrap();
         assert_eq!(status.vault_id(), fixture.store.vault_document().vault_id);
         assert_eq!(status.key_generation(), fixture.store.current_generation().unwrap());
+        let bootstrap = fixture.control().vault_bootstrap().unwrap();
+        assert_eq!(bootstrap.vault_id(), status.vault_id());
         let batch = fixture.control().next_outbound(10).unwrap();
 
         assert_eq!(batch.commits().len(), 1);

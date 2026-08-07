@@ -16,6 +16,7 @@ pub mod record_journal;
 pub mod record_publisher;
 pub mod record_transaction;
 pub mod secret_state;
+pub mod sync_bootstrap;
 pub mod sync_control;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
