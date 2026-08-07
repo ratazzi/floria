@@ -45,13 +45,19 @@ actor CloudSyncService {
         _ supportDirectory: URL,
         _ vaultID: String
     ) throws -> any CloudSyncSessionRunning
+    typealias DiscoveryFactory = @Sendable () throws -> any CloudVaultDiscovering
+    typealias LifecycleLoaderFactory = @Sendable () throws -> any CloudVaultLifecycleLoading
 
     private let control: any CloudSyncControlling
     private let supportDirectory: URL
     private let preferences: CloudSyncPreferences
     private let sessionFactory: SessionFactory
+    private let discoveryFactory: DiscoveryFactory
+    private let lifecycleLoaderFactory: LifecycleLoaderFactory
     private var session: (any CloudSyncSessionRunning)?
     private var sessionVaultID: String?
+    private var discovery: (any CloudVaultDiscovering)?
+    private var lifecycleLoader: (any CloudVaultLifecycleLoading)?
 
     init(
         control: any CloudSyncControlling,
@@ -70,18 +76,39 @@ actor CloudSyncService {
                 supportDirectory: supportDirectory,
                 vaultID: vaultID)
         }
+        discoveryFactory = {
+            let container = CKContainer(
+                identifier: ProductIdentity.cloudKitContainerIdentifier)
+            return CloudVaultDiscovery(
+                query: CloudKitVaultZoneQuery(database: container.privateCloudDatabase))
+        }
+        lifecycleLoaderFactory = { [control] in
+            let container = CKContainer(
+                identifier: ProductIdentity.cloudKitContainerIdentifier)
+            return CloudVaultLifecycleLoader(
+                query: CloudKitVaultLifecycleQuery(database: container.privateCloudDatabase),
+                control: control)
+        }
     }
 
     init(
         control: any CloudSyncControlling,
         supportDirectory: URL,
         preferences: CloudSyncPreferences,
-        sessionFactory: @escaping SessionFactory
+        sessionFactory: @escaping SessionFactory,
+        discoveryFactory: @escaping DiscoveryFactory = {
+            throw CloudSyncServiceError.unconfiguredTestDependency
+        },
+        lifecycleLoaderFactory: @escaping LifecycleLoaderFactory = {
+            throw CloudSyncServiceError.unconfiguredTestDependency
+        }
     ) {
         self.control = control
         self.supportDirectory = supportDirectory
         self.preferences = preferences
         self.sessionFactory = sessionFactory
+        self.discoveryFactory = discoveryFactory
+        self.lifecycleLoaderFactory = lifecycleLoaderFactory
     }
 
     func isEnabled() -> Bool {
@@ -94,7 +121,33 @@ actor CloudSyncService {
         if !enabled {
             session = nil
             sessionVaultID = nil
+            discovery = nil
+            lifecycleLoader = nil
         }
+    }
+
+    func discoverVaults() async throws -> [CloudVaultCandidate] {
+        guard preferences.isEnabled else { throw CloudSyncServiceError.disabled }
+        let activeDiscovery: any CloudVaultDiscovering
+        if let discovery {
+            activeDiscovery = discovery
+        } else {
+            activeDiscovery = try discoveryFactory()
+            discovery = activeDiscovery
+        }
+        return try await activeDiscovery.discover()
+    }
+
+    func authenticateVault(_ vaultID: String) async throws -> SyncVaultBootstrap {
+        guard preferences.isEnabled else { throw CloudSyncServiceError.disabled }
+        let activeLoader: any CloudVaultLifecycleLoading
+        if let lifecycleLoader {
+            activeLoader = lifecycleLoader
+        } else {
+            activeLoader = try lifecycleLoaderFactory()
+            lifecycleLoader = activeLoader
+        }
+        return try await activeLoader.loadAndAuthenticate(vaultID: vaultID)
     }
 
     func localStatus() async throws -> SyncDomainStatus? {
@@ -122,8 +175,14 @@ actor CloudSyncService {
 
 enum CloudSyncServiceError: Error, Equatable, LocalizedError {
     case disabled
+    case unconfiguredTestDependency
 
     var errorDescription: String? {
-        "iCloud Sync is off. Enable it before syncing."
+        switch self {
+        case .disabled:
+            "iCloud Sync is off. Enable it before using iCloud."
+        case .unconfiguredTestDependency:
+            "Cloud sync test dependency is not configured."
+        }
     }
 }

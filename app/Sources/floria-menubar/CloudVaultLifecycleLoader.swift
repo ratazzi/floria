@@ -9,6 +9,10 @@ protocol CloudVaultLifecycleQuerying: Sendable {
     ) async throws -> [CKRecord]
 }
 
+protocol CloudVaultLifecycleLoading: Sendable {
+    func loadAndAuthenticate(vaultID: String) async throws -> SyncVaultBootstrap
+}
+
 /// Paged CloudKit query adapter used only after the user explicitly asks to
 /// discover or join a Vault. It never starts from app launch or opt-in alone.
 struct CloudKitVaultLifecycleQuery: CloudVaultLifecycleQuerying, @unchecked Sendable {
@@ -112,6 +116,8 @@ struct CloudVaultLifecycleLoader: Sendable {
             candidate, expectedVaultID: codec.recordCodec.vaultID)
     }
 }
+
+extension CloudVaultLifecycleLoader: CloudVaultLifecycleLoading {}
 
 enum CloudVaultLifecycleLoaderError: Error, Equatable, LocalizedError {
     case tooManyRecords(recordType: String, count: Int)

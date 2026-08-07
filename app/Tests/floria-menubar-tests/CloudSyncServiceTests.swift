@@ -71,6 +71,75 @@ final class CloudSyncServiceTests: XCTestCase {
         XCTAssertEqual(statusCount, 0)
     }
 
+    func testVaultDiscoveryAndAuthenticationAreExplicitAndLazilyConstructed() async throws {
+        let suiteName = "floria-cloud-sync-tests-\(UUID().uuidString)"
+        let preferences = CloudSyncPreferences(suiteName: suiteName)
+        preferences.setEnabled(true)
+        let control = CloudSyncControlStub(status: status())
+        let discovery = CloudVaultDiscoveryStub(
+            candidates: [
+                CloudVaultCandidate(
+                    vaultID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                    vaultDocumentBase64: "dmF1bHQ="),
+            ])
+        let bootstrap = SyncVaultBootstrap(
+            vaultID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            vaultDocumentBase64: "dmF1bHQ=",
+            deviceIdentities: [],
+            enrollmentRequests: [],
+            keyGenerations: [],
+            generationEnvelopes: [])
+        let loader = CloudVaultLifecycleLoaderStub(bootstrap: bootstrap)
+        let discoveryFactory = CloudVaultDiscoveryFactoryProbe(discovery: discovery)
+        let loaderFactory = CloudVaultLifecycleFactoryProbe(loader: loader)
+        let service = CloudSyncService(
+            control: control,
+            supportDirectory: FileManager.default.temporaryDirectory,
+            preferences: preferences,
+            sessionFactory: { _, _, _ in CloudSyncSessionStub() },
+            discoveryFactory: { try discoveryFactory.make() },
+            lifecycleLoaderFactory: { try loaderFactory.make() })
+        defer { UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName) }
+
+        XCTAssertEqual(discoveryFactory.count, 0)
+        XCTAssertEqual(loaderFactory.count, 0)
+
+        let first = try await service.discoverVaults()
+        let second = try await service.discoverVaults()
+        let authenticated = try await service.authenticateVault(bootstrap.vaultID)
+        let discoveryCalls = await discovery.callCount
+        let loaderVaultIDs = await loader.vaultIDs
+
+        XCTAssertEqual(first, second)
+        XCTAssertEqual(first.map(\.vaultID), [bootstrap.vaultID])
+        XCTAssertEqual(authenticated, bootstrap)
+        XCTAssertEqual(discoveryFactory.count, 1)
+        XCTAssertEqual(loaderFactory.count, 1)
+        XCTAssertEqual(discoveryCalls, 2)
+        XCTAssertEqual(loaderVaultIDs, [bootstrap.vaultID])
+    }
+
+    func testDisabledVaultDiscoveryConstructsNoCloudKitDependency() async throws {
+        let suiteName = "floria-cloud-sync-tests-\(UUID().uuidString)"
+        let factory = CloudVaultDiscoveryFactoryProbe(
+            discovery: CloudVaultDiscoveryStub(candidates: []))
+        let service = CloudSyncService(
+            control: CloudSyncControlStub(status: status()),
+            supportDirectory: FileManager.default.temporaryDirectory,
+            preferences: CloudSyncPreferences(suiteName: suiteName),
+            sessionFactory: { _, _, _ in CloudSyncSessionStub() },
+            discoveryFactory: { try factory.make() })
+        defer { UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName) }
+
+        do {
+            _ = try await service.discoverVaults()
+            XCTFail("Expected disabled discovery to fail locally")
+        } catch let error as CloudSyncServiceError {
+            XCTAssertEqual(error, .disabled)
+        }
+        XCTAssertEqual(factory.count, 0)
+    }
+
     private func status() -> SyncDomainStatus {
         SyncDomainStatus(
             vaultID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -152,5 +221,71 @@ private actor CloudSyncControlStub: CloudSyncControlling {
         -> SyncInboundReport
     {
         throw CloudSyncServiceError.disabled
+    }
+}
+
+private actor CloudVaultDiscoveryStub: CloudVaultDiscovering {
+    private let candidates: [CloudVaultCandidate]
+    private(set) var callCount = 0
+
+    init(candidates: [CloudVaultCandidate]) {
+        self.candidates = candidates
+    }
+
+    func discover() async throws -> [CloudVaultCandidate] {
+        callCount += 1
+        return candidates
+    }
+}
+
+private actor CloudVaultLifecycleLoaderStub: CloudVaultLifecycleLoading {
+    private let bootstrap: SyncVaultBootstrap
+    private(set) var vaultIDs = [String]()
+
+    init(bootstrap: SyncVaultBootstrap) {
+        self.bootstrap = bootstrap
+    }
+
+    func loadAndAuthenticate(vaultID: String) async throws -> SyncVaultBootstrap {
+        vaultIDs.append(vaultID)
+        return bootstrap
+    }
+}
+
+private final class CloudVaultDiscoveryFactoryProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private let discovery: any CloudVaultDiscovering
+    private var constructions = 0
+
+    init(discovery: any CloudVaultDiscovering) {
+        self.discovery = discovery
+    }
+
+    var count: Int {
+        lock.withLock { constructions }
+    }
+
+    func make() throws -> any CloudVaultDiscovering {
+        lock.withLock { constructions += 1 }
+        return discovery
+    }
+}
+
+private final class CloudVaultLifecycleFactoryProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private let loader: any CloudVaultLifecycleLoading
+    private var constructions = 0
+
+    init(loader: any CloudVaultLifecycleLoading) {
+        self.loader = loader
+    }
+
+    var count: Int {
+        lock.withLock { constructions }
+    }
+
+    func make() throws -> any CloudVaultLifecycleLoading {
+        lock.withLock { constructions += 1 }
+        return loader
     }
 }

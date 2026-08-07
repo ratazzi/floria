@@ -9,6 +9,10 @@ struct CloudVaultCandidate: Equatable, Sendable {
     let vaultDocumentBase64: String
 }
 
+protocol CloudVaultDiscovering: Sendable {
+    func discover() async throws -> [CloudVaultCandidate]
+}
+
 enum CloudVaultRecordLookup {
     case found(CKRecord)
     case missing
@@ -117,6 +121,8 @@ struct CloudVaultDiscovery: Sendable {
         return candidates.sorted { $0.vaultID < $1.vaultID }
     }
 }
+
+extension CloudVaultDiscovery: CloudVaultDiscovering {}
 
 enum CloudVaultDiscoveryError: Error, Equatable, LocalizedError {
     case duplicateVault(String)
