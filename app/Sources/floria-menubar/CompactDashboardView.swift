@@ -183,7 +183,9 @@ struct DashboardView: View {
                 })
         }
         .sheet(isPresented: $showingSync) {
-            SyncView(store: state.workspace)
+            SyncView(
+                service: state.cloudSyncService,
+                restartDaemon: { await state.restartDaemonForCloudSync() })
         }
         .onAppear {
             presentRequestedSystemHealth()

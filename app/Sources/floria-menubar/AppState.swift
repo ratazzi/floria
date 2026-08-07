@@ -93,6 +93,7 @@ final class AppState {
 
     @ObservationIgnored private var client: AgentClient!
     @ObservationIgnored private let controlClient: ControlClient
+    @ObservationIgnored let cloudSyncService: CloudSyncService
     @ObservationIgnored private var policyRefreshTask: Task<Void, Never>?
     @ObservationIgnored private var healthRefreshTask: Task<Void, Never>?
     @ObservationIgnored private var checkoutRefreshTask: Task<Void, Never>?
@@ -113,6 +114,9 @@ final class AppState {
         let controlSock = (supportDirectory as NSString).appendingPathComponent("control.sock")
         let controlClient = ControlClient(socketPath: controlSock)
         self.controlClient = controlClient
+        cloudSyncService = CloudSyncService(
+            control: controlClient,
+            supportDirectory: URL(fileURLWithPath: supportDirectory, isDirectory: true))
         workspace = WorkspaceStore(controlClient: controlClient)
 
         client = AgentClient(socketPath: sock)
@@ -310,6 +314,16 @@ final class AppState {
             await probe?.value
             self?.macFuseRechecking = false
         }
+    }
+
+    /// Finish a durable cross-Vault activation scheduled by Rust. The service blocks further
+    /// CloudKit traffic until the replacement daemon reports the authenticated target Vault.
+    func restartDaemonForCloudSync() async {
+        guard DaemonManager.isProductionApp else { return }
+        let manager = daemonManager
+        await Task.detached(priority: .utility) { manager.stop() }.value
+        try? await Task.sleep(nanoseconds: 250_000_000)
+        await Task.detached(priority: .utility) { manager.ensureRunning() }.value
     }
 
     func clearRecents() {

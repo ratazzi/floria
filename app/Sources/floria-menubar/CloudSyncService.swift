@@ -188,6 +188,29 @@ actor CloudSyncService {
             requestedAt: requestedAt ?? Self.timestamp())
     }
 
+    func reviewEnrollments(
+        in bootstrap: SyncVaultBootstrap
+    ) async throws -> [SyncEnrollmentReview] {
+        guard preferences.isEnabled else { throw CloudSyncServiceError.disabled }
+        return try await control.reviewRecordSyncVaultEnrollments(bootstrap: bootstrap)
+    }
+
+    /// Approval mutates only Rust-owned lifecycle state. The caller follows it with `syncNow()`
+    /// to publish the new signed Device identity and key envelope to CloudKit.
+    func approveEnrollment(
+        _ review: SyncEnrollmentReview,
+        in bootstrap: SyncVaultBootstrap
+    ) async throws -> SyncVaultBootstrap {
+        guard preferences.isEnabled else { throw CloudSyncServiceError.disabled }
+        let approved = try await control.approveRecordSyncVaultEnrollment(
+            bootstrap: bootstrap,
+            deviceID: review.deviceID,
+            expectedFingerprint: review.fingerprint)
+        session = nil
+        sessionVaultID = nil
+        return approved
+    }
+
     /// Activate one Rust-authenticated lifecycle snapshot. A different populated Vault is
     /// prepared durably by the daemon and becomes active only after that daemon restarts.
     @discardableResult

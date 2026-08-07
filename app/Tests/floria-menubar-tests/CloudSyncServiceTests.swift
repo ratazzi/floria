@@ -227,6 +227,39 @@ final class CloudSyncServiceTests: XCTestCase {
         XCTAssertEqual(factory.vaultIDs, [targetVaultID])
     }
 
+    func testEnrollmentReviewAndApprovalStayInsideRustUntilTheNextExplicitSync() async throws {
+        let suiteName = "floria-cloud-sync-tests-\(UUID().uuidString)"
+        let preferences = CloudSyncPreferences(suiteName: suiteName)
+        preferences.setEnabled(true)
+        let review = SyncEnrollmentReview(
+            deviceID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            deviceName: "Studio",
+            requestedAt: "2026-08-08T12:00:00Z",
+            fingerprint: "sha256:fixture")
+        let control = CloudSyncControlStub(status: status(), reviews: [review])
+        let session = CloudSyncSessionStub()
+        let service = CloudSyncService(
+            control: control,
+            supportDirectory: FileManager.default.temporaryDirectory,
+            preferences: preferences,
+            sessionFactory: { _, _, _ in session })
+        let bootstrap = SyncVaultBootstrap(
+            vaultID: status().vaultID,
+            vaultDocumentBase64: "dmF1bHQ=",
+            deviceIdentities: [], enrollmentRequests: [], keyGenerations: [],
+            generationEnvelopes: [])
+        defer { UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName) }
+
+        let reviews = try await service.reviewEnrollments(in: bootstrap)
+        let approved = try await service.approveEnrollment(review, in: bootstrap)
+        let syncCount = await session.syncCount
+        let approvedFingerprints = await control.approvedFingerprints
+        XCTAssertEqual(reviews, [review])
+        XCTAssertEqual(approved, bootstrap)
+        XCTAssertEqual(syncCount, 0)
+        XCTAssertEqual(approvedFingerprints, [review.fingerprint])
+    }
+
     private func status() -> SyncDomainStatus {
         SyncDomainStatus(
             vaultID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -281,13 +314,17 @@ private actor CloudSyncSessionStub: CloudSyncSessionRunning {
 private actor CloudSyncControlStub: CloudSyncControlling {
     private var status: SyncDomainStatus
     private let activation: SyncVaultActivation
+    private let reviews: [SyncEnrollmentReview]
     private(set) var statusCount = 0
+    private(set) var approvedFingerprints = [String]()
 
     init(
         status: SyncDomainStatus,
-        activation: SyncVaultActivation? = nil
+        activation: SyncVaultActivation? = nil,
+        reviews: [SyncEnrollmentReview] = []
     ) {
         self.status = status
+        self.reviews = reviews
         self.activation = activation ?? .ready(
             vaultID: status.vaultID,
             keyGeneration: status.keyGeneration,
@@ -331,15 +368,16 @@ private actor CloudSyncControlStub: CloudSyncControlling {
     func reviewRecordSyncVaultEnrollments(
         bootstrap _: SyncVaultBootstrap
     ) async throws -> [SyncEnrollmentReview] {
-        []
+        reviews
     }
 
     func approveRecordSyncVaultEnrollment(
         bootstrap: SyncVaultBootstrap,
         deviceID _: String,
-        expectedFingerprint _: String
+        expectedFingerprint: String
     ) async throws -> SyncVaultBootstrap {
-        bootstrap
+        approvedFingerprints.append(expectedFingerprint)
+        return bootstrap
     }
 
     func activateRecordSyncVault(

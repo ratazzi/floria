@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
-struct SyncView: View {
+struct FolderSyncView: View {
     @Bindable var store: WorkspaceStore
     @Environment(\.dismiss) private var dismiss
 
