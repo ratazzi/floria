@@ -18,7 +18,9 @@ use crate::projection_applicator::{ProjectionApplicator, ProjectionApplyOutcome}
 use crate::record::{EntityRevision, ImmutableObjectRef, RevisionCommit, RECORD_FORMAT_VERSION};
 use crate::record_crypto::RecordCryptor;
 use crate::record_journal::{OutboundCommit, RecordJournal};
-use crate::sync_bootstrap::SyncVaultBootstrap;
+use crate::sync_bootstrap::{
+    SyncEnrollmentPreparation, SyncEnrollmentReview, SyncVaultBootstrap,
+};
 use crate::{ReplicationError, ReplicationResult};
 
 const MAX_OUTBOUND_COMMITS: usize = 100;
@@ -431,6 +433,43 @@ impl<'a> RecordSyncControl<'a> {
     ) -> ReplicationResult<SyncVaultBootstrap> {
         bootstrap.validate_for_vault(expected_vault_id)?;
         Ok(bootstrap)
+    }
+
+    /// Prepare this Store's local Device identity to join a user-selected Vault.
+    /// This signs an opaque request but does not install or switch any Vault state.
+    pub fn prepare_vault_enrollment(
+        &self,
+        bootstrap: SyncVaultBootstrap,
+        device_name: Option<String>,
+        requested_at: &str,
+    ) -> ReplicationResult<SyncEnrollmentPreparation> {
+        bootstrap.validate_for_vault(bootstrap.vault_id())?;
+        bootstrap.prepare_enrollment(&self.store.device(), device_name, requested_at)
+    }
+
+    /// Project authenticated pending requests into the minimal information a GUI
+    /// needs for out-of-band fingerprint comparison.
+    pub fn review_vault_enrollments(
+        &self,
+        bootstrap: SyncVaultBootstrap,
+    ) -> ReplicationResult<Vec<SyncEnrollmentReview>> {
+        bootstrap.validate_for_vault(self.store.vault_document().vault_id.as_str())?;
+        bootstrap.review_enrollments()
+    }
+
+    /// Approve exactly one reviewed request and return the updated authenticated
+    /// bootstrap ready for atomic create-only publication.
+    pub fn approve_vault_enrollment(
+        &self,
+        bootstrap: SyncVaultBootstrap,
+        device_id: &str,
+        expected_fingerprint: &str,
+    ) -> ReplicationResult<SyncVaultBootstrap> {
+        bootstrap.approve_enrollment(
+            std::sync::Arc::clone(&self.store),
+            device_id,
+            expected_fingerprint,
+        )
     }
 
     /// Return oldest durable publications without changing retry state.

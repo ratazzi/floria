@@ -14,11 +14,11 @@ use base64::Engine;
 use floria_store::vault::{
     self, DeviceDocument, EnrollmentRequestDocument, KeyGenerationDocument, MAX_DESCRIPTOR_BYTES,
 };
-use floria_store::AgeDirStore;
+use floria_store::{AgeDirStore, DeviceKeyMaterial};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::{ReplicationError, ReplicationResult};
+use crate::{ReplicationError, ReplicationPackage, ReplicationResult};
 
 const MAX_BOOTSTRAP_DEVICES: usize = 64;
 const MAX_BOOTSTRAP_GENERATIONS: usize = 64;
@@ -51,6 +51,58 @@ pub struct SyncBootstrapEnvelope {
     ciphertext_base64: String,
 }
 
+/// Result of preparing this Device to join an authenticated target Vault.
+/// The request remains self-signed and carries no authorization until a trusted
+/// genesis Device compares its fingerprint and approves it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SyncEnrollmentPreparation {
+    AlreadyEnrolled { device_id: String },
+    Request(SyncEnrollmentRequest),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncEnrollmentRequest {
+    device_id: String,
+    device_name: Option<String>,
+    requested_at: String,
+    fingerprint: String,
+    document_base64: String,
+}
+
+impl SyncEnrollmentRequest {
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    pub fn document_base64(&self) -> &str {
+        &self.document_base64
+    }
+}
+
+/// Human-reviewable projection of a cryptographically valid enrollment request.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncEnrollmentReview {
+    device_id: String,
+    device_name: Option<String>,
+    requested_at: String,
+    fingerprint: String,
+}
+
+impl SyncEnrollmentReview {
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+}
+
 impl SyncBootstrapEnvelope {
     pub fn device_id(&self) -> &str {
         &self.device_id
@@ -75,6 +127,12 @@ pub struct SyncVaultBootstrap {
     enrollment_requests: Vec<SyncBootstrapDocument>,
     key_generations: Vec<SyncBootstrapDocument>,
     generation_envelopes: Vec<SyncBootstrapEnvelope>,
+}
+
+struct ValidatedBootstrap {
+    vault: vault::VaultDocument,
+    identities: BTreeMap<String, DeviceDocument>,
+    requests: BTreeMap<String, EnrollmentRequestDocument>,
 }
 
 impl SyncVaultBootstrap {
@@ -185,6 +243,10 @@ impl SyncVaultBootstrap {
     /// Validate an untrusted transport snapshot and bind it to the selected Vault zone. Passing
     /// establishes internal authenticity, not user intent to join that Vault.
     pub fn validate_for_vault(&self, expected_vault_id: &str) -> ReplicationResult<()> {
+        self.validated(expected_vault_id).map(|_| ())
+    }
+
+    fn validated(&self, expected_vault_id: &str) -> ReplicationResult<ValidatedBootstrap> {
         let wire_size = serde_json::to_vec(self)?.len();
         if wire_size > MAX_BOOTSTRAP_WIRE_BYTES {
             return Err(ReplicationError::Invalid(format!(
@@ -270,7 +332,11 @@ impl SyncVaultBootstrap {
                 ));
             }
         }
-        Ok(())
+        Ok(ValidatedBootstrap {
+            vault,
+            identities,
+            requests,
+        })
     }
 
     pub fn vault_id(&self) -> &str {
@@ -296,6 +362,107 @@ impl SyncVaultBootstrap {
     pub fn generation_envelopes(&self) -> &[SyncBootstrapEnvelope] {
         &self.generation_envelopes
     }
+
+    /// Build or replay this Device's self-signed request for a selected Vault.
+    /// Existing immutable requests are reused exactly; a route collision with
+    /// other key material is rejected rather than overwritten.
+    pub fn prepare_enrollment(
+        &self,
+        device: &DeviceKeyMaterial,
+        device_name: Option<String>,
+        requested_at: &str,
+    ) -> ReplicationResult<SyncEnrollmentPreparation> {
+        let validated = self.validated(&self.vault_id)?;
+        let enrollment = device.enrollment_named(device_name.clone());
+        if let Some(identity) = validated.identities.get(device.device_id()) {
+            if identity.signing_public_key != enrollment.signing_public_key
+                || identity.wrapping_recipient != enrollment.wrapping_recipient
+            {
+                return Err(ReplicationError::Invalid(format!(
+                    "Device {} is enrolled with different public keys",
+                    device.device_id()
+                )));
+            }
+            return Ok(SyncEnrollmentPreparation::AlreadyEnrolled {
+                device_id: device.device_id().to_string(),
+            });
+        }
+
+        let request = if let Some(existing) = validated.requests.get(device.device_id()) {
+            if existing.signing_public_key != enrollment.signing_public_key
+                || existing.wrapping_recipient != enrollment.wrapping_recipient
+            {
+                return Err(ReplicationError::Invalid(format!(
+                    "enrollment request for Device {} uses different public keys",
+                    device.device_id()
+                )));
+            }
+            existing.clone()
+        } else {
+            device.enrollment_request(&validated.vault, device_name, requested_at)?
+        };
+        Ok(SyncEnrollmentPreparation::Request(
+            enrollment_request_transport(&request)?,
+        ))
+    }
+
+    /// Return only valid requests that have not already received a signed Device identity.
+    pub fn review_enrollments(&self) -> ReplicationResult<Vec<SyncEnrollmentReview>> {
+        let validated = self.validated(&self.vault_id)?;
+        Ok(validated
+            .requests
+            .into_values()
+            .filter(|request| !validated.identities.contains_key(&request.device_id))
+            .map(|request| {
+                let fingerprint = request.fingerprint();
+                SyncEnrollmentReview {
+                    device_id: request.device_id,
+                    device_name: request.device_name,
+                    requested_at: request.requested_at,
+                    fingerprint,
+                }
+            })
+            .collect())
+    }
+
+    /// Approve exactly the request whose fingerprint the user compared out of band.
+    /// Signing the Device identity and wrapping every historical generation are one
+    /// idempotent Rust lifecycle action; callers never handle either private key.
+    pub fn approve_enrollment(
+        &self,
+        store: std::sync::Arc<AgeDirStore>,
+        device_id: &str,
+        expected_fingerprint: &str,
+    ) -> ReplicationResult<SyncVaultBootstrap> {
+        let current_vault_id = store.vault_document().vault_id;
+        let validated = self.validated(&current_vault_id)?;
+        let request = validated.requests.get(device_id).ok_or_else(|| {
+            ReplicationError::Invalid(format!(
+                "Vault bootstrap has no enrollment request for Device {device_id}"
+            ))
+        })?;
+        let actual_fingerprint = request.fingerprint();
+        if actual_fingerprint != expected_fingerprint {
+            return Err(ReplicationError::Invalid(format!(
+                "enrollment fingerprint changed for Device {device_id}"
+            )));
+        }
+        let mut package = ReplicationPackage::for_store(std::sync::Arc::clone(&store))?;
+        package.enroll_device(request.enrollment())?;
+        SyncVaultBootstrap::capture(&store)
+    }
+}
+
+fn enrollment_request_transport(
+    request: &EnrollmentRequestDocument,
+) -> ReplicationResult<SyncEnrollmentRequest> {
+    Ok(SyncEnrollmentRequest {
+        device_id: request.device_id.clone(),
+        device_name: request.device_name.clone(),
+        requested_at: request.requested_at.clone(),
+        fingerprint: request.fingerprint(),
+        document_base64: encode_json(request)?,
+    })
 }
 
 fn decode_generations(
@@ -537,5 +704,109 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("maximum"));
+    }
+
+    #[test]
+    fn enrollment_request_is_replayed_and_hidden_after_identity_arrives() {
+        let directory = tempfile::tempdir().unwrap();
+        let genesis = store(&directory);
+        let mut snapshot = SyncVaultBootstrap::capture(&genesis).unwrap();
+        let joining = DeviceKeyMaterial::generate().unwrap();
+
+        let prepared = snapshot
+            .prepare_enrollment(
+                &joining,
+                Some("Joining Mac".to_string()),
+                "2026-08-08T00:00:00Z",
+            )
+            .unwrap();
+        let SyncEnrollmentPreparation::Request(request) = prepared else {
+            panic!("new Device unexpectedly enrolled")
+        };
+        snapshot.enrollment_requests.push(SyncBootstrapDocument {
+            route: request.device_id.clone(),
+            document_base64: request.document_base64.clone(),
+        });
+        snapshot.validate_for_vault(snapshot.vault_id()).unwrap();
+
+        let replayed = snapshot
+            .prepare_enrollment(
+                &joining,
+                Some("Renamed Mac".to_string()),
+                "2026-08-09T00:00:00Z",
+            )
+            .unwrap();
+        let SyncEnrollmentPreparation::Request(replayed) = replayed else {
+            panic!("pending Device unexpectedly enrolled")
+        };
+        assert_eq!(replayed.document_base64, request.document_base64);
+        assert_eq!(replayed.requested_at, "2026-08-08T00:00:00Z");
+        assert_eq!(snapshot.review_enrollments().unwrap().len(), 1);
+
+        let approved = snapshot
+            .approve_enrollment(
+                Arc::clone(&genesis),
+                joining.device_id(),
+                request.fingerprint(),
+            )
+            .unwrap();
+        assert_eq!(approved.device_identities().len(), 2);
+        assert_eq!(approved.generation_envelopes().len(), 1);
+        assert!(approved.review_enrollments().unwrap().is_empty());
+        assert_eq!(
+            approved
+                .prepare_enrollment(&joining, None, "2026-08-10T00:00:00Z")
+                .unwrap(),
+            SyncEnrollmentPreparation::AlreadyEnrolled {
+                device_id: joining.device_id().to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn approval_requires_the_exact_reviewed_fingerprint_and_is_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let genesis = store(&directory);
+        let mut snapshot = SyncVaultBootstrap::capture(&genesis).unwrap();
+        let joining = DeviceKeyMaterial::generate().unwrap();
+        let SyncEnrollmentPreparation::Request(request) = snapshot
+            .prepare_enrollment(&joining, None, "2026-08-08T00:00:00Z")
+            .unwrap()
+        else {
+            panic!("new Device unexpectedly enrolled")
+        };
+        snapshot.enrollment_requests.push(SyncBootstrapDocument {
+            route: request.device_id.clone(),
+            document_base64: request.document_base64.clone(),
+        });
+
+        assert!(snapshot
+            .approve_enrollment(Arc::clone(&genesis), joining.device_id(), "00-00-00-00-00-00")
+            .unwrap_err()
+            .to_string()
+            .contains("fingerprint changed"));
+        assert_eq!(
+            SyncVaultBootstrap::capture(&genesis)
+                .unwrap()
+                .device_identities()
+                .len(),
+            1
+        );
+
+        let first = snapshot
+            .approve_enrollment(
+                Arc::clone(&genesis),
+                joining.device_id(),
+                request.fingerprint(),
+            )
+            .unwrap();
+        let second = snapshot
+            .approve_enrollment(
+                Arc::clone(&genesis),
+                joining.device_id(),
+                request.fingerprint(),
+            )
+            .unwrap();
+        assert_eq!(first, second);
     }
 }
