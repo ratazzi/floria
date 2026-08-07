@@ -18,6 +18,7 @@ final class CloudSyncStateStoreTests: XCTestCase {
         let restored = try fixture.store.loadRecovering()
 
         XCTAssertNil(restored.engineState)
+        XCTAssertNil(restored.vaultBootstrap)
         let restoredHead = try XCTUnwrap(restored.heads[entityID])
         XCTAssertEqual(restoredHead.recordID, head.recordID)
         XCTAssertEqual(
@@ -30,6 +31,34 @@ final class CloudSyncStateStoreTests: XCTestCase {
 
         XCTAssertEqual(try permissions(of: fixture.directory), 0o700)
         XCTAssertEqual(try permissions(of: fixture.stateURL), 0o600)
+    }
+
+    func testRoundTripsAnOpaqueVaultBootstrapWithoutMakingItDomainAuthority() throws {
+        let fixture = try makeFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.root) }
+        let deviceID = "33333333-3333-4333-8333-333333333333"
+        let bootstrap = SyncVaultBootstrap(
+            vaultID: vaultID,
+            vaultDocumentBase64: encoded("signed Vault"),
+            deviceIdentities: [
+                SyncBootstrapDocument(
+                    route: deviceID, documentBase64: encoded("signed Device"))
+            ],
+            enrollmentRequests: [],
+            keyGenerations: [
+                SyncBootstrapDocument(
+                    route: "1", documentBase64: encoded("signed generation"))
+            ],
+            generationEnvelopes: [])
+
+        try fixture.store.save(
+            engineState: nil,
+            heads: [entityID: headRecord(codec: fixture.codec)],
+            vaultBootstrap: bootstrap)
+        let restored = try fixture.store.loadRecovering()
+
+        XCTAssertEqual(restored.vaultBootstrap, bootstrap)
+        XCTAssertEqual(restored.heads.keys.sorted(), [entityID])
     }
 
     func testDamagedCheckpointIsIsolatedAndRefetchedWithoutDeletingEvidence() throws {
@@ -106,5 +135,9 @@ final class CloudSyncStateStoreTests: XCTestCase {
     private func permissions(of url: URL) throws -> Int {
         let attributes = try FileManager.default.attributesOfItem(atPath: url.path)
         return try XCTUnwrap(attributes[.posixPermissions] as? NSNumber).intValue
+    }
+
+    private func encoded(_ value: String) -> String {
+        Data(value.utf8).base64EncodedString()
     }
 }

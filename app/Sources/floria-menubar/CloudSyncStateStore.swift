@@ -8,7 +8,8 @@ import Foundation
 /// damaged, Floria isolates it and starts a fresh CloudKit fetch instead of
 /// touching the local library.
 struct CloudSyncStateStore {
-    private static let formatVersion = 1
+    private static let formatVersion = 2
+    private static let maximumStateBytes: UInt64 = 16 * 1024 * 1024
 
     private let codec: CloudRecordCodec
     private let directory: URL
@@ -48,7 +49,8 @@ struct CloudSyncStateStore {
 
     func save(
         engineState: CKSyncEngine.State.Serialization?,
-        heads: [String: CKRecord]
+        heads: [String: CKRecord],
+        vaultBootstrap: SyncVaultBootstrap? = nil
     ) throws {
         try ensurePrivateDirectory()
 
@@ -73,11 +75,17 @@ struct CloudSyncStateStore {
                 systemFields: try encodeSystemFields(record))
         }
 
+        if let vaultBootstrap {
+            _ = try CloudVaultBootstrapCodec(vaultID: codec.vaultID)
+                .records(for: vaultBootstrap)
+        }
+
         let envelope = CloudSyncStateEnvelope(
             formatVersion: Self.formatVersion,
             vaultID: codec.vaultID,
             engineState: engineStateData,
-            heads: persistedHeads)
+            heads: persistedHeads,
+            vaultBootstrap: vaultBootstrap)
         let encoder = PropertyListEncoder()
         encoder.outputFormat = .binary
         let data = try encoder.encode(envelope)
@@ -97,6 +105,12 @@ struct CloudSyncStateStore {
     }
 
     private func load() throws -> CloudSyncRestoredState {
+        let attributes = try fileManager.attributesOfItem(atPath: stateURL.path)
+        guard let size = attributes[.size] as? NSNumber,
+              size.uint64Value <= Self.maximumStateBytes
+        else {
+            throw CloudSyncStateError.checkpointTooLarge
+        }
         let data = try Data(contentsOf: stateURL, options: .mappedIfSafe)
         let envelope = try PropertyListDecoder().decode(CloudSyncStateEnvelope.self, from: data)
         guard envelope.formatVersion == Self.formatVersion else {
@@ -131,7 +145,14 @@ struct CloudSyncStateStore {
             }
             heads[entityID] = record
         }
-        return CloudSyncRestoredState(engineState: engineState, heads: heads)
+        if let bootstrap = envelope.vaultBootstrap {
+            _ = try CloudVaultBootstrapCodec(vaultID: codec.vaultID)
+                .records(for: bootstrap)
+        }
+        return CloudSyncRestoredState(
+            engineState: engineState,
+            heads: heads,
+            vaultBootstrap: envelope.vaultBootstrap)
     }
 
     private func ensurePrivateDirectory() throws {
@@ -167,10 +188,14 @@ struct CloudSyncStateStore {
 }
 
 struct CloudSyncRestoredState {
-    static let empty = CloudSyncRestoredState(engineState: nil, heads: [:])
+    static let empty = CloudSyncRestoredState(
+        engineState: nil, heads: [:], vaultBootstrap: nil)
 
     let engineState: CKSyncEngine.State.Serialization?
     let heads: [String: CKRecord]
+    /// Previously authenticated transport snapshot. A consumer must submit it to Rust again
+    /// before using it after process restart; this checkpoint is not domain authority.
+    let vaultBootstrap: SyncVaultBootstrap?
 }
 
 private struct CloudSyncStateEnvelope: Codable {
@@ -178,6 +203,7 @@ private struct CloudSyncStateEnvelope: Codable {
     let vaultID: String
     let engineState: Data?
     let heads: [String: PersistedCloudHead]
+    let vaultBootstrap: SyncVaultBootstrap?
 }
 
 private struct PersistedCloudHead: Codable {
@@ -191,4 +217,5 @@ enum CloudSyncStateError: Error, Equatable {
     case wrongVault(String)
     case invalidHead(String)
     case invalidSystemFields
+    case checkpointTooLarge
 }
