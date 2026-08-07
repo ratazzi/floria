@@ -6,6 +6,7 @@ import Foundation
 /// bounds, and zone identity.
 struct CloudVaultBootstrapCodec {
     static let maximumPayloadBytes = 64 * 1024
+    static let maximumWireBytes = 6 * 1024 * 1024
 
     let recordCodec: CloudRecordCodec
 
@@ -335,13 +336,15 @@ struct CloudVaultBootstrapCodec {
     }
 
 
-    private static let recordTypes = Set([
-        RecordType.vault,
-        RecordType.device,
-        RecordType.enrollmentRequest,
-        RecordType.generation,
-        RecordType.generationEnvelope,
-    ])
+    static let lifecycleRecordLimits = [
+        RecordType.vault: 1,
+        RecordType.device: 64,
+        RecordType.enrollmentRequest: 64,
+        RecordType.generation: 64,
+        RecordType.generationEnvelope: 64 * 64,
+    ]
+
+    private static let recordTypes = Set(lifecycleRecordLimits.keys)
 
     private static let recordNamePrefixes = [
         "vault-", "device-", "enrollment-", "generation-", "envelope-",
