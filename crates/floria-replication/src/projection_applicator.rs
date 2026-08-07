@@ -9,7 +9,6 @@ use floria_store::{AgeDirStore, NewSecret, SecretId, SecretOrigin};
 
 use crate::entity_document::EntityLifecycle;
 use crate::local_projection::LocalProjectionPlan;
-use crate::object_file::verify_object_file;
 use crate::record_journal::{ProjectionPreparation, RecordJournal};
 use crate::{ReplicationError, ReplicationResult};
 
@@ -105,10 +104,9 @@ impl<'a> ProjectionApplicator<'a> {
 
     /// Reject a partial asset arrival before any machine-local state changes.
     fn preflight_objects(&self, plan: &LocalProjectionPlan) -> ReplicationResult<()> {
-        let layout = self.store.shared_layout();
         for object in plan.object_refs() {
-            let path = layout.object(object.digest());
-            verify_object_file(&path, object.digest(), object.ciphertext_size())?;
+            self.store
+                .verify_replicated_object(object.digest(), object.ciphertext_size())?;
         }
         Ok(())
     }

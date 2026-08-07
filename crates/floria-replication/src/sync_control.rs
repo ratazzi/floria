@@ -11,7 +11,6 @@ use base64::Engine;
 use floria_store::AgeDirStore;
 use serde::{Deserialize, Serialize};
 
-use crate::object_file::verify_object_file;
 use crate::record_journal::{OutboundCommit, RecordJournal};
 use crate::{ReplicationError, ReplicationResult};
 
@@ -331,7 +330,8 @@ impl<'a> RecordSyncControl<'a> {
                     }
                     Some(_) => {}
                     None => {
-                        verify_object_file(&asset.file, &asset.digest, asset.ciphertext_size)?;
+                        self.store
+                            .verify_replicated_object(&asset.digest, asset.ciphertext_size)?;
                         objects.insert(asset.digest.clone(), asset);
                     }
                 }

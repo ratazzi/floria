@@ -716,6 +716,88 @@ impl AgeDirStore {
         Ok(ordinal)
     }
 
+    /// Install one ciphertext asset received from an untrusted transport.
+    ///
+    /// The source is streamed into a private sibling and verified before create-only publication.
+    /// An identical canonical object is idempotent; different existing bytes are never replaced.
+    pub fn install_replicated_object(
+        &self,
+        digest: &str,
+        expected_size: u64,
+        source: &Path,
+    ) -> StoreResult<bool> {
+        validate_object_descriptor(digest, expected_size)?;
+        let layout = self.shared_layout();
+        let objects = layout.objects_dir();
+        ensure_private_directory(&objects)?;
+        let target = layout.object(digest);
+        match verify_object_file(&target, digest, expected_size) {
+            Ok(()) => return Ok(false),
+            Err(StoreError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+
+        let mut input = open_regular_file(source, expected_size)?;
+        let temporary = objects.join(format!(".floria-{}.tmp", uuid::Uuid::new_v4()));
+        let result = (|| {
+            let mut output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&temporary)
+                .map_err(|error| StoreError::io(&temporary, error))?;
+            let actual_digest = copy_and_hash(
+                &mut input,
+                &mut output,
+                expected_size,
+                source,
+                &temporary,
+            )?;
+            if actual_digest != digest {
+                return Err(StoreError::Invalid(format!(
+                    "replicated object {} has digest {actual_digest}, expected {digest}",
+                    source.display()
+                )));
+            }
+            output
+                .sync_all()
+                .map_err(|error| StoreError::io(&temporary, error))?;
+            match std::fs::hard_link(&temporary, &target) {
+                Ok(()) => {
+                    std::fs::remove_file(&temporary)
+                        .map_err(|error| StoreError::io(&temporary, error))?;
+                    std::fs::File::open(&objects)
+                        .and_then(|directory| directory.sync_all())
+                        .map_err(|error| StoreError::io(&objects, error))?;
+                    Ok(true)
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    std::fs::remove_file(&temporary)
+                        .map_err(|error| StoreError::io(&temporary, error))?;
+                    verify_object_file(&target, digest, expected_size)?;
+                    Ok(false)
+                }
+                Err(error) => Err(StoreError::io(&target, error)),
+            }
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        result
+    }
+
+    /// Verify the canonical ciphertext asset before transport or local projection uses it.
+    pub fn verify_replicated_object(&self, digest: &str, expected_size: u64) -> StoreResult<()> {
+        validate_object_descriptor(digest, expected_size)?;
+        verify_object_file(
+            &self.shared_layout().object(digest),
+            digest,
+            expected_size,
+        )
+    }
+
     /// Register a version that arrived through replication. The object already sits in the
     /// shared half; this verifies it end to end (digest, decrypt, payload binding, declared
     /// size) and appends a row to the local head document. No bytes are copied.
@@ -1344,6 +1426,134 @@ impl AgeDirStore {
 
 const MAX_OBJECT_BYTES: u64 = 1024 * 1024 * 1024;
 
+fn validate_object_descriptor(digest: &str, expected_size: u64) -> StoreResult<()> {
+    let valid_digest = digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+    if !valid_digest {
+        return Err(StoreError::Invalid(format!(
+            "object digest must be 64 lowercase hexadecimal characters: {digest}"
+        )));
+    }
+    if expected_size > MAX_OBJECT_BYTES {
+        return Err(StoreError::Invalid(format!(
+            "replicated object {digest} exceeds the {MAX_OBJECT_BYTES} byte format limit"
+        )));
+    }
+    Ok(())
+}
+
+fn open_regular_file(path: &Path, expected_size: u64) -> StoreResult<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|error| StoreError::io(path, error))?;
+    let metadata = file.metadata().map_err(|error| StoreError::io(path, error))?;
+    if !metadata.file_type().is_file() {
+        return Err(StoreError::Invalid(format!(
+            "replicated object {} is not a regular file",
+            path.display()
+        )));
+    }
+    if metadata.len() != expected_size {
+        return Err(StoreError::Invalid(format!(
+            "replicated object {} has {} bytes, expected {expected_size}",
+            path.display(),
+            metadata.len()
+        )));
+    }
+    Ok(file)
+}
+
+fn verify_object_file(path: &Path, digest: &str, expected_size: u64) -> StoreResult<()> {
+    let mut file = open_regular_file(path, expected_size)?;
+    let actual_digest = hash_reader(&mut file, expected_size, path)?;
+    if actual_digest != digest {
+        return Err(StoreError::Invalid(format!(
+            "replicated object {} has digest {actual_digest}, expected {digest}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+fn hash_reader(
+    reader: &mut std::fs::File,
+    expected_size: u64,
+    path: &Path,
+) -> StoreResult<String> {
+    use std::io::Read as _;
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|error| StoreError::io(path, error))?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| StoreError::Invalid("replicated object size overflow".to_string()))?;
+        hasher.update(&buffer[..read]);
+    }
+    require_stream_size(path, total, expected_size)?;
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn copy_and_hash(
+    input: &mut std::fs::File,
+    output: &mut std::fs::File,
+    expected_size: u64,
+    source: &Path,
+    destination: &Path,
+) -> StoreResult<String> {
+    use std::io::{Read as _, Write as _};
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+    let mut total = 0_u64;
+    loop {
+        let read = input
+            .read(&mut buffer)
+            .map_err(|error| StoreError::io(source, error))?;
+        if read == 0 {
+            break;
+        }
+        total = total
+            .checked_add(read as u64)
+            .ok_or_else(|| StoreError::Invalid("replicated object size overflow".to_string()))?;
+        hasher.update(&buffer[..read]);
+        output
+            .write_all(&buffer[..read])
+            .map_err(|error| StoreError::io(destination, error))?;
+    }
+    require_stream_size(source, total, expected_size)?;
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn require_stream_size(path: &Path, actual: u64, expected: u64) -> StoreResult<()> {
+    if actual != expected {
+        return Err(StoreError::Invalid(format!(
+            "replicated object {} changed while reading: {actual} bytes, expected {expected}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 fn new_heads_document(id: &SecretId, meta: NewSecret) -> StoreResult<HeadsDocument> {
     let mode = meta.mode;
     let enforcement = meta.enforcement;
@@ -1850,6 +2060,55 @@ mod tests {
         let blob = std::fs::read(&object).unwrap();
         assert_eq!(hex_sha256(&blob), refs[0].digest);
         assert!(!blob.windows(secret.len()).any(|w| w == secret));
+    }
+
+    #[test]
+    fn replicated_object_install_is_create_only_and_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path().join("store"));
+        let source = tmp.path().join("download.age");
+        let bytes = b"ciphertext fixture from transport";
+        std::fs::write(&source, bytes).unwrap();
+        let digest = hex_sha256(bytes);
+
+        assert!(s
+            .install_replicated_object(&digest, bytes.len() as u64, &source)
+            .unwrap());
+        assert!(!s
+            .install_replicated_object(&digest, bytes.len() as u64, &source)
+            .unwrap());
+        s.verify_replicated_object(&digest, bytes.len() as u64)
+            .unwrap();
+        assert_eq!(std::fs::read(s.shared_layout().object(&digest)).unwrap(), bytes);
+    }
+
+    #[test]
+    fn replicated_object_install_rejects_tampering_and_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path().join("store"));
+        let source = tmp.path().join("download.age");
+        let link = tmp.path().join("download-link.age");
+        let bytes = b"ciphertext fixture from transport";
+        std::fs::write(&source, bytes).unwrap();
+        symlink(&source, &link).unwrap();
+        let digest = hex_sha256(bytes);
+
+        assert!(s
+            .install_replicated_object(&"0".repeat(64), bytes.len() as u64, &source)
+            .is_err());
+        assert!(s
+            .install_replicated_object(&digest, bytes.len() as u64, &link)
+            .is_err());
+        assert!(!s.shared_layout().object(&digest).exists());
+
+        let target = s.shared_layout().object(&digest);
+        std::fs::write(&target, vec![0_u8; bytes.len()]).unwrap();
+        assert!(s
+            .install_replicated_object(&digest, bytes.len() as u64, &source)
+            .is_err());
+        assert_eq!(std::fs::read(target).unwrap(), vec![0_u8; bytes.len()]);
     }
 
     #[test]
