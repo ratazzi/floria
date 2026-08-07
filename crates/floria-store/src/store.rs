@@ -479,6 +479,97 @@ impl AgeDirStore {
         Arc::clone(&self.keys)
     }
 
+    /// Open an isolated migration target whose `shared/` half already contains an authenticated
+    /// Vault lifecycle. The target receives this installation's exact Device private material;
+    /// it never generates a second Device identity while joining another Vault.
+    ///
+    /// The target must be a disposable sibling outside the live Store. Callers own cleanup until
+    /// a later activation transaction publishes it.
+    pub fn open_migration_target(
+        &self,
+        target_root: PathBuf,
+        expected_vault_id: &str,
+    ) -> StoreResult<Self> {
+        if target_root.starts_with(&self.root) {
+            return Err(StoreError::Invalid(format!(
+                "migration target must be outside the live Store: {}",
+                target_root.display()
+            )));
+        }
+        if !target_root.join("shared").is_dir() {
+            return Err(StoreError::Invalid(format!(
+                "migration target has no materialized shared Vault: {}",
+                target_root.display()
+            )));
+        }
+        for local_name in ["device.age", "local", SHARED_LOCATION_FILE] {
+            let path = target_root.join(local_name);
+            if path.exists() {
+                return Err(StoreError::Invalid(format!(
+                    "migration target contains unexpected local state: {}",
+                    path.display()
+                )));
+            }
+        }
+
+        copy_private_regular_file(&self.root.join("device.age"), &target_root.join("device.age"))?;
+        let target = AgeDirStore::open(target_root, Arc::clone(&self.keys))?;
+        let vault = target.vault_document();
+        if vault.vault_id != expected_vault_id {
+            return Err(StoreError::Invalid(format!(
+                "migration target Vault {} does not match selected Vault {expected_vault_id}",
+                vault.vault_id
+            )));
+        }
+        target.verify_device_access(&target.shared_layout(), &vault)?;
+        Ok(target)
+    }
+
+    /// Copy this Store's complete logical history into an empty Store in another Vault.
+    ///
+    /// Stable Secret ids, version UUIDs, metadata, history ordering, and selected heads are
+    /// preserved. Ciphertext digests and key generations intentionally change because every
+    /// plaintext is encrypted under the target Vault's current generation. A partial target is
+    /// never usable: callers must treat it as staging and publish it only after this method
+    /// returns successfully.
+    pub fn copy_logical_contents_to(
+        &self,
+        target: &AgeDirStore,
+    ) -> StoreResult<StoreVerification> {
+        if self.root == target.root {
+            return Err(StoreError::Invalid(
+                "source and target Store must be different".to_string(),
+            ));
+        }
+        let _source_lock = self.lock_exclusive()?;
+        self.verify_security_state()?;
+        let _target_lock = target.lock_exclusive()?;
+        target.verify_security_state()?;
+        if !target.heads_ids()?.is_empty() {
+            return Err(StoreError::Invalid(
+                "migration target Store is not empty".to_string(),
+            ));
+        }
+
+        let source_ids = self.heads_ids()?;
+        for id in &source_ids {
+            let source_heads = self.read_heads(id)?;
+            let mut target_heads = source_heads.clone();
+            target_heads.versions.clear();
+            for version in &source_heads.versions {
+                let plaintext = self.decrypt_version(id, version.version)?;
+                target_heads.versions.push(target.write_version_object_exact(
+                    id,
+                    version,
+                    plaintext.as_slice(),
+                )?);
+            }
+            target.write_heads(id, &target_heads)?;
+        }
+        target.seal_security_state()?;
+        self.verify_logical_copy(target, &source_ids)
+    }
+
     /// Encryption recipients for new payloads (current generation + recovery), straight from
     /// the signed generation document — no private key involved.
     pub fn generation_recipients(&self) -> StoreResult<Vec<Box<dyn age::Recipient + Send>>> {
@@ -1364,12 +1455,57 @@ impl AgeDirStore {
         note: Option<String>,
         mutation_id: Option<String>,
     ) -> StoreResult<HeadsVersion> {
+        let version_uuid = uuid::Uuid::new_v4().to_string();
+        self.write_version_object_with_identity(
+            id,
+            ordinal,
+            &version_uuid,
+            plaintext,
+            now_rfc3339(),
+            note,
+            mutation_id,
+        )
+    }
+
+    fn write_version_object_exact(
+        &self,
+        id: &SecretId,
+        source: &HeadsVersion,
+        plaintext: &[u8],
+    ) -> StoreResult<HeadsVersion> {
+        self.write_version_object_with_identity(
+            id,
+            source.version,
+            &source.version_uuid,
+            plaintext,
+            source.created.clone(),
+            source.note.clone(),
+            source.mutation_id.clone(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_version_object_with_identity(
+        &self,
+        id: &SecretId,
+        ordinal: u32,
+        version_uuid: &str,
+        plaintext: &[u8],
+        created: String,
+        note: Option<String>,
+        mutation_id: Option<String>,
+    ) -> StoreResult<HeadsVersion> {
+        uuid::Uuid::parse_str(version_uuid).map_err(|_| {
+            StoreError::Invalid(format!("invalid version UUID {version_uuid:?}"))
+        })?;
+        if let Some(mutation_id) = mutation_id.as_deref() {
+            validate_mutation_id(mutation_id)?;
+        }
         let state = self.state.read().expect("shared state poisoned");
         let generation = self.generations.current(&state.layout, &state.vault)?;
         // A device that cannot decrypt what it writes is not enrolled yet; refuse early.
         self.generations.identity(&state.layout, &state.vault, &self.device(), generation)?;
-        let version_uuid = uuid::Uuid::new_v4().to_string();
-        let bound = encode_bound_payload(id, &version_uuid, plaintext)?;
+        let bound = encode_bound_payload(id, version_uuid, plaintext)?;
         let recipients = self.generations.recipients(&state.layout, &state.vault)?;
         let encryptor = age::Encryptor::with_recipients(recipients)
             .ok_or_else(|| StoreError::Crypto("no recipients configured".to_string()))?;
@@ -1389,14 +1525,79 @@ impl AgeDirStore {
         publish_immutable(&state.layout.object(&digest), &ciphertext)?;
         Ok(HeadsVersion {
             version: ordinal,
-            version_uuid,
+            version_uuid: version_uuid.to_string(),
             generation,
             size: plaintext.len() as u64,
             digest,
-            created: now_rfc3339(),
+            created,
             note,
             mutation_id,
         })
+    }
+
+    fn verify_logical_copy(
+        &self,
+        target: &AgeDirStore,
+        source_ids: &[SecretId],
+    ) -> StoreResult<StoreVerification> {
+        if target.heads_ids()? != source_ids {
+            return Err(StoreError::Corrupt {
+                id: "migration target".to_string(),
+                reason: "Secret identity set changed during copy".to_string(),
+            });
+        }
+        for id in source_ids {
+            let source = self.read_heads(id)?;
+            let copied = target.read_heads(id)?;
+            if source.format != copied.format
+                || source.id != copied.id
+                || source.source_path != copied.source_path
+                || source.managed_label != copied.managed_label
+                || source.mode != copied.mode
+                || source.created != copied.created
+                || source.current_version != copied.current_version
+                || source.enforcement != copied.enforcement
+                || source.environment_ids != copied.environment_ids
+                || source.metadata != copied.metadata
+                || source.versions.len() != copied.versions.len()
+            {
+                return Err(StoreError::Corrupt {
+                    id: id.to_string(),
+                    reason: "Secret metadata changed during Vault copy".to_string(),
+                });
+            }
+            for (source_version, copied_version) in
+                source.versions.iter().zip(&copied.versions)
+            {
+                if source_version.version != copied_version.version
+                    || source_version.version_uuid != copied_version.version_uuid
+                    || source_version.size != copied_version.size
+                    || source_version.created != copied_version.created
+                    || source_version.note != copied_version.note
+                    || source_version.mutation_id != copied_version.mutation_id
+                {
+                    return Err(StoreError::Corrupt {
+                        id: id.to_string(),
+                        reason: format!(
+                            "version {} metadata changed during Vault copy",
+                            source_version.version
+                        ),
+                    });
+                }
+                let source_plaintext = self.decrypt_version(id, source_version.version)?;
+                let copied_plaintext = target.decrypt_version(id, copied_version.version)?;
+                if source_plaintext.as_slice() != copied_plaintext.as_slice() {
+                    return Err(StoreError::Corrupt {
+                        id: id.to_string(),
+                        reason: format!(
+                            "version {} plaintext changed during Vault copy",
+                            source_version.version
+                        ),
+                    });
+                }
+            }
+        }
+        target.verify_all()
     }
 
     fn put_internal(
@@ -1954,6 +2155,11 @@ impl SecretStore for AgeDirStore {
     }
 }
 
+fn copy_private_regular_file(source: &Path, destination: &Path) -> StoreResult<()> {
+    let bytes = read_untrusted_file(source, vault::MAX_DESCRIPTOR_BYTES)?;
+    write_new_atomic(destination, &bytes)
+}
+
 fn copy_directory(source: &Path, destination: &Path) -> StoreResult<()> {
     std::fs::DirBuilder::new()
         .recursive(true)
@@ -2163,6 +2369,88 @@ mod tests {
         assert_eq!(vault.genesis_device_id, s.device().device_id());
         assert_eq!(s.current_generation().unwrap(), 1);
         assert!(!s.has_other_enrolled_devices().unwrap());
+    }
+
+    #[test]
+    fn copies_complete_logical_history_into_another_vault() {
+        let tmp = tempfile::tempdir().unwrap();
+        let keys: Arc<dyn KeyProvider> =
+            Arc::new(X25519Keys(age::x25519::Identity::generate()));
+        let source_root = tmp.path().join("source");
+        let source = AgeDirStore::open(source_root.clone(), Arc::clone(&keys)).unwrap();
+        let id: SecretId = "11111111-1111-4111-8111-111111111111".parse().unwrap();
+        source
+            .put_identified(
+                id.clone(),
+                NewSecret::file(PathBuf::from("/workspace/project/.env"), 0o640)
+                    .with_enforcement(Enforcement::TouchId),
+                b"FIRST=one",
+                "22222222-2222-4222-8222-222222222222",
+            )
+            .unwrap();
+        source
+            .append_version_identified(
+                &id,
+                b"SECOND=two",
+                "33333333-3333-4333-8333-333333333333",
+            )
+            .unwrap();
+        source
+            .update_settings(
+                &id,
+                ItemMetadata {
+                    note: Some("copied note".to_string()),
+                    links: vec![floria_core::metadata::ItemLink {
+                        label: "Source".to_string(),
+                        url: "https://example.test".to_string(),
+                    }],
+                },
+                Enforcement::Allow,
+                Some(vec!["production".to_string()]),
+            )
+            .unwrap();
+        source.set_head(&id, 1).unwrap();
+        let source_refs = source.version_refs(&id).unwrap();
+
+        // Build an authenticated target lifecycle for the same Device, then reduce it to the
+        // transport-delivered shared half expected by `open_migration_target`.
+        let seed_root = tmp.path().join("target-seed");
+        ensure_private_directory(&seed_root).unwrap();
+        copy_private_regular_file(
+            &source_root.join("device.age"),
+            &seed_root.join("device.age"),
+        )
+        .unwrap();
+        let seed = AgeDirStore::open(seed_root.clone(), Arc::clone(&keys)).unwrap();
+        let target_vault_id = seed.vault_document().vault_id;
+        let target_root = tmp.path().join("target");
+        ensure_private_directory(&target_root).unwrap();
+        copy_directory(&seed_root.join("shared"), &target_root.join("shared")).unwrap();
+        let target = source
+            .open_migration_target(target_root, &target_vault_id)
+            .unwrap();
+
+        let report = source.copy_logical_contents_to(&target).unwrap();
+
+        assert_eq!(report.secrets, 1);
+        assert_eq!(report.versions, 2);
+        assert_eq!(report.plaintext_bytes, 19);
+        assert_eq!(target.get(&id).unwrap().as_slice(), b"FIRST=one");
+        let copied = target.record(&id).unwrap().unwrap();
+        assert_eq!(copied.source_path(), Some(Path::new("/workspace/project/.env")));
+        assert_eq!(copied.mode, 0o640);
+        assert_eq!(copied.enforcement, Enforcement::Allow);
+        assert_eq!(copied.environment_ids, Some(vec!["production".to_string()]));
+        assert_eq!(copied.metadata.note.as_deref(), Some("copied note"));
+        let copied_refs = target.version_refs(&id).unwrap();
+        assert_eq!(
+            copied_refs.iter().map(|version| &version.version_uuid).collect::<Vec<_>>(),
+            source_refs.iter().map(|version| &version.version_uuid).collect::<Vec<_>>()
+        );
+        assert!(copied_refs
+            .iter()
+            .zip(source_refs)
+            .all(|(copied, source)| copied.digest != source.digest));
     }
 
     #[test]
