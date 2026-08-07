@@ -57,6 +57,31 @@ pub struct InboundCommit {
     received_at: String,
 }
 
+/// Complete, conflict-free encrypted history accepted as input to Local Projection.
+///
+/// The plan builder still authenticates every envelope. This type only proves that the journal
+/// observed complete transaction closures and selected heads without consulting arrival order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectionRecords {
+    commits: Vec<RevisionCommit>,
+    revisions: Vec<EntityRevision>,
+    head_revision_ids: Vec<String>,
+}
+
+impl ProjectionRecords {
+    pub fn commits(&self) -> &[RevisionCommit] {
+        &self.commits
+    }
+
+    pub fn revisions(&self) -> &[EntityRevision] {
+        &self.revisions
+    }
+
+    pub fn head_revision_ids(&self) -> &[String] {
+        &self.head_revision_ids
+    }
+}
+
 impl InboundCommit {
     pub fn commit(&self) -> &RevisionCommit {
         &self.commit
@@ -286,6 +311,14 @@ impl RecordJournal {
         self.with_read(|_, snapshot| analysis_from(&snapshot.revisions))
     }
 
+    /// Select only revisions protected by complete transaction closures.
+    ///
+    /// Any concurrent entity heads block the whole projection. Applying the unaffected entities
+    /// would violate a transaction that also changed the conflicted entity.
+    pub fn projection_records(&self) -> ReplicationResult<ProjectionRecords> {
+        self.with_read(|_, snapshot| projection_records_from(snapshot))
+    }
+
     fn with_read<T>(
         &self,
         operation: impl FnOnce(&Transaction<'_>, &JournalSecuritySnapshot) -> ReplicationResult<T>,
@@ -495,6 +528,61 @@ fn analysis_from(revisions: &[EntityRevision]) -> ReplicationResult<RevisionAnal
     revision_set_from(revisions)?
         .analyze()
         .map_err(|error| ReplicationError::Invalid(error.to_string()))
+}
+
+fn projection_records_from(
+    snapshot: &JournalSecuritySnapshot,
+) -> ReplicationResult<ProjectionRecords> {
+    let all_revisions = revision_set_from(&snapshot.revisions)?;
+    let mut commits = Vec::new();
+    let mut revision_ids = BTreeSet::new();
+    for commit in &snapshot.commits {
+        let readiness = all_revisions
+            .commit_readiness(commit, &snapshot.commits)
+            .map_err(|error| ReplicationError::Invalid(error.to_string()))?;
+        if readiness.is_ready() {
+            commits.push(commit.clone());
+            revision_ids.extend(commit.revision_ids().iter().cloned());
+        }
+    }
+
+    let revisions = snapshot
+        .revisions
+        .iter()
+        .filter(|revision| revision_ids.contains(revision.revision_id()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let committed = revision_set_from(&revisions)?;
+    let analysis = committed
+        .analyze()
+        .map_err(|error| ReplicationError::Invalid(error.to_string()))?;
+    if !analysis.pending().is_empty() {
+        return Err(ReplicationError::Invalid(
+            "committed projection history contains missing ancestry".to_string(),
+        ));
+    }
+    let conflicts = analysis
+        .heads()
+        .iter()
+        .filter_map(|(entity_id, heads)| (heads.len() > 1).then_some(entity_id.clone()))
+        .collect::<Vec<_>>();
+    if !conflicts.is_empty() {
+        return Err(ReplicationError::Invalid(format!(
+            "local projection is blocked by conflicting entities: {}",
+            conflicts.join(", ")
+        )));
+    }
+    let head_revision_ids = analysis
+        .heads()
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(ProjectionRecords {
+        commits,
+        revisions,
+        head_revision_ids,
+    })
 }
 
 fn revision_set_from(revisions: &[EntityRevision]) -> ReplicationResult<RevisionSet> {
@@ -1078,6 +1166,11 @@ mod tests {
             .unwrap();
         assert_eq!(journal.inbound().unwrap().len(), 1);
         assert!(journal.ready_inbound().unwrap().is_empty());
+        assert!(journal
+            .projection_records()
+            .unwrap()
+            .head_revision_ids()
+            .is_empty());
         assert!(journal.settle_inbound(&commit_id).is_err());
         let root = revision(&entity_id, &root_id, &root_commit_id, Vec::new());
         let root_commit = make_commit(&root_commit_id, std::slice::from_ref(&root));
@@ -1088,13 +1181,48 @@ mod tests {
                 "2026-08-07T00:00:02Z",
             )
             .unwrap();
-        assert_eq!(journal.analysis().unwrap().heads_for(&entity_id), &[child_id]);
+        assert_eq!(
+            journal.analysis().unwrap().heads_for(&entity_id),
+            std::slice::from_ref(&child_id)
+        );
         let ready = journal.ready_inbound().unwrap();
         assert_eq!(ready.len(), 2);
         assert!(ready
             .iter()
             .any(|item| item.commit().commit_id() == commit_id));
+        assert_eq!(
+            journal.projection_records().unwrap().head_revision_ids(),
+            std::slice::from_ref(&child_id)
+        );
         assert!(journal.settle_inbound(&commit_id).unwrap());
+    }
+
+    #[test]
+    fn concurrent_committed_heads_block_the_whole_projection() {
+        let directory = tempfile::tempdir().unwrap();
+        let vault_id = id();
+        let entity_id = id();
+        let first_commit_id = id();
+        let second_commit_id = id();
+        let first = revision(&entity_id, &id(), &first_commit_id, Vec::new());
+        let second = revision(&entity_id, &id(), &second_commit_id, Vec::new());
+        let first_commit = make_commit(&first_commit_id, std::slice::from_ref(&first));
+        let second_commit = make_commit(&second_commit_id, std::slice::from_ref(&second));
+        let journal = open(&directory, &vault_id, authenticator());
+
+        journal
+            .receive_inbound(
+                vec![first_commit, second_commit],
+                vec![first, second],
+                "2026-08-07T00:00:00Z",
+            )
+            .unwrap();
+
+        assert!(journal
+            .projection_records()
+            .unwrap_err()
+            .to_string()
+            .contains("blocked by conflicting entities"));
     }
 
     #[test]
