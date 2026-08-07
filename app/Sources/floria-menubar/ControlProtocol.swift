@@ -1,6 +1,6 @@
 import Foundation
 
-let supportedControlProtocolVersion: UInt32 = 12
+let supportedControlProtocolVersion: UInt32 = 13
 
 struct ControlServerInfo: Decodable, Equatable, Sendable {
     let protocolVersion: UInt32?
@@ -1278,6 +1278,7 @@ enum ControlCommand: Sendable {
     case replicationApprove(deviceID: String)
     case recordSyncStatus
     case recordSyncVaultBootstrap
+    case recordSyncValidateVaultBootstrap(expectedVaultID: String, bootstrap: SyncVaultBootstrap)
     case recordSyncNextOutbound(limit: Int)
     case recordSyncSettleOutbound(outcomes: [SyncDeliveryOutcome])
     case recordSyncApplyInbound(batch: SyncInboundBatch, observedAt: String)
@@ -1368,6 +1369,7 @@ enum ControlCommand: Sendable {
         case .replicationApprove: "replication_approve"
         case .recordSyncStatus: "record_sync_status"
         case .recordSyncVaultBootstrap: "record_sync_vault_bootstrap"
+        case .recordSyncValidateVaultBootstrap: "record_sync_validate_vault_bootstrap"
         case .recordSyncNextOutbound: "record_sync_next_outbound"
         case .recordSyncSettleOutbound: "record_sync_settle_outbound"
         case .recordSyncApplyInbound: "record_sync_apply_inbound"
@@ -1484,6 +1486,12 @@ enum ControlCommand: Sendable {
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: ReplicationRevokeDeviceParams(deviceID: deviceID)))
+        case .recordSyncValidateVaultBootstrap(let expectedVaultID, let bootstrap):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: RecordSyncValidateVaultBootstrapParams(
+                        expectedVaultID: expectedVaultID, bootstrap: bootstrap)))
         case .recordSyncNextOutbound(let limit):
             return try encoder.encode(
                 ControlRequest(
@@ -1710,6 +1718,10 @@ private struct ReplicationRevokeDeviceParams: Encodable {
     enum CodingKeys: String, CodingKey { case deviceID = "device_id" }
 }
 private struct RecordSyncNextOutboundParams: Encodable { let limit: Int }
+private struct RecordSyncValidateVaultBootstrapParams: Encodable {
+    let expectedVaultID: String
+    let bootstrap: SyncVaultBootstrap
+}
 private struct RecordSyncSettleOutboundParams: Encodable {
     let outcomes: [SyncDeliveryOutcome]
 }

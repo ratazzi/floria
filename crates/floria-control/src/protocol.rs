@@ -24,7 +24,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 const MAX_MSG: usize = 8 << 20;
 pub(crate) const MAX_RECORD_SYNC_BATCH_BYTES: usize = 6 << 20;
-pub const CONTROL_PROTOCOL_VERSION: u32 = 12;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 13;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRequest {
@@ -93,6 +93,10 @@ pub enum ControlCommand {
     ReplicationApprove { device_id: String },
     RecordSyncStatus,
     RecordSyncVaultBootstrap,
+    RecordSyncValidateVaultBootstrap {
+        expected_vault_id: String,
+        bootstrap: SyncVaultBootstrap,
+    },
     RecordSyncNextOutbound { limit: usize },
     RecordSyncSettleOutbound { outcomes: Vec<SyncDeliveryOutcome> },
     RecordSyncApplyInbound { batch: SyncInboundBatch, observed_at: String },
@@ -1625,6 +1629,36 @@ mod tests {
         .unwrap();
         assert_eq!(bootstrap_request["method"], "record_sync_vault_bootstrap");
         assert!(bootstrap_request.get("params").is_none());
+
+        let bootstrap: SyncVaultBootstrap = serde_json::from_value(serde_json::json!({
+            "vault_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "vault_document_base64": "dmF1bHQ=",
+            "device_identities": [],
+            "enrollment_requests": [],
+            "key_generations": [],
+            "generation_envelopes": []
+        }))
+        .unwrap();
+        let validation_request = serde_json::to_value(ControlRequest {
+            request_id: 45,
+            command: ControlCommand::RecordSyncValidateVaultBootstrap {
+                expected_vault_id: bootstrap.vault_id().to_string(),
+                bootstrap,
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            validation_request["method"],
+            "record_sync_validate_vault_bootstrap"
+        );
+        assert_eq!(
+            validation_request["params"]["expected_vault_id"],
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        );
+        assert_eq!(
+            validation_request["params"]["bootstrap"]["vault_id"],
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        );
 
         let request = ControlRequest {
             request_id: 42,

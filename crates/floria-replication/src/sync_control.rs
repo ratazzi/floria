@@ -422,6 +422,17 @@ impl<'a> RecordSyncControl<'a> {
         SyncVaultBootstrap::capture(&self.store)
     }
 
+    /// Authenticate one transport-provided bootstrap without installing it or changing the
+    /// current Store. `expected_vault_id` must come from the user-selected transport route.
+    pub fn validate_vault_bootstrap(
+        &self,
+        expected_vault_id: &str,
+        bootstrap: SyncVaultBootstrap,
+    ) -> ReplicationResult<SyncVaultBootstrap> {
+        bootstrap.validate_for_vault(expected_vault_id)?;
+        Ok(bootstrap)
+    }
+
     /// Return oldest durable publications without changing retry state.
     pub fn next_outbound(&self, limit: usize) -> ReplicationResult<SyncOutboundBatch> {
         if limit == 0 || limit > MAX_OUTBOUND_COMMITS {
@@ -983,6 +994,29 @@ mod tests {
         )
         .contains("private fixture payload"));
         assert!(fixture.control().next_outbound(0).is_err());
+    }
+
+    #[test]
+    fn downloaded_bootstrap_is_authenticated_without_changing_the_store() {
+        let fixture = Fixture::new();
+        let original_vault = fixture.store.vault_document();
+        let original_generation = fixture.store.current_generation().unwrap();
+        let bootstrap = fixture.control().vault_bootstrap().unwrap();
+
+        let validated = fixture
+            .control()
+            .validate_vault_bootstrap(&original_vault.vault_id, bootstrap.clone())
+            .unwrap();
+        assert_eq!(validated, bootstrap);
+        assert_eq!(fixture.store.vault_document().vault_id, original_vault.vault_id);
+        assert_eq!(fixture.store.current_generation().unwrap(), original_generation);
+
+        assert!(fixture
+            .control()
+            .validate_vault_bootstrap(&uuid::Uuid::new_v4().to_string(), bootstrap)
+            .is_err());
+        assert_eq!(fixture.store.vault_document().vault_id, original_vault.vault_id);
+        assert_eq!(fixture.store.current_generation().unwrap(), original_generation);
     }
 
     #[test]

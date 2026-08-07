@@ -1260,6 +1260,17 @@ impl RuntimeRecordSyncService for DaemonRecordSyncService {
         })
     }
 
+    fn validate_vault_bootstrap(
+        &self,
+        expected_vault_id: &str,
+        bootstrap: SyncVaultBootstrap,
+    ) -> Result<SyncVaultBootstrap, String> {
+        self.with_journal(|journal| {
+            RecordSyncControl::new(journal, Arc::clone(&self.store))
+                .validate_vault_bootstrap(expected_vault_id, bootstrap)
+        })
+    }
+
     fn next_outbound(&self, limit: usize) -> Result<SyncOutboundBatch, String> {
         self.with_captured_state(&self.catalog, |journal| {
             RecordSyncControl::new(journal, Arc::clone(&self.store)).next_outbound(limit)

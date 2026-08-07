@@ -135,6 +135,7 @@
     struct FixtureRecordSyncService {
         status_calls: AtomicUsize,
         bootstrap_calls: AtomicUsize,
+        bootstrap_validation_calls: AtomicUsize,
         outbound_calls: AtomicUsize,
         settlement_calls: AtomicUsize,
         inbound_calls: AtomicUsize,
@@ -157,6 +158,19 @@
                 "generation_envelopes": []
             }))
             .expect("fixture Vault bootstrap"))
+        }
+
+        fn validate_vault_bootstrap(
+            &self,
+            expected_vault_id: &str,
+            bootstrap: SyncVaultBootstrap,
+        ) -> Result<SyncVaultBootstrap, String> {
+            self.bootstrap_validation_calls
+                .fetch_add(1, Ordering::Relaxed);
+            if bootstrap.vault_id() != expected_vault_id {
+                return Err("fixture Vault route mismatch".to_string());
+            }
+            Ok(bootstrap)
         }
 
         fn next_outbound(&self, _limit: usize) -> Result<SyncOutboundBatch, String> {
@@ -2932,9 +2946,18 @@
             client.request(ControlCommand::RecordSyncStatus).unwrap(),
             ControlResult::RecordSyncStatus(_)
         ));
+        let ControlResult::RecordSyncVaultBootstrap(bootstrap) = client
+            .request(ControlCommand::RecordSyncVaultBootstrap)
+            .unwrap()
+        else {
+            panic!("expected Vault bootstrap");
+        };
         assert!(matches!(
             client
-                .request(ControlCommand::RecordSyncVaultBootstrap)
+                .request(ControlCommand::RecordSyncValidateVaultBootstrap {
+                    expected_vault_id: bootstrap.vault_id().to_string(),
+                    bootstrap,
+                })
                 .unwrap(),
             ControlResult::RecordSyncVaultBootstrap(_)
         ));
@@ -2967,6 +2990,12 @@
 
         assert_eq!(record_sync.status_calls.load(Ordering::Relaxed), 1);
         assert_eq!(record_sync.bootstrap_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            record_sync
+                .bootstrap_validation_calls
+                .load(Ordering::Relaxed),
+            1
+        );
         assert_eq!(record_sync.outbound_calls.load(Ordering::Relaxed), 1);
         assert_eq!(record_sync.settlement_calls.load(Ordering::Relaxed), 1);
         assert_eq!(record_sync.inbound_calls.load(Ordering::Relaxed), 1);
@@ -3209,6 +3238,14 @@
         assert!(is_read_only(&ControlCommand::Snapshot));
         assert!(is_read_only(&ControlCommand::RecordSyncStatus));
         assert!(is_read_only(&ControlCommand::RecordSyncVaultBootstrap));
+        assert!(is_read_only(
+            &ControlCommand::RecordSyncValidateVaultBootstrap {
+                expected_vault_id: "fixture-vault".to_string(),
+                bootstrap: FixtureRecordSyncService::default()
+                    .vault_bootstrap()
+                    .unwrap(),
+            }
+        ));
         assert!(!command_allowed_for_peer(
             PeerAccess::ReadOnly,
             &ControlCommand::RecordSyncStatus,

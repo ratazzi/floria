@@ -149,6 +149,11 @@ pub trait RuntimeReplicationService: Send + Sync + 'static {
 pub trait RuntimeRecordSyncService: Send + Sync + 'static {
     fn status(&self) -> Result<SyncDomainStatus, String>;
     fn vault_bootstrap(&self) -> Result<SyncVaultBootstrap, String>;
+    fn validate_vault_bootstrap(
+        &self,
+        expected_vault_id: &str,
+        bootstrap: SyncVaultBootstrap,
+    ) -> Result<SyncVaultBootstrap, String>;
     fn next_outbound(&self, limit: usize) -> Result<SyncOutboundBatch, String>;
     fn settle_outbound(
         &self,
@@ -498,6 +503,7 @@ fn is_read_only(command: &ControlCommand) -> bool {
             | ControlCommand::ReplicationEnrollment
             | ControlCommand::RecordSyncStatus
             | ControlCommand::RecordSyncVaultBootstrap
+            | ControlCommand::RecordSyncValidateVaultBootstrap { .. }
             | ControlCommand::RecordSyncNextOutbound { .. }
             | ControlCommand::Snapshot
             | ControlCommand::Discover { .. }

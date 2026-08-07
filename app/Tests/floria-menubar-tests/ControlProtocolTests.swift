@@ -15,7 +15,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertNil(request["params"])
 
         let response = Data(
-            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":12,"daemon_version":"0.1.0","schema_version":14,"minimum_schema_version":14,"store_format_version":5,"minimum_store_format_version":5}}}"#.utf8)
+            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":13,"daemon_version":"0.1.0","schema_version":14,"minimum_schema_version":14,"store_format_version":5,"minimum_store_format_version":5}}}"#.utf8)
         let decoded = try JSONDecoder().decode(
             ControlResponseEnvelope<ControlServerInfo>.self, from: response)
         let info = try XCTUnwrap(decoded.result?.value)
@@ -147,6 +147,26 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(
             bootstrapRequest["method"] as? String, "record_sync_vault_bootstrap")
         XCTAssertNil(bootstrapRequest["params"])
+
+        let candidate = SyncVaultBootstrap(
+            vaultID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            vaultDocumentBase64: "dmF1bHQ=",
+            deviceIdentities: [], enrollmentRequests: [], keyGenerations: [],
+            generationEnvelopes: [])
+        let validationData = try ControlCommand.recordSyncValidateVaultBootstrap(
+            expectedVaultID: candidate.vaultID, bootstrap: candidate
+        ).requestData(requestID: 73, encoder: encoder)
+        let validationRequest = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: validationData) as? [String: Any])
+        let validationParams = try XCTUnwrap(
+            validationRequest["params"] as? [String: Any])
+        XCTAssertEqual(
+            validationRequest["method"] as? String,
+            "record_sync_validate_vault_bootstrap")
+        XCTAssertEqual(validationParams["expected_vault_id"] as? String, candidate.vaultID)
+        XCTAssertEqual(
+            (validationParams["bootstrap"] as? [String: Any])?["vault_id"] as? String,
+            candidate.vaultID)
 
         let outboundData = try ControlCommand.recordSyncNextOutbound(limit: 12)
             .requestData(requestID: 70, encoder: encoder)
