@@ -586,6 +586,7 @@ mod replication;
 mod validation;
 
 use outbox::outbox_from;
+pub use replication::validate_replicated_catalog;
 use replication::replicated_catalog_from;
 use schema::migrate;
 use snapshot::{snapshot_from, validate_snapshot_conflicts};

@@ -9,6 +9,7 @@
 pub mod record;
 pub mod record_crypto;
 pub mod record_journal;
+pub mod entity_state;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};

@@ -9,7 +9,8 @@ mod domain;
 mod error;
 
 pub use catalog::{
-    catalog_surface_semantic_revision, resolve_catalog_snapshot, resolve_catalog_surface, Catalog,
+    catalog_surface_semantic_revision, resolve_catalog_snapshot, resolve_catalog_surface,
+    validate_replicated_catalog, Catalog,
 };
 pub use domain::{
     Binding, BindingScope, CatalogSnapshot, EntrySelection, EntrySpec, Environment, FileBacking,

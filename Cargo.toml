@@ -33,7 +33,7 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["clock"], default-features = false }
 age = { version = "0.10", features = ["ssh"] }
 getrandom = "0.2"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "v5"] }
 tempfile = "3"
 notify = "8.2"
 rusqlite = { version = "0.40", features = ["backup", "bundled"] }

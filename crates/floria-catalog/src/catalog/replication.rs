@@ -218,7 +218,10 @@ fn replicated_surfaces_from(conn: &Connection) -> CatalogResult<Vec<ReplicatedSu
     Ok(surfaces)
 }
 
-pub(super) fn validate_replicated_catalog(projection: &ReplicatedCatalog) -> CatalogResult<()> {
+/// Validate a portable projection without writing it to the local catalog.
+///
+/// Replication uses this as the semantic gate after independent entity records are assembled.
+pub fn validate_replicated_catalog(projection: &ReplicatedCatalog) -> CatalogResult<()> {
     if projection.format_version != REPLICATED_CATALOG_FORMAT_VERSION {
         return Err(CatalogError::Validation(format!(
             "unsupported replicated catalog format {}",
