@@ -179,6 +179,15 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(inboundParams["observed_at"] as? String, "2026-08-07T12:00:00Z")
         XCTAssertFalse(String(decoding: inboundData, as: UTF8.self).contains("plaintext"))
 
+        let statusResponse = Data(
+            #"{"request_id":69,"status":"ok","result":{"type":"record_sync_status","value":{"vault_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","key_generation":2,"outbound_transactions":1,"inbound_transactions":0,"pending_transactions":0,"conflicting_entities":0,"projection_pending":false}}}"#.utf8)
+        let decodedStatus = try JSONDecoder().decode(
+            ControlResponseEnvelope<SyncDomainStatus>.self, from: statusResponse)
+        XCTAssertEqual(
+            decodedStatus.result?.value?.vaultID,
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        XCTAssertEqual(decodedStatus.result?.value?.keyGeneration, 2)
+
         let response = Data(
             #"{"request_id":70,"status":"ok","result":{"type":"record_sync_outbound","value":{"commits":[{"commit_id":"commit-1","manifest_base64":"bWFuaWZlc3Q=","revisions":[{"entity_id":"entity-1","revision_id":"revision-1","expected_head_revision_id":null,"envelope_base64":"cmV2aXNpb24="}],"created_at":"2026-08-07T12:00:00Z"}],"objects":[{"digest":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","ciphertext_size":9,"file":"/tmp/floria-sync-object"}]}}}"#.utf8)
         let decoded = try JSONDecoder().decode(

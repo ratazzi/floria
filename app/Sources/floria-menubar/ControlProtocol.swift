@@ -1191,6 +1191,8 @@ struct SyncSettlementReport: Codable, Equatable, Sendable {
 }
 
 struct SyncDomainStatus: Codable, Equatable, Sendable {
+    let vaultID: String
+    let keyGeneration: UInt32
     let outboundTransactions: Int
     let inboundTransactions: Int
     let pendingTransactions: Int
@@ -1198,6 +1200,8 @@ struct SyncDomainStatus: Codable, Equatable, Sendable {
     let projectionPending: Bool
 
     enum CodingKeys: String, CodingKey {
+        case vaultID = "vault_id"
+        case keyGeneration = "key_generation"
         case outboundTransactions = "outbound_transactions"
         case inboundTransactions = "inbound_transactions"
         case pendingTransactions = "pending_transactions"

@@ -6,9 +6,19 @@ import Foundation
 /// This type deliberately knows nothing about decrypted entities, projects, or
 /// secrets. Rust owns those semantics. The Swift adapter only maps authenticated
 /// envelopes and encrypted object files to records in one private custom zone.
-enum CloudRecordCodec {
+struct CloudRecordCodec {
     static let schemaVersion: Int64 = 1
-    static let zoneID = CKRecordZone.ID(zoneName: "FloriaVaultV1")
+    static let zoneNamePrefix = "FloriaVaultV1-"
+
+    let vaultID: String
+    let zoneID: CKRecordZone.ID
+
+    init(vaultID: String) throws {
+        let canonicalVaultID = try Self.validatedUUID(vaultID, field: "vaultID")
+        self.vaultID = canonicalVaultID
+        zoneID = CKRecordZone.ID(
+            zoneName: "\(Self.zoneNamePrefix)\(canonicalVaultID)")
+    }
 
     enum RecordType {
         static let object = "FloriaObjectV1"
@@ -29,7 +39,7 @@ enum CloudRecordCodec {
         static let manifest = "manifest"
     }
 
-    static func objectRecord(_ asset: SyncObjectAsset) throws -> CKRecord {
+    func objectRecord(_ asset: SyncObjectAsset) throws -> CKRecord {
         let digest = try validatedDigest(asset.digest)
         guard asset.ciphertextSize <= UInt64(Int64.max) else {
             throw CloudRecordCodecError.invalidCiphertextSize(asset.ciphertextSize)
@@ -43,33 +53,33 @@ enum CloudRecordCodec {
         let record = CKRecord(
             recordType: RecordType.object,
             recordID: recordID(prefix: "object", stableID: digest))
-        record[Field.schemaVersion] = NSNumber(value: schemaVersion)
+        record[Field.schemaVersion] = NSNumber(value: Self.schemaVersion)
         record[Field.digest] = digest as NSString
         record[Field.ciphertextSize] = NSNumber(value: Int64(asset.ciphertextSize))
         record[Field.ciphertext] = CKAsset(fileURL: fileURL)
         return record
     }
 
-    static func immutableRecords(for commit: SyncOutboundCommit) throws -> [CKRecord] {
-        let commitID = try validatedUUID(commit.commitID, field: Field.commitID)
+    func immutableRecords(for commit: SyncOutboundCommit) throws -> [CKRecord] {
+        let commitID = try Self.validatedUUID(commit.commitID, field: Field.commitID)
         let manifest = try decodedEnvelope(commit.manifestBase64, field: Field.manifest)
 
         let commitRecord = CKRecord(
             recordType: RecordType.commit,
             recordID: recordID(prefix: "commit", stableID: commitID))
-        commitRecord[Field.schemaVersion] = NSNumber(value: schemaVersion)
+        commitRecord[Field.schemaVersion] = NSNumber(value: Self.schemaVersion)
         commitRecord[Field.commitID] = commitID as NSString
         commitRecord[Field.manifest] = manifest as NSData
 
         let revisionRecords = try commit.revisions.map { revision -> CKRecord in
-            let entityID = try validatedUUID(revision.entityID, field: Field.entityID)
-            let revisionID = try validatedUUID(revision.revisionID, field: Field.revisionID)
+            let entityID = try Self.validatedUUID(revision.entityID, field: Field.entityID)
+            let revisionID = try Self.validatedUUID(revision.revisionID, field: Field.revisionID)
             let envelope = try decodedEnvelope(
                 revision.envelopeBase64, field: Field.envelope)
             let record = CKRecord(
                 recordType: RecordType.revision,
                 recordID: recordID(prefix: "revision", stableID: revisionID))
-            record[Field.schemaVersion] = NSNumber(value: schemaVersion)
+            record[Field.schemaVersion] = NSNumber(value: Self.schemaVersion)
             record[Field.entityID] = entityID as NSString
             record[Field.revisionID] = revisionID as NSString
             record[Field.envelope] = envelope as NSData
@@ -84,7 +94,7 @@ enum CloudRecordCodec {
     /// Existing heads are copied so their CloudKit system fields, especially
     /// `recordChangeTag`, remain attached to the update. A missing cache entry is
     /// not treated as a new record when Rust expected an existing revision.
-    static func planCommit(
+    func planCommit(
         _ commit: SyncOutboundCommit,
         cachedHeads: [String: CKRecord]
     ) throws -> CloudCommitRecordPlan {
@@ -93,11 +103,12 @@ enum CloudRecordCodec {
         var conflicts = Set<String>()
 
         for revision in commit.revisions {
-            let entityID = try validatedUUID(revision.entityID, field: Field.entityID)
-            let revisionID = try validatedUUID(revision.revisionID, field: Field.revisionID)
+            let entityID = try Self.validatedUUID(revision.entityID, field: Field.entityID)
+            let revisionID = try Self.validatedUUID(revision.revisionID, field: Field.revisionID)
 
             if let expected = revision.expectedHeadRevisionID {
-                let expectedID = try validatedUUID(expected, field: "expectedHeadRevisionID")
+                let expectedID = try Self.validatedUUID(
+                    expected, field: "expectedHeadRevisionID")
                 guard let cached = cachedHeads[entityID] else {
                     needsFetch.insert(entityID)
                     continue
@@ -117,7 +128,7 @@ enum CloudRecordCodec {
                 let head = CKRecord(
                     recordType: RecordType.head,
                     recordID: recordID(prefix: "head", stableID: entityID))
-                head[Field.schemaVersion] = NSNumber(value: schemaVersion)
+                head[Field.schemaVersion] = NSNumber(value: Self.schemaVersion)
                 head[Field.entityID] = entityID as NSString
                 head[Field.revisionID] = revisionID as NSString
                 heads.append(head)
@@ -133,7 +144,7 @@ enum CloudRecordCodec {
         return .ready(records: try immutableRecords(for: commit) + heads)
     }
 
-    static func decode(_ record: CKRecord) throws -> CloudDecodedRecord {
+    func decode(_ record: CKRecord) throws -> CloudDecodedRecord {
         try validateCommonFields(record)
         switch record.recordType {
         case RecordType.object:
@@ -153,9 +164,9 @@ enum CloudRecordCodec {
                     file: fileURL.path))
 
         case RecordType.revision:
-            let entityID = try validatedUUID(
+            let entityID = try Self.validatedUUID(
                 try stringField(Field.entityID, in: record), field: Field.entityID)
-            let revisionID = try validatedUUID(
+            let revisionID = try Self.validatedUUID(
                 try stringField(Field.revisionID, in: record), field: Field.revisionID)
             try validateRecordID(record, prefix: "revision", stableID: revisionID)
             let envelope = try dataField(Field.envelope, in: record)
@@ -166,7 +177,7 @@ enum CloudRecordCodec {
                     envelopeBase64: envelope.base64EncodedString()))
 
         case RecordType.commit:
-            let commitID = try validatedUUID(
+            let commitID = try Self.validatedUUID(
                 try stringField(Field.commitID, in: record), field: Field.commitID)
             try validateRecordID(record, prefix: "commit", stableID: commitID)
             let manifest = try dataField(Field.manifest, in: record)
@@ -176,7 +187,7 @@ enum CloudRecordCodec {
                     manifestBase64: manifest.base64EncodedString()))
 
         case RecordType.head:
-            let entityID = try validatedUUID(
+            let entityID = try Self.validatedUUID(
                 try stringField(Field.entityID, in: record), field: Field.entityID)
             _ = try headRevisionID(record, expectedEntityID: entityID)
             return .head(entityID: entityID, record: record)
@@ -186,21 +197,21 @@ enum CloudRecordCodec {
         }
     }
 
-    static func recordID(prefix: String, stableID: String) -> CKRecord.ID {
+    func recordID(prefix: String, stableID: String) -> CKRecord.ID {
         CKRecord.ID(recordName: "\(prefix)-\(stableID)", zoneID: zoneID)
     }
 
-    private static func validateCommonFields(_ record: CKRecord) throws {
+    private func validateCommonFields(_ record: CKRecord) throws {
         guard record.recordID.zoneID == zoneID else {
             throw CloudRecordCodecError.wrongZone(record.recordID.zoneID.zoneName)
         }
         let version = try nonnegativeIntegerField(Field.schemaVersion, in: record)
-        guard version == schemaVersion else {
+        guard version == Self.schemaVersion else {
             throw CloudRecordCodecError.unsupportedSchemaVersion(version)
         }
     }
 
-    private static func headRevisionID(
+    private func headRevisionID(
         _ record: CKRecord,
         expectedEntityID: String
     ) throws -> String {
@@ -209,18 +220,18 @@ enum CloudRecordCodec {
             throw CloudRecordCodecError.unexpectedRecordType(
                 expected: RecordType.head, actual: record.recordType)
         }
-        let entityID = try validatedUUID(
+        let entityID = try Self.validatedUUID(
             try stringField(Field.entityID, in: record), field: Field.entityID)
         guard entityID == expectedEntityID,
               record.recordID == recordID(prefix: "head", stableID: entityID)
         else {
             throw CloudRecordCodecError.headIdentityMismatch(expectedEntityID)
         }
-        return try validatedUUID(
+        return try Self.validatedUUID(
             try stringField(Field.revisionID, in: record), field: Field.revisionID)
     }
 
-    private static func validateRecordID(
+    private func validateRecordID(
         _ record: CKRecord,
         prefix: String,
         stableID: String
@@ -232,7 +243,7 @@ enum CloudRecordCodec {
         }
     }
 
-    private static func stringField(_ field: String, in record: CKRecord) throws -> String {
+    private func stringField(_ field: String, in record: CKRecord) throws -> String {
         guard let value = record[field] as? String, !value.isEmpty else {
             throw CloudRecordCodecError.missingField(
                 recordType: record.recordType, field: field)
@@ -240,7 +251,7 @@ enum CloudRecordCodec {
         return value
     }
 
-    private static func dataField(_ field: String, in record: CKRecord) throws -> Data {
+    private func dataField(_ field: String, in record: CKRecord) throws -> Data {
         guard let value = record[field] as? Data, !value.isEmpty else {
             throw CloudRecordCodecError.missingField(
                 recordType: record.recordType, field: field)
@@ -248,7 +259,7 @@ enum CloudRecordCodec {
         return value
     }
 
-    private static func nonnegativeIntegerField(
+    private func nonnegativeIntegerField(
         _ field: String,
         in record: CKRecord
     ) throws -> Int64 {
@@ -263,14 +274,14 @@ enum CloudRecordCodec {
         return integer
     }
 
-    private static func decodedEnvelope(_ value: String, field: String) throws -> Data {
+    private func decodedEnvelope(_ value: String, field: String) throws -> Data {
         guard let data = Data(base64Encoded: value), !data.isEmpty else {
             throw CloudRecordCodecError.invalidBase64(field)
         }
         return data
     }
 
-    private static func validatedDigest(_ value: String) throws -> String {
+    private func validatedDigest(_ value: String) throws -> String {
         guard value.utf8.count == 64,
               value.utf8.allSatisfy({
                   ($0 >= 48 && $0 <= 57) || ($0 >= 97 && $0 <= 102)

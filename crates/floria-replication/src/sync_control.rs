@@ -364,6 +364,8 @@ impl SyncSettlementReport {
 /// Transport-neutral health visible to either a GUI or a future non-Apple adapter.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncDomainStatus {
+    vault_id: String,
+    key_generation: u32,
     outbound_transactions: usize,
     inbound_transactions: usize,
     pending_transactions: usize,
@@ -372,6 +374,14 @@ pub struct SyncDomainStatus {
 }
 
 impl SyncDomainStatus {
+    pub fn vault_id(&self) -> &str {
+        &self.vault_id
+    }
+
+    pub fn key_generation(&self) -> u32 {
+        self.key_generation
+    }
+
     pub fn outbound_transactions(&self) -> usize {
         self.outbound_transactions
     }
@@ -551,6 +561,8 @@ impl<'a> RecordSyncControl<'a> {
     }
 
     pub fn status(&self) -> ReplicationResult<SyncDomainStatus> {
+        let vault_id = self.store.vault_document().vault_id;
+        let key_generation = self.store.current_generation()?;
         let outbound_transactions = self.journal.outbound()?.len();
         let inbound = self.journal.inbound()?;
         let pending_transactions = self.journal.pending_transactions()?;
@@ -560,6 +572,8 @@ impl<'a> RecordSyncControl<'a> {
             Err(error) => return Err(error),
         };
         Ok(SyncDomainStatus {
+            vault_id,
+            key_generation,
             outbound_transactions,
             inbound_transactions: inbound.len(),
             pending_transactions,
@@ -930,6 +944,9 @@ mod tests {
     #[test]
     fn outbound_batch_contains_opaque_records_and_verified_asset_paths() {
         let fixture = Fixture::new();
+        let status = fixture.control().status().unwrap();
+        assert_eq!(status.vault_id(), fixture.store.vault_document().vault_id);
+        assert_eq!(status.key_generation(), fixture.store.current_generation().unwrap());
         let batch = fixture.control().next_outbound(10).unwrap();
 
         assert_eq!(batch.commits().len(), 1);

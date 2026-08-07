@@ -5,10 +5,12 @@ import XCTest
 @testable import floria_menubar
 
 final class CloudRecordCodecTests: XCTestCase {
+    private let vaultID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     private let entityID = "11111111-1111-4111-8111-111111111111"
     private let oldRevisionID = "22222222-2222-4222-8222-222222222222"
     private let newRevisionID = "33333333-3333-4333-8333-333333333333"
     private let commitID = "44444444-4444-4444-8444-444444444444"
+    private var codec: CloudRecordCodec { try! CloudRecordCodec(vaultID: vaultID) }
 
     func testMapsOpaqueOutboundPayloadsWithoutPlaintextFields() throws {
         let file = FileManager.default.temporaryDirectory
@@ -17,10 +19,10 @@ final class CloudRecordCodecTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: file) }
 
         let digest = String(repeating: "a", count: 64)
-        let object = try CloudRecordCodec.objectRecord(
+        let object = try codec.objectRecord(
             SyncObjectAsset(digest: digest, ciphertextSize: 10, file: file.path))
         XCTAssertEqual(object.recordType, CloudRecordCodec.RecordType.object)
-        XCTAssertEqual(object.recordID.zoneID, CloudRecordCodec.zoneID)
+        XCTAssertEqual(object.recordID.zoneID, codec.zoneID)
         XCTAssertEqual(object[CloudRecordCodec.Field.digest] as? String, digest)
         XCTAssertEqual(
             object[CloudRecordCodec.Field.ciphertextSize] as? NSNumber,
@@ -29,7 +31,7 @@ final class CloudRecordCodecTests: XCTestCase {
             (object[CloudRecordCodec.Field.ciphertext] as? CKAsset)?.fileURL,
             file)
 
-        let records = try CloudRecordCodec.immutableRecords(for: outboundCommit())
+        let records = try codec.immutableRecords(for: outboundCommit())
         XCTAssertEqual(records.map(\.recordType), [
             CloudRecordCodec.RecordType.commit,
             CloudRecordCodec.RecordType.revision,
@@ -44,7 +46,7 @@ final class CloudRecordCodecTests: XCTestCase {
     }
 
     func testPlansCreateAndChangeTagPreservingHeadUpdate() throws {
-        let create = try CloudRecordCodec.planCommit(
+        let create = try codec.planCommit(
             outboundCommit(expectedHead: nil), cachedHeads: [:])
         let createRecords = try readyRecords(create)
         let createdHead = try XCTUnwrap(
@@ -54,7 +56,7 @@ final class CloudRecordCodecTests: XCTestCase {
             newRevisionID)
 
         let cachedHead = headRecord(revisionID: oldRevisionID)
-        let update = try CloudRecordCodec.planCommit(
+        let update = try codec.planCommit(
             outboundCommit(expectedHead: oldRevisionID),
             cachedHeads: [entityID: cachedHead])
         let updateRecords = try readyRecords(update)
@@ -71,7 +73,7 @@ final class CloudRecordCodecTests: XCTestCase {
     }
 
     func testDoesNotGuessWhenHeadMustBeFetchedOrHasChanged() throws {
-        let missing = try CloudRecordCodec.planCommit(
+        let missing = try codec.planCommit(
             outboundCommit(expectedHead: oldRevisionID), cachedHeads: [:])
         guard case .needsHeadFetch(let missingIDs) = missing else {
             return XCTFail("Expected a head fetch")
@@ -80,7 +82,7 @@ final class CloudRecordCodecTests: XCTestCase {
 
         let changedHead = headRecord(
             revisionID: "55555555-5555-4555-8555-555555555555")
-        let changed = try CloudRecordCodec.planCommit(
+        let changed = try codec.planCommit(
             outboundCommit(expectedHead: oldRevisionID),
             cachedHeads: [entityID: changedHead])
         guard case .conflict(let conflictIDs) = changed else {
@@ -88,7 +90,7 @@ final class CloudRecordCodecTests: XCTestCase {
         }
         XCTAssertEqual(conflictIDs, [entityID])
 
-        let unexpectedExisting = try CloudRecordCodec.planCommit(
+        let unexpectedExisting = try codec.planCommit(
             outboundCommit(expectedHead: nil),
             cachedHeads: [entityID: changedHead])
         guard case .conflict(let existingIDs) = unexpectedExisting else {
@@ -98,15 +100,15 @@ final class CloudRecordCodecTests: XCTestCase {
     }
 
     func testDecodesFetchedRecordsBackToOpaqueInboundPayloads() throws {
-        let records = try CloudRecordCodec.immutableRecords(for: outboundCommit())
+        let records = try codec.immutableRecords(for: outboundCommit())
 
-        guard case .manifest(let manifest) = try CloudRecordCodec.decode(records[0]) else {
+        guard case .manifest(let manifest) = try codec.decode(records[0]) else {
             return XCTFail("Expected manifest")
         }
         XCTAssertEqual(manifest.commitID, commitID)
         XCTAssertEqual(manifest.manifestBase64, Data("manifest".utf8).base64EncodedString())
 
-        guard case .revision(let revision) = try CloudRecordCodec.decode(records[1]) else {
+        guard case .revision(let revision) = try codec.decode(records[1]) else {
             return XCTFail("Expected revision")
         }
         XCTAssertEqual(revision.entityID, entityID)
@@ -115,12 +117,33 @@ final class CloudRecordCodecTests: XCTestCase {
 
         let head = headRecord(revisionID: newRevisionID)
         guard case .head(let decodedEntityID, let decodedHead) =
-            try CloudRecordCodec.decode(head)
+            try codec.decode(head)
         else {
             return XCTFail("Expected head")
         }
         XCTAssertEqual(decodedEntityID, entityID)
         XCTAssertTrue(decodedHead === head)
+    }
+
+    func testDerivesAnIsolatedZoneFromTheAuthenticatedVaultIdentity() throws {
+        XCTAssertEqual(
+            codec.zoneID.zoneName,
+            "FloriaVaultV1-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+
+        let other = try CloudRecordCodec(
+            vaultID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+        let foreign = try other.immutableRecords(for: outboundCommit())[0]
+        XCTAssertThrowsError(try codec.decode(foreign)) {
+            XCTAssertEqual(
+                $0 as? CloudRecordCodecError,
+                .wrongZone(other.zoneID.zoneName))
+        }
+
+        XCTAssertThrowsError(try CloudRecordCodec(vaultID: "not-a-vault")) {
+            XCTAssertEqual(
+                $0 as? CloudRecordCodecError,
+                .invalidUUID(field: "vaultID", value: "not-a-vault"))
+        }
     }
 
     func testRejectsMalformedTransportMetadataBeforeCloudKit() throws {
@@ -134,20 +157,20 @@ final class CloudRecordCodecTests: XCTestCase {
             manifestBase64: Data("manifest".utf8).base64EncodedString(),
             revisions: [invalidRevision],
             createdAt: "2026-08-07T12:00:00Z")
-        XCTAssertThrowsError(try CloudRecordCodec.immutableRecords(for: invalidCommit)) {
+        XCTAssertThrowsError(try codec.immutableRecords(for: invalidCommit)) {
             XCTAssertEqual(
                 $0 as? CloudRecordCodecError,
                 .invalidUUID(field: CloudRecordCodec.Field.entityID, value: "not-a-uuid"))
         }
 
         XCTAssertThrowsError(
-            try CloudRecordCodec.objectRecord(
+            try codec.objectRecord(
                 SyncObjectAsset(digest: "BAD", ciphertextSize: 1, file: "/tmp/object"))) {
             XCTAssertEqual($0 as? CloudRecordCodecError, .invalidDigest("BAD"))
         }
 
         XCTAssertThrowsError(
-            try CloudRecordCodec.objectRecord(
+            try codec.objectRecord(
                 SyncObjectAsset(
                     digest: String(repeating: "a", count: 64),
                     ciphertextSize: 1,
@@ -157,14 +180,14 @@ final class CloudRecordCodecTests: XCTestCase {
                 .assetPathMustBeAbsolute("relative-object.age"))
         }
 
-        let aliased = try CloudRecordCodec.immutableRecords(for: outboundCommit())[0]
+        let aliased = try codec.immutableRecords(for: outboundCommit())[0]
         let wrongIDRecord = CKRecord(
             recordType: aliased.recordType,
-            recordID: CloudRecordCodec.recordID(prefix: "commit", stableID: entityID))
+            recordID: codec.recordID(prefix: "commit", stableID: entityID))
         for key in aliased.allKeys() {
             wrongIDRecord[key] = aliased[key]
         }
-        XCTAssertThrowsError(try CloudRecordCodec.decode(wrongIDRecord)) {
+        XCTAssertThrowsError(try codec.decode(wrongIDRecord)) {
             XCTAssertEqual(
                 $0 as? CloudRecordCodecError,
                 .recordIdentityMismatch(
@@ -190,7 +213,7 @@ final class CloudRecordCodecTests: XCTestCase {
     private func headRecord(revisionID: String) -> CKRecord {
         let record = CKRecord(
             recordType: CloudRecordCodec.RecordType.head,
-            recordID: CloudRecordCodec.recordID(prefix: "head", stableID: entityID))
+            recordID: codec.recordID(prefix: "head", stableID: entityID))
         record[CloudRecordCodec.Field.schemaVersion] = NSNumber(
             value: CloudRecordCodec.schemaVersion)
         record[CloudRecordCodec.Field.entityID] = entityID as NSString
