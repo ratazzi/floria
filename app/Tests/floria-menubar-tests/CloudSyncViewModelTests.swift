@@ -106,6 +106,33 @@ final class CloudSyncViewModelTests: XCTestCase {
         XCTAssertNil(model.errorMessage)
     }
 
+    func testFailedSyncReportsAnAuthenticatedCurrentMacRemoval() async {
+        let vaultID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let removed = SyncVaultDevice(
+            deviceID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            deviceName: "This Mac",
+            fingerprint: "AB12-CD34-EF56",
+            enrolledGeneration: 1,
+            revokedGeneration: 2,
+            isGenesis: false,
+            isCurrent: true)
+        let service = CloudSyncViewServiceStub(
+            status: status(vaultID: vaultID),
+            candidates: [],
+            bootstrap: bootstrap(vaultID: vaultID),
+            devices: [removed],
+            syncFailure: .activationRequired("Device has no envelope"))
+        let model = CloudSyncViewModel(service: service, restartDaemon: {})
+
+        await model.load()
+        await model.syncNow()
+
+        XCTAssertEqual(model.devices, [removed])
+        XCTAssertEqual(
+            model.errorMessage,
+            "This Mac was removed from the iCloud Library. Existing local data remains available, but new changes will not sync.")
+    }
+
     private func status(vaultID: String) -> SyncDomainStatus {
         SyncDomainStatus(
             vaultID: vaultID,
@@ -144,6 +171,7 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
     private let enrollment: SyncEnrollmentPreparation
     private let activation: SyncVaultActivation
     private let devices: [SyncVaultDevice]
+    private let syncFailure: CloudRecordSyncSessionError?
     private var restartTarget: String?
     private(set) var revokedDevices = [SyncVaultDevice]()
 
@@ -153,13 +181,15 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
         bootstrap: SyncVaultBootstrap? = nil,
         enrollment: SyncEnrollmentPreparation = .alreadyEnrolled(deviceID: "local"),
         devices: [SyncVaultDevice] = [],
-        activation: SyncVaultActivation? = nil
+        activation: SyncVaultActivation? = nil,
+        syncFailure: CloudRecordSyncSessionError? = nil
     ) {
         self.status = status
         self.candidates = candidates
         self.bootstrap = bootstrap
         self.enrollment = enrollment
         self.devices = devices
+        self.syncFailure = syncFailure
         self.activation = activation ?? .ready(
             vaultID: status.vaultID,
             keyGeneration: status.keyGeneration,
@@ -191,7 +221,10 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
         return status
     }
 
-    func syncNow() async throws -> SyncDomainStatus { status }
+    func syncNow() async throws -> SyncDomainStatus {
+        if let syncFailure { throw syncFailure }
+        return status
+    }
 
     func discoverVaults() async throws -> [CloudVaultCandidate] { candidates }
 

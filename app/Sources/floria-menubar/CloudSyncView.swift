@@ -77,10 +77,17 @@ final class CloudSyncViewModel {
 
     func syncNow() async {
         await perform {
-            let status = try await self.service.syncNow()
-            self.status = status
-            self.notice = "Your encrypted Library is up to date in iCloud."
-            try await self.loadDeviceManagement(for: status.vaultID)
+            do {
+                let status = try await self.service.syncNow()
+                self.status = status
+                self.notice = "Your encrypted Library is up to date in iCloud."
+                try await self.loadDeviceManagement(for: status.vaultID)
+            } catch {
+                if await self.detectCurrentMacRemoval() {
+                    throw CloudSyncViewError.currentMacRemoved
+                }
+                throw error
+            }
         }
     }
 
@@ -193,6 +200,17 @@ final class CloudSyncViewModel {
         devices = try await service.reviewDevices(in: bootstrap)
     }
 
+    /// Diagnose a failed sync only from a fresh Rust-authenticated lifecycle. A transport error
+    /// remains the original error if CloudKit cannot provide enough evidence to prove removal.
+    private func detectCurrentMacRemoval() async -> Bool {
+        guard let vaultID = status?.vaultID,
+              let bootstrap = try? await service.authenticateVault(vaultID),
+              let reviewed = try? await service.reviewDevices(in: bootstrap)
+        else { return false }
+        devices = reviewed
+        return reviewed.contains { $0.isCurrent && $0.revokedGeneration != nil }
+    }
+
     private func perform(_ operation: @escaping () async throws -> Void) async {
         guard !isWorking else { return }
         isWorking = true
@@ -208,11 +226,14 @@ final class CloudSyncViewModel {
 
 enum CloudSyncViewError: LocalizedError {
     case daemonRestartTimedOut
+    case currentMacRemoved
 
     var errorDescription: String? {
         switch self {
         case .daemonRestartTimedOut:
             "Floria could not finish switching Libraries. Reopen Floria and try Sync Now."
+        case .currentMacRemoved:
+            "This Mac was removed from the iCloud Library. Existing local data remains available, but new changes will not sync."
         }
     }
 }
