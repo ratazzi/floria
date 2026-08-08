@@ -20,7 +20,9 @@ use floria_discover::{
 };
 use floria_platform::{PeerAccess, SocketPeerVerifier};
 use floria_ssh::ManagedKeyError;
-use floria_store::{NewSecret, SecretId, SecretOrigin, SecretRecord, SecretStore, StoreError};
+use floria_store::{
+    ManagedPlacement, NewSecret, SecretId, SecretOrigin, SecretRecord, SecretStore, StoreError,
+};
 use floria_surface::{
     checkout_link_issues, decode_source, ensure_file_surface_link_in_snapshot,
     file_surface_instances,

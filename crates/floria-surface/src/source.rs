@@ -97,6 +97,14 @@ mod tests {
             unimplemented!()
         }
 
+        fn update_placements(
+            &self,
+            _id: &SecretId,
+            _placements: Vec<floria_store::ManagedPlacement>,
+        ) -> StoreResult<()> {
+            unimplemented!()
+        }
+
         fn delete(&self, _id: &SecretId) -> StoreResult<()> {
             unimplemented!()
         }

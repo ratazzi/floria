@@ -132,6 +132,7 @@ impl<'a> ProjectionApplicator<'a> {
                     },
                     mode: descriptor.mode(),
                     enforcement: descriptor.enforcement(),
+                    placements: descriptor.placements().to_vec(),
                 }),
                 version.version_id(),
                 version.key_generation(),
@@ -148,6 +149,7 @@ impl<'a> ProjectionApplicator<'a> {
                 descriptor.metadata().clone(),
                 descriptor.enforcement(),
                 descriptor.environment_ids().map(|ids| ids.to_vec()),
+                descriptor.placements().to_vec(),
             )?;
         }
         Ok(())
@@ -216,6 +218,7 @@ mod tests {
                     },
                     mode: 0o440,
                     enforcement: floria_core::authz::Enforcement::TouchId,
+                    placements: Vec::new(),
                 },
                 b"private projection fixture",
             )

@@ -2414,11 +2414,13 @@ fn managed_policy_items(
     let mut items = Vec::new();
     let configured_secret_ids = snapshot.file_surface_secret_ids();
 
-    // File-origin secrets are independently managed items. Managed-origin secrets inherit from
-    // their Resource below. Once a file is explicitly configured, its Resource owns this policy
-    // so the former byte-preserving file does not remain as a hidden stricter rule.
+    // Raw file secrets are independently managed items. A replicated item may have only a
+    // portable placement on this Device; typed Managed secrets still inherit from their Resource.
+    // Once a file is explicitly configured, its Resource owns this policy so the former
+    // byte-preserving file does not remain as a hidden stricter rule.
     for record in records.iter().filter(|record| {
-        record.source_path().is_some() && !configured_secret_ids.contains(record.id.as_str())
+        (record.source_path().is_some() || !record.placements.is_empty())
+            && !configured_secret_ids.contains(record.id.as_str())
     }) {
         items.push(ManagedPolicyItem {
             object: ManagedObject::Secret { secret_id: record.id.to_string() },
@@ -3859,6 +3861,7 @@ mod tests {
             current_version: 1,
             enforcement: Enforcement::Allow,
             environment_ids: None,
+            placements: Vec::new(),
             metadata: Default::default(),
         }];
 

@@ -203,7 +203,11 @@ impl ItemsNs {
     }
 
     fn secret_item(record: SecretRecord) -> Option<ManagedItem> {
-        let basename = record.source_path()?.file_name()?.to_os_string();
+        let basename = record
+            .source_path()
+            .and_then(|path| path.file_name())
+            .or_else(|| record.placements.first()?.relative_path().file_name())?
+            .to_os_string();
         Some(ManagedItem {
             id: record.id.to_string(),
             basename,
@@ -1225,7 +1229,7 @@ fn errno(code: i32) -> Errno {
 /// Only user-protected files are addressable through `secrets/<id>`. Managed values (shared
 /// secrets, env documents, SSH private keys) stay behind their typed surface or capability.
 fn exposed_as_raw_secret(record: &SecretRecord) -> bool {
-    record.source_path().is_some()
+    record.source_path().is_some() || !record.placements.is_empty()
 }
 
 /// What to do with a `setattr` request.
@@ -2050,7 +2054,8 @@ mod tests {
     use floria_core::config::FileEntry;
     use floria_core::identity::ProcessIdentity;
     use floria_store::{
-        NewSecret, SecretOrigin, SecretRecord, StoreError, StoreResult, VersionRecord,
+        ManagedPlacement, NewSecret, SecretOrigin, SecretRecord, StoreError, StoreResult,
+        VersionRecord,
     };
     use floria_surface::{DIRENV_MAX_SIZE, DOTENV_MAX_SIZE, INI_MAX_SIZE, LINES_MAX_SIZE};
     use std::collections::{HashMap, HashSet};
@@ -2189,6 +2194,7 @@ mod tests {
                 current_version: entry.head,
                 enforcement: Enforcement::Prompt,
                 environment_ids: None,
+                placements: Vec::new(),
                 metadata: Default::default(),
             }))
         }
@@ -2227,6 +2233,7 @@ mod tests {
                     current_version: entry.head,
                     enforcement: Enforcement::Prompt,
                     environment_ids: None,
+                    placements: Vec::new(),
                     metadata: Default::default(),
                 })
                 .collect())
@@ -2242,6 +2249,14 @@ mod tests {
             _metadata: floria_core::metadata::ItemMetadata,
             _enforcement: Enforcement,
             _environment_ids: Option<Vec<String>>,
+        ) -> StoreResult<()> {
+            unimplemented!()
+        }
+
+        fn update_placements(
+            &self,
+            _id: &SecretId,
+            _placements: Vec<floria_store::ManagedPlacement>,
         ) -> StoreResult<()> {
             unimplemented!()
         }
@@ -2566,7 +2581,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_secret_namespace_exposes_only_file_origin_records() {
+    fn raw_secret_namespace_exposes_file_origins_and_portable_placements() {
         let record = |origin| SecretRecord {
             id: "00000000-0000-0000-0000-000000000301".parse().unwrap(),
             origin,
@@ -2576,6 +2591,7 @@ mod tests {
             current_version: 1,
             enforcement: floria_core::authz::Enforcement::Prompt,
             environment_ids: None,
+            placements: Vec::new(),
             metadata: Default::default(),
         };
 
@@ -2585,6 +2601,12 @@ mod tests {
         assert!(!exposed_as_raw_secret(&record(SecretOrigin::Managed {
             label: "Fixture managed value".to_string(),
         })));
+        let mut portable = record(SecretOrigin::Managed {
+            label: "Portable file".to_string(),
+        });
+        portable.placements = vec![ManagedPlacement::home(".pgpass").unwrap()];
+        assert!(exposed_as_raw_secret(&portable));
+        assert_eq!(ItemsNs::secret_item(portable).unwrap().basename, ".pgpass");
     }
 
     #[test]
@@ -3108,6 +3130,13 @@ mod tests {
             _metadata: floria_core::metadata::ItemMetadata,
             _enforcement: floria_core::authz::Enforcement,
             _environment_ids: Option<Vec<String>>,
+        ) -> StoreResult<()> {
+            unimplemented!()
+        }
+        fn update_placements(
+            &self,
+            _id: &SecretId,
+            _placements: Vec<floria_store::ManagedPlacement>,
         ) -> StoreResult<()> {
             unimplemented!()
         }

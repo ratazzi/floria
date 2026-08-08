@@ -22,7 +22,7 @@ pub use keys::{
 pub use recovery::{decrypt_recovery_key, export_recovery_key};
 pub use source::StoreSource;
 pub use store::{
-    AgeDirStore, NewSecret, SecretId, SecretOrigin, SecretRecord, SecretStore,
+    AgeDirStore, ManagedPlacement, NewSecret, SecretId, SecretOrigin, SecretRecord, SecretStore,
     StoreMaintenanceGuard, StoreVerification, StoreVersionRef, VersionRecord,
     MIN_SUPPORTED_STORE_FORMAT_VERSION, STORE_FORMAT_VERSION,
 };

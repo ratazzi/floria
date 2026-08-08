@@ -9,7 +9,7 @@ use floria_catalog::{
     CatalogSnapshot, ProjectCheckout, ProjectCheckoutKind, Surface, SurfaceKind,
 };
 use floria_core::config::{ITEMS_DIR, SECRETS_DIR, SURFACES_DIR};
-use floria_store::{SecretRecord, SecretStore};
+use floria_store::{ManagedPlacement, SecretRecord, SecretStore};
 
 use crate::error::{SurfaceError, SurfaceResult};
 
@@ -469,9 +469,9 @@ pub struct ProtectedCheckoutLink {
     current_version: u32,
 }
 
-/// Build the desired protected-file links for managed worktrees. A file belongs
-/// to exactly one project: the deepest project path that contains its original
-/// source, matching discovery's nested-project assignment rule.
+/// Build every desired link for byte-preserving Managed files. Portable declarations resolve
+/// against this Mac's Project/Home roots; legacy records without declarations retain the old
+/// deepest-project worktree behavior until they are backfilled.
 pub fn protected_checkout_links(
     snapshot: &CatalogSnapshot,
     records: &[SecretRecord],
@@ -506,15 +506,14 @@ pub fn managed_file_links(
         )?;
         insert_managed_link(&mut links, link)?;
     }
-    for record in records.iter().filter(|record| {
-        !configured_secret_ids.contains(record.id.as_str()) && record.source_path().is_some()
-    }) {
-        let link = protected_file_link(
-            record,
-            record.source_path().expect("filtered file origin").to_path_buf(),
-            mount_path,
-        )?;
-        insert_managed_link(&mut links, link)?;
+    for record in records
+        .iter()
+        .filter(|record| !configured_secret_ids.contains(record.id.as_str()))
+    {
+        if let Some(source_path) = record.source_path() {
+            let link = protected_file_link(record, source_path.to_path_buf(), mount_path)?;
+            insert_managed_link(&mut links, link)?;
+        }
     }
     for link in protected_checkout_links(snapshot, records, mount_path) {
         insert_managed_link(
@@ -583,48 +582,62 @@ fn protected_checkout_links_excluding(
 ) -> Vec<ProtectedCheckoutLink> {
     let mut links = Vec::new();
     for record in records {
-        let Some(source) = record.source_path() else { continue };
-        let Some(project) = snapshot
-            .projects
-            .iter()
-            .filter(|project| source.starts_with(&project.path))
-            .max_by_key(|project| project.path.components().count())
-        else {
-            continue;
-        };
-        let Ok(relative) = source.strip_prefix(&project.path) else { continue };
-        if relative.as_os_str().is_empty()
-            || relative
-                .components()
-                .any(|component| !matches!(component, Component::Normal(_)))
-        {
+        if record.placements.is_empty() {
+            append_legacy_project_links(snapshot, record, mount_path, excluded_paths, &mut links);
             continue;
         }
-        for checkout in snapshot.checkouts.iter().filter(|checkout| {
-            checkout.kind == ProjectCheckoutKind::Worktree
-                && checkout.project_id == project.id
-                && record.environment_ids.as_ref().is_none_or(|environment_ids| {
-                    checkout
-                        .environment_id
-                        .as_ref()
-                        .is_some_and(|id| environment_ids.contains(id))
-                })
-        }) {
-            let path = checkout.path.join(relative);
-            if excluded_paths.contains(&path) {
-                continue;
+        for placement in &record.placements {
+            match placement {
+                ManagedPlacement::Home { relative_path } => {
+                    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+                        continue;
+                    };
+                    append_protected_link(
+                        record,
+                        home.join(relative_path),
+                        mount_path,
+                        excluded_paths,
+                        &mut links,
+                    );
+                }
+                ManagedPlacement::Project {
+                    project_id,
+                    relative_path,
+                    environment_ids,
+                } => {
+                    let Some(project) = snapshot
+                        .projects
+                        .iter()
+                        .find(|project| project.id == *project_id)
+                    else {
+                        continue;
+                    };
+                    append_protected_link(
+                        record,
+                        project.path.join(relative_path),
+                        mount_path,
+                        excluded_paths,
+                        &mut links,
+                    );
+                    for checkout in snapshot.checkouts.iter().filter(|checkout| {
+                        checkout.kind == ProjectCheckoutKind::Worktree
+                            && checkout.project_id == *project_id
+                            && (environment_ids.is_empty()
+                                || checkout
+                                    .environment_id
+                                    .as_ref()
+                                    .is_some_and(|id| environment_ids.contains(id)))
+                    }) {
+                        append_protected_link(
+                            record,
+                            checkout.path.join(relative_path),
+                            mount_path,
+                            excluded_paths,
+                            &mut links,
+                        );
+                    }
+                }
             }
-            let Ok(managed) = protected_file_link(record, path.clone(), mount_path) else {
-                continue;
-            };
-            links.push(ProtectedCheckoutLink {
-                secret_id: record.id.clone(),
-                path,
-                target: managed.expected,
-                accepted_legacy_targets: managed.accepted_legacy_targets,
-                mode: record.mode,
-                current_version: record.current_version,
-            });
         }
     }
     links.sort_by(|left, right| {
@@ -634,6 +647,73 @@ fn protected_checkout_links_excluding(
             .then_with(|| left.path.cmp(&right.path))
     });
     links
+}
+
+fn append_legacy_project_links(
+    snapshot: &CatalogSnapshot,
+    record: &SecretRecord,
+    mount_path: &Path,
+    excluded_paths: &HashSet<PathBuf>,
+    links: &mut Vec<ProtectedCheckoutLink>,
+) {
+    let Some(source) = record.source_path() else { return };
+    let Some(project) = snapshot
+        .projects
+        .iter()
+        .filter(|project| source.starts_with(&project.path))
+        .max_by_key(|project| project.path.components().count())
+    else {
+        return;
+    };
+    let Ok(relative) = source.strip_prefix(&project.path) else { return };
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return;
+    }
+    for checkout in snapshot.checkouts.iter().filter(|checkout| {
+        checkout.kind == ProjectCheckoutKind::Worktree
+            && checkout.project_id == project.id
+            && record.environment_ids.as_ref().is_none_or(|environment_ids| {
+                checkout
+                    .environment_id
+                    .as_ref()
+                    .is_some_and(|id| environment_ids.contains(id))
+            })
+    }) {
+        append_protected_link(
+            record,
+            checkout.path.join(relative),
+            mount_path,
+            excluded_paths,
+            links,
+        );
+    }
+}
+
+fn append_protected_link(
+    record: &SecretRecord,
+    path: PathBuf,
+    mount_path: &Path,
+    excluded_paths: &HashSet<PathBuf>,
+    links: &mut Vec<ProtectedCheckoutLink>,
+) {
+    if excluded_paths.contains(&path) {
+        return;
+    }
+    let Ok(managed) = protected_file_link(record, path.clone(), mount_path) else {
+        return;
+    };
+    links.push(ProtectedCheckoutLink {
+        secret_id: record.id.clone(),
+        path,
+        target: managed.expected,
+        accepted_legacy_targets: managed.accepted_legacy_targets,
+        mode: record.mode,
+        current_version: record.current_version,
+    });
 }
 
 /// Release an exact protected-file worktree link when a configured file Surface now owns the
@@ -724,7 +804,10 @@ pub fn restore_protected_checkout_links(
     mount_path: &Path,
 ) -> io::Result<()> {
     let links = protected_checkout_links(snapshot, std::slice::from_ref(record), mount_path);
-    for link in links {
+    for link in links
+        .into_iter()
+        .filter(|link| record.source_path() != Some(link.path.as_path()))
+    {
         restore_exact_link(&link, plaintext)?;
     }
     Ok(())
@@ -796,11 +879,11 @@ fn restore_exact_link(link: &ProtectedCheckoutLink, plaintext: &[u8]) -> io::Res
 fn link_protected_copy(link: &ProtectedCheckoutLink, plaintext: &[u8]) -> io::Result<()> {
     match std::fs::symlink_metadata(&link.path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            // Do not invent directories inside a checkout; only fill in the leaf.
+            // The relative declaration owns this location. Creating only missing directories is
+            // safe and lets a newly attached Project materialize without a per-file repair step;
+            // an existing non-directory still remains a conflict below.
             let Some(parent) = link.path.parent() else { return Ok(()) };
-            if !parent.is_dir() {
-                return Ok(());
-            }
+            std::fs::create_dir_all(parent)?;
             symlink(&link.target, &link.path)?;
             tracing::info!(path = %link.path.display(), "linked protected file into worktree");
             Ok(())
@@ -1559,6 +1642,89 @@ mod tests {
                 .join(missing_id.to_string())
                 .join(".pgpass")
         );
+    }
+
+    #[test]
+    fn portable_project_placement_resolves_against_this_macs_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("different/local/project");
+        let development = dir.path().join("worktrees/development");
+        let production = dir.path().join("worktrees/production");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&development).unwrap();
+        std::fs::create_dir_all(&production).unwrap();
+        let mount = dir.path().join("mount");
+        let store = AgeDirStore::open(
+            dir.path().join("store"),
+            Arc::new(TestKeys(age::x25519::Identity::generate())),
+        )
+        .unwrap();
+        let id = store
+            .put(
+                NewSecret::managed("production.key").with_placements(vec![
+                    ManagedPlacement::project(
+                        "fixture-project",
+                        "config/credentials/production.key",
+                        vec!["fixture-production".to_string()],
+                    )
+                    .unwrap(),
+                ]),
+                b"portable fixture",
+            )
+            .unwrap();
+        let snapshot = CatalogSnapshot {
+            projects: vec![Project {
+                id: "fixture-project".to_string(),
+                name: "Fixture".to_string(),
+                path: primary.clone(),
+                ..Default::default()
+            }],
+            checkouts: vec![
+                ProjectCheckout {
+                    id: "fixture-development-checkout".to_string(),
+                    project_id: "fixture-project".to_string(),
+                    path: development.clone(),
+                    environment_id: Some("fixture-development".to_string()),
+                    kind: ProjectCheckoutKind::Worktree,
+                    ..Default::default()
+                },
+                ProjectCheckout {
+                    id: "fixture-production-checkout".to_string(),
+                    project_id: "fixture-project".to_string(),
+                    path: production.clone(),
+                    environment_id: Some("fixture-production".to_string()),
+                    kind: ProjectCheckoutKind::Worktree,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let links = protected_checkout_links(&snapshot, &store.list().unwrap(), &mount);
+        assert_eq!(links.len(), 2, "primary and selected Environment only");
+        refresh_protected_checkout_links(&mut Vec::new(), links, &store).unwrap();
+
+        let relative = Path::new("config/credentials/production.key");
+        assert!(std::fs::symlink_metadata(primary.join(relative))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::symlink_metadata(production.join(relative))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!development.join(relative).exists());
+        assert_eq!(
+            std::fs::read_link(primary.join(relative)).unwrap(),
+            mount.join(ITEMS_DIR).join(id.to_string()).join("production.key")
+        );
+
+        assert!(protected_checkout_links(
+            &CatalogSnapshot::default(),
+            &store.list().unwrap(),
+            &mount,
+        )
+        .is_empty());
     }
 
     #[test]

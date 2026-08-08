@@ -13,7 +13,7 @@
 //! Plaintext exists only as [`Zeroizing`] in memory and never touches disk here.
 
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -82,6 +82,55 @@ pub enum SecretOrigin {
     Managed { label: String },
 }
 
+/// A portable declaration of where one byte-preserving Managed file appears.
+///
+/// Absolute paths never cross the replication boundary. A Project placement resolves against
+/// that Project's checkout on each Mac; a Home placement resolves against that Mac's HOME.
+/// Files outside both scopes remain device-local through [`SecretOrigin::File`] alone.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum ManagedPlacement {
+    Project {
+        project_id: String,
+        relative_path: PathBuf,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        environment_ids: Vec<String>,
+    },
+    Home {
+        relative_path: PathBuf,
+    },
+}
+
+impl ManagedPlacement {
+    pub fn project(
+        project_id: impl Into<String>,
+        relative_path: impl Into<PathBuf>,
+        mut environment_ids: Vec<String>,
+    ) -> StoreResult<Self> {
+        environment_ids.sort();
+        environment_ids.dedup();
+        let placement = Self::Project {
+            project_id: project_id.into(),
+            relative_path: relative_path.into(),
+            environment_ids,
+        };
+        validate_managed_placements(std::slice::from_ref(&placement))?;
+        Ok(placement)
+    }
+
+    pub fn home(relative_path: impl Into<PathBuf>) -> StoreResult<Self> {
+        let placement = Self::Home { relative_path: relative_path.into() };
+        validate_managed_placements(std::slice::from_ref(&placement))?;
+        Ok(placement)
+    }
+
+    pub fn relative_path(&self) -> &Path {
+        match self {
+            Self::Project { relative_path, .. } | Self::Home { relative_path } => relative_path,
+        }
+    }
+}
+
 /// What the caller knows about a secret when creating it.
 #[derive(Debug, Clone)]
 pub struct NewSecret {
@@ -90,6 +139,9 @@ pub struct NewSecret {
     /// Initial authorization behavior. Once persisted, callers update it only through the
     /// explicit settings interface.
     pub enforcement: Enforcement,
+    /// Portable locations for a byte-preserving Managed file. Empty means device-local or a
+    /// non-file Secret.
+    pub placements: Vec<ManagedPlacement>,
 }
 
 impl NewSecret {
@@ -98,6 +150,7 @@ impl NewSecret {
             origin: SecretOrigin::File { source_path },
             mode,
             enforcement: Enforcement::Prompt,
+            placements: Vec::new(),
         }
     }
 
@@ -106,11 +159,17 @@ impl NewSecret {
             origin: SecretOrigin::Managed { label: label.into() },
             mode: 0o600,
             enforcement: Enforcement::Prompt,
+            placements: Vec::new(),
         }
     }
 
     pub fn with_enforcement(mut self, enforcement: Enforcement) -> Self {
         self.enforcement = enforcement;
+        self
+    }
+
+    pub fn with_placements(mut self, placements: Vec<ManagedPlacement>) -> Self {
+        self.placements = placements;
         self
     }
 }
@@ -131,6 +190,9 @@ pub struct SecretRecord {
     pub enforcement: Enforcement,
     /// Project Environments where this file-backed item is exposed to managed worktrees.
     pub environment_ids: Option<Vec<String>>,
+    /// Portable Project/Home locations. The local file origin, when present, remains authoritative
+    /// only for this Device and is never derived from a remote absolute path.
+    pub placements: Vec<ManagedPlacement>,
     /// Plaintext, non-secret context for display and navigation.
     pub metadata: ItemMetadata,
 }
@@ -217,6 +279,13 @@ pub trait SecretStore: Send + Sync {
         enforcement: Enforcement,
         environment_ids: Option<Vec<String>>,
     ) -> StoreResult<()>;
+    /// Replace only the portable Project/Home declarations. Device-local origin and content
+    /// history are unchanged.
+    fn update_placements(
+        &self,
+        id: &SecretId,
+        placements: Vec<ManagedPlacement>,
+    ) -> StoreResult<()>;
     /// Delete a secret. On a solo vault this destroys the objects too; once other devices are
     /// enrolled it only removes the local head document (shared objects stay immutable).
     fn delete(&self, id: &SecretId) -> StoreResult<()>;
@@ -241,6 +310,8 @@ struct HeadsDocument {
     enforcement: Enforcement,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     environment_ids: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    placements: Vec<ManagedPlacement>,
     #[serde(default, skip_serializing_if = "ItemMetadata::is_empty")]
     metadata: ItemMetadata,
     versions: Vec<HeadsVersion>,
@@ -262,6 +333,59 @@ struct HeadsVersion {
 
 fn default_secret_enforcement() -> Enforcement {
     Enforcement::Prompt
+}
+
+fn validate_managed_placements(placements: &[ManagedPlacement]) -> StoreResult<()> {
+    let mut canonical = placements.to_vec();
+    for placement in &mut canonical {
+        let relative_path = placement.relative_path();
+        if relative_path.as_os_str().is_empty()
+            || relative_path.is_absolute()
+            || relative_path
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(StoreError::Invalid(format!(
+                "managed placement path must be a normalized relative path: {}",
+                relative_path.display()
+            )));
+        }
+        if let ManagedPlacement::Project {
+            project_id,
+            environment_ids,
+            ..
+        } = placement
+        {
+            if project_id.trim().is_empty() || project_id.contains('\0') {
+                return Err(StoreError::Invalid(
+                    "managed placement project id cannot be empty or contain NUL".to_string(),
+                ));
+            }
+            environment_ids.sort();
+            environment_ids.dedup();
+            if environment_ids
+                .iter()
+                .any(|id| id.trim().is_empty() || id.contains('\0'))
+            {
+                return Err(StoreError::Invalid(
+                    "managed placement environment ids cannot be empty or contain NUL".to_string(),
+                ));
+            }
+        }
+    }
+    canonical.sort();
+    if canonical != placements {
+        return Err(StoreError::Invalid(
+            "managed placements must be sorted, unique, and contain sorted unique Environment ids"
+                .to_string(),
+        ));
+    }
+    if canonical.windows(2).any(|window| window[0] == window[1]) {
+        return Err(StoreError::Invalid(
+            "managed placements must be unique".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -1094,6 +1218,7 @@ impl AgeDirStore {
         metadata: ItemMetadata,
         enforcement: Enforcement,
         environment_ids: Option<Vec<String>>,
+        placements: Vec<ManagedPlacement>,
     ) -> StoreResult<()> {
         if label.trim().is_empty() || label.contains('\0') {
             return Err(StoreError::Invalid(
@@ -1106,6 +1231,7 @@ impl AgeDirStore {
             )));
         }
         metadata.validate().map_err(StoreError::Invalid)?;
+        validate_managed_placements(&placements)?;
         let _lock = self.lock_exclusive()?;
         self.verify_security_state()?;
         let mut heads = self.read_heads(id)?;
@@ -1116,6 +1242,7 @@ impl AgeDirStore {
         heads.metadata = metadata;
         heads.enforcement = enforcement;
         heads.environment_ids = environment_ids;
+        heads.placements = placements;
         self.write_heads(id, &heads)?;
         self.seal_security_state()
     }
@@ -1371,6 +1498,10 @@ impl AgeDirStore {
                 })
             }
         }
+        validate_managed_placements(&heads.placements).map_err(|error| StoreError::Corrupt {
+            id: id.to_string(),
+            reason: error.to_string(),
+        })?;
         let mut seen = std::collections::HashSet::new();
         for version in &heads.versions {
             if version.version == 0
@@ -1558,6 +1689,7 @@ impl AgeDirStore {
                 || source.current_version != copied.current_version
                 || source.enforcement != copied.enforcement
                 || source.environment_ids != copied.environment_ids
+                || source.placements != copied.placements
                 || source.metadata != copied.metadata
                 || source.versions.len() != copied.versions.len()
             {
@@ -1863,6 +1995,7 @@ fn require_stream_size(path: &Path, actual: u64, expected: u64) -> StoreResult<(
 fn new_heads_document(id: &SecretId, meta: NewSecret) -> StoreResult<HeadsDocument> {
     let mode = meta.mode;
     let enforcement = meta.enforcement;
+    validate_managed_placements(&meta.placements)?;
     let (source_path, managed_label) = validate_new_secret_origin(meta.origin)?;
     Ok(HeadsDocument {
         format: STORE_FORMAT_VERSION,
@@ -1874,6 +2007,7 @@ fn new_heads_document(id: &SecretId, meta: NewSecret) -> StoreResult<HeadsDocume
         current_version: 0,
         enforcement,
         environment_ids: None,
+        placements: meta.placements,
         metadata: ItemMetadata::default(),
         versions: Vec::new(),
     })
@@ -2080,6 +2214,7 @@ impl SecretStore for AgeDirStore {
             current_version: heads.current_version,
             enforcement: heads.enforcement,
             environment_ids: heads.environment_ids,
+            placements: heads.placements,
             metadata: heads.metadata,
         }))
     }
@@ -2119,7 +2254,34 @@ impl SecretStore for AgeDirStore {
         let mut heads = self.read_heads(id)?;
         heads.metadata = metadata;
         heads.enforcement = enforcement;
-        heads.environment_ids = environment_ids;
+        heads.environment_ids = environment_ids.clone();
+        for placement in &mut heads.placements {
+            if let ManagedPlacement::Project {
+                environment_ids: placement_environment_ids,
+                ..
+            } = placement
+            {
+                *placement_environment_ids = environment_ids.clone().unwrap_or_default();
+                placement_environment_ids.sort();
+                placement_environment_ids.dedup();
+            }
+        }
+        heads.placements.sort();
+        heads.placements.dedup();
+        self.write_heads(id, &heads)?;
+        self.seal_security_state()
+    }
+
+    fn update_placements(
+        &self,
+        id: &SecretId,
+        placements: Vec<ManagedPlacement>,
+    ) -> StoreResult<()> {
+        validate_managed_placements(&placements)?;
+        let _lock = self.lock_exclusive()?;
+        self.verify_security_state()?;
+        let mut heads = self.read_heads(id)?;
+        heads.placements = placements;
         self.write_heads(id, &heads)?;
         self.seal_security_state()
     }
@@ -2635,6 +2797,62 @@ mod tests {
     }
 
     #[test]
+    fn portable_placements_roundtrip_and_follow_environment_settings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path().to_path_buf());
+        let placement = ManagedPlacement::project(
+            "fixture-project",
+            "config/production.key",
+            vec!["production".to_string(), "development".to_string()],
+        )
+        .unwrap();
+        let id = store
+            .put(
+                NewSecret::file(PathBuf::from("/local/config/production.key"), 0o600)
+                    .with_placements(vec![placement]),
+                b"fixture",
+            )
+            .unwrap();
+
+        let record = store.record(&id).unwrap().unwrap();
+        assert_eq!(
+            record.placements,
+            vec![ManagedPlacement::Project {
+                project_id: "fixture-project".to_string(),
+                relative_path: PathBuf::from("config/production.key"),
+                environment_ids: vec!["development".to_string(), "production".to_string()],
+            }]
+        );
+
+        store
+            .update_settings(
+                &id,
+                ItemMetadata::default(),
+                Enforcement::Prompt,
+                Some(vec!["production".to_string()]),
+            )
+            .unwrap();
+        assert!(matches!(
+            &store.record(&id).unwrap().unwrap().placements[0],
+            ManagedPlacement::Project { environment_ids, .. }
+                if environment_ids == &["production".to_string()]
+        ));
+
+        assert!(store
+            .put(
+                NewSecret::file(PathBuf::from("/local/bad"), 0o600).with_placements(vec![
+                    ManagedPlacement::Home {
+                        relative_path: PathBuf::from("../escape"),
+                    },
+                ]),
+                b"fixture",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("normalized relative path"));
+    }
+
+    #[test]
     fn replicated_settings_preserve_local_file_placement_and_update_managed_labels() {
         let tmp = tempfile::tempdir().unwrap();
         let store = store(tmp.path().to_path_buf());
@@ -2653,6 +2871,7 @@ mod tests {
                 ItemMetadata::default(),
                 Enforcement::Allow,
                 None,
+                Vec::new(),
             )
             .unwrap();
         store
@@ -2663,6 +2882,7 @@ mod tests {
                 ItemMetadata::default(),
                 Enforcement::TouchId,
                 None,
+                Vec::new(),
             )
             .unwrap();
 

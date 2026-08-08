@@ -677,6 +677,7 @@ mod tests {
                 current_version: *head,
                 enforcement: Default::default(),
                 environment_ids: None,
+                placements: Vec::new(),
                 metadata: Default::default(),
             }))
         }
@@ -714,6 +715,13 @@ mod tests {
             _metadata: floria_core::metadata::ItemMetadata,
             _enforcement: floria_core::authz::Enforcement,
             _environment_ids: Option<Vec<String>>,
+        ) -> StoreResult<()> {
+            unimplemented!()
+        }
+        fn update_placements(
+            &self,
+            _id: &SecretId,
+            _placements: Vec<floria_store::ManagedPlacement>,
         ) -> StoreResult<()> {
             unimplemented!()
         }
@@ -794,6 +802,14 @@ mod tests {
             environment_ids: Option<Vec<String>>,
         ) -> StoreResult<()> {
             self.inner.update_settings(id, metadata, enforcement, environment_ids)
+        }
+
+        fn update_placements(
+            &self,
+            id: &SecretId,
+            placements: Vec<floria_store::ManagedPlacement>,
+        ) -> StoreResult<()> {
+            self.inner.update_placements(id, placements)
         }
 
         fn delete(&self, id: &SecretId) -> StoreResult<()> {

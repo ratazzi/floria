@@ -304,24 +304,61 @@ fn validate_secret_environment_scopes(
     catalog: &ReplicatedCatalog,
     secrets: &BTreeMap<String, SecretEntityDocument>,
 ) -> ReplicationResult<()> {
-    let environment_ids = catalog
+    let environment_projects = catalog
         .environments
         .iter()
-        .map(|environment| environment.id.as_str())
+        .map(|environment| (environment.id.as_str(), environment.project_id.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let project_ids = catalog
+        .projects
+        .iter()
+        .map(|project| project.id.as_str())
         .collect::<BTreeSet<_>>();
     for secret in secrets.values() {
         if secret.lifecycle() != EntityLifecycle::Active {
             continue;
         }
-        let Some(scope) = secret.descriptor().environment_ids() else {
-            continue;
-        };
-        for environment_id in scope {
-            if !environment_ids.contains(environment_id.as_str()) {
+        if let Some(scope) = secret.descriptor().environment_ids() {
+            for environment_id in scope {
+                if !environment_projects.contains_key(environment_id.as_str()) {
+                    return Err(ReplicationError::Invalid(format!(
+                        "active secret {} references missing environment {environment_id}",
+                        secret.entity_id()
+                    )));
+                }
+            }
+        }
+        for placement in secret.descriptor().placements() {
+            let floria_store::ManagedPlacement::Project {
+                project_id,
+                environment_ids,
+                ..
+            } = placement
+            else {
+                continue;
+            };
+            if !project_ids.contains(project_id.as_str()) {
                 return Err(ReplicationError::Invalid(format!(
-                    "active secret {} references missing environment {environment_id}",
+                    "active secret {} placement references missing project {project_id}",
                     secret.entity_id()
                 )));
+            }
+            for environment_id in environment_ids {
+                match environment_projects.get(environment_id.as_str()) {
+                    Some(owner) if *owner == project_id.as_str() => {}
+                    Some(_) => {
+                        return Err(ReplicationError::Invalid(format!(
+                            "active secret {} placement environment {environment_id} does not belong to project {project_id}",
+                            secret.entity_id()
+                        )));
+                    }
+                    None => {
+                        return Err(ReplicationError::Invalid(format!(
+                            "active secret {} placement references missing environment {environment_id}",
+                            secret.entity_id()
+                        )));
+                    }
+                }
             }
         }
     }

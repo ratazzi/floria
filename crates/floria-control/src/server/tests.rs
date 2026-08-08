@@ -275,6 +275,7 @@
         enforcement: Enforcement,
         metadata: ItemMetadata,
         environment_ids: Option<Vec<String>>,
+        placements: Vec<floria_store::ManagedPlacement>,
     }
 
     struct FixtureStore {
@@ -563,6 +564,7 @@
                         enforcement: meta.enforcement,
                         metadata: ItemMetadata::default(),
                         environment_ids: None,
+                        placements: meta.placements,
                     },
                 );
             self.heads.lock().unwrap().insert(id.to_string(), 1);
@@ -632,6 +634,7 @@
                 current_version: heads[id.as_str()],
                 enforcement: metadata[id.as_str()].enforcement,
                 environment_ids: metadata[id.as_str()].environment_ids.clone(),
+                placements: metadata[id.as_str()].placements.clone(),
                 metadata: metadata[id.as_str()].metadata.clone(),
             }))
         }
@@ -651,6 +654,7 @@
                     current_version: heads[id],
                     enforcement: metadata[id].enforcement,
                     environment_ids: metadata[id].environment_ids.clone(),
+                    placements: metadata[id].placements.clone(),
                     metadata: metadata[id].metadata.clone(),
                 })
                 .collect())
@@ -684,7 +688,25 @@
             let entry = metadata.get_mut(id.as_str()).unwrap();
             entry.metadata = item_metadata;
             entry.enforcement = enforcement;
-            entry.environment_ids = environment_ids;
+            entry.environment_ids = environment_ids.clone();
+            for placement in &mut entry.placements {
+                if let floria_store::ManagedPlacement::Project {
+                    environment_ids: placement_environment_ids,
+                    ..
+                } = placement
+                {
+                    *placement_environment_ids = environment_ids.clone().unwrap_or_default();
+                }
+            }
+            Ok(())
+        }
+
+        fn update_placements(
+            &self,
+            id: &SecretId,
+            placements: Vec<floria_store::ManagedPlacement>,
+        ) -> StoreResult<()> {
+            self.metadata.lock().unwrap().get_mut(id.as_str()).unwrap().placements = placements;
             Ok(())
         }
 

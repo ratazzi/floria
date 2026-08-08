@@ -2527,6 +2527,7 @@ impl ReplicationEngine {
                                 },
                                 mode: delta.descriptor.mode,
                                 enforcement: delta.descriptor.enforcement,
+                                placements: Vec::new(),
                             }),
                             &version.version_uuid,
                             version.generation,

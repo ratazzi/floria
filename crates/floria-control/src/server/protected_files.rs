@@ -83,8 +83,13 @@ pub(super) fn configure_managed_file(
     environment_id: Option<&str>,
 ) -> Result<ControlResult, DispatchError> {
     let (secret_id, record) = file_record(store, id)?;
-    let SecretOrigin::File { source_path } = &record.origin else { unreachable!() };
     let snapshot = catalog.snapshot()?;
+    let source_path = local_file_path(&snapshot, &record).ok_or_else(|| {
+        DispatchError::Validation(format!(
+            "{} has no applicable location on this Mac",
+            record.display_name()
+        ))
+    })?;
     let project = snapshot
         .projects
         .iter()
@@ -108,9 +113,8 @@ pub(super) fn configure_managed_file(
             source_path.display()
         )));
     }
-    let managed_link = managed_protected_file_link(&record, mount_path)
-        .map_err(|error| DispatchError::Validation(error.to_string()))?;
-    let actual = std::fs::read_link(source_path).map_err(|source| DispatchError::Io {
+    let managed_link = local_managed_file_link(&snapshot, &record, mount_path, &source_path)?;
+    let actual = std::fs::read_link(&source_path).map_err(|source| DispatchError::Io {
         path: source_path.clone(),
         source,
     })?;
@@ -121,7 +125,7 @@ pub(super) fn configure_managed_file(
         )));
     }
 
-    let (codec, format) = configurable_file_format(source_path)?;
+    let (codec, format) = configurable_file_format(&source_path)?;
     let plaintext = store.get(&secret_id)?;
     let decoded = decode_source(codec, id, &plaintext)
         .map_err(|error| DispatchError::Validation(error.to_string()))?;
@@ -527,10 +531,11 @@ pub(super) fn protected_file(
     mount_path: &Path,
     snapshot: &CatalogSnapshot,
 ) -> Option<ProtectedFile> {
-    let SecretOrigin::File { source_path } = &record.origin else { return None };
-    let source_path = source_path.clone();
-    let linked = managed_protected_file_link(&record, mount_path)
-        .and_then(|link| link.is_ready())
+    let source_path = local_file_path(snapshot, &record)?;
+    let linked = managed_file_links(snapshot, std::slice::from_ref(&record), mount_path)
+        .ok()
+        .and_then(|links| links.into_iter().find(|link| link.path() == source_path))
+        .and_then(|link| link.is_ready().ok())
         .unwrap_or(false);
     let environment_ids = effective_file_environment_ids(
         snapshot,
@@ -548,6 +553,51 @@ pub(super) fn protected_file(
         environment_ids,
         metadata: record.metadata,
     })
+}
+
+fn local_file_path(snapshot: &CatalogSnapshot, record: &SecretRecord) -> Option<PathBuf> {
+    if let Some(source_path) = record.source_path() {
+        return Some(source_path.to_path_buf());
+    }
+    for placement in &record.placements {
+        match placement {
+            ManagedPlacement::Project {
+                project_id,
+                relative_path,
+                ..
+            } => {
+                if let Some(project) =
+                    snapshot.projects.iter().find(|project| project.id == *project_id)
+                {
+                    return Some(project.path.join(relative_path));
+                }
+            }
+            ManagedPlacement::Home { relative_path } => {
+                if let Some(home) = std::env::var_os("HOME") {
+                    return Some(PathBuf::from(home).join(relative_path));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn local_managed_file_link(
+    snapshot: &CatalogSnapshot,
+    record: &SecretRecord,
+    mount_path: &Path,
+    path: &Path,
+) -> Result<ManagedSymlink, DispatchError> {
+    managed_file_links(snapshot, std::slice::from_ref(record), mount_path)
+        .map_err(|error| DispatchError::Validation(error.to_string()))?
+        .into_iter()
+        .find(|link| link.path() == path)
+        .ok_or_else(|| {
+            DispatchError::Validation(format!(
+                "{} has no applicable location on this Mac",
+                record.display_name()
+            ))
+        })
 }
 
 fn effective_file_environment_ids(
@@ -633,12 +683,21 @@ fn protect_file_with_initial_enforcement(
     })?;
     if metadata.file_type().is_symlink() {
         let snapshot = catalog.snapshot()?;
-        let record = store.get_by_path(&path)?.ok_or_else(|| {
+        let mut record = store.get_by_path(&path)?.ok_or_else(|| {
             DispatchError::Validation(format!(
                 "{} is a symlink not managed by Floria",
                 path.display()
             ))
         })?;
+        if record.placements.is_empty() {
+            let placements = portable_file_placements(&snapshot, &path)?;
+            if !placements.is_empty() {
+                store.update_placements(&record.id, placements)?;
+                record = store
+                    .record(&record.id)?
+                    .ok_or_else(|| StoreError::NotFound(record.id.to_string()))?;
+            }
+        }
         let managed_link = managed_protected_file_link(&record, mount_path)
             .map_err(|error| DispatchError::Validation(error.to_string()))?;
         let actual = std::fs::read_link(&path).map_err(|source| DispatchError::Io {
@@ -670,12 +729,18 @@ fn protect_file_with_initial_enforcement(
     // Opening with O_NOFOLLOW closes the race where a regular file becomes a symlink between
     // inspection and reading.
     let absolute = path;
+    let catalog_snapshot = catalog.snapshot()?;
+    let placements = portable_file_placements(&catalog_snapshot, &absolute)?;
     let (plaintext, file_snapshot) = read_protection_snapshot(&absolute)?;
     let mode = file_snapshot.mode() & 0o7777;
     let existing = store.get_by_path(&absolute)?;
     let mut previous_head = None;
     let (id, created) = match existing {
-        Some(record) => {
+        Some(mut record) => {
+            if record.placements.is_empty() && !placements.is_empty() {
+                store.update_placements(&record.id, placements.clone())?;
+                record.placements = placements.clone();
+            }
             let current = store.get(&record.id)?;
             if current.as_slice() != plaintext.as_slice() {
                 let snapshot = catalog.snapshot()?;
@@ -689,7 +754,8 @@ fn protect_file_with_initial_enforcement(
         None => (
             store.put(
                 NewSecret::file(absolute.clone(), mode)
-                    .with_enforcement(initial_enforcement),
+                    .with_enforcement(initial_enforcement)
+                    .with_placements(placements),
                 &plaintext,
             )?,
             true,
@@ -728,6 +794,38 @@ fn protect_file_with_initial_enforcement(
             .expect("new file protection has file-origin metadata"),
         created,
     })
+}
+
+fn portable_file_placements(
+    snapshot: &CatalogSnapshot,
+    source_path: &Path,
+) -> Result<Vec<ManagedPlacement>, DispatchError> {
+    if let Some(project) = snapshot
+        .projects
+        .iter()
+        .filter(|project| source_path.starts_with(&project.path))
+        .max_by_key(|project| project.path.components().count())
+    {
+        let relative = source_path.strip_prefix(&project.path).map_err(|_| {
+            DispatchError::Validation(format!(
+                "{} cannot be made relative to project {}",
+                source_path.display(),
+                project.path.display()
+            ))
+        })?;
+        return Ok(vec![ManagedPlacement::project(
+            project.id.clone(),
+            relative.to_path_buf(),
+            Vec::new(),
+        )?]);
+    }
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return Ok(Vec::new());
+    };
+    let Ok(relative) = source_path.strip_prefix(home) else {
+        return Ok(Vec::new());
+    };
+    Ok(vec![ManagedPlacement::home(relative.to_path_buf())?])
 }
 
 fn read_protection_snapshot(
@@ -828,8 +926,13 @@ pub(super) fn update_protected_file_metadata(
     metadata: ItemMetadata,
 ) -> Result<ControlResult, DispatchError> {
     let (id, record) = file_record(store, id)?;
-    let source_path = record.source_path().expect("validated file record");
     let snapshot = catalog.snapshot()?;
+    let source_path = local_file_path(&snapshot, &record).ok_or_else(|| {
+        DispatchError::Validation(format!(
+            "{} has no applicable location on this Mac",
+            record.display_name()
+        ))
+    })?;
     let project = snapshot
         .projects
         .iter()
@@ -882,7 +985,7 @@ pub(super) fn update_protected_file_metadata(
         protected_checkout_links(&snapshot, std::slice::from_ref(&updated_record), mount_path);
     remove_excluded_protected_checkout_links(&current_links, &next_links).map_err(|source| {
         DispatchError::Io {
-            path: source_path.to_path_buf(),
+            path: source_path.clone(),
             source,
         }
     })?;
@@ -991,10 +1094,14 @@ pub(super) fn restore_file(
             references.join(", ")
         )));
     }
-    let SecretOrigin::File { source_path } = &record.origin else { unreachable!() };
-    let managed_link = managed_protected_file_link(&record, mount_path)
-        .map_err(|error| DispatchError::Validation(error.to_string()))?;
-    let metadata = std::fs::symlink_metadata(source_path).map_err(|source| DispatchError::Io {
+    let source_path = local_file_path(&snapshot, &record).ok_or_else(|| {
+        DispatchError::Validation(format!(
+            "{} has no applicable location on this Mac",
+            record.display_name()
+        ))
+    })?;
+    let managed_link = local_managed_file_link(&snapshot, &record, mount_path, &source_path)?;
+    let metadata = std::fs::symlink_metadata(&source_path).map_err(|source| DispatchError::Io {
         path: source_path.clone(),
         source,
     })?;
@@ -1004,7 +1111,7 @@ pub(super) fn restore_file(
             source_path.display()
         )));
     }
-    let actual = std::fs::read_link(source_path).map_err(|source| DispatchError::Io {
+    let actual = std::fs::read_link(&source_path).map_err(|source| DispatchError::Io {
         path: source_path.clone(),
         source,
     })?;
@@ -1018,14 +1125,8 @@ pub(super) fn restore_file(
     }
 
     let plaintext = store.get(&id)?;
-    restore_protected_checkout_links(&snapshot, &record, &plaintext, mount_path).map_err(
-        |source| DispatchError::Io {
-            path: source_path.clone(),
-            source,
-        },
-    )?;
     let restored =
-        replace_symlink_with_file_if_target(source_path, &actual, &plaintext, record.mode)
+        replace_symlink_with_file_if_target(&source_path, &actual, &plaintext, record.mode)
             .map_err(|source| DispatchError::Io {
                 path: source_path.clone(),
                 source,
@@ -1036,6 +1137,12 @@ pub(super) fn restore_file(
             source_path.display()
         )));
     }
+    restore_protected_checkout_links(&snapshot, &record, &plaintext, mount_path).map_err(
+        |source| DispatchError::Io {
+            path: source_path.clone(),
+            source,
+        },
+    )?;
     let storage_deleted = match store.delete(&id) {
         Ok(()) => true,
         Err(error) => {
@@ -1043,7 +1150,7 @@ pub(super) fn restore_file(
             false
         }
     };
-    Ok(ControlResult::FileRestored { path: source_path.clone(), storage_deleted })
+    Ok(ControlResult::FileRestored { path: source_path, storage_deleted })
 }
 
 pub(super) fn file_record(
@@ -1054,7 +1161,7 @@ pub(super) fn file_record(
     let record = store
         .record(&id)?
         .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
-    if !matches!(&record.origin, SecretOrigin::File { .. }) {
+    if record.source_path().is_none() && record.placements.is_empty() {
         return Err(DispatchError::Validation(format!(
             "secret {id} is not a protected file"
         )));

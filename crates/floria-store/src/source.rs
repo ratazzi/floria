@@ -150,6 +150,7 @@ mod tests {
                 current_version: self.head.load(Ordering::Relaxed),
                 enforcement: floria_core::authz::Enforcement::Prompt,
                 environment_ids: None,
+                placements: Vec::new(),
                 metadata: ItemMetadata::default(),
             }))
         }
@@ -168,6 +169,14 @@ mod tests {
             _metadata: ItemMetadata,
             _enforcement: floria_core::authz::Enforcement,
             _environment_ids: Option<Vec<String>>,
+        ) -> StoreResult<()> {
+            unimplemented!()
+        }
+
+        fn update_placements(
+            &self,
+            _id: &SecretId,
+            _placements: Vec<crate::ManagedPlacement>,
         ) -> StoreResult<()> {
             unimplemented!()
         }

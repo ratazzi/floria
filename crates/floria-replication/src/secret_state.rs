@@ -5,24 +5,27 @@
 //! at all. Its portable descriptor can rebuild a Library item, while source paths and placement
 //! declarations remain separate concerns.
 
+use std::path::Component;
 use std::str::FromStr;
 
 use floria_core::authz::Enforcement;
 use floria_core::metadata::ItemMetadata;
-use floria_store::{AgeDirStore, SecretId, SecretOrigin, SecretRecord, SecretStore};
+use floria_store::{
+    AgeDirStore, ManagedPlacement, SecretId, SecretOrigin, SecretRecord, SecretStore,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::entity_document::EntityLifecycle;
 use crate::record::ImmutableObjectRef;
 use crate::{ReplicationError, ReplicationResult};
 
-const SECRET_STATE_FORMAT_VERSION: u32 = 2;
+const SECRET_STATE_FORMAT_VERSION: u32 = 3;
 const MAX_PORTABLE_LABEL_BYTES: usize = 255;
 
 /// Portable settings required to reconstruct a local Secret head document on a new Device.
 ///
-/// Source paths and placements are deliberately absent. A new Device initially creates a
-/// library item with this label; machine-local reconciliation attaches it to local paths later.
+/// Absolute source paths are deliberately absent. Portable Project/Home placements let a new
+/// Device rebuild links only after their local roots are available.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretDescriptorState {
     label: String,
@@ -30,6 +33,8 @@ pub struct SecretDescriptorState {
     enforcement: Enforcement,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     environment_ids: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    placements: Vec<ManagedPlacement>,
     #[serde(default, skip_serializing_if = "ItemMetadata::is_empty")]
     metadata: ItemMetadata,
 }
@@ -54,6 +59,7 @@ impl SecretDescriptorState {
             mode: record.mode,
             enforcement: record.enforcement,
             environment_ids,
+            placements: record.placements.clone(),
             metadata: record.metadata.clone(),
         }
     }
@@ -72,6 +78,10 @@ impl SecretDescriptorState {
 
     pub fn environment_ids(&self) -> Option<&[String]> {
         self.environment_ids.as_deref()
+    }
+
+    pub fn placements(&self) -> &[ManagedPlacement] {
+        &self.placements
     }
 
     pub fn metadata(&self) -> &ItemMetadata {
@@ -120,10 +130,59 @@ impl SecretDescriptorState {
                 previous = Some(environment_id.as_str());
             }
         }
+        validate_placements(&self.placements)?;
         self.metadata
             .validate()
             .map_err(ReplicationError::Invalid)
     }
+}
+
+fn validate_placements(placements: &[ManagedPlacement]) -> ReplicationResult<()> {
+    if placements.windows(2).any(|window| window[0] >= window[1]) {
+        return Err(ReplicationError::Invalid(
+            "secret descriptor placements must be sorted and unique".to_string(),
+        ));
+    }
+    for placement in placements {
+        let relative = placement.relative_path();
+        if relative.as_os_str().is_empty()
+            || relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(ReplicationError::Invalid(format!(
+                "secret placement path must be normalized and relative: {}",
+                relative.display()
+            )));
+        }
+        if let ManagedPlacement::Project {
+            project_id,
+            environment_ids,
+            ..
+        } = placement
+        {
+            validate_prefixed_uuid("project", project_id)?;
+            if environment_ids.windows(2).any(|window| window[0] >= window[1]) {
+                return Err(ReplicationError::Invalid(
+                    "placement environment ids must be sorted and unique".to_string(),
+                ));
+            }
+            for environment_id in environment_ids {
+                validate_prefixed_uuid("environment", environment_id)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_prefixed_uuid(prefix: &str, value: &str) -> ReplicationResult<()> {
+    let raw = value.strip_prefix(&format!("{prefix}-")).ok_or_else(|| {
+        ReplicationError::Invalid(format!("{prefix} id is invalid: {value:?}"))
+    })?;
+    uuid::Uuid::parse_str(raw)
+        .map(|_| ())
+        .map_err(|_| ReplicationError::Invalid(format!("{prefix} id is invalid: {value:?}")))
 }
 
 /// Transport-stable identity of one immutable encrypted Secret version.
@@ -329,7 +388,17 @@ mod tests {
                 NewSecret::file(
                     PathBuf::from("/Users/private/workspace/fixture/.env"),
                     0o640,
-                ),
+                )
+                .with_placements(vec![
+                    ManagedPlacement::project(
+                        "project-33333333-3333-4333-8333-333333333333",
+                        ".env",
+                        vec![
+                            "environment-22222222-2222-4222-8222-222222222222".to_string(),
+                        ],
+                    )
+                    .unwrap(),
+                ]),
                 b"private fixture",
             )
             .unwrap();
@@ -355,6 +424,10 @@ mod tests {
             document.descriptor().environment_ids(),
             Some([first_environment, second_environment].as_slice())
         );
+        assert_eq!(document.descriptor().placements().len(), 1);
+        assert!(encoded.windows(b"project-33333333".len()).any(|window| {
+            window == b"project-33333333"
+        }));
         assert!(!encoded
             .windows("/Users/private".len())
             .any(|window| window == b"/Users/private"));
