@@ -15,7 +15,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertNil(request["params"])
 
         let response = Data(
-            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":15,"daemon_version":"0.1.0","schema_version":14,"minimum_schema_version":14,"store_format_version":5,"minimum_store_format_version":5}}}"#.utf8)
+            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":16,"daemon_version":"0.1.0","schema_version":14,"minimum_schema_version":14,"store_format_version":5,"minimum_store_format_version":5}}}"#.utf8)
         let decoded = try JSONDecoder().decode(
             ControlResponseEnvelope<ControlServerInfo>.self, from: response)
         let info = try XCTUnwrap(decoded.result?.value)
@@ -189,6 +189,15 @@ final class ControlProtocolTests: XCTestCase {
             reviewRequest["method"] as? String,
             "record_sync_review_vault_enrollments")
 
+        let deviceReviewData = try ControlCommand.recordSyncReviewVaultDevices(
+            bootstrap: candidate
+        ).requestData(requestID: 78, encoder: encoder)
+        let deviceReviewRequest = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: deviceReviewData) as? [String: Any])
+        XCTAssertEqual(
+            deviceReviewRequest["method"] as? String,
+            "record_sync_review_vault_devices")
+
         let approvalData = try ControlCommand.recordSyncApproveVaultEnrollment(
             bootstrap: candidate, deviceID: "fixture-device",
             expectedFingerprint: "sha256:fixture"
@@ -201,6 +210,21 @@ final class ControlProtocolTests: XCTestCase {
             "record_sync_approve_vault_enrollment")
         XCTAssertEqual(
             approvalParams["expected_fingerprint"] as? String,
+            "sha256:fixture")
+
+        let revokeData = try ControlCommand.recordSyncRevokeVaultDevice(
+            bootstrap: candidate, deviceID: "fixture-device",
+            expectedFingerprint: "sha256:fixture"
+        ).requestData(requestID: 79, encoder: encoder)
+        let revokeRequest = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: revokeData) as? [String: Any])
+        let revokeParams = try XCTUnwrap(revokeRequest["params"] as? [String: Any])
+        XCTAssertEqual(
+            revokeRequest["method"] as? String,
+            "record_sync_revoke_vault_device")
+        XCTAssertEqual(revokeParams["device_id"] as? String, "fixture-device")
+        XCTAssertEqual(
+            revokeParams["expected_fingerprint"] as? String,
             "sha256:fixture")
 
         let activationData = try ControlCommand.recordSyncActivateVault(bootstrap: candidate)
@@ -290,6 +314,14 @@ final class ControlProtocolTests: XCTestCase {
             from: reviewsResponse)
         XCTAssertEqual(decodedReviews.result?.value?.first?.deviceName, "Studio")
         XCTAssertEqual(decodedReviews.result?.value?.first?.fingerprint, "sha256:fixture")
+
+        let devicesResponse = Data(
+            #"{"request_id":78,"status":"ok","result":{"type":"record_sync_vault_devices","value":[{"device_id":"fixture-device","device_name":"Studio","fingerprint":"sha256:fixture","enrolled_generation":1,"revoked_generation":null,"is_genesis":true,"is_current":true}]}}"#.utf8)
+        let decodedDevices = try JSONDecoder().decode(
+            ControlResponseEnvelope<[SyncVaultDevice]>.self,
+            from: devicesResponse)
+        XCTAssertEqual(decodedDevices.result?.value?.first?.deviceName, "Studio")
+        XCTAssertEqual(decodedDevices.result?.value?.first?.isCurrent, true)
 
         let activationResponse = Data(
             #"{"request_id":77,"status":"ok","result":{"type":"record_sync_vault_activation","value":{"status":"ready","vault_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","key_generation":2,"restart_required":true}}}"#.utf8)

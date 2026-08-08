@@ -227,7 +227,7 @@ final class CloudSyncServiceTests: XCTestCase {
         XCTAssertEqual(factory.vaultIDs, [targetVaultID])
     }
 
-    func testEnrollmentReviewAndApprovalStayInsideRustUntilTheNextExplicitSync() async throws {
+    func testLifecycleManagementStaysInsideRustUntilTheNextExplicitSync() async throws {
         let suiteName = "floria-cloud-sync-tests-\(UUID().uuidString)"
         let preferences = CloudSyncPreferences(suiteName: suiteName)
         preferences.setEnabled(true)
@@ -236,7 +236,16 @@ final class CloudSyncServiceTests: XCTestCase {
             deviceName: "Studio",
             requestedAt: "2026-08-08T12:00:00Z",
             fingerprint: "sha256:fixture")
-        let control = CloudSyncControlStub(status: status(), reviews: [review])
+        let device = SyncVaultDevice(
+            deviceID: review.deviceID,
+            deviceName: review.deviceName,
+            fingerprint: review.fingerprint,
+            enrolledGeneration: 1,
+            revokedGeneration: nil,
+            isGenesis: false,
+            isCurrent: false)
+        let control = CloudSyncControlStub(
+            status: status(), reviews: [review], devices: [device])
         let session = CloudSyncSessionStub()
         let service = CloudSyncService(
             control: control,
@@ -252,12 +261,18 @@ final class CloudSyncServiceTests: XCTestCase {
 
         let reviews = try await service.reviewEnrollments(in: bootstrap)
         let approved = try await service.approveEnrollment(review, in: bootstrap)
+        let devices = try await service.reviewDevices(in: bootstrap)
+        let revoked = try await service.revokeDevice(device, in: bootstrap)
         let syncCount = await session.syncCount
         let approvedFingerprints = await control.approvedFingerprints
+        let revokedFingerprints = await control.revokedFingerprints
         XCTAssertEqual(reviews, [review])
         XCTAssertEqual(approved, bootstrap)
+        XCTAssertEqual(devices, [device])
+        XCTAssertEqual(revoked, bootstrap)
         XCTAssertEqual(syncCount, 0)
         XCTAssertEqual(approvedFingerprints, [review.fingerprint])
+        XCTAssertEqual(revokedFingerprints, [device.fingerprint])
     }
 
     private func status() -> SyncDomainStatus {
@@ -315,16 +330,20 @@ private actor CloudSyncControlStub: CloudSyncControlling {
     private var status: SyncDomainStatus
     private let activation: SyncVaultActivation
     private let reviews: [SyncEnrollmentReview]
+    private let devices: [SyncVaultDevice]
     private(set) var statusCount = 0
     private(set) var approvedFingerprints = [String]()
+    private(set) var revokedFingerprints = [String]()
 
     init(
         status: SyncDomainStatus,
         activation: SyncVaultActivation? = nil,
-        reviews: [SyncEnrollmentReview] = []
+        reviews: [SyncEnrollmentReview] = [],
+        devices: [SyncVaultDevice] = []
     ) {
         self.status = status
         self.reviews = reviews
+        self.devices = devices
         self.activation = activation ?? .ready(
             vaultID: status.vaultID,
             keyGeneration: status.keyGeneration,
@@ -371,12 +390,27 @@ private actor CloudSyncControlStub: CloudSyncControlling {
         reviews
     }
 
+    func reviewRecordSyncVaultDevices(
+        bootstrap _: SyncVaultBootstrap
+    ) async throws -> [SyncVaultDevice] {
+        devices
+    }
+
     func approveRecordSyncVaultEnrollment(
         bootstrap: SyncVaultBootstrap,
         deviceID _: String,
         expectedFingerprint: String
     ) async throws -> SyncVaultBootstrap {
         approvedFingerprints.append(expectedFingerprint)
+        return bootstrap
+    }
+
+    func revokeRecordSyncVaultDevice(
+        bootstrap: SyncVaultBootstrap,
+        deviceID _: String,
+        expectedFingerprint: String
+    ) async throws -> SyncVaultBootstrap {
+        revokedFingerprints.append(expectedFingerprint)
         return bootstrap
     }
 

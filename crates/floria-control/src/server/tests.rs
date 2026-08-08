@@ -138,7 +138,9 @@
         bootstrap_validation_calls: AtomicUsize,
         enrollment_preparation_calls: AtomicUsize,
         enrollment_review_calls: AtomicUsize,
+        device_review_calls: AtomicUsize,
         enrollment_approval_calls: AtomicUsize,
+        device_revocation_calls: AtomicUsize,
         activation_calls: AtomicUsize,
         outbound_calls: AtomicUsize,
         settlement_calls: AtomicUsize,
@@ -200,6 +202,14 @@
             Ok(Vec::new())
         }
 
+        fn review_vault_devices(
+            &self,
+            _bootstrap: SyncVaultBootstrap,
+        ) -> Result<Vec<SyncVaultDevice>, String> {
+            self.device_review_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Vec::new())
+        }
+
         fn approve_vault_enrollment(
             &self,
             bootstrap: SyncVaultBootstrap,
@@ -208,6 +218,16 @@
         ) -> Result<SyncVaultBootstrap, String> {
             self.enrollment_approval_calls
                 .fetch_add(1, Ordering::Relaxed);
+            Ok(bootstrap)
+        }
+
+        fn revoke_vault_device(
+            &self,
+            bootstrap: SyncVaultBootstrap,
+            _device_id: &str,
+            _expected_fingerprint: &str,
+        ) -> Result<SyncVaultBootstrap, String> {
+            self.device_revocation_calls.fetch_add(1, Ordering::Relaxed);
             Ok(bootstrap)
         }
 
@@ -3031,7 +3051,25 @@
         ));
         assert!(matches!(
             client
+                .request(ControlCommand::RecordSyncReviewVaultDevices {
+                    bootstrap: bootstrap.clone(),
+                })
+                .unwrap(),
+            ControlResult::RecordSyncVaultDevices(_)
+        ));
+        assert!(matches!(
+            client
                 .request(ControlCommand::RecordSyncApproveVaultEnrollment {
+                    bootstrap: bootstrap.clone(),
+                    device_id: "fixture-device".to_string(),
+                    expected_fingerprint: "sha256:fixture".to_string(),
+                })
+                .unwrap(),
+            ControlResult::RecordSyncVaultBootstrap(_)
+        ));
+        assert!(matches!(
+            client
+                .request(ControlCommand::RecordSyncRevokeVaultDevice {
                     bootstrap: bootstrap.clone(),
                     device_id: "fixture-device".to_string(),
                     expected_fingerprint: "sha256:fixture".to_string(),
@@ -3091,8 +3129,13 @@
             record_sync.enrollment_review_calls.load(Ordering::Relaxed),
             1
         );
+        assert_eq!(record_sync.device_review_calls.load(Ordering::Relaxed), 1);
         assert_eq!(
             record_sync.enrollment_approval_calls.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            record_sync.device_revocation_calls.load(Ordering::Relaxed),
             1
         );
         assert_eq!(record_sync.activation_calls.load(Ordering::Relaxed), 1);
@@ -3360,8 +3403,20 @@
                 bootstrap: bootstrap.clone(),
             }
         ));
+        assert!(is_read_only(
+            &ControlCommand::RecordSyncReviewVaultDevices {
+                bootstrap: bootstrap.clone(),
+            }
+        ));
         assert!(!is_read_only(
             &ControlCommand::RecordSyncApproveVaultEnrollment {
+                bootstrap: bootstrap.clone(),
+                device_id: "fixture-device".to_string(),
+                expected_fingerprint: "sha256:fixture".to_string(),
+            }
+        ));
+        assert!(!is_read_only(
+            &ControlCommand::RecordSyncRevokeVaultDevice {
                 bootstrap: bootstrap.clone(),
                 device_id: "fixture-device".to_string(),
                 expected_fingerprint: "sha256:fixture".to_string(),

@@ -262,6 +262,19 @@ final class ControlClient: @unchecked Sendable {
         return reviews
     }
 
+    func reviewRecordSyncVaultDevices(
+        bootstrap: SyncVaultBootstrap
+    ) async throws -> [SyncVaultDevice] {
+        guard let devices: [SyncVaultDevice] = try await request(
+            .recordSyncReviewVaultDevices(bootstrap: bootstrap),
+            expecting: "record_sync_vault_devices",
+            as: [SyncVaultDevice].self)
+        else {
+            throw ControlClientError.missingResult("record_sync_vault_devices")
+        }
+        return devices
+    }
+
     func approveRecordSyncVaultEnrollment(
         bootstrap: SyncVaultBootstrap,
         deviceID: String,
@@ -277,6 +290,23 @@ final class ControlClient: @unchecked Sendable {
             throw ControlClientError.missingResult("record_sync_vault_bootstrap")
         }
         return approved
+    }
+
+    func revokeRecordSyncVaultDevice(
+        bootstrap: SyncVaultBootstrap,
+        deviceID: String,
+        expectedFingerprint: String
+    ) async throws -> SyncVaultBootstrap {
+        guard let revoked: SyncVaultBootstrap = try await request(
+            .recordSyncRevokeVaultDevice(
+                bootstrap: bootstrap, deviceID: deviceID,
+                expectedFingerprint: expectedFingerprint),
+            expecting: "record_sync_vault_bootstrap",
+            as: SyncVaultBootstrap.self)
+        else {
+            throw ControlClientError.missingResult("record_sync_vault_bootstrap")
+        }
+        return revoked
     }
 
     func activateRecordSyncVault(

@@ -20,7 +20,7 @@ use crate::record_crypto::RecordCryptor;
 use crate::record_journal::{OutboundCommit, RecordJournal};
 use crate::sync_bootstrap::{
     PreparedVaultMerge, SyncEnrollmentPreparation, SyncEnrollmentReview, SyncVaultActivation,
-    SyncVaultBootstrap,
+    SyncVaultBootstrap, SyncVaultDevice,
 };
 use crate::{ReplicationError, ReplicationResult};
 
@@ -458,6 +458,15 @@ impl<'a> RecordSyncControl<'a> {
         bootstrap.review_enrollments()
     }
 
+    /// Project authenticated enrolled Devices for the management UI.
+    pub fn review_vault_devices(
+        &self,
+        bootstrap: SyncVaultBootstrap,
+    ) -> ReplicationResult<Vec<SyncVaultDevice>> {
+        bootstrap.validate_for_vault(self.store.vault_document().vault_id.as_str())?;
+        bootstrap.review_devices(self.store.device().device_id())
+    }
+
     /// Approve exactly one reviewed request and return the updated authenticated
     /// bootstrap ready for atomic create-only publication.
     pub fn approve_vault_enrollment(
@@ -467,6 +476,20 @@ impl<'a> RecordSyncControl<'a> {
         expected_fingerprint: &str,
     ) -> ReplicationResult<SyncVaultBootstrap> {
         bootstrap.approve_enrollment(
+            std::sync::Arc::clone(&self.store),
+            device_id,
+            expected_fingerprint,
+        )
+    }
+
+    /// Remove exactly the Device identity whose fingerprint the user confirmed.
+    pub fn revoke_vault_device(
+        &self,
+        bootstrap: SyncVaultBootstrap,
+        device_id: &str,
+        expected_fingerprint: &str,
+    ) -> ReplicationResult<SyncVaultBootstrap> {
+        bootstrap.revoke_device(
             std::sync::Arc::clone(&self.store),
             device_id,
             expected_fingerprint,

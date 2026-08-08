@@ -2,7 +2,7 @@ import CloudKit
 import Foundation
 
 protocol CloudSyncControlling: RecordSyncControlling, VaultBootstrapControlling,
-    VaultEnrollmentControlling, VaultActivationControlling
+    VaultEnrollmentControlling, VaultDeviceControlling, VaultActivationControlling
 {
     func recordSyncStatus() async throws -> SyncDomainStatus
 }
@@ -209,6 +209,27 @@ actor CloudSyncService {
         session = nil
         sessionVaultID = nil
         return approved
+    }
+
+    func reviewDevices(in bootstrap: SyncVaultBootstrap) async throws -> [SyncVaultDevice] {
+        guard preferences.isEnabled else { throw CloudSyncServiceError.disabled }
+        return try await control.reviewRecordSyncVaultDevices(bootstrap: bootstrap)
+    }
+
+    /// Revocation rotates the Rust-owned Vault generation. The next explicit `syncNow()` publishes
+    /// the returned create-only lifecycle records to CloudKit.
+    func revokeDevice(
+        _ device: SyncVaultDevice,
+        in bootstrap: SyncVaultBootstrap
+    ) async throws -> SyncVaultBootstrap {
+        guard preferences.isEnabled else { throw CloudSyncServiceError.disabled }
+        let revoked = try await control.revokeRecordSyncVaultDevice(
+            bootstrap: bootstrap,
+            deviceID: device.deviceID,
+            expectedFingerprint: device.fingerprint)
+        session = nil
+        sessionVaultID = nil
+        return revoked
     }
 
     /// Activate one Rust-authenticated lifecycle snapshot. A different populated Vault is

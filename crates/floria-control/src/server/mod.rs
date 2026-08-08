@@ -46,7 +46,7 @@ use crate::protocol::{
     RecoveryKeyReport, ReplicationEnrollment, ReplicationStatus, SshIdentity, WorkspaceSnapshot,
     SyncDeliveryOutcome, SyncDomainStatus, SyncInboundBatch, SyncInboundReport, SyncOutboundBatch,
     SyncEnrollmentPreparation, SyncEnrollmentReview, SyncSettlementReport, SyncVaultActivation,
-    SyncVaultBootstrap,
+    SyncVaultBootstrap, SyncVaultDevice,
 };
 
 pub struct ControlServer {
@@ -165,7 +165,17 @@ pub trait RuntimeRecordSyncService: Send + Sync + 'static {
         &self,
         bootstrap: SyncVaultBootstrap,
     ) -> Result<Vec<SyncEnrollmentReview>, String>;
+    fn review_vault_devices(
+        &self,
+        bootstrap: SyncVaultBootstrap,
+    ) -> Result<Vec<SyncVaultDevice>, String>;
     fn approve_vault_enrollment(
+        &self,
+        bootstrap: SyncVaultBootstrap,
+        device_id: &str,
+        expected_fingerprint: &str,
+    ) -> Result<SyncVaultBootstrap, String>;
+    fn revoke_vault_device(
         &self,
         bootstrap: SyncVaultBootstrap,
         device_id: &str,
@@ -527,6 +537,7 @@ fn is_read_only(command: &ControlCommand) -> bool {
             | ControlCommand::RecordSyncValidateVaultBootstrap { .. }
             | ControlCommand::RecordSyncPrepareVaultEnrollment { .. }
             | ControlCommand::RecordSyncReviewVaultEnrollments { .. }
+            | ControlCommand::RecordSyncReviewVaultDevices { .. }
             | ControlCommand::RecordSyncNextOutbound { .. }
             | ControlCommand::Snapshot
             | ControlCommand::Discover { .. }

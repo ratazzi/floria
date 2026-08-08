@@ -241,6 +241,11 @@ fn dispatch_uncoordinated(
             .review_vault_enrollments(bootstrap)
             .map(ControlResult::RecordSyncEnrollmentReviews)
             .map_err(DispatchError::RecordSync),
+        ControlCommand::RecordSyncReviewVaultDevices { bootstrap } => record_sync
+            .ok_or_else(record_sync_unavailable)?
+            .review_vault_devices(bootstrap)
+            .map(ControlResult::RecordSyncVaultDevices)
+            .map_err(DispatchError::RecordSync),
         ControlCommand::RecordSyncApproveVaultEnrollment {
             bootstrap,
             device_id,
@@ -248,6 +253,15 @@ fn dispatch_uncoordinated(
         } => record_sync
             .ok_or_else(record_sync_unavailable)?
             .approve_vault_enrollment(bootstrap, &device_id, &expected_fingerprint)
+            .map(ControlResult::RecordSyncVaultBootstrap)
+            .map_err(DispatchError::RecordSync),
+        ControlCommand::RecordSyncRevokeVaultDevice {
+            bootstrap,
+            device_id,
+            expected_fingerprint,
+        } => record_sync
+            .ok_or_else(record_sync_unavailable)?
+            .revoke_vault_device(bootstrap, &device_id, &expected_fingerprint)
             .map(ControlResult::RecordSyncVaultBootstrap)
             .map_err(DispatchError::RecordSync),
         ControlCommand::RecordSyncActivateVault { bootstrap } => record_sync

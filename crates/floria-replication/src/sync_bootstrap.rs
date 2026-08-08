@@ -96,6 +96,21 @@ pub struct SyncEnrollmentReview {
     fingerprint: String,
 }
 
+/// Human-reviewable projection of one authenticated Device identity.
+///
+/// The transport never interprets the signed identity. Rust derives this view only after the
+/// complete Vault lifecycle has passed signature and generation-chain validation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncVaultDevice {
+    device_id: String,
+    device_name: Option<String>,
+    fingerprint: String,
+    enrolled_generation: u32,
+    revoked_generation: Option<u32>,
+    is_genesis: bool,
+    is_current: bool,
+}
+
 /// Result of explicitly activating an authenticated, enrolled Vault candidate.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -153,6 +168,28 @@ impl SyncEnrollmentReview {
 
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
+    }
+}
+
+impl SyncVaultDevice {
+    pub fn device_id(&self) -> &str {
+        &self.device_id
+    }
+
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    pub fn revoked_generation(&self) -> Option<u32> {
+        self.revoked_generation
+    }
+
+    pub fn is_genesis(&self) -> bool {
+        self.is_genesis
+    }
+
+    pub fn is_current(&self) -> bool {
+        self.is_current
     }
 }
 
@@ -480,6 +517,42 @@ impl SyncVaultBootstrap {
             .collect())
     }
 
+    /// Project authenticated Device identities without exposing their signing documents.
+    pub fn review_devices(
+        &self,
+        current_device_id: &str,
+    ) -> ReplicationResult<Vec<SyncVaultDevice>> {
+        let validated = self.validated(&self.vault_id)?;
+        let mut revoked = BTreeMap::<String, u32>::new();
+        for generation in validated.generations.values() {
+            for device_id in generation.revoked_devices.keys() {
+                revoked.entry(device_id.clone()).or_insert(generation.generation);
+            }
+        }
+        let mut devices = validated
+            .identities
+            .into_values()
+            .map(|identity| SyncVaultDevice {
+                fingerprint: vault::signing_key_fingerprint(&identity.signing_public_key),
+                revoked_generation: revoked.get(&identity.device_id).copied(),
+                is_genesis: identity.device_id == validated.vault.genesis_device_id,
+                is_current: identity.device_id == current_device_id,
+                device_id: identity.device_id,
+                device_name: identity.device_name,
+                enrolled_generation: identity.enrolled_generation,
+            })
+            .collect::<Vec<_>>();
+        devices.sort_by(|left, right| {
+            right
+                .is_current
+                .cmp(&left.is_current)
+                .then(left.revoked_generation.is_some().cmp(&right.revoked_generation.is_some()))
+                .then(left.device_name.cmp(&right.device_name))
+                .then(left.device_id.cmp(&right.device_id))
+        });
+        Ok(devices)
+    }
+
     /// Approve exactly the request whose fingerprint the user compared out of band.
     /// Signing the Device identity and wrapping every historical generation are one
     /// idempotent Rust lifecycle action; callers never handle either private key.
@@ -504,6 +577,83 @@ impl SyncVaultBootstrap {
         }
         let mut package = ReplicationPackage::for_store(std::sync::Arc::clone(&store))?;
         package.enroll_device(request.enrollment())?;
+        SyncVaultBootstrap::capture(&store)
+    }
+
+    /// Revoke exactly the authenticated Device identity the user reviewed, rotate the Vault data
+    /// key, and return the complete lifecycle ready for create-only publication.
+    ///
+    /// Existing ciphertext remains readable by that Device; key rotation fences it from every
+    /// later version. Version 1 reserves the revocation sequence for the generic operation-log
+    /// transport, so coordinated-record sync records zero here and relies on generation keys.
+    pub fn revoke_device(
+        &self,
+        store: std::sync::Arc<AgeDirStore>,
+        device_id: &str,
+        expected_fingerprint: &str,
+    ) -> ReplicationResult<SyncVaultBootstrap> {
+        let current_vault_id = store.vault_document().vault_id;
+        let validated = self.validated(&current_vault_id)?;
+        verify_local_device_access(self, &validated, &store.device())?;
+        if store.device().device_id() != validated.vault.genesis_device_id {
+            return Err(ReplicationError::Invalid(
+                "only the first Mac may remove another Mac in version 1".to_string(),
+            ));
+        }
+
+        // Bring create-only lifecycle additions observed through CloudKit into the local Store
+        // before rotating. Any route collision fails closed and leaves the current generation.
+        materialize_lifecycle(self, &store.shared_root())?;
+        store.refresh_shared_lifecycle(&current_vault_id)?;
+        let current = SyncVaultBootstrap::capture(&store)?;
+        let validated = current.validated(&current_vault_id)?;
+        if device_id == validated.vault.genesis_device_id
+            || device_id == store.device().device_id()
+        {
+            return Err(ReplicationError::Invalid(
+                "the first Mac cannot remove itself in version 1".to_string(),
+            ));
+        }
+        let target = validated.identities.get(device_id).ok_or_else(|| {
+            ReplicationError::Invalid(format!("Device {device_id} is not enrolled"))
+        })?;
+        let actual_fingerprint = vault::signing_key_fingerprint(&target.signing_public_key);
+        if actual_fingerprint != expected_fingerprint {
+            return Err(ReplicationError::Invalid(format!(
+                "Device fingerprint changed for Device {device_id}"
+            )));
+        }
+
+        let revoked = validated
+            .generations
+            .values()
+            .flat_map(|generation| generation.revoked_devices.keys().cloned())
+            .collect::<BTreeSet<_>>();
+        if revoked.contains(device_id) {
+            return Err(ReplicationError::Invalid(format!(
+                "Device {device_id} is already removed"
+            )));
+        }
+        let recipients = validated
+            .identities
+            .iter()
+            .filter(|(candidate_id, _)| {
+                candidate_id.as_str() != device_id && !revoked.contains(candidate_id.as_str())
+            })
+            .map(|(candidate_id, identity)| {
+                let recipient = x25519::Recipient::from_str(&identity.wrapping_recipient)
+                    .map_err(|error| {
+                        ReplicationError::Invalid(format!(
+                            "invalid Device wrapping recipient for {candidate_id}: {error}"
+                        ))
+                    })?;
+                Ok((candidate_id.clone(), recipient))
+            })
+            .collect::<ReplicationResult<BTreeMap<_, _>>>()?;
+        store.rotate_generation(
+            &recipients,
+            BTreeMap::from([(device_id.to_string(), 0)]),
+        )?;
         SyncVaultBootstrap::capture(&store)
     }
 
@@ -677,7 +827,7 @@ fn materialize_lifecycle(
     vault::ensure_private_directory(&layout.operations_dir())?;
     vault::ensure_private_directory(&layout.checkpoints_dir())?;
 
-    vault::publish_immutable(
+    publish_json_immutable(
         &layout.vault_json(),
         &decode_bounded(
             &bootstrap.vault_document_base64,
@@ -687,7 +837,7 @@ fn materialize_lifecycle(
     )?;
     for routed in &bootstrap.device_identities {
         vault::ensure_private_directory(&layout.device_dir(&routed.route))?;
-        vault::publish_immutable(
+        publish_json_immutable(
             &layout.device_identity(&routed.route),
             &decode_bounded(
                 &routed.document_base64,
@@ -698,7 +848,7 @@ fn materialize_lifecycle(
     }
     for routed in &bootstrap.enrollment_requests {
         vault::ensure_private_directory(&layout.device_dir(&routed.route))?;
-        vault::publish_immutable(
+        publish_json_immutable(
             &layout.enrollment_request(&routed.route),
             &decode_bounded(
                 &routed.document_base64,
@@ -728,7 +878,7 @@ fn materialize_lifecycle(
                 routed.route
             ))
         })?;
-        vault::publish_immutable(
+        publish_json_immutable(
             &layout.generation_document(generation),
             &decode_bounded(
                 &routed.document_base64,
@@ -736,6 +886,41 @@ fn materialize_lifecycle(
                 MAX_DESCRIPTOR_BYTES as usize,
             )?,
         )?;
+    }
+    Ok(())
+}
+
+/// Publish signed JSON create-only while tolerating insignificant serialization differences.
+/// Ciphertext and encrypted envelopes continue to use byte identity; only JSON whitespace and
+/// object-key order are normalized here, after the complete bootstrap has already been verified.
+fn publish_json_immutable(path: &Path, candidate: &[u8]) -> ReplicationResult<()> {
+    let existing = match vault::read_untrusted_file(path, MAX_DESCRIPTOR_BYTES) {
+        Ok(existing) => existing,
+        Err(floria_store::StoreError::Io { source, .. })
+            if source.kind() == io::ErrorKind::NotFound =>
+        {
+            return vault::publish_immutable(path, candidate).map_err(Into::into);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let existing_value = serde_json::from_slice::<serde_json::Value>(&existing).map_err(|error| {
+        ReplicationError::Invalid(format!(
+            "existing signed document {} is invalid JSON: {error}",
+            path.display()
+        ))
+    })?;
+    let candidate_value =
+        serde_json::from_slice::<serde_json::Value>(candidate).map_err(|error| {
+            ReplicationError::Invalid(format!(
+                "candidate signed document {} is invalid JSON: {error}",
+                path.display()
+            ))
+        })?;
+    if existing_value != candidate_value {
+        return Err(ReplicationError::Invalid(format!(
+            "signed document collision at {}",
+            path.display()
+        )));
     }
     Ok(())
 }
@@ -1124,6 +1309,106 @@ mod tests {
             )
             .unwrap();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn device_review_is_authenticated_and_marks_the_current_mac() {
+        let genesis_directory = tempfile::tempdir().unwrap();
+        let joining_directory = tempfile::tempdir().unwrap();
+        let genesis = store(&genesis_directory);
+        let joining = store(&joining_directory);
+        let approved = approved_bootstrap(&genesis, &joining);
+
+        let devices = approved.review_devices(genesis.device().device_id()).unwrap();
+
+        assert_eq!(devices.len(), 2);
+        assert!(devices[0].is_current());
+        assert!(devices[0].is_genesis());
+        assert_eq!(devices[1].device_id(), joining.device().device_id());
+        assert_eq!(devices[1].revoked_generation(), None);
+    }
+
+    #[test]
+    fn revocation_requires_the_reviewed_fingerprint_and_rotates_the_generation() {
+        let genesis_directory = tempfile::tempdir().unwrap();
+        let joining_directory = tempfile::tempdir().unwrap();
+        let genesis = store(&genesis_directory);
+        let joining = store(&joining_directory);
+        let approved = approved_bootstrap(&genesis, &joining);
+        let target = approved
+            .review_devices(genesis.device().device_id())
+            .unwrap()
+            .into_iter()
+            .find(|device| device.device_id() == joining.device().device_id())
+            .unwrap();
+
+        let mismatched = approved
+            .revoke_device(
+                Arc::clone(&genesis),
+                target.device_id(),
+                "00-00-00-00-00-00",
+            )
+            .unwrap_err();
+        assert!(
+            mismatched.to_string().contains("fingerprint changed"),
+            "unexpected revocation error: {mismatched}"
+        );
+        assert_eq!(genesis.current_generation().unwrap(), 1);
+
+        let revoked = approved
+            .revoke_device(
+                Arc::clone(&genesis),
+                target.device_id(),
+                target.fingerprint(),
+            )
+            .unwrap();
+        assert_eq!(genesis.current_generation().unwrap(), 2);
+        let removed = revoked
+            .review_devices(genesis.device().device_id())
+            .unwrap()
+            .into_iter()
+            .find(|device| device.device_id() == joining.device().device_id())
+            .unwrap();
+        assert_eq!(removed.revoked_generation(), Some(2));
+        assert!(revoked
+            .generation_envelopes()
+            .iter()
+            .all(|envelope| {
+                envelope.device_id() != joining.device().device_id()
+                    || envelope.generation() != 2
+            }));
+        assert!(revoked
+            .activate(Arc::clone(&joining), 0)
+            .unwrap_err()
+            .to_string()
+            .contains("has no envelope"));
+    }
+
+    #[test]
+    fn only_the_genesis_mac_can_revoke_another_device() {
+        let genesis_directory = tempfile::tempdir().unwrap();
+        let joining_directory = tempfile::tempdir().unwrap();
+        let genesis = store(&genesis_directory);
+        let joining = store(&joining_directory);
+        let approved = approved_bootstrap(&genesis, &joining);
+        approved.activate(Arc::clone(&joining), 0).unwrap();
+        let genesis_device = approved
+            .review_devices(joining.device().device_id())
+            .unwrap()
+            .into_iter()
+            .find(|device| device.is_genesis())
+            .unwrap();
+
+        assert!(approved
+            .revoke_device(
+                Arc::clone(&joining),
+                genesis_device.device_id(),
+                genesis_device.fingerprint(),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("only the first Mac"));
+        assert_eq!(joining.current_generation().unwrap(), 1);
     }
 
     #[test]

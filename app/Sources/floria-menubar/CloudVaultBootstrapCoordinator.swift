@@ -29,6 +29,19 @@ protocol VaultEnrollmentControlling: Sendable {
 
 extension ControlClient: VaultEnrollmentControlling {}
 
+protocol VaultDeviceControlling: Sendable {
+    func reviewRecordSyncVaultDevices(
+        bootstrap: SyncVaultBootstrap
+    ) async throws -> [SyncVaultDevice]
+    func revokeRecordSyncVaultDevice(
+        bootstrap: SyncVaultBootstrap,
+        deviceID: String,
+        expectedFingerprint: String
+    ) async throws -> SyncVaultBootstrap
+}
+
+extension ControlClient: VaultDeviceControlling {}
+
 protocol VaultActivationControlling: Sendable {
     func activateRecordSyncVault(
         bootstrap: SyncVaultBootstrap

@@ -1390,6 +1390,16 @@ impl RuntimeRecordSyncService for DaemonRecordSyncService {
         })
     }
 
+    fn review_vault_devices(
+        &self,
+        bootstrap: SyncVaultBootstrap,
+    ) -> Result<Vec<floria_replication::sync_bootstrap::SyncVaultDevice>, String> {
+        self.with_journal(|journal| {
+            RecordSyncControl::new(journal, Arc::clone(&self.store))
+                .review_vault_devices(bootstrap)
+        })
+    }
+
     fn approve_vault_enrollment(
         &self,
         bootstrap: SyncVaultBootstrap,
@@ -1400,6 +1410,20 @@ impl RuntimeRecordSyncService for DaemonRecordSyncService {
             self.with_journal(|journal| {
                 RecordSyncControl::new(journal, Arc::clone(&self.store))
                     .approve_vault_enrollment(bootstrap, device_id, expected_fingerprint)
+            })
+        })
+    }
+
+    fn revoke_vault_device(
+        &self,
+        bootstrap: SyncVaultBootstrap,
+        device_id: &str,
+        expected_fingerprint: &str,
+    ) -> Result<SyncVaultBootstrap, String> {
+        self.mutations.run(|| {
+            self.with_journal(|journal| {
+                RecordSyncControl::new(journal, Arc::clone(&self.store))
+                    .revoke_vault_device(bootstrap, device_id, expected_fingerprint)
             })
         })
     }
@@ -2619,6 +2643,9 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
         }
         ControlResult::RecordSyncEnrollmentReviews(reviews) => {
             println!("{}", serde_json::to_string_pretty(&reviews)?);
+        }
+        ControlResult::RecordSyncVaultDevices(devices) => {
+            println!("{}", serde_json::to_string_pretty(&devices)?);
         }
         ControlResult::RecordSyncVaultActivation(activation) => {
             println!("{}", serde_json::to_string_pretty(&activation)?);

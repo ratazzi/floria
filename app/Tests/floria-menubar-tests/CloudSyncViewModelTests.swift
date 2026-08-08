@@ -79,6 +79,33 @@ final class CloudSyncViewModelTests: XCTestCase {
         XCTAssertNil(model.errorMessage)
     }
 
+    func testRevokingAMacUsesTheReviewedDeviceFingerprint() async {
+        let vaultID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let device = SyncVaultDevice(
+            deviceID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            deviceName: "Old Mac",
+            fingerprint: "AB12-CD34-EF56",
+            enrolledGeneration: 1,
+            revokedGeneration: nil,
+            isGenesis: false,
+            isCurrent: false)
+        let service = CloudSyncViewServiceStub(
+            status: status(vaultID: vaultID),
+            candidates: [],
+            bootstrap: bootstrap(vaultID: vaultID),
+            devices: [device])
+        let model = CloudSyncViewModel(service: service, restartDaemon: {})
+
+        await model.load()
+        await model.syncNow()
+        await model.revoke(device)
+
+        let revoked = await service.revokedDevices
+        XCTAssertEqual(model.devices, [device])
+        XCTAssertEqual(revoked, [device])
+        XCTAssertNil(model.errorMessage)
+    }
+
     private func status(vaultID: String) -> SyncDomainStatus {
         SyncDomainStatus(
             vaultID: vaultID,
@@ -116,19 +143,23 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
     private let bootstrap: SyncVaultBootstrap?
     private let enrollment: SyncEnrollmentPreparation
     private let activation: SyncVaultActivation
+    private let devices: [SyncVaultDevice]
     private var restartTarget: String?
+    private(set) var revokedDevices = [SyncVaultDevice]()
 
     init(
         status: SyncDomainStatus,
         candidates: [CloudVaultCandidate],
         bootstrap: SyncVaultBootstrap? = nil,
         enrollment: SyncEnrollmentPreparation = .alreadyEnrolled(deviceID: "local"),
+        devices: [SyncVaultDevice] = [],
         activation: SyncVaultActivation? = nil
     ) {
         self.status = status
         self.candidates = candidates
         self.bootstrap = bootstrap
         self.enrollment = enrollment
+        self.devices = devices
         self.activation = activation ?? .ready(
             vaultID: status.vaultID,
             keyGeneration: status.keyGeneration,
@@ -190,6 +221,18 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
         in bootstrap: SyncVaultBootstrap
     ) async throws -> SyncVaultBootstrap {
         bootstrap
+    }
+
+    func reviewDevices(in _: SyncVaultBootstrap) async throws -> [SyncVaultDevice] {
+        devices
+    }
+
+    func revokeDevice(
+        _ device: SyncVaultDevice,
+        in bootstrap: SyncVaultBootstrap
+    ) async throws -> SyncVaultBootstrap {
+        revokedDevices.append(device)
+        return bootstrap
     }
 
     func activateVault(_ _: SyncVaultBootstrap) async throws -> SyncVaultActivation {

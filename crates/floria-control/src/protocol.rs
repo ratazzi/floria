@@ -16,7 +16,7 @@ pub use floria_replication::sync_control::{
 };
 pub use floria_replication::sync_bootstrap::{
     SyncBootstrapDocument, SyncBootstrapEnvelope, SyncEnrollmentPreparation,
-    SyncEnrollmentReview, SyncVaultActivation, SyncVaultBootstrap,
+    SyncEnrollmentReview, SyncVaultActivation, SyncVaultBootstrap, SyncVaultDevice,
 };
 use floria_store::StoreError;
 use serde::de::DeserializeOwned;
@@ -25,7 +25,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 const MAX_MSG: usize = 8 << 20;
 pub(crate) const MAX_RECORD_SYNC_BATCH_BYTES: usize = 6 << 20;
-pub const CONTROL_PROTOCOL_VERSION: u32 = 15;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 16;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRequest {
@@ -106,7 +106,15 @@ pub enum ControlCommand {
     RecordSyncReviewVaultEnrollments {
         bootstrap: SyncVaultBootstrap,
     },
+    RecordSyncReviewVaultDevices {
+        bootstrap: SyncVaultBootstrap,
+    },
     RecordSyncApproveVaultEnrollment {
+        bootstrap: SyncVaultBootstrap,
+        device_id: String,
+        expected_fingerprint: String,
+    },
+    RecordSyncRevokeVaultDevice {
         bootstrap: SyncVaultBootstrap,
         device_id: String,
         expected_fingerprint: String,
@@ -265,6 +273,7 @@ pub enum ControlResult {
     RecordSyncVaultBootstrap(SyncVaultBootstrap),
     RecordSyncEnrollmentPreparation(SyncEnrollmentPreparation),
     RecordSyncEnrollmentReviews(Vec<SyncEnrollmentReview>),
+    RecordSyncVaultDevices(Vec<SyncVaultDevice>),
     RecordSyncVaultActivation(SyncVaultActivation),
     RecordSyncOutbound(SyncOutboundBatch),
     RecordSyncSettlement(SyncSettlementReport),
@@ -1707,6 +1716,18 @@ mod tests {
             "record_sync_review_vault_enrollments"
         );
 
+        let device_review_request = serde_json::to_value(ControlRequest {
+            request_id: 50,
+            command: ControlCommand::RecordSyncReviewVaultDevices {
+                bootstrap: bootstrap.clone(),
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            device_review_request["method"],
+            "record_sync_review_vault_devices"
+        );
+
         let approval_request = serde_json::to_value(ControlRequest {
             request_id: 48,
             command: ControlCommand::RecordSyncApproveVaultEnrollment {
@@ -1722,6 +1743,24 @@ mod tests {
         );
         assert_eq!(
             approval_request["params"]["expected_fingerprint"],
+            "sha256:fixture"
+        );
+
+        let revocation_request = serde_json::to_value(ControlRequest {
+            request_id: 51,
+            command: ControlCommand::RecordSyncRevokeVaultDevice {
+                bootstrap: bootstrap.clone(),
+                device_id: "fixture-device".to_string(),
+                expected_fingerprint: "sha256:fixture".to_string(),
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            revocation_request["method"],
+            "record_sync_revoke_vault_device"
+        );
+        assert_eq!(
+            revocation_request["params"]["expected_fingerprint"],
             "sha256:fixture"
         );
 

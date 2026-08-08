@@ -19,6 +19,11 @@ protocol CloudSyncServicing: Sendable {
         _ review: SyncEnrollmentReview,
         in bootstrap: SyncVaultBootstrap
     ) async throws -> SyncVaultBootstrap
+    func reviewDevices(in bootstrap: SyncVaultBootstrap) async throws -> [SyncVaultDevice]
+    func revokeDevice(
+        _ device: SyncVaultDevice,
+        in bootstrap: SyncVaultBootstrap
+    ) async throws -> SyncVaultBootstrap
     func activateVault(_ bootstrap: SyncVaultBootstrap) async throws -> SyncVaultActivation
 }
 
@@ -36,6 +41,7 @@ final class CloudSyncViewModel {
     var candidates = [CloudVaultCandidate]()
     var enrollmentRequest: SyncEnrollmentRequest?
     var approvals = [SyncEnrollmentReview]()
+    var devices = [SyncVaultDevice]()
     var notice: String?
     var errorMessage: String?
 
@@ -64,6 +70,7 @@ final class CloudSyncViewModel {
             candidates = []
             enrollmentRequest = nil
             approvals = []
+            devices = []
             joiningBootstrap = nil
         }
     }
@@ -73,7 +80,7 @@ final class CloudSyncViewModel {
             let status = try await self.service.syncNow()
             self.status = status
             self.notice = "Your encrypted Library is up to date in iCloud."
-            try await self.loadApprovals(for: status.vaultID)
+            try await self.loadDeviceManagement(for: status.vaultID)
         }
     }
 
@@ -111,8 +118,20 @@ final class CloudSyncViewModel {
             _ = try await self.service.approveEnrollment(review, in: bootstrap)
             let updated = try await self.service.syncNow()
             self.status = updated
-            try await self.loadApprovals(for: updated.vaultID)
+            try await self.loadDeviceManagement(for: updated.vaultID)
             self.notice = "\(review.deviceName ?? "The other Mac") can now use this Library."
+        }
+    }
+
+    func revoke(_ device: SyncVaultDevice) async {
+        guard let vaultID = status?.vaultID else { return }
+        await perform {
+            let bootstrap = try await self.service.authenticateVault(vaultID)
+            _ = try await self.service.revokeDevice(device, in: bootstrap)
+            let updated = try await self.service.syncNow()
+            self.status = updated
+            try await self.loadDeviceManagement(for: updated.vaultID)
+            self.notice = "\(device.deviceName ?? "The other Mac") was removed from this Library."
         }
     }
 
@@ -155,6 +174,7 @@ final class CloudSyncViewModel {
         candidates = []
         joiningBootstrap = nil
         approvals = []
+        devices = []
         notice = "This Mac now uses your iCloud Library."
     }
 
@@ -167,9 +187,10 @@ final class CloudSyncViewModel {
         throw CloudSyncViewError.daemonRestartTimedOut
     }
 
-    private func loadApprovals(for vaultID: String) async throws {
+    private func loadDeviceManagement(for vaultID: String) async throws {
         let bootstrap = try await service.authenticateVault(vaultID)
         approvals = try await service.reviewEnrollments(in: bootstrap)
+        devices = try await service.reviewDevices(in: bootstrap)
     }
 
     private func perform(_ operation: @escaping () async throws -> Void) async {
@@ -200,6 +221,7 @@ struct SyncView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var model: CloudSyncViewModel
     @State private var pendingApproval: SyncEnrollmentReview?
+    @State private var pendingRemoval: SyncVaultDevice?
 
     init(
         service: any CloudSyncServicing,
@@ -224,6 +246,9 @@ struct SyncView: View {
                         }
                         if !model.approvals.isEmpty {
                             approvalsSection
+                        }
+                        if !model.devices.isEmpty {
+                            devicesSection
                         }
                         if !model.candidates.isEmpty {
                             candidatesSection
@@ -273,6 +298,23 @@ struct SyncView: View {
         } message: { review in
             Text(
                 "Only approve if \(review.deviceName ?? "the other Mac") shows exactly this code: \(review.fingerprint)"
+            )
+        }
+        .confirmationDialog(
+            "Remove Mac from Library?",
+            isPresented: Binding(
+                get: { pendingRemoval != nil },
+                set: { if !$0 { pendingRemoval = nil } }),
+            presenting: pendingRemoval
+        ) { device in
+            Button("Remove Mac", role: .destructive) {
+                pendingRemoval = nil
+                Task { await model.revoke(device) }
+            }
+            Button("Cancel", role: .cancel) { pendingRemoval = nil }
+        } message: { device in
+            Text(
+                "\(device.deviceName ?? "This Mac") will keep data it already received, but cannot decrypt future changes. Floria will rotate the Library encryption key."
             )
         }
     }
@@ -401,6 +443,60 @@ struct SyncView: View {
             }
         }
         .disabled(model.isWorking)
+    }
+
+    private var devicesSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Macs")
+                .font(.headline)
+            ForEach(model.devices, id: \.deviceID) { device in
+                HStack(spacing: 12) {
+                    Image(systemName: device.isCurrent ? "laptopcomputer.and.arrow.down" : "laptopcomputer")
+                        .foregroundStyle(device.revokedGeneration == nil ? .blue : .secondary)
+                        .frame(width: 28)
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack(spacing: 6) {
+                            Text(device.deviceName ?? "Mac")
+                                .font(.callout.weight(.medium))
+                            if device.isCurrent {
+                                Text("This Mac")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            } else if device.isGenesis {
+                                Text("First Mac")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            } else if device.revokedGeneration != nil {
+                                Text("Removed")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        Text(device.fingerprint)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(.secondary)
+                            .textSelection(.enabled)
+                    }
+                    Spacer()
+                    if canRemoveDevices,
+                       !device.isCurrent,
+                       !device.isGenesis,
+                       device.revokedGeneration == nil
+                    {
+                        Button("Remove…", role: .destructive) {
+                            pendingRemoval = device
+                        }
+                    }
+                }
+                .padding(12)
+                .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+            }
+        }
+        .disabled(model.isWorking)
+    }
+
+    private var canRemoveDevices: Bool {
+        model.devices.contains { $0.isCurrent && $0.isGenesis }
     }
 
     private var candidatesSection: some View {
