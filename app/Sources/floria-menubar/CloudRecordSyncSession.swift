@@ -489,9 +489,11 @@ enum CloudRecordSyncSessionError: Error, Equatable, LocalizedError {
 
     var errorDescription: String? {
         switch self {
-        case .activationRequired(let message), .accountChanged(let message),
-            .cloudKit(let message), .damaged(let message), .transport(let message):
+        case .activationRequired(let message), .cloudKit(let message), .damaged(let message),
+            .transport(let message):
             message
+        case .accountChanged:
+            "Your iCloud account changed. Review the current account in System Settings, then choose Sync Now again."
         case .retryPending:
             "CloudKit has retained this batch for a later retry"
         case .sendAlreadyInProgress:

@@ -72,6 +72,44 @@ final class CloudSyncServiceTests: XCTestCase {
         XCTAssertEqual(statusCount, 0)
     }
 
+    func testFailedManualSessionIsRebuiltFromTheDurableCheckpointOnRetry() async throws {
+        let suiteName = "floria-cloud-sync-tests-\(UUID().uuidString)"
+        let preferences = CloudSyncPreferences(suiteName: suiteName)
+        preferences.setEnabled(true)
+        let failedSession = CloudSyncSessionStub(
+            failure: .accountChanged("The iCloud account changed during synchronization"))
+        let recoveredSession = CloudSyncSessionStub()
+        let factory = CloudSyncSequenceFactory(sessions: [failedSession, recoveredSession])
+        let service = CloudSyncService(
+            control: CloudSyncControlStub(status: status()),
+            supportDirectory: FileManager.default.temporaryDirectory,
+            preferences: preferences,
+            sessionFactory: { control, supportDirectory, vaultID in
+                try factory.make(
+                    control: control,
+                    supportDirectory: supportDirectory,
+                    vaultID: vaultID)
+            })
+        defer { UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName) }
+
+        do {
+            _ = try await service.syncNow()
+            XCTFail("Expected the account change to stop this manual sync")
+        } catch let error as CloudRecordSyncSessionError {
+            guard case .accountChanged = error else {
+                return XCTFail("Expected an account-change failure, received \(error)")
+            }
+        }
+
+        let recovered = try await service.syncNow()
+        let failedSyncCount = await failedSession.syncCount
+        let recoveredSyncCount = await recoveredSession.syncCount
+        XCTAssertEqual(recovered, status())
+        XCTAssertEqual(factory.count, 2)
+        XCTAssertEqual(failedSyncCount, 1)
+        XCTAssertEqual(recoveredSyncCount, 1)
+    }
+
     func testVaultDiscoveryAndAuthenticationAreExplicitAndLazilyConstructed() async throws {
         let suiteName = "floria-cloud-sync-tests-\(UUID().uuidString)"
         let preferences = CloudSyncPreferences(suiteName: suiteName)
@@ -320,9 +358,41 @@ private final class CloudSyncFactoryProbe: @unchecked Sendable {
 
 private actor CloudSyncSessionStub: CloudSyncSessionRunning {
     private(set) var syncCount = 0
+    private let failure: CloudRecordSyncSessionError?
+
+    init(failure: CloudRecordSyncSessionError? = nil) {
+        self.failure = failure
+    }
 
     func syncNow() async throws {
         syncCount += 1
+        if let failure { throw failure }
+    }
+}
+
+private final class CloudSyncSequenceFactory: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sessions: [any CloudSyncSessionRunning]
+    private var constructions = 0
+
+    init(sessions: [any CloudSyncSessionRunning]) {
+        precondition(!sessions.isEmpty)
+        self.sessions = sessions
+    }
+
+    var count: Int {
+        lock.withLock { constructions }
+    }
+
+    func make(
+        control _: any CloudSyncControlling,
+        supportDirectory _: URL,
+        vaultID _: String
+    ) throws -> any CloudSyncSessionRunning {
+        lock.withLock {
+            constructions += 1
+            return sessions.removeFirst()
+        }
     }
 }
 

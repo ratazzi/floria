@@ -280,7 +280,18 @@ actor CloudSyncService {
             session = activeSession
             sessionVaultID = before.vaultID
         }
-        try await activeSession.syncNow()
+        do {
+            try await activeSession.syncNow()
+        } catch {
+            // A failed CKSyncEngine session may have advanced only in-memory tokens or retained a
+            // terminal account-change failure. The durable checkpoint and Rust outbox are the
+            // recovery boundary, so the user's next explicit Sync Now must start a fresh session.
+            if sessionVaultID == before.vaultID {
+                session = nil
+                sessionVaultID = nil
+            }
+            throw error
+        }
         return try await control.recordSyncStatus()
     }
 
