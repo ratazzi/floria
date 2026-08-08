@@ -313,6 +313,56 @@ final class CloudSyncServiceTests: XCTestCase {
         XCTAssertEqual(revokedFingerprints, [device.fingerprint])
     }
 
+    func testAttachingSyncedProjectUsesCanonicalExistingDirectory() async throws {
+        let suiteName = "floria-cloud-sync-tests-\(UUID().uuidString)"
+        let preferences = CloudSyncPreferences(suiteName: suiteName)
+        preferences.setEnabled(true)
+        let project = SyncedProject(
+            id: "project-a", name: "Floria", defaultEnvironmentID: "development")
+        let control = CloudSyncControlStub(
+            status: status(), projectsWithoutLocalFolder: [project])
+        let service = CloudSyncService(
+            control: control,
+            supportDirectory: FileManager.default.temporaryDirectory,
+            preferences: preferences,
+            sessionFactory: { _, _, _ in CloudSyncSessionStub() })
+        defer { UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName) }
+
+        let before = try await service.projectsWithoutLocalFolder()
+        XCTAssertEqual(before, [project])
+        try await service.attachProject(project, at: FileManager.default.temporaryDirectory)
+
+        let attached = await control.attachedProjects
+        XCTAssertEqual(attached.map(\.id), [project.id])
+        XCTAssertEqual(
+            attached.map(\.path),
+            [FileManager.default.temporaryDirectory.standardizedFileURL.resolvingSymlinksInPath().path])
+        let after = try await service.projectsWithoutLocalFolder()
+        XCTAssertEqual(after, [])
+    }
+
+    func testAttachingSyncedProjectRejectsMissingDirectory() async throws {
+        let suiteName = "floria-cloud-sync-tests-\(UUID().uuidString)"
+        let preferences = CloudSyncPreferences(suiteName: suiteName)
+        preferences.setEnabled(true)
+        let project = SyncedProject(id: "project-a", name: "Floria", defaultEnvironmentID: nil)
+        let service = CloudSyncService(
+            control: CloudSyncControlStub(status: status()),
+            supportDirectory: FileManager.default.temporaryDirectory,
+            preferences: preferences,
+            sessionFactory: { _, _, _ in CloudSyncSessionStub() })
+        let missing = FileManager.default.temporaryDirectory
+            .appending(path: "floria-missing-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName) }
+
+        do {
+            try await service.attachProject(project, at: missing)
+            XCTFail("Expected a missing folder to be rejected")
+        } catch let error as CloudSyncServiceError {
+            XCTAssertEqual(error, .invalidProjectDirectory(missing.path))
+        }
+    }
+
     private func status() -> SyncDomainStatus {
         SyncDomainStatus(
             vaultID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -401,19 +451,23 @@ private actor CloudSyncControlStub: CloudSyncControlling {
     private let activation: SyncVaultActivation
     private let reviews: [SyncEnrollmentReview]
     private let devices: [SyncVaultDevice]
+    private var projectsWithoutLocalFolder: [SyncedProject]
     private(set) var statusCount = 0
     private(set) var approvedFingerprints = [String]()
     private(set) var revokedFingerprints = [String]()
+    private(set) var attachedProjects = [(id: String, path: String)]()
 
     init(
         status: SyncDomainStatus,
         activation: SyncVaultActivation? = nil,
         reviews: [SyncEnrollmentReview] = [],
-        devices: [SyncVaultDevice] = []
+        devices: [SyncVaultDevice] = [],
+        projectsWithoutLocalFolder: [SyncedProject] = []
     ) {
         self.status = status
         self.reviews = reviews
         self.devices = devices
+        self.projectsWithoutLocalFolder = projectsWithoutLocalFolder
         self.activation = activation ?? .ready(
             vaultID: status.vaultID,
             keyGeneration: status.keyGeneration,
@@ -427,6 +481,15 @@ private actor CloudSyncControlStub: CloudSyncControlling {
     func recordSyncStatus() async throws -> SyncDomainStatus {
         statusCount += 1
         return status
+    }
+
+    func syncedProjectsWithoutLocalFolder() async throws -> [SyncedProject] {
+        projectsWithoutLocalFolder
+    }
+
+    func attachSyncedProject(_ project: SyncedProject, path: String) async throws {
+        attachedProjects.append((project.id, path))
+        projectsWithoutLocalFolder.removeAll { $0.id == project.id }
     }
 
     func recordSyncVaultBootstrap() async throws -> SyncVaultBootstrap {

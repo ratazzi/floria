@@ -1,6 +1,6 @@
 import Foundation
 
-let supportedControlProtocolVersion: UInt32 = 16
+let supportedControlProtocolVersion: UInt32 = 17
 
 struct ControlServerInfo: Decodable, Equatable, Sendable {
     let protocolVersion: UInt32?
@@ -140,6 +140,19 @@ struct CatalogProject: Codable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case id, name, path
+        case defaultEnvironmentID = "default_environment_id"
+    }
+}
+
+/// A Library Project whose identity and Managed declarations are synced, but whose checkout path
+/// is intentionally local to each Mac.
+struct SyncedProject: Codable, Equatable, Identifiable, Sendable {
+    let id: String
+    let name: String
+    let defaultEnvironmentID: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, name
         case defaultEnvironmentID = "default_environment_id"
     }
 }
@@ -379,10 +392,12 @@ struct CatalogSnapshot: Codable, Sendable {
     let bindings: [CatalogBinding]
     let surfaces: [CatalogSurface]
     let managedLinks: [CatalogManagedLink]
+    let unplacedProjects: [SyncedProject]
 
     private enum CodingKeys: String, CodingKey {
         case projects, checkouts, environments, resources, endpoints, bindings, surfaces
         case managedLinks = "managed_links"
+        case unplacedProjects = "unplaced_projects"
     }
 
     init(from decoder: Decoder) throws {
@@ -398,6 +413,8 @@ struct CatalogSnapshot: Codable, Sendable {
         surfaces = try container.decode([CatalogSurface].self, forKey: .surfaces)
         managedLinks =
             try container.decodeIfPresent([CatalogManagedLink].self, forKey: .managedLinks) ?? []
+        unplacedProjects =
+            try container.decodeIfPresent([SyncedProject].self, forKey: .unplacedProjects) ?? []
     }
 
     func encode(to encoder: Encoder) throws {
@@ -410,6 +427,7 @@ struct CatalogSnapshot: Codable, Sendable {
         try container.encode(bindings, forKey: .bindings)
         try container.encode(surfaces, forKey: .surfaces)
         try container.encode(managedLinks, forKey: .managedLinks)
+        try container.encode(unplacedProjects, forKey: .unplacedProjects)
     }
 }
 

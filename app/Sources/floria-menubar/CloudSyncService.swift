@@ -5,6 +5,8 @@ protocol CloudSyncControlling: RecordSyncControlling, VaultBootstrapControlling,
     VaultEnrollmentControlling, VaultDeviceControlling, VaultActivationControlling
 {
     func recordSyncStatus() async throws -> SyncDomainStatus
+    func syncedProjectsWithoutLocalFolder() async throws -> [SyncedProject]
+    func attachSyncedProject(_ project: SyncedProject, path: String) async throws
 }
 
 extension ControlClient: CloudSyncControlling {}
@@ -262,6 +264,23 @@ actor CloudSyncService {
         return try await control.recordSyncStatus()
     }
 
+    func projectsWithoutLocalFolder() async throws -> [SyncedProject] {
+        guard preferences.isEnabled else { throw CloudSyncServiceError.disabled }
+        return try await control.syncedProjectsWithoutLocalFolder()
+    }
+
+    func attachProject(_ project: SyncedProject, at directory: URL) async throws {
+        guard preferences.isEnabled else { throw CloudSyncServiceError.disabled }
+        let resolved = directory.standardizedFileURL.resolvingSymlinksInPath()
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: resolved.path, isDirectory: &isDirectory),
+              isDirectory.boolValue
+        else {
+            throw CloudSyncServiceError.invalidProjectDirectory(resolved.path)
+        }
+        try await control.attachSyncedProject(project, path: resolved.path)
+    }
+
     @discardableResult
     func syncNow() async throws -> SyncDomainStatus {
         guard preferences.isEnabled else { throw CloudSyncServiceError.disabled }
@@ -305,6 +324,7 @@ actor CloudSyncService {
 
 enum CloudSyncServiceError: Error, Equatable, LocalizedError {
     case disabled
+    case invalidProjectDirectory(String)
     case mergeRequired(currentVaultID: String, targetVaultID: String, localItems: Int)
     case restartRequired(vaultID: String)
     case unexpectedActivatedVault(expected: String, actual: String)
@@ -314,6 +334,8 @@ enum CloudSyncServiceError: Error, Equatable, LocalizedError {
         switch self {
         case .disabled:
             "iCloud Sync is off. Enable it before using iCloud."
+        case .invalidProjectDirectory(let path):
+            "Choose an existing project folder. \(path) is not a directory."
         case .mergeRequired(let currentVaultID, let targetVaultID, let localItems):
             "Could not prepare \(localItems) local items from Vault \(currentVaultID) for Vault \(targetVaultID)."
         case .restartRequired(let vaultID):

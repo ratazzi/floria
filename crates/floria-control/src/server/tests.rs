@@ -8,7 +8,7 @@
     use crate::client::ControlClient;
     use floria_catalog::{
         Binding, BindingScope, EntrySelection, Environment, ItemLink, Project, ProjectCheckout,
-        ProjectCheckoutKind, Surface, SurfaceKind,
+        ProjectCheckoutKind, ReplicatedCatalog, ReplicatedProject, Surface, SurfaceKind,
     };
     use floria_store::{
         SecretOrigin, SecretRecord, StoreResult, VersionRecord,
@@ -2992,6 +2992,54 @@
         };
         assert_eq!(snapshot.projects.len(), 1);
         assert_eq!(snapshot.environments.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_exposes_synced_projects_until_this_mac_attaches_a_checkout() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        catalog
+            .apply_replicated_catalog(&ReplicatedCatalog {
+                projects: vec![ReplicatedProject {
+                    id: "synced-project".to_string(),
+                    name: "Synced Project".to_string(),
+                    default_environment_id: None,
+                }],
+                ..ReplicatedCatalog::default()
+            })
+            .unwrap();
+        let socket = dir.path().join("control.sock");
+        let _server = ControlServer::start(&socket, catalog, test_peer_verifier()).unwrap();
+        let mut client = ControlClient::connect(&socket).unwrap();
+
+        let ControlResult::Snapshot(snapshot) =
+            client.request(ControlCommand::Snapshot).unwrap()
+        else {
+            panic!("expected snapshot");
+        };
+        assert!(snapshot.projects.is_empty());
+        assert_eq!(snapshot.unplaced_projects.len(), 1);
+        assert_eq!(snapshot.unplaced_projects[0].id, "synced-project");
+
+        let checkout = dir.path().join("synced-project");
+        std::fs::create_dir(&checkout).unwrap();
+        client
+            .request(ControlCommand::ProjectUpsert {
+                project: Project {
+                    id: "synced-project".to_string(),
+                    name: "Synced Project".to_string(),
+                    path: checkout.clone(),
+                    default_environment_id: None,
+                },
+            })
+            .unwrap();
+        let ControlResult::Snapshot(snapshot) =
+            client.request(ControlCommand::Snapshot).unwrap()
+        else {
+            panic!("expected snapshot");
+        };
+        assert!(snapshot.unplaced_projects.is_empty());
+        assert_eq!(snapshot.projects[0].path, checkout);
     }
 
     #[test]

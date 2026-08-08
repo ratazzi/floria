@@ -1,9 +1,12 @@
+import AppKit
 import SwiftUI
 
 protocol CloudSyncServicing: Sendable {
     func isEnabled() async -> Bool
     func setEnabled(_ enabled: Bool) async
     func localStatus() async throws -> SyncDomainStatus?
+    func projectsWithoutLocalFolder() async throws -> [SyncedProject]
+    func attachProject(_ project: SyncedProject, at directory: URL) async throws
     func syncNow() async throws -> SyncDomainStatus
     func discoverVaults() async throws -> [CloudVaultCandidate]
     func authenticateVault(_ vaultID: String) async throws -> SyncVaultBootstrap
@@ -42,6 +45,7 @@ final class CloudSyncViewModel {
     var enrollmentRequest: SyncEnrollmentRequest?
     var approvals = [SyncEnrollmentReview]()
     var devices = [SyncVaultDevice]()
+    var projectsWithoutLocalFolder = [SyncedProject]()
     var notice: String?
     var errorMessage: String?
 
@@ -57,6 +61,7 @@ final class CloudSyncViewModel {
         isEnabled = await service.isEnabled()
         guard isEnabled else { return }
         await refreshLocalStatus()
+        await refreshProjectsWithoutLocalFolder()
     }
 
     func setEnabled(_ enabled: Bool) async {
@@ -66,11 +71,13 @@ final class CloudSyncViewModel {
         errorMessage = nil
         if enabled {
             await refreshLocalStatus()
+            await refreshProjectsWithoutLocalFolder()
         } else {
             candidates = []
             enrollmentRequest = nil
             approvals = []
             devices = []
+            projectsWithoutLocalFolder = []
             joiningBootstrap = nil
         }
     }
@@ -82,6 +89,7 @@ final class CloudSyncViewModel {
                 self.status = status
                 self.notice = "Your encrypted Library is up to date in iCloud."
                 try await self.loadDeviceManagement(for: status.vaultID)
+                try await self.loadProjectsWithoutLocalFolder()
             } catch {
                 if await self.detectCurrentMacRemoval() {
                     throw CloudSyncViewError.currentMacRemoved
@@ -142,6 +150,14 @@ final class CloudSyncViewModel {
         }
     }
 
+    func attach(_ project: SyncedProject, at directory: URL) async {
+        await perform {
+            try await self.service.attachProject(project, at: directory)
+            try await self.loadProjectsWithoutLocalFolder()
+            self.notice = "\(project.name) is now available on this Mac."
+        }
+    }
+
     private func refreshLocalStatus() async {
         do {
             status = try await service.localStatus()
@@ -149,6 +165,18 @@ final class CloudSyncViewModel {
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    private func refreshProjectsWithoutLocalFolder() async {
+        do {
+            try await loadProjectsWithoutLocalFolder()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func loadProjectsWithoutLocalFolder() async throws {
+        projectsWithoutLocalFolder = try await service.projectsWithoutLocalFolder()
     }
 
     private func continueJoining(_ bootstrap: SyncVaultBootstrap) async throws {
@@ -178,6 +206,7 @@ final class CloudSyncViewModel {
             try await waitForActivation(vaultID)
         }
         status = try await service.syncNow()
+        try await loadProjectsWithoutLocalFolder()
         candidates = []
         joiningBootstrap = nil
         approvals = []
@@ -262,6 +291,9 @@ struct SyncView: View {
                     enableSection
                     if model.isEnabled {
                         currentLibrarySection
+                        if !model.projectsWithoutLocalFolder.isEmpty {
+                            projectsFromICloudSection
+                        }
                         if let request = model.enrollmentRequest {
                             enrollmentSection(request)
                         }
@@ -416,6 +448,47 @@ struct SyncView: View {
             }
         }
         .disabled(model.isWorking)
+    }
+
+    private var projectsFromICloudSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Projects from iCloud")
+                .font(.headline)
+            ForEach(model.projectsWithoutLocalFolder) { project in
+                HStack(spacing: 12) {
+                    Image(systemName: "folder")
+                        .foregroundStyle(.blue)
+                        .frame(width: 28)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(project.name)
+                            .font(.callout.weight(.medium))
+                        Text("Choose its folder on this Mac to make Managed files available.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Choose Folder…") {
+                        chooseFolder(for: project)
+                    }
+                }
+                .padding(12)
+                .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 10))
+            }
+        }
+        .disabled(model.isWorking)
+    }
+
+    private func chooseFolder(for project: SyncedProject) {
+        let panel = NSOpenPanel()
+        panel.title = "Choose \(project.name) Folder"
+        panel.message = "Choose the existing project folder on this Mac."
+        panel.prompt = "Use Folder"
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let directory = panel.url else { return }
+        Task { await model.attach(project, at: directory) }
     }
 
     private func enrollmentSection(_ request: SyncEnrollmentRequest) -> some View {

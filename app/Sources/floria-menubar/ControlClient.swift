@@ -365,6 +365,19 @@ final class ControlClient: @unchecked Sendable {
         return snapshot
     }
 
+    func syncedProjectsWithoutLocalFolder() async throws -> [SyncedProject] {
+        try await snapshot().unplacedProjects
+    }
+
+    func attachSyncedProject(_ project: SyncedProject, path: String) async throws {
+        try await upsertProject(
+            CatalogProject(
+                id: project.id,
+                name: project.name,
+                path: path,
+                defaultEnvironmentID: project.defaultEnvironmentID))
+    }
+
     func discover(path: String) async throws -> DiscoveryPlan {
         try await discover(paths: [path])
     }

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use floria_catalog::{
     Binding, CatalogError, CatalogSnapshot, Environment, Project, ResolvedEnvironment, Resource,
-    ItemMetadata, ProjectCheckout, ResourceCodec, ResourceUsage, Surface,
+    ItemMetadata, ProjectCheckout, ReplicatedProject, ResourceCodec, ResourceUsage, Surface,
 };
 use floria_core::authz::{Enforcement, PolicyEvaluation, PolicyMode, PolicyModeStatus};
 use floria_discover::DiscoveryPlan;
@@ -25,7 +25,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 const MAX_MSG: usize = 8 << 20;
 pub(crate) const MAX_RECORD_SYNC_BATCH_BYTES: usize = 6 << 20;
-pub const CONTROL_PROTOCOL_VERSION: u32 = 16;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 17;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRequest {
@@ -435,6 +435,9 @@ pub struct WorkspaceSnapshot {
     pub catalog: CatalogSnapshot,
     #[serde(default)]
     pub managed_links: Vec<ManagedLink>,
+    /// Portable Projects downloaded from the Library that have no checkout on this Mac yet.
+    #[serde(default)]
+    pub unplaced_projects: Vec<ReplicatedProject>,
 }
 
 impl Deref for WorkspaceSnapshot {

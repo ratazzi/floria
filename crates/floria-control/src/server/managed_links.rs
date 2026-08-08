@@ -5,8 +5,19 @@ pub(super) fn workspace_snapshot(
     store: Option<&dyn SecretStore>,
     mount_path: Option<&Path>,
 ) -> Result<ControlResult, DispatchError> {
-    let catalog = catalog.snapshot()?;
-    let managed_links = configured_managed_links(&catalog, store, mount_path)?
+    let snapshot = catalog.snapshot()?;
+    let local_project_ids = snapshot
+        .projects
+        .iter()
+        .map(|project| project.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let unplaced_projects = catalog
+        .replicated_catalog()?
+        .projects
+        .into_iter()
+        .filter(|project| !local_project_ids.contains(project.id.as_str()))
+        .collect();
+    let managed_links = configured_managed_links(&snapshot, store, mount_path)?
     .into_iter()
     .map(|link| {
         let status = match link.status() {
@@ -17,7 +28,11 @@ pub(super) fn workspace_snapshot(
         ManagedLink { path: link.path().to_path_buf(), status }
     })
     .collect();
-    Ok(ControlResult::Snapshot(WorkspaceSnapshot { catalog, managed_links }))
+    Ok(ControlResult::Snapshot(WorkspaceSnapshot {
+        catalog: snapshot,
+        managed_links,
+        unplaced_projects,
+    }))
 }
 
 pub(super) fn repair_managed_path_link(

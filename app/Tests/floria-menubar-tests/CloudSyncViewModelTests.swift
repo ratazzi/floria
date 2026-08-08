@@ -133,6 +133,28 @@ final class CloudSyncViewModelTests: XCTestCase {
             "This Mac was removed from the iCloud Library. Existing local data remains available, but new changes will not sync.")
     }
 
+    func testAttachingProjectMakesItAvailableOnThisMac() async {
+        let project = SyncedProject(
+            id: "project-a", name: "Floria", defaultEnvironmentID: "development")
+        let service = CloudSyncViewServiceStub(
+            status: status(vaultID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            candidates: [],
+            projectsWithoutLocalFolder: [project])
+        let model = CloudSyncViewModel(service: service, restartDaemon: {})
+        let directory = FileManager.default.temporaryDirectory
+
+        await model.load()
+        XCTAssertEqual(model.projectsWithoutLocalFolder, [project])
+
+        await model.attach(project, at: directory)
+
+        XCTAssertEqual(model.projectsWithoutLocalFolder, [])
+        let attachedProjectIDs = await service.attachedProjectIDs
+        XCTAssertEqual(attachedProjectIDs, [project.id])
+        XCTAssertEqual(model.notice, "Floria is now available on this Mac.")
+        XCTAssertNil(model.errorMessage)
+    }
+
     private func status(vaultID: String) -> SyncDomainStatus {
         SyncDomainStatus(
             vaultID: vaultID,
@@ -172,8 +194,10 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
     private let activation: SyncVaultActivation
     private let devices: [SyncVaultDevice]
     private let syncFailure: CloudRecordSyncSessionError?
+    private var projectsWithoutLocalFolder: [SyncedProject]
     private var restartTarget: String?
     private(set) var revokedDevices = [SyncVaultDevice]()
+    private(set) var attachedProjectIDs = [String]()
 
     init(
         status: SyncDomainStatus,
@@ -182,7 +206,8 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
         enrollment: SyncEnrollmentPreparation = .alreadyEnrolled(deviceID: "local"),
         devices: [SyncVaultDevice] = [],
         activation: SyncVaultActivation? = nil,
-        syncFailure: CloudRecordSyncSessionError? = nil
+        syncFailure: CloudRecordSyncSessionError? = nil,
+        projectsWithoutLocalFolder: [SyncedProject] = []
     ) {
         self.status = status
         self.candidates = candidates
@@ -190,6 +215,7 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
         self.enrollment = enrollment
         self.devices = devices
         self.syncFailure = syncFailure
+        self.projectsWithoutLocalFolder = projectsWithoutLocalFolder
         self.activation = activation ?? .ready(
             vaultID: status.vaultID,
             keyGeneration: status.keyGeneration,
@@ -219,6 +245,15 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
             self.restartTarget = nil
         }
         return status
+    }
+
+    func projectsWithoutLocalFolder() async throws -> [SyncedProject] {
+        projectsWithoutLocalFolder
+    }
+
+    func attachProject(_ project: SyncedProject, at _: URL) async throws {
+        attachedProjectIDs.append(project.id)
+        projectsWithoutLocalFolder.removeAll { $0.id == project.id }
     }
 
     func syncNow() async throws -> SyncDomainStatus {
