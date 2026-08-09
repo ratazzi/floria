@@ -336,6 +336,7 @@
             path: path.to_path_buf(),
             destination: DiscoveryImportDestination::ProjectFile {
                 project_path: project_path.to_path_buf(),
+                project_id: None,
             },
             source_disposition: DiscoverySourceDisposition::ProtectInPlace,
         }
@@ -1506,6 +1507,101 @@
             store.record(&secret_id).unwrap().unwrap().environment_ids,
             Some(vec![snapshot.environments[0].id.clone()])
         );
+    }
+
+    #[test]
+    fn discovery_explicitly_attaches_a_matching_synced_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("Synced Project");
+        let source_path = project_path.join(".env");
+        let mount_path = dir.path().join("mount");
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
+        std::fs::create_dir_all(&mount_path).unwrap();
+        std::fs::write(&source_path, "SYNCED_TOKEN=fixture-value\n").unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        catalog
+            .apply_replicated_catalog(&ReplicatedCatalog {
+                projects: vec![ReplicatedProject {
+                    id: "synced-project".to_string(),
+                    name: "synced-project".to_string(),
+                    default_environment_id: None,
+                }],
+                ..ReplicatedCatalog::default()
+            })
+            .unwrap();
+        let store = FixtureStore::new();
+        let services = DispatchServices {
+            store: Some(&store),
+            mount_path: Some(&mount_path),
+            ..DispatchServices::default()
+        };
+
+        let ControlResult::Discovery(review) = dispatch(
+            &catalog,
+            services,
+            ControlCommand::Discover { paths: vec![project_path.clone()] },
+        )
+        .unwrap()
+        else {
+            panic!("expected discovery review")
+        };
+        assert_eq!(review.projects[0].managed_project_id, None);
+        assert_eq!(review.projects[0].project_matches.len(), 1);
+        assert_eq!(
+            review.projects[0].project_matches[0].project_id,
+            "synced-project"
+        );
+
+        let invalid = dispatch(
+            &catalog,
+            services,
+            ControlCommand::DiscoverApply {
+                paths: vec![project_path.clone()],
+                imports: Some(vec![DiscoveryImport {
+                    path: source_path.clone(),
+                    destination: DiscoveryImportDestination::ProjectFile {
+                        project_path: project_path.clone(),
+                        project_id: Some("stale-project".to_string()),
+                    },
+                    source_disposition: DiscoverySourceDisposition::ProtectInPlace,
+                }]),
+                separate_entries: Vec::new(),
+                promote_entries: Vec::new(),
+                demote_entries: Vec::new(),
+            },
+        )
+        .unwrap_err();
+        assert!(invalid.body().message.contains("no longer a discovery match"));
+        assert!(catalog.snapshot().unwrap().projects.is_empty());
+
+        let ControlResult::DiscoveryApplied(applied) = dispatch(
+            &catalog,
+            services,
+            ControlCommand::DiscoverApply {
+                paths: vec![project_path.clone()],
+                imports: Some(vec![DiscoveryImport {
+                    path: source_path.clone(),
+                    destination: DiscoveryImportDestination::ProjectFile {
+                        project_path: project_path.clone(),
+                        project_id: Some("synced-project".to_string()),
+                    },
+                    source_disposition: DiscoverySourceDisposition::ProtectInPlace,
+                }]),
+                separate_entries: Vec::new(),
+                promote_entries: Vec::new(),
+                demote_entries: Vec::new(),
+            },
+        )
+        .unwrap()
+        else {
+            panic!("expected discovery apply result")
+        };
+        assert_eq!(applied.project_id.as_deref(), Some("synced-project"));
+        let snapshot = catalog.snapshot().unwrap();
+        assert_eq!(snapshot.projects.len(), 1);
+        assert_eq!(snapshot.projects[0].id, "synced-project");
+        assert_eq!(snapshot.projects[0].path, project_path);
+        assert_eq!(catalog.replicated_catalog().unwrap().projects.len(), 1);
     }
 
     #[test]

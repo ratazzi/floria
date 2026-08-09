@@ -17,6 +17,7 @@ use floria_discover::{
     classify_key, discover_git_checkouts, discover_many, DiscoveredContent, DiscoveredFileAction,
     DiscoveredFileKind, DiscoveryPlan, ExistingEnvironment, ExistingProject, ExistingSecret,
     ExistingSurface, GitCheckoutDiscovery, GitCheckoutMonitor, KeyClass, MonitoredGitCheckout,
+    PortableProjectCandidate,
 };
 use floria_platform::{PeerAccess, SocketPeerVerifier};
 use floria_ssh::ManagedKeyError;

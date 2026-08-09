@@ -2321,6 +2321,7 @@ private struct DiscoveryProjectGroup: Identifiable {
 
 private struct DiscoveryProjectHeader: View {
     let group: DiscoveryProjectGroup
+    @Binding var identity: DiscoveryProjectIdentityChoice?
 
     var body: some View {
         HStack(spacing: 9) {
@@ -2340,8 +2341,60 @@ private struct DiscoveryProjectHeader: View {
             Text("\(itemCount) item\(itemCount == 1 ? "" : "s")")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            if let project = group.project,
+               project.managedProjectID == nil,
+               !project.projectMatches.isEmpty
+            {
+                Menu {
+                    Section("Projects from iCloud") {
+                        ForEach(project.projectMatches) { match in
+                            Button {
+                                identity = .existing(match.projectID)
+                            } label: {
+                                if identity == .existing(match.projectID) {
+                                    Label(match.projectName, systemImage: "checkmark")
+                                } else {
+                                    Text(match.projectName)
+                                }
+                            }
+                        }
+                    }
+                    Divider()
+                    Button("Create New Project") {
+                        identity = .createNew
+                    }
+                } label: {
+                    Label(identityTitle(for: project), systemImage: identityIcon)
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(identity == nil ? Color.orange : Color.secondary)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .help("Choose whether this folder belongs to an existing synced Project.")
+            }
         }
         .padding(.horizontal, 2)
+    }
+
+    private var identityIcon: String {
+        switch identity {
+        case .existing: "checkmark.icloud"
+        case .createNew: "plus"
+        case nil: "questionmark.folder"
+        }
+    }
+
+    private func identityTitle(for project: DiscoveredProject) -> String {
+        switch identity {
+        case .existing(let projectID):
+            project.projectMatches
+                .first(where: { $0.projectID == projectID })?
+                .projectName ?? "Existing Project"
+        case .createNew:
+            "New Project"
+        case nil:
+            "Choose Project"
+        }
     }
 
     private var detail: String {
@@ -2666,6 +2719,11 @@ private enum DiscoveryDestinationChoice: Equatable {
     case library(protectOriginal: Bool)
 }
 
+private enum DiscoveryProjectIdentityChoice: Equatable {
+    case existing(String)
+    case createNew
+}
+
 private struct DiscoveryReviewSheet: View {
     @Environment(\.dismiss) private var dismiss
     let plan: DiscoveryPlan
@@ -2680,6 +2738,7 @@ private struct DiscoveryReviewSheet: View {
     @State private var applyError: String?
     @State private var selectedFilePaths: Set<String>
     @State private var destinations: [String: DiscoveryDestinationChoice]
+    @State private var projectIdentities: [String: DiscoveryProjectIdentityChoice]
     @State private var protectedExpansion: [String: Bool] = [:]
 
     init(
@@ -2726,6 +2785,17 @@ private struct DiscoveryReviewSheet: View {
                         destination = nil
                     }
                     return destination.map { (file.path, $0) }
+                }))
+        _projectIdentities = State(
+            initialValue: Dictionary(
+                uniqueKeysWithValues: plan.projects.compactMap { project in
+                    if let managedProjectID = project.managedProjectID {
+                        return (project.path, .existing(managedProjectID))
+                    }
+                    if project.projectMatches.isEmpty {
+                        return (project.path, .createNew)
+                    }
+                    return nil
                 }))
     }
 
@@ -2869,7 +2939,11 @@ private struct DiscoveryReviewSheet: View {
                             protectedExpansion[group.id]
                             ?? (group.files.isEmpty && attentionItems.isEmpty)
                         LazyVStack(alignment: .leading, spacing: 9) {
-                            DiscoveryProjectHeader(group: group)
+                            DiscoveryProjectHeader(
+                                group: group,
+                                identity: Binding(
+                                    get: { projectIdentities[group.id] },
+                                    set: { projectIdentities[group.id] = $0 }))
                             ForEach(attentionItems) { item in
                                 DiscoveryManagedItemCard(item: item)
                             }
@@ -3083,7 +3157,16 @@ private struct DiscoveryReviewSheet: View {
     }
 
     private func destinationIsResolved(for file: DiscoveredFile) -> Bool {
-        destinations[file.path] != nil
+        guard let destination = destinations[file.path] else { return false }
+        guard case .project(let projectPath) = destination else { return true }
+        return projectIdentities[projectPath] != nil
+    }
+
+    private func selectedProjectID(for projectPath: String) -> String? {
+        guard case .existing(let projectID) = projectIdentities[projectPath] else {
+            return nil
+        }
+        return projectID
     }
 
     private func discoveryImport(for file: DiscoveredFile) -> DiscoveryImport? {
@@ -3093,7 +3176,9 @@ private struct DiscoveryReviewSheet: View {
             case .project(let projectPath):
                 return DiscoveryImport(
                     path: file.path,
-                    destination: .projectFile(projectPath: projectPath),
+                    destination: .projectFile(
+                        projectPath: projectPath,
+                        projectID: selectedProjectID(for: projectPath)),
                     sourceDisposition: .protectInPlace)
             case .library, nil:
                 return DiscoveryImport(
@@ -3118,7 +3203,9 @@ private struct DiscoveryReviewSheet: View {
             case .project(let projectPath):
                 return DiscoveryImport(
                     path: file.path,
-                    destination: .projectFile(projectPath: projectPath),
+                    destination: .projectFile(
+                        projectPath: projectPath,
+                        projectID: selectedProjectID(for: projectPath)),
                     sourceDisposition: .protectInPlace)
             case .library(let protectOriginal):
                 return DiscoveryImport(

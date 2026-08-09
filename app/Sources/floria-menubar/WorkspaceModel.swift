@@ -1012,9 +1012,10 @@ final class WorkspaceStore {
         let standardizedImports = imports.map { item in
             let destination: DiscoveryImportDestination
             switch item.destination {
-            case .projectFile(let projectPath):
+            case .projectFile(let projectPath, let projectID):
                 destination = .projectFile(
-                    projectPath: (projectPath as NSString).standardizingPath)
+                    projectPath: (projectPath as NSString).standardizingPath,
+                    projectID: projectID)
             case .projectOutput(let projectPath, let outputPath):
                 destination = .projectOutput(
                     projectPath: (projectPath as NSString).standardizingPath,

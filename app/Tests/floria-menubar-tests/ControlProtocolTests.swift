@@ -15,7 +15,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertNil(request["params"])
 
         let response = Data(
-            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":17,"daemon_version":"0.1.0","schema_version":14,"minimum_schema_version":14,"store_format_version":5,"minimum_store_format_version":5}}}"#.utf8)
+            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":18,"daemon_version":"0.1.0","schema_version":14,"minimum_schema_version":14,"store_format_version":5,"minimum_store_format_version":5}}}"#.utf8)
         let decoded = try JSONDecoder().decode(
             ControlResponseEnvelope<ControlServerInfo>.self, from: response)
         let info = try XCTUnwrap(decoded.result?.value)
@@ -405,7 +405,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(params.count, 1)
 
         let response = Data(
-            #"{"request_id":8,"status":"ok","result":{"type":"discovery","value":{"paths":["/fixture/project"],"projects":[{"name":"project","path":"/fixture/project","markers":[{"kind":"git","path":"/fixture/project/.git"}],"ecosystems":[]}],"files":[{"path":"/fixture/project/.env","relative_path":".env","assignment":{"state":"assigned","project_path":"/fixture/project","candidate_project_paths":[]},"kind":"dotenv","codec":"dotenv","environment":"development","tags":["dotenv","development"],"entries":[{"address":"keys/API_TOKEN","key":"API_TOKEN","section":null,"action":{"type":"reuse_shared_secret","resource_id":"fixture-shared","resource_name":"Fixture Shared Secret"}}],"warnings":[],"action":"compose"}],"summary":{"files":1,"entries":1,"new_secrets":0,"reused_secrets":1,"missing_reference_entries":0,"warnings":0}}}}"#.utf8)
+            #"{"request_id":8,"status":"ok","result":{"type":"discovery","value":{"paths":["/fixture/project"],"projects":[{"name":"project","path":"/fixture/project","markers":[{"kind":"git","path":"/fixture/project/.git"}],"ecosystems":[],"project_matches":[]}],"files":[{"path":"/fixture/project/.env","relative_path":".env","assignment":{"state":"assigned","project_path":"/fixture/project","candidate_project_paths":[]},"kind":"dotenv","codec":"dotenv","environment":"development","tags":["dotenv","development"],"entries":[{"address":"keys/API_TOKEN","key":"API_TOKEN","section":null,"action":{"type":"reuse_shared_secret","resource_id":"fixture-shared","resource_name":"Fixture Shared Secret"}}],"warnings":[],"action":"compose"}],"summary":{"files":1,"entries":1,"new_secrets":0,"reused_secrets":1,"missing_reference_entries":0,"warnings":0}}}}"#.utf8)
         let decoded = try JSONDecoder().decode(
             ControlResponseEnvelope<DiscoveryPlan>.self, from: response)
         let plan = try XCTUnwrap(decoded.result?.value)
@@ -483,14 +483,26 @@ final class ControlProtocolTests: XCTestCase {
         let project = try JSONDecoder().decode(
             DiscoveredProject.self,
             from: Data(
-                #"{"name":"project","path":"/fixture/project","markers":[],"ecosystems":[],"managed_project_id":"fixture-project"}"#.utf8))
+                #"{"name":"project","path":"/fixture/project","markers":[],"ecosystems":[],"managed_project_id":"fixture-project","project_matches":[]}"#.utf8))
 
         XCTAssertEqual(project.managedProjectID, "fixture-project")
     }
 
+    func testSyncedProjectSuggestionMatchesRustWireShape() throws {
+        let project = try JSONDecoder().decode(
+            DiscoveredProject.self,
+            from: Data(
+                #"{"name":"project","path":"/fixture/project","markers":[],"ecosystems":[],"project_matches":[{"project_id":"synced-project","project_name":"Project","evidence":["same_name"]}]}"#.utf8))
+
+        XCTAssertNil(project.managedProjectID)
+        XCTAssertEqual(project.projectMatches.count, 1)
+        XCTAssertEqual(project.projectMatches[0].projectID, "synced-project")
+        XCTAssertEqual(project.projectMatches[0].evidence, [.sameName])
+    }
+
     func testManagedDiscoveryItemsMatchRustWireShape() throws {
         let response = Data(
-            #"{"request_id":8,"status":"ok","result":{"type":"discovery","value":{"paths":["/fixture/project"],"projects":[{"name":"project","path":"/fixture/project","markers":[],"ecosystems":[],"managed_project_id":"fixture-project"}],"files":[],"summary":{"files":0,"entries":0,"new_secrets":0,"reused_secrets":0,"missing_reference_entries":0,"warnings":0},"managed_items":[{"id":"fixture-surface","path":"/fixture/project/.env","relative_path":".env","project_path":"/fixture/project","environment":"Development","kind":"surface","status":"linked"},{"id":"fixture-protected","path":"/fixture/project/client.p12","relative_path":"client.p12","project_path":"/fixture/project","kind":"protected_file","status":"missing"}]}}}"#.utf8)
+            #"{"request_id":8,"status":"ok","result":{"type":"discovery","value":{"paths":["/fixture/project"],"projects":[{"name":"project","path":"/fixture/project","markers":[],"ecosystems":[],"managed_project_id":"fixture-project","project_matches":[]}],"files":[],"summary":{"files":0,"entries":0,"new_secrets":0,"reused_secrets":0,"missing_reference_entries":0,"warnings":0},"managed_items":[{"id":"fixture-surface","path":"/fixture/project/.env","relative_path":".env","project_path":"/fixture/project","environment":"Development","kind":"surface","status":"linked"},{"id":"fixture-protected","path":"/fixture/project/client.p12","relative_path":"client.p12","project_path":"/fixture/project","kind":"protected_file","status":"missing"}]}}}"#.utf8)
 
         let decoded = try JSONDecoder().decode(
             ControlResponseEnvelope<DiscoveryPlan>.self, from: response)
@@ -512,7 +524,9 @@ final class ControlProtocolTests: XCTestCase {
             imports: [
                 DiscoveryImport(
                     path: "/fixture/project/.dev.vars",
-                    destination: .projectFile(projectPath: "/fixture/project"),
+                    destination: .projectFile(
+                        projectPath: "/fixture/project",
+                        projectID: "synced-project"),
                     sourceDisposition: .protectInPlace),
                 DiscoveryImport(
                     path: "/fixture/project/.env",
@@ -553,6 +567,9 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(
             (imports[0]["destination"] as? [String: Any])?["type"] as? String,
             "project_file")
+        XCTAssertEqual(
+            (imports[0]["destination"] as? [String: Any])?["project_id"] as? String,
+            "synced-project")
         XCTAssertEqual(imports[0]["source_disposition"] as? String, "protect_in_place")
         XCTAssertEqual(
             (imports[1]["destination"] as? [String: Any])?["type"] as? String,

@@ -11,8 +11,8 @@ use floria_discover::{
 use floria_store::SecretStore;
 
 use super::{
-    discovery_review_plan, existing_discovery_projects, DiscoveryJobPhase, DiscoveryJobProgress,
-    DiscoveryJobState, DiscoveryJobStatus, DispatchError,
+    discovery_review_plan, existing_discovery_projects, portable_discovery_project_candidates,
+    DiscoveryJobPhase, DiscoveryJobProgress, DiscoveryJobState, DiscoveryJobStatus, DispatchError,
 };
 
 const MAX_RETAINED_JOBS: usize = 8;
@@ -190,6 +190,7 @@ fn run_job(
     let result = (|| {
         let projects_started = Instant::now();
         let managed_projects = existing_discovery_projects(&catalog, discovery.projects())?;
+        let portable_projects = portable_discovery_project_candidates(&catalog)?;
         let project_match_ms = projects_started.elapsed().as_millis() as u64;
         if job.cancel.load(Ordering::Relaxed) {
             return Err(DispatchError::Validation("discovery was cancelled".to_string()));
@@ -197,7 +198,11 @@ fn run_job(
         let plan_started = Instant::now();
         // Preview must never block on Keychain. Apply rescans and performs exact key+value reuse
         // matching inside the trusted daemon before it mutates the catalog.
-        let plan = discovery.plan_with_projects(&[], &managed_projects);
+        let plan = discovery.plan_with_project_context(
+            &[],
+            &managed_projects,
+            &portable_projects,
+        );
         let plan_ms = plan_started.elapsed().as_millis() as u64;
         if job.cancel.load(Ordering::Relaxed) {
             return Err(DispatchError::Validation("discovery was cancelled".to_string()));

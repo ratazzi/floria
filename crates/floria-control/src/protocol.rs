@@ -25,7 +25,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 const MAX_MSG: usize = 8 << 20;
 pub(crate) const MAX_RECORD_SYNC_BATCH_BYTES: usize = 6 << 20;
-pub const CONTROL_PROTOCOL_VERSION: u32 = 17;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 18;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRequest {
@@ -676,6 +676,10 @@ pub struct DiscoveryImport {
 pub enum DiscoveryImportDestination {
     ProjectFile {
         project_path: PathBuf,
+        /// An existing portable Project explicitly chosen during review. `None` creates a new
+        /// Project unless this path is already attached locally.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_id: Option<String>,
     },
     ProjectOutput {
         project_path: PathBuf,
@@ -1378,6 +1382,22 @@ mod tests {
                 "path": "/fixture/project/.env",
                 "address": "keys/API_TOKEN"
             }])
+        );
+
+        let existing_project = serde_json::to_value(
+            DiscoveryImportDestination::ProjectFile {
+                project_path: PathBuf::from("/fixture/project"),
+                project_id: Some("synced-project".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            existing_project,
+            serde_json::json!({
+                "type": "project_file",
+                "project_path": "/fixture/project",
+                "project_id": "synced-project"
+            })
         );
     }
 

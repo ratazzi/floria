@@ -16,7 +16,13 @@ pub(super) fn apply_discovery(
         .map_err(|error| DispatchError::Validation(error.to_string()))?;
     let candidate_keys = discovery.shared_secret_candidate_keys();
     let mut existing = existing_discovery_secrets(catalog, store, &candidate_keys)?;
-    let plan = discovery.plan(&existing);
+    let managed_projects = existing_discovery_projects(catalog, discovery.projects())?;
+    let portable_projects = portable_discovery_project_candidates(catalog)?;
+    let plan = discovery.plan_with_project_context(
+        &existing,
+        &managed_projects,
+        &portable_projects,
+    );
     let mut contents = discovery.into_contents();
     let imports = resolve_discovery_imports(&contents, reviewed_imports)?;
     let valid_project_paths = plan
@@ -92,13 +98,22 @@ pub(super) fn apply_discovery(
             )));
         }
     }
-    let required_project_paths = imports_by_path
-        .values()
-        .flat_map(|import| import_project_paths(&import.destination))
-        .cloned()
-        .collect::<HashSet<_>>();
+    let mut required_projects = HashMap::<PathBuf, Option<String>>::new();
+    for import in imports_by_path.values() {
+        for (project_path, project_id) in import_project_targets(&import.destination) {
+            let selected_id = project_id.map(str::to_string);
+            if let Some(previous) = required_projects.insert(project_path.clone(), selected_id.clone()) {
+                if previous != selected_id {
+                    return Err(DispatchError::Validation(format!(
+                        "discovery selected more than one Project identity for {}",
+                        project_path.display()
+                    )));
+                }
+            }
+        }
+    }
     let mut project_states = HashMap::<PathBuf, (String, bool)>::new();
-    for project_path in &required_project_paths {
+    for (project_path, selected_project_id) in &required_projects {
         let project = plan
             .projects
             .iter()
@@ -109,7 +124,11 @@ pub(super) fn apply_discovery(
                     project_path.display()
                 ))
             })?;
-        let state = ensure_discovered_project(catalog, project)?;
+        let state = ensure_discovered_project(
+            catalog,
+            project,
+            selected_project_id.as_deref(),
+        )?;
         project_states.insert(project_path.clone(), state);
     }
     let mut project_ids = project_states
@@ -163,7 +182,7 @@ pub(super) fn apply_discovery(
                             "protecting a discovered file returned an unexpected result".to_string(),
                         ))
                     } else {
-                        if let DiscoveryImportDestination::ProjectFile { project_path } =
+                        if let DiscoveryImportDestination::ProjectFile { project_path, .. } =
                             &import.destination
                         {
                             let project_id = &project_states[project_path].0;
@@ -258,7 +277,7 @@ pub(super) fn apply_discovery(
                     Ok(Vec::new())
                 }
                 DiscoveredFileAction::Compose => match import.destination {
-                    DiscoveryImportDestination::ProjectFile { project_path } => {
+                    DiscoveryImportDestination::ProjectFile { project_path, .. } => {
                         let protected =
                             protect_discovered_file(catalog, store, mount_path, &file)?;
                         if !matches!(protected, ControlResult::FileProtected { .. }) {
@@ -414,7 +433,10 @@ fn resolve_discovery_imports(
                     };
                     DiscoveryImport {
                         path: file.path.clone(),
-                        destination: DiscoveryImportDestination::ProjectFile { project_path },
+                        destination: DiscoveryImportDestination::ProjectFile {
+                            project_path,
+                            project_id: None,
+                        },
                         source_disposition: DiscoverySourceDisposition::ProtectInPlace,
                     }
                 }
@@ -424,7 +446,10 @@ fn resolve_discovery_imports(
                         .project_path
                         .clone()
                         .map(|project_path| {
-                            DiscoveryImportDestination::ProjectFile { project_path }
+                            DiscoveryImportDestination::ProjectFile {
+                                project_path,
+                                project_id: None,
+                            }
                         })
                         .unwrap_or(DiscoveryImportDestination::Library);
                     DiscoveryImport {
@@ -445,17 +470,31 @@ fn resolve_discovery_imports(
         .collect()
 }
 
-fn import_project_paths(
+fn import_project_targets(
     destination: &DiscoveryImportDestination,
-) -> Vec<&PathBuf> {
+) -> Vec<(&PathBuf, Option<&str>)> {
     match destination {
-        DiscoveryImportDestination::ProjectFile { project_path } => vec![project_path],
-        DiscoveryImportDestination::ProjectOutput { project_path, .. } => vec![project_path],
+        DiscoveryImportDestination::ProjectFile { project_path, project_id } => {
+            vec![(project_path, project_id.as_deref())]
+        }
+        DiscoveryImportDestination::ProjectOutput { project_path, .. } => {
+            vec![(project_path, None)]
+        }
         DiscoveryImportDestination::Library => Vec::new(),
         DiscoveryImportDestination::ProjectOutputs { outputs } => {
-            outputs.iter().map(|output| &output.project_path).collect()
+            outputs
+                .iter()
+                .map(|output| (&output.project_path, None))
+                .collect()
         }
     }
+}
+
+fn import_project_paths(destination: &DiscoveryImportDestination) -> Vec<&PathBuf> {
+    import_project_targets(destination)
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect()
 }
 
 fn validate_discovery_import(
@@ -469,7 +508,7 @@ fn validate_discovery_import(
     ));
     match (&import.destination, import.source_disposition) {
         (
-            DiscoveryImportDestination::ProjectFile { project_path },
+            DiscoveryImportDestination::ProjectFile { project_path, .. },
             DiscoverySourceDisposition::ProtectInPlace,
         ) if matches!(
             file.action,
@@ -1265,6 +1304,7 @@ impl Drop for DiscoveryMutationGuard<'_> {
 pub(super) fn ensure_discovered_project(
     catalog: &Catalog,
     project: &floria_discover::DiscoveredProject,
+    selected_project_id: Option<&str>,
 ) -> Result<(String, bool), DispatchError> {
     if let Some(existing) = catalog
         .snapshot()?
@@ -1272,7 +1312,52 @@ pub(super) fn ensure_discovered_project(
         .into_iter()
         .find(|candidate| candidate.path == project.path)
     {
+        if selected_project_id.is_some_and(|selected| selected != existing.id) {
+            return Err(DispatchError::Validation(format!(
+                "{} is already attached to a different Project",
+                project.path.display()
+            )));
+        }
         return Ok((existing.id, false));
+    }
+    if let Some(selected_project_id) = selected_project_id {
+        if !project
+            .project_matches
+            .iter()
+            .any(|candidate| candidate.project_id == selected_project_id)
+        {
+            return Err(DispatchError::Validation(format!(
+                "Project {selected_project_id:?} is no longer a discovery match for {}",
+                project.path.display()
+            )));
+        }
+        let replicated = catalog.replicated_catalog()?;
+        let selected = replicated
+            .projects
+            .into_iter()
+            .find(|candidate| candidate.id == selected_project_id)
+            .ok_or_else(|| {
+                DispatchError::Validation(format!(
+                    "Project {selected_project_id:?} is no longer available"
+                ))
+            })?;
+        if catalog
+            .snapshot()?
+            .projects
+            .iter()
+            .any(|candidate| candidate.id == selected_project_id)
+        {
+            return Err(DispatchError::Validation(format!(
+                "Project {selected_project_id:?} is already attached elsewhere on this Mac"
+            )));
+        }
+        catalog.upsert_project(&Project {
+            id: selected.id.clone(),
+            name: selected.name,
+            path: project.path.clone(),
+            default_environment_id: selected.default_environment_id,
+        })?;
+        return Ok((selected.id, false));
     }
     let id = generated_id("project");
     catalog.upsert_project(&Project {
@@ -1495,6 +1580,27 @@ pub(super) fn existing_discovery_projects(
         });
     }
     Ok(existing)
+}
+
+pub(super) fn portable_discovery_project_candidates(
+    catalog: &Catalog,
+) -> Result<Vec<PortableProjectCandidate>, DispatchError> {
+    let local_project_ids = catalog
+        .snapshot()?
+        .projects
+        .into_iter()
+        .map(|project| project.id)
+        .collect::<HashSet<_>>();
+    Ok(catalog
+        .replicated_catalog()?
+        .projects
+        .into_iter()
+        .filter(|project| !local_project_ids.contains(&project.id))
+        .map(|project| PortableProjectCandidate {
+            id: project.id,
+            name: project.name,
+        })
+        .collect())
 }
 
 pub(super) fn discovery_review_plan(

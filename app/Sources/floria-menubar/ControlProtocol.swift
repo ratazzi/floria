@@ -1,6 +1,6 @@
 import Foundation
 
-let supportedControlProtocolVersion: UInt32 = 17
+let supportedControlProtocolVersion: UInt32 = 18
 
 struct ControlServerInfo: Decodable, Equatable, Sendable {
     let protocolVersion: UInt32?
@@ -594,11 +594,30 @@ struct DiscoveredProject: Codable, Hashable, Sendable {
     let markers: [ProjectMarker]
     let ecosystems: [String]
     let managedProjectID: String?
+    let projectMatches: [DiscoveredProjectMatch]
 
     enum CodingKeys: String, CodingKey {
         case name, path, markers, ecosystems
         case managedProjectID = "managed_project_id"
+        case projectMatches = "project_matches"
     }
+}
+
+struct DiscoveredProjectMatch: Codable, Hashable, Identifiable, Sendable {
+    var id: String { projectID }
+    let projectID: String
+    let projectName: String
+    let evidence: [ProjectMatchEvidence]
+
+    enum CodingKeys: String, CodingKey {
+        case evidence
+        case projectID = "project_id"
+        case projectName = "project_name"
+    }
+}
+
+enum ProjectMatchEvidence: String, Codable, Hashable, Sendable {
+    case sameName = "same_name"
 }
 
 struct ProjectMarker: Codable, Hashable, Identifiable, Sendable {
@@ -829,7 +848,7 @@ struct DiscoveryProjectOutput: Codable, Hashable, Sendable {
 }
 
 enum DiscoveryImportDestination: Codable, Hashable, Sendable {
-    case projectFile(projectPath: String)
+    case projectFile(projectPath: String, projectID: String? = nil)
     case projectOutput(projectPath: String, outputPath: String)
     case library
     case projectOutputs(outputs: [DiscoveryProjectOutput])
@@ -837,6 +856,7 @@ enum DiscoveryImportDestination: Codable, Hashable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case type
         case projectPath = "project_path"
+        case projectID = "project_id"
         case outputPath = "output_path"
         case outputs
     }
@@ -853,7 +873,8 @@ enum DiscoveryImportDestination: Codable, Hashable, Sendable {
         switch try container.decode(Kind.self, forKey: .type) {
         case .projectFile:
             self = .projectFile(
-                projectPath: try container.decode(String.self, forKey: .projectPath))
+                projectPath: try container.decode(String.self, forKey: .projectPath),
+                projectID: try container.decodeIfPresent(String.self, forKey: .projectID))
         case .projectOutput:
             self = .projectOutput(
                 projectPath: try container.decode(String.self, forKey: .projectPath),
@@ -869,9 +890,10 @@ enum DiscoveryImportDestination: Codable, Hashable, Sendable {
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         switch self {
-        case .projectFile(let projectPath):
+        case .projectFile(let projectPath, let projectID):
             try container.encode(Kind.projectFile, forKey: .type)
             try container.encode(projectPath, forKey: .projectPath)
+            try container.encodeIfPresent(projectID, forKey: .projectID)
         case .projectOutput(let projectPath, let outputPath):
             try container.encode(Kind.projectOutput, forKey: .type)
             try container.encode(projectPath, forKey: .projectPath)

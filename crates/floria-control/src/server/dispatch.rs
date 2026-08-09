@@ -421,11 +421,16 @@ fn dispatch_uncoordinated(
             let existing = existing_discovery_secrets(catalog, store, &candidate_keys)?;
             let managed_projects =
                 existing_discovery_projects(catalog, discovery.projects())?;
+            let portable_projects = portable_discovery_project_candidates(catalog)?;
             discovery_review_plan(
                 catalog,
                 store,
                 mount_path,
-                discovery.plan_with_projects(&existing, &managed_projects),
+                discovery.plan_with_project_context(
+                    &existing,
+                    &managed_projects,
+                    &portable_projects,
+                ),
             )
             .map(ControlResult::Discovery)
         }

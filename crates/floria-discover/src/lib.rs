@@ -211,6 +211,23 @@ pub struct DiscoveredProject {
     pub ecosystems: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub managed_project_id: Option<String>,
+    /// Portable Projects whose identity may match this checkout. These are suggestions only:
+    /// applying discovery must carry an explicit Project choice and revalidate the evidence.
+    #[serde(default)]
+    pub project_matches: Vec<DiscoveredProjectMatch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiscoveredProjectMatch {
+    pub project_id: String,
+    pub project_name: String,
+    pub evidence: Vec<ProjectMatchEvidence>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectMatchEvidence {
+    SameName,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -445,6 +462,13 @@ pub struct ExistingProject {
     pub environments: Vec<ExistingEnvironment>,
 }
 
+/// A portable Project with no checkout on this device. Discovery may suggest attaching a local
+/// candidate to it, but never chooses it automatically.
+pub struct PortableProjectCandidate {
+    pub id: String,
+    pub name: String,
+}
+
 pub struct ExistingEnvironment {
     pub name: String,
     pub surfaces: Vec<ExistingSurface>,
@@ -639,6 +663,18 @@ impl Discovery {
         existing: &[ExistingSecret],
         managed_projects: &[ExistingProject],
     ) -> DiscoveryPlan {
+        self.plan_with_project_context(existing, managed_projects, &[])
+    }
+
+    /// Produce a review-safe plan with both device-local Projects and portable Projects that may
+    /// be attached here. A match is deliberately informational: the reviewed apply request must
+    /// still name the existing Project explicitly.
+    pub fn plan_with_project_context(
+        &self,
+        existing: &[ExistingSecret],
+        managed_projects: &[ExistingProject],
+        portable_projects: &[PortableProjectCandidate],
+    ) -> DiscoveryPlan {
         let mut reused_secrets = 0;
         let mut new_secrets = 0;
         let mut missing_reference_entries = 0;
@@ -758,6 +794,30 @@ impl Discovery {
                 .iter()
                 .find(|existing| existing.path == project.path)
                 .map(|existing| existing.id.clone());
+            project.project_matches = if project.managed_project_id.is_some() {
+                Vec::new()
+            } else {
+                let discovered_name = normalized_project_name(&project.name);
+                portable_projects
+                    .iter()
+                    .filter(|candidate| {
+                        !discovered_name.is_empty()
+                            && normalized_project_name(&candidate.name) == discovered_name
+                    })
+                    .map(|candidate| DiscoveredProjectMatch {
+                        project_id: candidate.id.clone(),
+                        project_name: candidate.name.clone(),
+                        evidence: vec![ProjectMatchEvidence::SameName],
+                    })
+                    .collect()
+            };
+            project
+                .project_matches
+                .sort_by(|left, right| {
+                    left.project_name
+                        .cmp(&right.project_name)
+                        .then_with(|| left.project_id.cmp(&right.project_id))
+                });
         }
         DiscoveryPlan {
             paths: self.requested_paths.clone(),
@@ -1280,6 +1340,7 @@ fn discovered_project(path: &Path, markers: Vec<ProjectMarker>) -> DiscoveredPro
         markers,
         ecosystems: Vec::new(),
         managed_project_id: None,
+        project_matches: Vec::new(),
     };
     project.ecosystems = project_ecosystems(&project.markers);
     project
@@ -1999,6 +2060,13 @@ fn normalize_environment(environment: Option<&str>) -> String {
     } else {
         normalized
     }
+}
+
+fn normalized_project_name(name: &str) -> String {
+    name.chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 const DOTENV_REFERENCE_MARKERS: &[&str] = &["example", "sample", "template", "dist"];
@@ -2822,6 +2890,46 @@ mod tests {
                 && entry.action
                     == DiscoveredEntryAction::ReferenceEntry { matched: false }
         }));
+    }
+
+    #[test]
+    fn portable_project_name_match_is_a_review_suggestion_not_an_assignment() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("Floria API");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("Cargo.toml"), "[package]\nname = \"fixture\"\n").unwrap();
+        let candidates = [
+            PortableProjectCandidate {
+                id: "project-b".to_string(),
+                name: "floria-api".to_string(),
+            },
+            PortableProjectCandidate {
+                id: "project-a".to_string(),
+                name: "Floria API".to_string(),
+            },
+            PortableProjectCandidate {
+                id: "other".to_string(),
+                name: "Other".to_string(),
+            },
+        ];
+
+        let plan = discover(&root)
+            .unwrap()
+            .plan_with_project_context(&[], &[], &candidates);
+
+        assert_eq!(plan.projects[0].managed_project_id, None);
+        assert_eq!(
+            plan.projects[0]
+                .project_matches
+                .iter()
+                .map(|candidate| candidate.project_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["project-a", "project-b"]
+        );
+        assert!(plan.projects[0]
+            .project_matches
+            .iter()
+            .all(|candidate| candidate.evidence == [ProjectMatchEvidence::SameName]));
     }
 
     #[test]
