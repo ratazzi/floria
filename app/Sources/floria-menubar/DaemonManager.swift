@@ -60,11 +60,17 @@ struct DaemonManager: Sendable {
             try withReconciliationLock {
                 try prepareRuntimeFiles()
                 if installedDefinitionMatches(daemonPath: daemonURL.path) {
-                    switch currentLaunchAgentState {
+                    let status = currentLaunchAgentStatus
+                    switch status.state {
                     case .running:
                         Self.log.info("daemon LaunchAgent already running")
                         return
                     case .loaded:
+                        if status.restartPending {
+                            Self.log.info(
+                                "daemon LaunchAgent is already waiting for launchd's scheduled restart")
+                            return
+                        }
                         try runLaunchctl(["kickstart", serviceTarget])
                         Self.log.info("inactive daemon LaunchAgent started")
                         return
@@ -90,26 +96,18 @@ struct DaemonManager: Sendable {
     func recoverAfterDisconnect() {
         guard Self.isProductionApp else { return }
 
-        switch currentLaunchAgentState {
-        case .running:
-            return
-        case .notLoaded:
-            ensureRunning()
-            return
-        case .loaded:
-            break
-        }
+        var recovery = DisconnectRecoveryTracker(initial: currentLaunchAgentStatus)
 
         for _ in 0..<24 {
             Thread.sleep(forTimeInterval: 0.25)
-            switch currentLaunchAgentState {
-            case .running:
+            switch recovery.observe(currentLaunchAgentStatus) {
+            case .recovered:
                 Self.log.info("daemon recovered through LaunchAgent KeepAlive")
                 return
-            case .notLoaded:
+            case .reconcile:
                 ensureRunning()
                 return
-            case .loaded:
+            case .wait:
                 continue
             }
         }
@@ -293,7 +291,23 @@ struct DaemonManager: Sendable {
     struct LaunchAgentStatus: Equatable, Sendable {
         let state: LaunchAgentState
         let runs: Int
+        let pid: Int?
         let lastExitCode: Int?
+        let restartPending: Bool
+
+        init(
+            state: LaunchAgentState,
+            runs: Int,
+            pid: Int?,
+            lastExitCode: Int?,
+            restartPending: Bool = false
+        ) {
+            self.state = state
+            self.runs = runs
+            self.pid = pid
+            self.lastExitCode = lastExitCode
+            self.restartPending = restartPending
+        }
 
         var hasFailedRun: Bool {
             state != .running && runs > 0 && lastExitCode.map { $0 != 0 } == true
@@ -302,17 +316,57 @@ struct DaemonManager: Sendable {
 
     static func launchAgentStatus(from output: String?) -> LaunchAgentStatus {
         guard let output else {
-            return LaunchAgentStatus(state: .notLoaded, runs: 0, lastExitCode: nil)
+            return LaunchAgentStatus(state: .notLoaded, runs: 0, pid: nil, lastExitCode: nil)
         }
 
         let lines = output
             .split(whereSeparator: \.isNewline)
             .map { $0.trimmingCharacters(in: .whitespaces) }
         let isRunning = lines.contains("state = running")
+        // `launchctl stop` leaves a KeepAlive job in this transient state while its
+        // throttle-window restart is already scheduled. Kickstarting it here creates a short-
+        // lived extra generation that launchd terminates when the scheduled restart fires.
+        let restartPending = lines.contains("state = SIGTERMed")
         return LaunchAgentStatus(
             state: isRunning ? .running : .loaded,
             runs: integerValue(named: "runs", in: lines) ?? 0,
-            lastExitCode: integerValue(named: "last exit code", in: lines))
+            pid: integerValue(named: "pid", in: lines),
+            lastExitCode: integerValue(named: "last exit code", in: lines),
+            restartPending: restartPending)
+    }
+
+    enum DisconnectRecoveryAction: Equatable, Sendable {
+        case wait
+        case recovered
+        case reconcile
+    }
+
+    /// Tracks the LaunchAgent generation that owned the socket when disconnect recovery began.
+    /// The old daemon can close its socket before launchd stops reporting that PID as running, so
+    /// seeing that same generation once is not evidence that recovery completed.
+    struct DisconnectRecoveryTracker: Sendable {
+        private let initialPID: Int?
+        private var observedStoppedGeneration: Bool
+
+        init(initial: LaunchAgentStatus) {
+            initialPID = initial.pid
+            observedStoppedGeneration = initial.state != .running
+        }
+
+        mutating func observe(_ status: LaunchAgentStatus) -> DisconnectRecoveryAction {
+            switch status.state {
+            case .notLoaded:
+                return .reconcile
+            case .loaded:
+                observedStoppedGeneration = true
+                return .wait
+            case .running:
+                if observedStoppedGeneration || status.pid != initialPID {
+                    return .recovered
+                }
+                return .wait
+            }
+        }
     }
 
     static func launchAgentState(from output: String?) -> LaunchAgentState {
@@ -336,8 +390,8 @@ struct DaemonManager: Sendable {
         return true
     }
 
-    private var currentLaunchAgentState: LaunchAgentState {
-        Self.launchAgentState(from: try? runLaunchctl(["print", serviceTarget]))
+    private var currentLaunchAgentStatus: LaunchAgentStatus {
+        Self.launchAgentStatus(from: try? runLaunchctl(["print", serviceTarget]))
     }
 
     /// A completed non-zero launchd run is stronger evidence than waiting for the entire

@@ -11,6 +11,7 @@ use std::io;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
+use std::process::Command;
 use std::ptr;
 
 use fuser::{BackgroundSession, Config, Filesystem, MountOption, Session, SessionACL};
@@ -29,6 +30,7 @@ unsafe extern "C" {
     fn fuse_opt_free_args(args: *mut FuseArgs);
     fn fuse_mount(mountpoint: *const c_char, args: *mut FuseArgs) -> *mut FuseChannel;
     fn fuse_unmount(mountpoint: *const c_char, channel: *mut FuseChannel);
+    fn fuse_chan_destroy(channel: *mut FuseChannel);
     fn fuse_chan_fd(channel: *mut FuseChannel) -> c_int;
 }
 
@@ -39,10 +41,10 @@ pub(crate) struct MacOsBackgroundSession {
 }
 
 impl MacOsBackgroundSession {
-    /// Unmount first so the duplicated fd receives ENODEV, then join fuser's read loop.
+    /// Synchronously unmount, then join fuser after its duplicated device fd receives ENODEV.
     pub(crate) fn unmount_and_join(mut self) -> io::Result<()> {
         if let Some(mut mount) = self.mount.take() {
-            mount.unmount();
+            mount.unmount()?;
         }
         match self.session.take() {
             Some(session) => session.join(),
@@ -54,7 +56,7 @@ impl MacOsBackgroundSession {
 impl Drop for MacOsBackgroundSession {
     fn drop(&mut self) {
         if let Some(mut mount) = self.mount.take() {
-            mount.unmount();
+            let _ = mount.unmount();
         }
     }
 }
@@ -129,20 +131,57 @@ impl ModernMount {
         Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
     }
 
-    fn unmount(&mut self) {
+    fn unmount(&mut self) -> io::Result<()> {
         if self.channel.is_null() {
-            return;
+            return Ok(());
         }
-        // SAFETY: both values came from the successful fuse_mount call. fuse_unmount consumes
-        // the channel and detaches exactly this mount.
-        unsafe { fuse_unmount(self.mountpoint.as_ptr(), self.channel) };
+
+        // macFUSE's fuse_unmount dispatches an asynchronous Disk Arbitration request on modern
+        // macOS. If shutdown follows a just-completed mount, fuser can remain blocked on the
+        // duplicated device fd until launchd's ExitTimeOut kills the daemon. The unmount syscall
+        // is synchronous and makes every descriptor for this connection observe ENODEV before
+        // we join the request loop.
+        // SAFETY: mountpoint is the live path used by the successful fuse_mount call.
+        let result = unsafe { libc::unmount(self.mountpoint.as_ptr(), 0) };
+        let error = io::Error::last_os_error();
+        if result != 0 && error.raw_os_error() == Some(libc::EBUSY) {
+            // A reader may still hold a vnode when launchd asks the daemon to stop. This is a
+            // read-only virtual mount and shutdown must invalidate those old handles. macFUSE 5
+            // can reject even unmount(2) with MNT_FORCE here; diskutil is macOS's synchronous
+            // Disk Arbitration frontend and reliably completes that supported forced unmount.
+            let path = std::ffi::OsStr::from_bytes(self.mountpoint.as_bytes());
+            let output = Command::new("/usr/sbin/diskutil")
+                .args(["unmount", "force"])
+                .arg(path)
+                .output()?;
+            if !output.status.success() {
+                let detail = String::from_utf8_lossy(&output.stderr);
+                return Err(io::Error::other(format!(
+                    "diskutil forced unmount failed: {}",
+                    detail.trim()
+                )));
+            }
+        } else if result != 0 {
+            // Preserve macFUSE's best-effort Disk Arbitration fallback for unusual teardown
+            // failures. It is asynchronous, so the synchronous error remains authoritative.
+            // SAFETY: the channel is still owned by this ModernMount.
+            unsafe { fuse_unmount(self.mountpoint.as_ptr(), self.channel) };
+            self.channel = ptr::null_mut();
+            return Err(error);
+        }
+
+        // fuse_mount owns this original channel. fuser reads from an independent duplicated fd,
+        // so the channel can be destroyed after the kernel has detached the mount.
+        // SAFETY: synchronous unmount completed and this is the channel returned by fuse_mount.
+        unsafe { fuse_chan_destroy(self.channel) };
         self.channel = ptr::null_mut();
+        Ok(())
     }
 }
 
 impl Drop for ModernMount {
     fn drop(&mut self) {
-        self.unmount();
+        let _ = self.unmount();
     }
 }
 

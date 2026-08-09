@@ -309,9 +309,13 @@ restore_environment() {
     fi
 
     if [[ -n "${CRASH_FIXTURE_PATH}" && -L "${CRASH_FIXTURE_PATH}" ]]; then
-        if ! "${DAEMON_PATH}" unprotect "${CRASH_FIXTURE_PATH}" \
-            --config "${CONFIG_PATH}" >/dev/null 2>&1; then
+        local unprotect_output=""
+        if ! unprotect_output="$(
+            "${DAEMON_PATH}" unprotect "${CRASH_FIXTURE_PATH}" \
+                --config "${CONFIG_PATH}" 2>&1
+        )"; then
             echo "Could not stop protecting crash-test fixture ${CRASH_FIXTURE_PATH}" >&2
+            [[ -n "${unprotect_output}" ]] && echo "${unprotect_output}" >&2
             cleanup_failed=1
             fixture_cleanup_failed=1
         fi

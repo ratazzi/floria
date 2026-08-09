@@ -32,7 +32,7 @@ final class DaemonManagerTests: XCTestCase {
         XCTAssertEqual(DaemonManager.launchAgentState(from: output), .loaded)
         XCTAssertEqual(
             DaemonManager.launchAgentStatus(from: output),
-            DaemonManager.LaunchAgentStatus(state: .loaded, runs: 3, lastExitCode: 1))
+            DaemonManager.LaunchAgentStatus(state: .loaded, runs: 3, pid: nil, lastExitCode: 1))
         XCTAssertTrue(DaemonManager.launchAgentStatus(from: output).hasFailedRun)
     }
 
@@ -46,6 +46,23 @@ final class DaemonManagerTests: XCTestCase {
 
         XCTAssertEqual(DaemonManager.launchAgentState(from: output), .loaded)
         XCTAssertFalse(DaemonManager.launchAgentStatus(from: output).hasFailedRun)
+    }
+
+    func testLaunchAgentRecognizesScheduledRestartAfterLaunchctlStop() {
+        let output = """
+        gui/501/floria.hola.ac.daemon = {
+            active count = 1
+            state = SIGTERMed
+            runs = 2
+            pid = 65970
+            last exit code = 0
+        }
+        """
+
+        let status = DaemonManager.launchAgentStatus(from: output)
+        XCTAssertEqual(status.state, .loaded)
+        XCTAssertEqual(status.pid, 65970)
+        XCTAssertTrue(status.restartPending)
     }
 
     func testRunningLaunchAgentIsNotTreatedAsAFailedStartup() {
@@ -79,5 +96,38 @@ final class DaemonManagerTests: XCTestCase {
             output: "Invalid property list")
 
         XCTAssertFalse(DaemonManager.shouldRetryBootstrap(error, completedAttempts: 1))
+    }
+
+    func testDisconnectRecoveryWaitsForTheOriginalRunningGenerationToStop() {
+        var recovery = DaemonManager.DisconnectRecoveryTracker(
+            initial: .init(state: .running, runs: 2, pid: 945, lastExitCode: nil))
+
+        XCTAssertEqual(
+            recovery.observe(.init(state: .running, runs: 2, pid: 945, lastExitCode: nil)),
+            .wait)
+        XCTAssertEqual(
+            recovery.observe(.init(state: .loaded, runs: 2, pid: 945, lastExitCode: 0)),
+            .wait)
+        XCTAssertEqual(
+            recovery.observe(.init(state: .running, runs: 3, pid: 946, lastExitCode: 0)),
+            .recovered)
+    }
+
+    func testDisconnectRecoveryAcceptsAReplacementGenerationWithoutSamplingTheStop() {
+        var recovery = DaemonManager.DisconnectRecoveryTracker(
+            initial: .init(state: .running, runs: 2, pid: 945, lastExitCode: nil))
+
+        XCTAssertEqual(
+            recovery.observe(.init(state: .running, runs: 3, pid: 946, lastExitCode: 0)),
+            .recovered)
+    }
+
+    func testDisconnectRecoveryReconcilesAnUnloadedJob() {
+        var recovery = DaemonManager.DisconnectRecoveryTracker(
+            initial: .init(state: .loaded, runs: 2, pid: nil, lastExitCode: 0))
+
+        XCTAssertEqual(
+            recovery.observe(.init(state: .notLoaded, runs: 0, pid: nil, lastExitCode: nil)),
+            .reconcile)
     }
 }

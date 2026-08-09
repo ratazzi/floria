@@ -272,6 +272,10 @@ final class AppState {
                         break
                     }
                 }
+                // The daemon can stop cleanly before AgentClient completes its first handshake,
+                // so no disconnect callback exists to schedule recovery. Reconciliation is
+                // idempotent for a running job and kickstarts a loaded, successfully exited one.
+                await Task.detached(priority: .utility) { manager.ensureRunning() }.value
             }
             guard let self, !Task.isCancelled else { return }
             let stage = MacFuseSetupStage.afterFailedDaemonProbe(
