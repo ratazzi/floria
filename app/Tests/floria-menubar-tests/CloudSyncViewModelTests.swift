@@ -270,6 +270,24 @@ final class CloudSyncViewModelTests: XCTestCase {
         XCTAssertNil(model.errorMessage)
     }
 
+    func testSuccessfulSyncIsNotReportedAsFailedWhenAccessoryRefreshFails() async {
+        let vaultID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let service = CloudSyncViewServiceStub(
+            status: status(vaultID: vaultID),
+            candidates: [],
+            bootstrap: bootstrap(vaultID: vaultID),
+            failAccessoryRefreshAfterSync: true)
+        let model = CloudSyncViewModel(service: service, restartDaemon: {})
+
+        await model.load()
+        await model.syncNow()
+
+        XCTAssertEqual(model.notice, "Your encrypted Library is up to date in iCloud.")
+        XCTAssertEqual(
+            model.errorMessage,
+            "Sync completed, but Floria could not refresh Macs and Projects. Try Sync Now again.")
+    }
+
     func testReviewedConflictRequiresAnExplicitCandidateAndThenSyncsTheMerge() async {
         let entityID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
         let local = SyncConflictCandidate(
@@ -379,6 +397,8 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
     private var pendingVault: String?
     private var projectsWithoutLocalFolder: [SyncedProject]
     private var restartTarget: String?
+    private let failAccessoryRefreshAfterSync: Bool
+    private var didSync = false
     private(set) var revokedDevices = [SyncVaultDevice]()
     private(set) var requestedAccessDevices = [SyncVaultDevice]()
     private(set) var attachedProjectIDs = [String]()
@@ -398,7 +418,8 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
         appliedRemoteChanges: Bool = false,
         projectsWithoutLocalFolder: [SyncedProject] = [],
         lastSuccessfulSyncAt: Date? = nil,
-        pendingVaultID: String? = nil
+        pendingVaultID: String? = nil,
+        failAccessoryRefreshAfterSync: Bool = false
     ) {
         self.available = available
         self.enabled = enabled
@@ -413,6 +434,7 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
         self.projectsWithoutLocalFolder = projectsWithoutLocalFolder
         lastSuccessfulSync = lastSuccessfulSyncAt
         pendingVault = pendingVaultID
+        self.failAccessoryRefreshAfterSync = failAccessoryRefreshAfterSync
         self.activation = activation ?? .ready(
             vaultID: status.vaultID,
             keyGeneration: status.keyGeneration,
@@ -470,7 +492,10 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
     }
 
     func projectsWithoutLocalFolder() async throws -> [SyncedProject] {
-        projectsWithoutLocalFolder
+        if failAccessoryRefreshAfterSync, didSync {
+            throw CloudSyncServiceError.unconfiguredTestDependency
+        }
+        return projectsWithoutLocalFolder
     }
 
     func attachProject(_ project: SyncedProject, at _: URL) async throws {
@@ -480,6 +505,7 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
 
     func syncNow() async throws -> CloudSyncOutcome {
         if let syncFailure { throw syncFailure }
+        didSync = true
         return CloudSyncOutcome(
             status: status,
             appliedRemoteChanges: appliedRemoteChanges)
@@ -526,7 +552,10 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
     }
 
     func reviewDevices(in _: SyncVaultBootstrap) async throws -> [SyncVaultDevice] {
-        devices
+        if failAccessoryRefreshAfterSync, didSync {
+            throw CloudSyncServiceError.unconfiguredTestDependency
+        }
+        return devices
     }
 
     func revokeDevice(

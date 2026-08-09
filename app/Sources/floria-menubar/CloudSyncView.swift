@@ -157,7 +157,6 @@ final class CloudSyncViewModel {
             do {
                 let outcome = try await self.service.syncNow()
                 self.status = outcome.status
-                try await self.loadConflicts(for: outcome.status)
                 await self.refreshPersistentState()
                 if self.syncAttentionMessage == nil {
                     self.notice = outcome.appliedRemoteChanges
@@ -166,8 +165,7 @@ final class CloudSyncViewModel {
                 } else {
                     self.notice = nil
                 }
-                try await self.loadDeviceManagement(for: outcome.status.vaultID)
-                try await self.loadProjectsWithoutLocalFolder()
+                await self.refreshPostSyncDetails(for: outcome.status)
             } catch {
                 if await self.detectCurrentMacRemoval() {
                     throw CloudSyncViewError.currentMacRemoved
@@ -241,7 +239,7 @@ final class CloudSyncViewModel {
             let outcome = try await self.service.syncNow()
             self.status = outcome.status
             await self.refreshPersistentState()
-            try await self.loadDeviceManagement(for: outcome.status.vaultID)
+            await self.refreshPostSyncDetails(for: outcome.status)
             self.notice = "\(review.deviceName ?? "The other Mac") can now use this Library."
         }
     }
@@ -254,7 +252,7 @@ final class CloudSyncViewModel {
             let outcome = try await self.service.syncNow()
             self.status = outcome.status
             await self.refreshPersistentState()
-            try await self.loadDeviceManagement(for: outcome.status.vaultID)
+            await self.refreshPostSyncDetails(for: outcome.status)
             self.notice = "\(device.deviceName ?? "The other Mac") was removed from this Library."
         }
     }
@@ -317,6 +315,41 @@ final class CloudSyncViewModel {
         conflicts = status.conflictingEntities == 0
             ? []
             : try await service.reviewConflicts()
+    }
+
+    /// The CloudKit transport has already settled when this runs. These views are useful, but a
+    /// failed refresh must not turn a successful sync into an apparent sync failure.
+    private func refreshPostSyncDetails(for status: SyncDomainStatus) async {
+        var failedSections = [String]()
+        do {
+            try await loadConflicts(for: status)
+        } catch {
+            conflicts = []
+            failedSections.append("Conflicts")
+        }
+        do {
+            try await loadDeviceManagement(for: status.vaultID)
+        } catch {
+            approvals = []
+            devices = []
+            failedSections.append("Macs")
+        }
+        do {
+            try await loadProjectsWithoutLocalFolder()
+        } catch {
+            projectsWithoutLocalFolder = []
+            failedSections.append("Projects")
+        }
+        guard !failedSections.isEmpty else { return }
+        errorMessage =
+            "Sync completed, but Floria could not refresh \(joined(failedSections)). "
+            + "Try Sync Now again."
+    }
+
+    private func joined(_ values: [String]) -> String {
+        guard let last = values.last else { return "details" }
+        guard values.count > 1 else { return last }
+        return values.dropLast().joined(separator: ", ") + " and " + last
     }
 
     private func refreshPersistentState() async {
@@ -637,7 +670,7 @@ struct SyncView: View {
             }
             Spacer()
             Toggle(
-                "",
+                "iCloud Sync",
                 isOn: Binding(
                     get: { model.isEnabled },
                     set: { enabled in Task { await model.setEnabled(enabled) } }))
