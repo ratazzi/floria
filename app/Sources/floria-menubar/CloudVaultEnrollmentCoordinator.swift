@@ -62,6 +62,28 @@ struct CloudVaultEnrollmentCoordinator: Sendable {
     ) async throws -> SyncEnrollmentPreparation {
         let preparation = try await control.prepareRecordSyncVaultEnrollment(
             bootstrap: bootstrap, deviceName: deviceName, requestedAt: requestedAt)
+        return try await publish(preparation, in: bootstrap)
+    }
+
+    @discardableResult
+    func requestReenrollment(
+        in bootstrap: SyncVaultBootstrap,
+        expectedFingerprint: String,
+        deviceName: String?,
+        requestedAt: String
+    ) async throws -> SyncEnrollmentPreparation {
+        let preparation = try await control.prepareRecordSyncVaultReenrollment(
+            bootstrap: bootstrap,
+            expectedFingerprint: expectedFingerprint,
+            deviceName: deviceName,
+            requestedAt: requestedAt)
+        return try await publish(preparation, in: bootstrap)
+    }
+
+    private func publish(
+        _ preparation: SyncEnrollmentPreparation,
+        in bootstrap: SyncVaultBootstrap
+    ) async throws -> SyncEnrollmentPreparation {
         guard case .request(let request) = preparation else { return preparation }
 
         let codec = try CloudVaultBootstrapCodec(vaultID: bootstrap.vaultID)

@@ -212,6 +212,22 @@
             .expect("fixture enrollment preparation"))
         }
 
+        fn prepare_vault_reenrollment(
+            &self,
+            _bootstrap: SyncVaultBootstrap,
+            _expected_fingerprint: &str,
+            _device_name: Option<String>,
+            _requested_at: &str,
+        ) -> Result<SyncEnrollmentPreparation, String> {
+            self.enrollment_preparation_calls
+                .fetch_add(1, Ordering::Relaxed);
+            Ok(serde_json::from_value(serde_json::json!({
+                "status": "already_enrolled",
+                "device_id": "fixture-device"
+            }))
+            .expect("fixture reenrollment preparation"))
+        }
+
         fn review_vault_enrollments(
             &self,
             _bootstrap: SyncVaultBootstrap,
@@ -3278,6 +3294,17 @@
         ));
         assert!(matches!(
             client
+                .request(ControlCommand::RecordSyncPrepareVaultReenrollment {
+                    bootstrap: bootstrap.clone(),
+                    expected_fingerprint: "AB12-CD34-EF56".to_string(),
+                    device_name: Some("Studio".to_string()),
+                    requested_at: "2026-08-09T12:00:00Z".to_string(),
+                })
+                .unwrap(),
+            ControlResult::RecordSyncEnrollmentPreparation(_)
+        ));
+        assert!(matches!(
+            client
                 .request(ControlCommand::RecordSyncReviewVaultEnrollments {
                     bootstrap: bootstrap.clone(),
                 })
@@ -3366,7 +3393,7 @@
             record_sync
                 .enrollment_preparation_calls
                 .load(Ordering::Relaxed),
-            1
+            2
         );
         assert_eq!(
             record_sync.enrollment_review_calls.load(Ordering::Relaxed),
@@ -3395,6 +3422,12 @@
                 entity_id: "11111111-1111-4111-8111-111111111111".to_string(),
                 selected_revision_id: "22222222-2222-4222-8222-222222222222".to_string(),
                 resolved_at: "2026-08-09T12:00:00Z".to_string(),
+            },
+            ControlCommand::RecordSyncPrepareVaultReenrollment {
+                bootstrap: bootstrap.clone(),
+                expected_fingerprint: "AB12-CD34-EF56".to_string(),
+                device_name: Some("Studio".to_string()),
+                requested_at: "2026-08-09T12:00:00Z".to_string(),
             },
             ControlCommand::RecordSyncApproveVaultEnrollment {
                 bootstrap: bootstrap.clone(),
@@ -3717,6 +3750,22 @@
                 bootstrap: bootstrap.clone(),
                 device_name: None,
                 requested_at: "2026-08-08T12:00:00Z".to_string(),
+            }
+        ));
+        assert!(!is_read_only(
+            &ControlCommand::RecordSyncPrepareVaultReenrollment {
+                bootstrap: bootstrap.clone(),
+                expected_fingerprint: "AB12-CD34-EF56".to_string(),
+                device_name: None,
+                requested_at: "2026-08-09T12:00:00Z".to_string(),
+            }
+        ));
+        assert!(is_self_coordinated(
+            &ControlCommand::RecordSyncPrepareVaultReenrollment {
+                bootstrap: bootstrap.clone(),
+                expected_fingerprint: "AB12-CD34-EF56".to_string(),
+                device_name: None,
+                requested_at: "2026-08-09T12:00:00Z".to_string(),
             }
         ));
         assert!(is_read_only(

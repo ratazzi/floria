@@ -66,6 +66,27 @@ final class CloudVaultEnrollmentCoordinatorTests: XCTestCase {
         XCTAssertNil(createdRecord)
     }
 
+    func testReenrollmentPreservesReviewedFingerprintAndPublishesTheFreshRequest() async throws {
+        let bootstrap = fixtureBootstrap()
+        let preparation = fixturePreparation()
+        let control = VaultEnrollmentControlStub(preparation: preparation)
+        let publisher = VaultEnrollmentPublisherStub(mode: .saved)
+
+        let result = try await CloudVaultEnrollmentCoordinator(
+            control: control, publisher: publisher
+        ).requestReenrollment(
+            in: bootstrap,
+            expectedFingerprint: "AB12-CD34-EF56",
+            deviceName: "Studio",
+            requestedAt: "2026-08-09T12:00:00Z")
+
+        XCTAssertEqual(result, preparation)
+        let reenrollmentFingerprint = await control.reenrollmentFingerprint
+        let createdRecord = await publisher.createdRecord
+        XCTAssertEqual(reenrollmentFingerprint, "AB12-CD34-EF56")
+        XCTAssertNotNil(createdRecord)
+    }
+
     func testReviewApprovalPreservesExactFingerprint() async throws {
         let bootstrap = fixtureBootstrap()
         let review = SyncEnrollmentReview(
@@ -108,6 +129,7 @@ private actor VaultEnrollmentControlStub: VaultEnrollmentControlling {
     let pendingReviews: [SyncEnrollmentReview]
     private(set) var preparationCalls = 0
     private(set) var approvedFingerprint: String?
+    private(set) var reenrollmentFingerprint: String?
 
     init(
         preparation: SyncEnrollmentPreparation,
@@ -123,6 +145,16 @@ private actor VaultEnrollmentControlStub: VaultEnrollmentControlling {
         requestedAt _: String
     ) async throws -> SyncEnrollmentPreparation {
         preparationCalls += 1
+        return preparation
+    }
+
+    func prepareRecordSyncVaultReenrollment(
+        bootstrap _: SyncVaultBootstrap,
+        expectedFingerprint: String,
+        deviceName _: String?,
+        requestedAt _: String
+    ) async throws -> SyncEnrollmentPreparation {
+        reenrollmentFingerprint = expectedFingerprint
         return preparation
     }
 

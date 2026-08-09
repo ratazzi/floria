@@ -240,6 +240,33 @@ actor CloudSyncService {
         return preparation
     }
 
+    func requestAccessAgain(
+        in bootstrap: SyncVaultBootstrap,
+        removedDevice: SyncVaultDevice,
+        deviceName: String?,
+        requestedAt: String? = nil
+    ) async throws -> SyncEnrollmentPreparation {
+        guard preferences.isEnabled else { throw CloudSyncServiceError.disabled }
+        let activePublisher: any CloudVaultEnrollmentPublishing
+        if let enrollmentPublisher {
+            activePublisher = enrollmentPublisher
+        } else {
+            activePublisher = try enrollmentPublisherFactory()
+            enrollmentPublisher = activePublisher
+        }
+        let preparation = try await CloudVaultEnrollmentCoordinator(
+            control: control, publisher: activePublisher
+        ).requestReenrollment(
+            in: bootstrap,
+            expectedFingerprint: removedDevice.fingerprint,
+            deviceName: deviceName,
+            requestedAt: requestedAt ?? Self.timestamp())
+        preferences.setPendingVaultID(bootstrap.vaultID)
+        session = nil
+        sessionVaultID = nil
+        return preparation
+    }
+
     func reviewEnrollments(
         in bootstrap: SyncVaultBootstrap
     ) async throws -> [SyncEnrollmentReview] {

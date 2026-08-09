@@ -498,6 +498,59 @@ impl SyncVaultBootstrap {
         ))
     }
 
+    /// Replace this installation's revoked identity and prepare its new self-signed request.
+    /// The authenticated lifecycle is the authority for revocation; callers cannot rotate a
+    /// healthy identity or substitute a different reviewed fingerprint.
+    pub fn prepare_reenrollment(
+        &self,
+        store: std::sync::Arc<AgeDirStore>,
+        expected_fingerprint: &str,
+        device_name: Option<String>,
+        requested_at: &str,
+    ) -> ReplicationResult<SyncEnrollmentPreparation> {
+        let current_vault_id = store.vault_document().vault_id;
+        let validated = self.validated(&current_vault_id)?;
+        let current = store.device();
+        let identity = validated.identities.get(current.device_id()).ok_or_else(|| {
+            ReplicationError::Invalid(format!(
+                "Device {} has not been approved for Vault {}",
+                current.device_id(), current_vault_id
+            ))
+        })?;
+        let local = current.enrollment();
+        if identity.signing_public_key != local.signing_public_key
+            || identity.wrapping_recipient != local.wrapping_recipient
+        {
+            return Err(ReplicationError::Invalid(format!(
+                "approved Device {} does not match this installation's private keys",
+                current.device_id()
+            )));
+        }
+        let actual_fingerprint = vault::signing_key_fingerprint(&identity.signing_public_key);
+        if actual_fingerprint != expected_fingerprint {
+            return Err(ReplicationError::Invalid(format!(
+                "Device fingerprint changed for Device {}",
+                current.device_id()
+            )));
+        }
+        let revoked = validated.generations.values().any(|generation| {
+            generation.revoked_devices.contains_key(current.device_id())
+        });
+        if !revoked {
+            return Err(ReplicationError::Invalid(format!(
+                "Device {} has not been removed from Vault {}",
+                current.device_id(), current_vault_id
+            )));
+        }
+
+        let replacement = store.rotate_device_identity()?;
+        self.prepare_enrollment(
+            replacement.as_ref(),
+            device_name,
+            requested_at,
+        )
+    }
+
     /// Return only valid requests that have not already received a signed Device identity.
     pub fn review_enrollments(&self) -> ReplicationResult<Vec<SyncEnrollmentReview>> {
         let validated = self.validated(&self.vault_id)?;
@@ -1382,6 +1435,75 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("has no envelope"));
+    }
+
+    #[test]
+    fn removed_mac_rotates_to_a_fresh_identity_and_keeps_old_generations_readable() {
+        let genesis_directory = tempfile::tempdir().unwrap();
+        let joining_directory = tempfile::tempdir().unwrap();
+        let genesis = store(&genesis_directory);
+        let joining = store(&joining_directory);
+        let approved = approved_bootstrap(&genesis, &joining);
+        approved.activate(Arc::clone(&joining), 0).unwrap();
+        let target = approved
+            .review_devices(genesis.device().device_id())
+            .unwrap()
+            .into_iter()
+            .find(|device| device.device_id() == joining.device().device_id())
+            .unwrap();
+        let previous_device_id = joining.device().device_id().to_string();
+        let generation_public = joining
+            .generation_identity(1)
+            .unwrap()
+            .to_public()
+            .to_string();
+
+        let healthy = approved
+            .prepare_reenrollment(
+                Arc::clone(&joining),
+                target.fingerprint(),
+                Some("Joining Mac".to_string()),
+                "2026-08-09T00:00:00Z",
+            )
+            .unwrap_err();
+        assert!(healthy.to_string().contains("has not been removed"));
+        assert_eq!(joining.device().device_id(), previous_device_id);
+
+        let revoked = approved
+            .revoke_device(
+                Arc::clone(&genesis),
+                target.device_id(),
+                target.fingerprint(),
+            )
+            .unwrap();
+        let mismatched = revoked
+            .prepare_reenrollment(
+                Arc::clone(&joining),
+                "00-00-00-00-00-00",
+                Some("Joining Mac".to_string()),
+                "2026-08-09T00:00:00Z",
+            )
+            .unwrap_err();
+        assert!(mismatched.to_string().contains("fingerprint changed"));
+        assert_eq!(joining.device().device_id(), previous_device_id);
+
+        let SyncEnrollmentPreparation::Request(request) = revoked
+            .prepare_reenrollment(
+                Arc::clone(&joining),
+                target.fingerprint(),
+                Some("Joining Mac".to_string()),
+                "2026-08-09T00:00:00Z",
+            )
+            .unwrap()
+        else {
+            panic!("removed Device unexpectedly remained enrolled")
+        };
+        assert_ne!(request.device_id(), previous_device_id);
+        assert_eq!(joining.device().device_id(), request.device_id());
+        assert_eq!(
+            joining.generation_identity(1).unwrap().to_public().to_string(),
+            generation_public
+        );
     }
 
     #[test]

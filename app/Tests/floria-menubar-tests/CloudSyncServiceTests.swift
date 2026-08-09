@@ -234,6 +234,49 @@ final class CloudSyncServiceTests: XCTestCase {
         XCTAssertEqual(preferences.pendingVaultID, bootstrap.vaultID)
     }
 
+    func testRemovedMacRequestsAccessAgainWithItsAuthenticatedFingerprint() async throws {
+        let suiteName = "floria-cloud-sync-tests-\(UUID().uuidString)"
+        let preferences = CloudSyncPreferences(suiteName: suiteName)
+        preferences.setEnabled(true)
+        let control = CloudSyncControlStub(status: status())
+        let publisher = CloudSyncEnrollmentPublisherStub()
+        let bootstrap = SyncVaultBootstrap(
+            vaultID: status().vaultID,
+            vaultDocumentBase64: "dmF1bHQ=", deviceIdentities: [], enrollmentRequests: [],
+            keyGenerations: [], generationEnvelopes: [])
+        let removed = SyncVaultDevice(
+            deviceID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            deviceName: "This Mac",
+            fingerprint: "AB12-CD34-EF56",
+            enrolledGeneration: 1,
+            revokedGeneration: 2,
+            isGenesis: false,
+            isCurrent: true)
+        let service = CloudSyncService(
+            control: control,
+            supportDirectory: FileManager.default.temporaryDirectory,
+            preferences: preferences,
+            sessionFactory: { _, _, _ in CloudSyncSessionStub() },
+            enrollmentPublisherFactory: { publisher })
+        defer { UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName) }
+
+        let result = try await service.requestAccessAgain(
+            in: bootstrap,
+            removedDevice: removed,
+            deviceName: "Studio",
+            requestedAt: "2026-08-09T12:00:00Z")
+
+        guard case .request(let request) = result else {
+            return XCTFail("Expected a fresh enrollment request")
+        }
+        let reenrollmentFingerprints = await control.reenrollmentFingerprints
+        let record = await publisher.record
+        XCTAssertEqual(reenrollmentFingerprints, [removed.fingerprint])
+        XCTAssertEqual(request.deviceID, "dddddddd-dddd-4ddd-8ddd-dddddddddddd")
+        XCTAssertNotNil(record)
+        XCTAssertEqual(preferences.pendingVaultID, bootstrap.vaultID)
+    }
+
     func testDifferentVaultActivationBlocksSyncUntilDaemonReportsTheTargetVault() async throws {
         let suiteName = "floria-cloud-sync-tests-\(UUID().uuidString)"
         let preferences = CloudSyncPreferences(suiteName: suiteName)
@@ -485,6 +528,7 @@ private actor CloudSyncControlStub: CloudSyncControlling {
     private(set) var statusCount = 0
     private(set) var approvedFingerprints = [String]()
     private(set) var revokedFingerprints = [String]()
+    private(set) var reenrollmentFingerprints = [String]()
     private(set) var attachedProjects = [(id: String, path: String)]()
 
     init(
@@ -555,6 +599,22 @@ private actor CloudSyncControlStub: CloudSyncControlling {
                 requestedAt: requestedAt,
                 fingerprint: "sha256:fixture",
                 documentBase64: "cmVxdWVzdA=="))
+    }
+
+    func prepareRecordSyncVaultReenrollment(
+        bootstrap _: SyncVaultBootstrap,
+        expectedFingerprint: String,
+        deviceName: String?,
+        requestedAt: String
+    ) async throws -> SyncEnrollmentPreparation {
+        reenrollmentFingerprints.append(expectedFingerprint)
+        return .request(
+            SyncEnrollmentRequest(
+                deviceID: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                deviceName: deviceName,
+                requestedAt: requestedAt,
+                fingerprint: "sha256:fresh",
+                documentBase64: "ZnJlc2g="))
     }
 
     func reviewRecordSyncVaultEnrollments(

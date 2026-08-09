@@ -449,6 +449,24 @@ impl<'a> RecordSyncControl<'a> {
         bootstrap.prepare_enrollment(&self.store.device(), device_name, requested_at)
     }
 
+    /// Replace this installation's authenticated revoked identity and return its new request.
+    /// The reviewed fingerprint and signed lifecycle both have to identify the current Device;
+    /// transport/UI callers cannot use this operation as a generic key-rotation endpoint.
+    pub fn prepare_vault_reenrollment(
+        &self,
+        bootstrap: SyncVaultBootstrap,
+        expected_fingerprint: &str,
+        device_name: Option<String>,
+        requested_at: &str,
+    ) -> ReplicationResult<SyncEnrollmentPreparation> {
+        bootstrap.prepare_reenrollment(
+            std::sync::Arc::clone(&self.store),
+            expected_fingerprint,
+            device_name,
+            requested_at,
+        )
+    }
+
     /// Project authenticated pending requests into the minimal information a GUI
     /// needs for out-of-band fingerprint comparison.
     pub fn review_vault_enrollments(

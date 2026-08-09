@@ -15,7 +15,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertNil(request["params"])
 
         let response = Data(
-            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":20,"daemon_version":"0.1.0","schema_version":14,"minimum_schema_version":14,"store_format_version":5,"minimum_store_format_version":5}}}"#.utf8)
+            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":21,"daemon_version":"0.1.0","schema_version":14,"minimum_schema_version":14,"store_format_version":5,"minimum_store_format_version":5}}}"#.utf8)
         let decoded = try JSONDecoder().decode(
             ControlResponseEnvelope<ControlServerInfo>.self, from: response)
         let info = try XCTUnwrap(decoded.result?.value)
@@ -179,6 +179,23 @@ final class ControlProtocolTests: XCTestCase {
             preparationRequest["method"] as? String,
             "record_sync_prepare_vault_enrollment")
         XCTAssertEqual(preparationParams["device_name"] as? String, "Studio")
+
+        let reenrollmentData = try ControlCommand.recordSyncPrepareVaultReenrollment(
+            bootstrap: candidate,
+            expectedFingerprint: "AB12-CD34-EF56",
+            deviceName: "Studio",
+            requestedAt: "2026-08-09T12:00:00Z"
+        ).requestData(requestID: 81, encoder: encoder)
+        let reenrollmentRequest = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: reenrollmentData) as? [String: Any])
+        let reenrollmentParams = try XCTUnwrap(
+            reenrollmentRequest["params"] as? [String: Any])
+        XCTAssertEqual(
+            reenrollmentRequest["method"] as? String,
+            "record_sync_prepare_vault_reenrollment")
+        XCTAssertEqual(
+            reenrollmentParams["expected_fingerprint"] as? String,
+            "AB12-CD34-EF56")
 
         let resolutionData = try ControlCommand.recordSyncResolveConflict(
             entityID: "11111111-1111-4111-8111-111111111111",

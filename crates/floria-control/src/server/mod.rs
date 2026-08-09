@@ -171,6 +171,13 @@ pub trait RuntimeRecordSyncService: Send + Sync + 'static {
         device_name: Option<String>,
         requested_at: &str,
     ) -> Result<SyncEnrollmentPreparation, String>;
+    fn prepare_vault_reenrollment(
+        &self,
+        bootstrap: SyncVaultBootstrap,
+        expected_fingerprint: &str,
+        device_name: Option<String>,
+        requested_at: &str,
+    ) -> Result<SyncEnrollmentPreparation, String>;
     fn review_vault_enrollments(
         &self,
         bootstrap: SyncVaultBootstrap,

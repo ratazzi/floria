@@ -17,6 +17,12 @@ protocol VaultEnrollmentControlling: Sendable {
         deviceName: String?,
         requestedAt: String
     ) async throws -> SyncEnrollmentPreparation
+    func prepareRecordSyncVaultReenrollment(
+        bootstrap: SyncVaultBootstrap,
+        expectedFingerprint: String,
+        deviceName: String?,
+        requestedAt: String
+    ) async throws -> SyncEnrollmentPreparation
     func reviewRecordSyncVaultEnrollments(
         bootstrap: SyncVaultBootstrap
     ) async throws -> [SyncEnrollmentReview]

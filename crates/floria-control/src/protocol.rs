@@ -28,7 +28,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 const MAX_MSG: usize = 8 << 20;
 pub(crate) const MAX_RECORD_SYNC_BATCH_BYTES: usize = 6 << 20;
-pub const CONTROL_PROTOCOL_VERSION: u32 = 20;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 21;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRequest {
@@ -109,6 +109,12 @@ pub enum ControlCommand {
     },
     RecordSyncPrepareVaultEnrollment {
         bootstrap: SyncVaultBootstrap,
+        device_name: Option<String>,
+        requested_at: String,
+    },
+    RecordSyncPrepareVaultReenrollment {
+        bootstrap: SyncVaultBootstrap,
+        expected_fingerprint: String,
         device_name: Option<String>,
         requested_at: String,
     },
@@ -1767,6 +1773,25 @@ mod tests {
             "record_sync_prepare_vault_enrollment"
         );
         assert_eq!(preparation_request["params"]["device_name"], "Studio");
+
+        let reenrollment_request = serde_json::to_value(ControlRequest {
+            request_id: 52,
+            command: ControlCommand::RecordSyncPrepareVaultReenrollment {
+                bootstrap: bootstrap.clone(),
+                expected_fingerprint: "AB12-CD34-EF56".to_string(),
+                device_name: Some("Studio".to_string()),
+                requested_at: "2026-08-09T12:00:00Z".to_string(),
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            reenrollment_request["method"],
+            "record_sync_prepare_vault_reenrollment"
+        );
+        assert_eq!(
+            reenrollment_request["params"]["expected_fingerprint"],
+            "AB12-CD34-EF56"
+        );
 
         let review_request = serde_json::to_value(ControlRequest {
             request_id: 47,

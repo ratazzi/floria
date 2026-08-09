@@ -20,6 +20,12 @@ protocol CloudSyncServicing: Sendable {
         deviceName: String?,
         requestedAt: String?
     ) async throws -> SyncEnrollmentPreparation
+    func requestAccessAgain(
+        in bootstrap: SyncVaultBootstrap,
+        removedDevice: SyncVaultDevice,
+        deviceName: String?,
+        requestedAt: String?
+    ) async throws -> SyncEnrollmentPreparation
     func reviewEnrollments(
         in bootstrap: SyncVaultBootstrap
     ) async throws -> [SyncEnrollmentReview]
@@ -42,6 +48,7 @@ final class CloudSyncViewModel {
     private let service: any CloudSyncServicing
     private let restartDaemon: @Sendable () async throws -> Void
     private var joiningBootstrap: SyncVaultBootstrap?
+    private var removedBootstrap: SyncVaultBootstrap?
 
     var isEnabled = false
     var isWorking = false
@@ -52,6 +59,7 @@ final class CloudSyncViewModel {
     var enrollmentRequest: SyncEnrollmentRequest?
     var approvals = [SyncEnrollmentReview]()
     var devices = [SyncVaultDevice]()
+    var removedCurrentMac: SyncVaultDevice?
     var projectsWithoutLocalFolder = [SyncedProject]()
     var conflicts = [SyncConflictReview]()
     var notice: String?
@@ -130,6 +138,8 @@ final class CloudSyncViewModel {
             projectsWithoutLocalFolder = []
             conflicts = []
             joiningBootstrap = nil
+            removedBootstrap = nil
+            removedCurrentMac = nil
         }
     }
 
@@ -182,6 +192,27 @@ final class CloudSyncViewModel {
         await perform {
             let refreshed = try await self.service.authenticateVault(joiningBootstrap.vaultID)
             try await self.continueJoining(refreshed)
+        }
+    }
+
+    func requestAccessAgain() async {
+        guard let removedBootstrap, let removedCurrentMac else { return }
+        await perform {
+            let preparation = try await self.service.requestAccessAgain(
+                in: removedBootstrap,
+                removedDevice: removedCurrentMac,
+                deviceName: Host.current().localizedName,
+                requestedAt: nil)
+            guard case .request(let request) = preparation else {
+                throw CloudSyncViewError.reenrollmentDidNotCreateRequest
+            }
+            self.joiningBootstrap = removedBootstrap
+            self.enrollmentRequest = request
+            self.removedBootstrap = nil
+            self.removedCurrentMac = nil
+            self.devices = []
+            await self.refreshPersistentState()
+            self.notice = "A new access request is ready for approval on another Mac."
         }
     }
 
@@ -350,7 +381,12 @@ final class CloudSyncViewModel {
               let reviewed = try? await service.reviewDevices(in: bootstrap)
         else { return false }
         devices = reviewed
-        return reviewed.contains { $0.isCurrent && $0.revokedGeneration != nil }
+        guard let removed = reviewed.first(where: {
+            $0.isCurrent && $0.revokedGeneration != nil
+        }) else { return false }
+        removedBootstrap = bootstrap
+        removedCurrentMac = removed
+        return true
     }
 
     private func perform(_ operation: @escaping () async throws -> Void) async {
@@ -369,6 +405,7 @@ final class CloudSyncViewModel {
 enum CloudSyncViewError: LocalizedError {
     case daemonRestartTimedOut
     case currentMacRemoved
+    case reenrollmentDidNotCreateRequest
 
     var errorDescription: String? {
         switch self {
@@ -376,6 +413,8 @@ enum CloudSyncViewError: LocalizedError {
             "Floria could not finish switching Libraries. Reopen Floria and try Sync Now."
         case .currentMacRemoved:
             "This Mac was removed from the iCloud Library. Existing local data remains available, but new changes will not sync."
+        case .reenrollmentDidNotCreateRequest:
+            "Floria could not create a new access request for this Mac."
         }
     }
 }
@@ -439,6 +478,9 @@ struct SyncView: View {
                     enableSection
                     if model.isEnabled {
                         currentLibrarySection
+                        if let removed = model.removedCurrentMac {
+                            removedMacSection(removed)
+                        }
                         if !model.conflicts.isEmpty {
                             conflictsSection
                         }
@@ -625,6 +667,36 @@ struct SyncView: View {
                 }
             }
         }
+        .disabled(model.isWorking)
+    }
+
+    private func removedMacSection(_ device: SyncVaultDevice) -> some View {
+        HStack(spacing: 14) {
+            Image(systemName: "laptopcomputer.trianglebadge.exclamationmark")
+                .foregroundStyle(.orange)
+                .font(.title3)
+                .frame(width: 28)
+            VStack(alignment: .leading, spacing: 3) {
+                Text("This Mac was removed")
+                    .font(.headline)
+                Text(
+                    "Local data remains available. Request access again with a new device identity to resume syncing."
+                )
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                Text("Previous code: \(device.fingerprint)")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("Request Access Again") {
+                Task { await model.requestAccessAgain() }
+            }
+            .buttonStyle(.borderedProminent)
+        }
+        .padding(16)
+        .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
         .disabled(model.isWorking)
     }
 

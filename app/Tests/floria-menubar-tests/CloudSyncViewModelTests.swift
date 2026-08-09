@@ -120,6 +120,13 @@ final class CloudSyncViewModelTests: XCTestCase {
             status: status(vaultID: vaultID),
             candidates: [],
             bootstrap: bootstrap(vaultID: vaultID),
+            enrollment: .request(
+                SyncEnrollmentRequest(
+                    deviceID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                    deviceName: "This Mac",
+                    requestedAt: "2026-08-09T12:00:00Z",
+                    fingerprint: "98-76-54-32-10-AB",
+                    documentBase64: "ZnJlc2g=")),
             devices: [removed],
             syncFailure: .activationRequired("Device has no envelope"))
         let model = CloudSyncViewModel(service: service, restartDaemon: {})
@@ -131,6 +138,15 @@ final class CloudSyncViewModelTests: XCTestCase {
         XCTAssertEqual(
             model.errorMessage,
             "This Mac was removed from the iCloud Library. Existing local data remains available, but new changes will not sync.")
+        XCTAssertEqual(model.removedCurrentMac, removed)
+
+        await model.requestAccessAgain()
+
+        XCTAssertEqual(model.enrollmentRequest?.fingerprint, "98-76-54-32-10-AB")
+        XCTAssertNil(model.removedCurrentMac)
+        XCTAssertNil(model.errorMessage)
+        let requestedAccessDevices = await service.requestedAccessDevices
+        XCTAssertEqual(requestedAccessDevices, [removed])
     }
 
     func testAttachingProjectMakesItAvailableOnThisMac() async {
@@ -345,6 +361,7 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
     private var projectsWithoutLocalFolder: [SyncedProject]
     private var restartTarget: String?
     private(set) var revokedDevices = [SyncVaultDevice]()
+    private(set) var requestedAccessDevices = [SyncVaultDevice]()
     private(set) var attachedProjectIDs = [String]()
     private(set) var resolvedRevisions = [(entityID: String, revisionID: String)]()
 
@@ -458,6 +475,16 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
         requestedAt _: String?
     ) async throws -> SyncEnrollmentPreparation {
         enrollment
+    }
+
+    func requestAccessAgain(
+        in _: SyncVaultBootstrap,
+        removedDevice: SyncVaultDevice,
+        deviceName _: String?,
+        requestedAt _: String?
+    ) async throws -> SyncEnrollmentPreparation {
+        requestedAccessDevices.append(removedDevice)
+        return enrollment
     }
 
     func reviewEnrollments(

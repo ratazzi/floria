@@ -1405,6 +1405,26 @@ impl RuntimeRecordSyncService for DaemonRecordSyncService {
         })
     }
 
+    fn prepare_vault_reenrollment(
+        &self,
+        bootstrap: SyncVaultBootstrap,
+        expected_fingerprint: &str,
+        device_name: Option<String>,
+        requested_at: &str,
+    ) -> Result<SyncEnrollmentPreparation, String> {
+        self.mutations.run(|| {
+            self.with_journal(|journal| {
+                RecordSyncControl::new(journal, Arc::clone(&self.store))
+                    .prepare_vault_reenrollment(
+                        bootstrap,
+                        expected_fingerprint,
+                        device_name,
+                        requested_at,
+                    )
+            })
+        })
+    }
+
     fn review_vault_enrollments(
         &self,
         bootstrap: SyncVaultBootstrap,

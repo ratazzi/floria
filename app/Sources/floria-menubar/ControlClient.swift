@@ -277,6 +277,26 @@ final class ControlClient: @unchecked Sendable {
         return preparation
     }
 
+    func prepareRecordSyncVaultReenrollment(
+        bootstrap: SyncVaultBootstrap,
+        expectedFingerprint: String,
+        deviceName: String?,
+        requestedAt: String
+    ) async throws -> SyncEnrollmentPreparation {
+        guard let preparation: SyncEnrollmentPreparation = try await request(
+            .recordSyncPrepareVaultReenrollment(
+                bootstrap: bootstrap,
+                expectedFingerprint: expectedFingerprint,
+                deviceName: deviceName,
+                requestedAt: requestedAt),
+            expecting: "record_sync_enrollment_preparation",
+            as: SyncEnrollmentPreparation.self)
+        else {
+            throw ControlClientError.missingResult("record_sync_enrollment_preparation")
+        }
+        return preparation
+    }
+
     func reviewRecordSyncVaultEnrollments(
         bootstrap: SyncVaultBootstrap
     ) async throws -> [SyncEnrollmentReview] {

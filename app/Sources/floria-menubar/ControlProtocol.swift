@@ -1,6 +1,6 @@
 import Foundation
 
-let supportedControlProtocolVersion: UInt32 = 20
+let supportedControlProtocolVersion: UInt32 = 21
 
 struct ControlServerInfo: Decodable, Equatable, Sendable {
     let protocolVersion: UInt32?
@@ -1482,6 +1482,9 @@ enum ControlCommand: Sendable {
     case recordSyncValidateVaultBootstrap(expectedVaultID: String, bootstrap: SyncVaultBootstrap)
     case recordSyncPrepareVaultEnrollment(
         bootstrap: SyncVaultBootstrap, deviceName: String?, requestedAt: String)
+    case recordSyncPrepareVaultReenrollment(
+        bootstrap: SyncVaultBootstrap, expectedFingerprint: String,
+        deviceName: String?, requestedAt: String)
     case recordSyncReviewVaultEnrollments(bootstrap: SyncVaultBootstrap)
     case recordSyncReviewVaultDevices(bootstrap: SyncVaultBootstrap)
     case recordSyncApproveVaultEnrollment(
@@ -1584,6 +1587,7 @@ enum ControlCommand: Sendable {
         case .recordSyncVaultBootstrap: "record_sync_vault_bootstrap"
         case .recordSyncValidateVaultBootstrap: "record_sync_validate_vault_bootstrap"
         case .recordSyncPrepareVaultEnrollment: "record_sync_prepare_vault_enrollment"
+        case .recordSyncPrepareVaultReenrollment: "record_sync_prepare_vault_reenrollment"
         case .recordSyncReviewVaultEnrollments: "record_sync_review_vault_enrollments"
         case .recordSyncReviewVaultDevices: "record_sync_review_vault_devices"
         case .recordSyncApproveVaultEnrollment: "record_sync_approve_vault_enrollment"
@@ -1725,6 +1729,14 @@ enum ControlCommand: Sendable {
                     requestID: requestID, method: method,
                     params: RecordSyncPrepareVaultEnrollmentParams(
                         bootstrap: bootstrap, deviceName: deviceName, requestedAt: requestedAt)))
+        case .recordSyncPrepareVaultReenrollment(
+            let bootstrap, let expectedFingerprint, let deviceName, let requestedAt):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: RecordSyncPrepareVaultReenrollmentParams(
+                        bootstrap: bootstrap, expectedFingerprint: expectedFingerprint,
+                        deviceName: deviceName, requestedAt: requestedAt)))
         case .recordSyncReviewVaultEnrollments(let bootstrap):
             return try encoder.encode(
                 ControlRequest(
@@ -2004,6 +2016,12 @@ private struct RecordSyncValidateVaultBootstrapParams: Encodable {
 }
 private struct RecordSyncPrepareVaultEnrollmentParams: Encodable {
     let bootstrap: SyncVaultBootstrap
+    let deviceName: String?
+    let requestedAt: String
+}
+private struct RecordSyncPrepareVaultReenrollmentParams: Encodable {
+    let bootstrap: SyncVaultBootstrap
+    let expectedFingerprint: String
     let deviceName: String?
     let requestedAt: String
 }

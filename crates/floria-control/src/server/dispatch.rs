@@ -50,6 +50,7 @@ pub(super) fn is_self_coordinated(command: &ControlCommand) -> bool {
             | ControlCommand::ReplicationEnroll { .. }
             | ControlCommand::ReplicationApprove { .. }
             | ControlCommand::RecordSyncResolveConflict { .. }
+            | ControlCommand::RecordSyncPrepareVaultReenrollment { .. }
             | ControlCommand::RecordSyncApproveVaultEnrollment { .. }
             | ControlCommand::RecordSyncRevokeVaultDevice { .. }
             | ControlCommand::RecordSyncActivateVault { .. }
@@ -262,6 +263,21 @@ fn dispatch_uncoordinated(
         } => record_sync
             .ok_or_else(record_sync_unavailable)?
             .prepare_vault_enrollment(bootstrap, device_name, &requested_at)
+            .map(ControlResult::RecordSyncEnrollmentPreparation)
+            .map_err(DispatchError::RecordSync),
+        ControlCommand::RecordSyncPrepareVaultReenrollment {
+            bootstrap,
+            expected_fingerprint,
+            device_name,
+            requested_at,
+        } => record_sync
+            .ok_or_else(record_sync_unavailable)?
+            .prepare_vault_reenrollment(
+                bootstrap,
+                &expected_fingerprint,
+                device_name,
+                &requested_at,
+            )
             .map(ControlResult::RecordSyncEnrollmentPreparation)
             .map_err(DispatchError::RecordSync),
         ControlCommand::RecordSyncReviewVaultEnrollments { bootstrap } => record_sync
