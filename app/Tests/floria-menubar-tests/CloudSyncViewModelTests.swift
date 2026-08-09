@@ -5,6 +5,24 @@ import XCTest
 
 @MainActor
 final class CloudSyncViewModelTests: XCTestCase {
+    func testUnavailableBuildCannotEnableICloudSync() async {
+        let service = CloudSyncViewServiceStub(
+            available: false,
+            enabled: false,
+            status: status(vaultID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            candidates: [])
+        let model = CloudSyncViewModel(service: service, restartDaemon: {})
+
+        await model.load()
+        await model.setEnabled(true)
+
+        XCTAssertFalse(model.isAvailable)
+        XCTAssertFalse(model.isEnabled)
+        XCTAssertEqual(
+            model.errorMessage,
+            "This build of Floria is not configured for iCloud Sync. Install a CloudKit-enabled build, then try again.")
+    }
+
     func testDiscoveryFiltersTheLibraryAlreadyActiveOnThisMac() async {
         let active = status(vaultID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
         let other = CloudVaultCandidate(
@@ -346,7 +364,8 @@ private actor RestartProbe {
 }
 
 private actor CloudSyncViewServiceStub: CloudSyncServicing {
-    private var enabled = true
+    private let available: Bool
+    private var enabled: Bool
     private var status: SyncDomainStatus
     private let candidates: [CloudVaultCandidate]
     private let bootstrap: SyncVaultBootstrap?
@@ -366,6 +385,8 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
     private(set) var resolvedRevisions = [(entityID: String, revisionID: String)]()
 
     init(
+        available: Bool = true,
+        enabled: Bool = true,
         status: SyncDomainStatus,
         candidates: [CloudVaultCandidate],
         bootstrap: SyncVaultBootstrap? = nil,
@@ -379,6 +400,8 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
         lastSuccessfulSyncAt: Date? = nil,
         pendingVaultID: String? = nil
     ) {
+        self.available = available
+        self.enabled = enabled
         self.status = status
         self.candidates = candidates
         self.bootstrap = bootstrap
@@ -399,6 +422,8 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
     func completeRestart(_ vaultID: String) {
         restartTarget = vaultID
     }
+
+    func isAvailable() async -> Bool { available }
 
     func isEnabled() async -> Bool { enabled }
 

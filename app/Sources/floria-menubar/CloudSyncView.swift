@@ -2,6 +2,7 @@ import AppKit
 import SwiftUI
 
 protocol CloudSyncServicing: Sendable {
+    func isAvailable() async -> Bool
     func isEnabled() async -> Bool
     func setEnabled(_ enabled: Bool) async
     func lastSuccessfulSyncAt() async -> Date?
@@ -51,6 +52,8 @@ final class CloudSyncViewModel {
     private var removedBootstrap: SyncVaultBootstrap?
 
     var isEnabled = false
+    var isAvailable = false
+    var isAvailabilityLoaded = false
     var isWorking = false
     var status: SyncDomainStatus?
     var lastSuccessfulSyncAt: Date?
@@ -112,15 +115,21 @@ final class CloudSyncViewModel {
     }
 
     func load() async {
+        isAvailable = await service.isAvailable()
+        isAvailabilityLoaded = true
         isEnabled = await service.isEnabled()
         await refreshPersistentState()
-        guard isEnabled else { return }
+        guard isEnabled, isAvailable else { return }
         await refreshLocalStatus()
         await refreshConflicts()
         await refreshProjectsWithoutLocalFolder()
     }
 
     func setEnabled(_ enabled: Bool) async {
+        guard !enabled || (isAvailabilityLoaded && isAvailable) else {
+            errorMessage = CloudSyncServiceError.unavailable.localizedDescription
+            return
+        }
         await service.setEnabled(enabled)
         isEnabled = enabled
         notice = nil
@@ -476,7 +485,7 @@ struct SyncView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     enableSection
-                    if model.isEnabled {
+                    if model.isEnabled && model.isAvailable {
                         currentLibrarySection
                         if let removed = model.removedCurrentMac {
                             removedMacSection(removed)
@@ -622,7 +631,7 @@ struct SyncView: View {
             VStack(alignment: .leading, spacing: 3) {
                 Text("iCloud Sync")
                     .font(.headline)
-                Text(model.isEnabled ? "Manual sync is ready." : "Off by default. Nothing is uploaded.")
+                Text(syncAvailabilityDescription)
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -636,7 +645,19 @@ struct SyncView: View {
         }
         .padding(16)
         .background(Color.secondary.opacity(0.07), in: RoundedRectangle(cornerRadius: 12))
-        .disabled(model.isWorking)
+        .disabled(
+            model.isWorking || !model.isAvailabilityLoaded
+                || (!model.isAvailable && !model.isEnabled))
+    }
+
+    private var syncAvailabilityDescription: String {
+        if !model.isAvailabilityLoaded {
+            return "Checking this build…"
+        }
+        if !model.isAvailable {
+            return "Requires a CloudKit-enabled signed build."
+        }
+        return model.isEnabled ? "Manual sync is ready." : "Off by default. Nothing is uploaded."
     }
 
     private var currentLibrarySection: some View {

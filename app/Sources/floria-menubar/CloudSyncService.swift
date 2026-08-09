@@ -92,6 +92,7 @@ actor CloudSyncService {
     private let control: any CloudSyncControlling
     private let supportDirectory: URL
     private let preferences: CloudSyncPreferences
+    private let cloudKitAvailable: @Sendable () -> Bool
     private let sessionFactory: SessionFactory
     private let discoveryFactory: DiscoveryFactory
     private let lifecycleLoaderFactory: LifecycleLoaderFactory
@@ -114,6 +115,7 @@ actor CloudSyncService {
         self.supportDirectory = supportDirectory
         self.preferences = preferences
         self.now = now
+        cloudKitAvailable = { CloudSyncBuildAvailability.isEnabled }
         sessionFactory = { control, supportDirectory, vaultID in
             let container = CKContainer(
                 identifier: ProductIdentity.cloudKitContainerIdentifier)
@@ -147,6 +149,7 @@ actor CloudSyncService {
         control: any CloudSyncControlling,
         supportDirectory: URL,
         preferences: CloudSyncPreferences,
+        cloudKitAvailable: @escaping @Sendable () -> Bool = { true },
         sessionFactory: @escaping SessionFactory,
         discoveryFactory: @escaping DiscoveryFactory = {
             throw CloudSyncServiceError.unconfiguredTestDependency
@@ -162,6 +165,7 @@ actor CloudSyncService {
         self.control = control
         self.supportDirectory = supportDirectory
         self.preferences = preferences
+        self.cloudKitAvailable = cloudKitAvailable
         self.sessionFactory = sessionFactory
         self.discoveryFactory = discoveryFactory
         self.lifecycleLoaderFactory = lifecycleLoaderFactory
@@ -171,6 +175,10 @@ actor CloudSyncService {
 
     func isEnabled() -> Bool {
         preferences.isEnabled
+    }
+
+    func isAvailable() -> Bool {
+        cloudKitAvailable()
     }
 
     func lastSuccessfulSyncAt() -> Date? {
@@ -195,6 +203,7 @@ actor CloudSyncService {
 
     func discoverVaults() async throws -> [CloudVaultCandidate] {
         guard preferences.isEnabled else { throw CloudSyncServiceError.disabled }
+        try requireCloudKit()
         let activeDiscovery: any CloudVaultDiscovering
         if let discovery {
             activeDiscovery = discovery
@@ -207,6 +216,7 @@ actor CloudSyncService {
 
     func authenticateVault(_ vaultID: String) async throws -> SyncVaultBootstrap {
         guard preferences.isEnabled else { throw CloudSyncServiceError.disabled }
+        try requireCloudKit()
         let activeLoader: any CloudVaultLifecycleLoading
         if let lifecycleLoader {
             activeLoader = lifecycleLoader
@@ -223,6 +233,7 @@ actor CloudSyncService {
         requestedAt: String? = nil
     ) async throws -> SyncEnrollmentPreparation {
         guard preferences.isEnabled else { throw CloudSyncServiceError.disabled }
+        try requireCloudKit()
         let activePublisher: any CloudVaultEnrollmentPublishing
         if let enrollmentPublisher {
             activePublisher = enrollmentPublisher
@@ -247,6 +258,7 @@ actor CloudSyncService {
         requestedAt: String? = nil
     ) async throws -> SyncEnrollmentPreparation {
         guard preferences.isEnabled else { throw CloudSyncServiceError.disabled }
+        try requireCloudKit()
         let activePublisher: any CloudVaultEnrollmentPublishing
         if let enrollmentPublisher {
             activePublisher = enrollmentPublisher
@@ -378,6 +390,7 @@ actor CloudSyncService {
     @discardableResult
     func syncNow() async throws -> CloudSyncOutcome {
         guard preferences.isEnabled else { throw CloudSyncServiceError.disabled }
+        try requireCloudKit()
         let before = try await control.recordSyncStatus()
         if let pendingRestartVaultID {
             guard before.vaultID == pendingRestartVaultID else {
@@ -422,10 +435,15 @@ actor CloudSyncService {
         return formatter.string(from: Date())
     }
 
+    private func requireCloudKit() throws {
+        guard cloudKitAvailable() else { throw CloudSyncServiceError.unavailable }
+    }
+
 }
 
 enum CloudSyncServiceError: Error, Equatable, LocalizedError {
     case disabled
+    case unavailable
     case invalidProjectDirectory(String)
     case mergeRequired(currentVaultID: String, targetVaultID: String, localItems: Int)
     case restartRequired(vaultID: String)
@@ -436,6 +454,8 @@ enum CloudSyncServiceError: Error, Equatable, LocalizedError {
         switch self {
         case .disabled:
             "iCloud Sync is off. Enable it before using iCloud."
+        case .unavailable:
+            "This build of Floria is not configured for iCloud Sync. Install a CloudKit-enabled build, then try again."
         case .invalidProjectDirectory(let path):
             "Choose an existing project folder. \(path) is not a directory."
         case .mergeRequired(let currentVaultID, let targetVaultID, let localItems):

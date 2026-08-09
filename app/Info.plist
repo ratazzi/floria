@@ -20,6 +20,8 @@
     <string>0.0.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
+    <key>FloriaCloudKitEnabled</key>
+    <false/>
     <key>LSMinimumSystemVersion</key>
     <string>15.0</string>
 	<key>LSMultipleInstancesProhibited</key>

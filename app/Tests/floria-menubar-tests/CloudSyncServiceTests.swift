@@ -5,6 +5,37 @@ import XCTest
 @testable import floria_menubar
 
 final class CloudSyncServiceTests: XCTestCase {
+    func testUnavailableBuildFailsBeforeTouchingRustOrCloudKit() async throws {
+        let suiteName = "floria-cloud-sync-tests-\(UUID().uuidString)"
+        let preferences = CloudSyncPreferences(suiteName: suiteName)
+        preferences.setEnabled(true)
+        let control = CloudSyncControlStub(status: status())
+        let factory = CloudSyncFactoryProbe(session: CloudSyncSessionStub())
+        let service = CloudSyncService(
+            control: control,
+            supportDirectory: FileManager.default.temporaryDirectory,
+            preferences: preferences,
+            cloudKitAvailable: { false },
+            sessionFactory: { control, supportDirectory, vaultID in
+                try factory.make(
+                    control: control,
+                    supportDirectory: supportDirectory,
+                    vaultID: vaultID)
+            })
+        defer { UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName) }
+
+        do {
+            _ = try await service.syncNow()
+            XCTFail("Expected a build without CloudKit capability to fail locally")
+        } catch let error as CloudSyncServiceError {
+            XCTAssertEqual(error, .unavailable)
+        }
+
+        let statusCount = await control.statusCount
+        XCTAssertEqual(statusCount, 0)
+        XCTAssertEqual(factory.count, 0)
+    }
+
     func testCloudKitIsNotConstructedUntilEnabledSyncNow() async throws {
         let suiteName = "floria-cloud-sync-tests-\(UUID().uuidString)"
         let preferences = CloudSyncPreferences(suiteName: suiteName)

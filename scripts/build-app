@@ -72,6 +72,9 @@ if [[ -n "${FLORIA_APP_PROVISIONING_PROFILE}" ]]; then
 fi
 plutil -replace CFBundleShortVersionString -string "${VERSION}" "${APP_BUNDLE}/Contents/Info.plist"
 plutil -replace CFBundleVersion -string "${BUILD_NUMBER}" "${APP_BUNDLE}/Contents/Info.plist"
+if [[ -n "${FLORIA_APP_PROVISIONING_PROFILE}" ]]; then
+    plutil -replace FloriaCloudKitEnabled -bool true "${APP_BUNDLE}/Contents/Info.plist"
+fi
 chmod 0755 "${APP_BUNDLE}/Contents/MacOS/${APP_NAME}"
 chmod 0755 "${APP_BUNDLE}/Contents/Resources/floria"
 codesign "${codesign_args[@]}" \
