@@ -182,7 +182,12 @@ struct DashboardView: View {
                     )
                 })
         }
-        .sheet(isPresented: $showingSync) {
+        .sheet(isPresented: $showingSync, onDismiss: {
+            Task {
+                await state.workspace.reload()
+                await state.workspace.refreshProjectCheckoutDiscoveries()
+            }
+        }) {
             SyncView(
                 service: state.cloudSyncService,
                 restartDaemon: { await state.restartDaemonForCloudSync() })

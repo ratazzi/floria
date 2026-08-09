@@ -207,6 +207,14 @@ final class ProductLanguageTests: XCTestCase {
                 #".frame(width: AccessSummaryRowLayout.timeWidth, alignment: .trailing)"#))
     }
 
+    func testClosingSyncRefreshesTheVisibleLibrary() throws {
+        let dashboard = try source("CompactDashboardView.swift")
+
+        XCTAssertTrue(dashboard.contains(#".sheet(isPresented: $showingSync, onDismiss:"#))
+        XCTAssertTrue(dashboard.contains("await state.workspace.reload()"))
+        XCTAssertTrue(dashboard.contains("await state.workspace.refreshProjectCheckoutDiscoveries()"))
+    }
+
     func testManagedItemRowsExposeDetailsWithoutOpeningTheMoreMenu() throws {
         let workspace = try source("WorkspaceView.swift")
         let dashboard = try source("CompactDashboardView.swift")
