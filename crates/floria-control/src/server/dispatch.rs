@@ -16,18 +16,7 @@ pub(super) fn dispatch_observed(
     observer: Option<&dyn CatalogObserver>,
 ) -> Result<ControlResult, DispatchError> {
     let mutating = !is_read_only(&command);
-    let self_coordinated = matches!(
-        command,
-        ControlCommand::ReplicationCreate { .. }
-            | ControlCommand::ReplicationOpen { .. }
-            | ControlCommand::ReplicationSync
-            | ControlCommand::ReplicationResolveWithCurrent
-            | ControlCommand::ReplicationRevokeDevice { .. }
-            | ControlCommand::ReplicationRequestReenrollment
-            | ControlCommand::ReplicationDisable
-            | ControlCommand::ReplicationEnroll { .. }
-            | ControlCommand::ReplicationApprove { .. }
-    );
+    let self_coordinated = is_self_coordinated(&command);
     let operation = || {
         let result = dispatch_uncoordinated(catalog, services, command);
         if result.is_ok() && mutating {
@@ -41,6 +30,31 @@ pub(super) fn dispatch_observed(
         }
     }
     operation()
+}
+
+/// Commands whose runtime service already holds the shared catalog/store mutation gate.
+///
+/// Wrapping these in `run_committed` would attempt to acquire the same non-recursive mutex twice
+/// on one control request. They still notify the catalog observer after the service releases the
+/// gate so FUSE surfaces, links, policy, and SSH runtime see the newly projected state.
+pub(super) fn is_self_coordinated(command: &ControlCommand) -> bool {
+    matches!(
+        command,
+        ControlCommand::ReplicationCreate { .. }
+            | ControlCommand::ReplicationOpen { .. }
+            | ControlCommand::ReplicationSync
+            | ControlCommand::ReplicationResolveWithCurrent
+            | ControlCommand::ReplicationRevokeDevice { .. }
+            | ControlCommand::ReplicationRequestReenrollment
+            | ControlCommand::ReplicationDisable
+            | ControlCommand::ReplicationEnroll { .. }
+            | ControlCommand::ReplicationApprove { .. }
+            | ControlCommand::RecordSyncResolveConflict { .. }
+            | ControlCommand::RecordSyncApproveVaultEnrollment { .. }
+            | ControlCommand::RecordSyncRevokeVaultDevice { .. }
+            | ControlCommand::RecordSyncActivateVault { .. }
+            | ControlCommand::RecordSyncApplyInbound { .. }
+    )
 }
 
 fn dispatch_uncoordinated(

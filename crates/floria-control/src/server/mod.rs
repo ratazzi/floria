@@ -550,6 +550,7 @@ fn is_read_only(command: &ControlCommand) -> bool {
             | ControlCommand::RecordSyncReviewVaultEnrollments { .. }
             | ControlCommand::RecordSyncReviewVaultDevices { .. }
             | ControlCommand::RecordSyncNextOutbound { .. }
+            | ControlCommand::RecordSyncSettleOutbound { .. }
             | ControlCommand::Snapshot
             | ControlCommand::Discover { .. }
             | ControlCommand::DiscoverStart { .. }

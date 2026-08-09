@@ -1,8 +1,9 @@
 //! Authenticated machine-local persistence for transport-neutral revisions.
 //!
 //! This database is deliberately separate from the runtime catalog. Creating it cannot bump the
-//! catalog schema or make an installation depend on sync. A later durable-intent step will bridge
-//! accepted records into the catalog/store projection.
+//! catalog schema or make an installation depend on sync. Authenticated projection intents below
+//! bridge accepted records into the catalog/store projection without making either backend trust
+//! transport state.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;

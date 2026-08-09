@@ -3387,6 +3387,84 @@
     }
 
     #[test]
+    fn coordinated_record_sync_mutations_are_never_wrapped_in_the_gate_twice() {
+        let service = FixtureRecordSyncService::default();
+        let bootstrap = service.vault_bootstrap().unwrap();
+        let commands = [
+            ControlCommand::RecordSyncResolveConflict {
+                entity_id: "11111111-1111-4111-8111-111111111111".to_string(),
+                selected_revision_id: "22222222-2222-4222-8222-222222222222".to_string(),
+                resolved_at: "2026-08-09T12:00:00Z".to_string(),
+            },
+            ControlCommand::RecordSyncApproveVaultEnrollment {
+                bootstrap: bootstrap.clone(),
+                device_id: "fixture-device".to_string(),
+                expected_fingerprint: "sha256:fixture".to_string(),
+            },
+            ControlCommand::RecordSyncRevokeVaultDevice {
+                bootstrap: bootstrap.clone(),
+                device_id: "fixture-device".to_string(),
+                expected_fingerprint: "sha256:fixture".to_string(),
+            },
+            ControlCommand::RecordSyncActivateVault {
+                bootstrap: bootstrap.clone(),
+            },
+            ControlCommand::RecordSyncApplyInbound {
+                batch: SyncInboundBatch::default(),
+                observed_at: "2026-08-09T12:00:00Z".to_string(),
+            },
+        ];
+
+        for command in &commands {
+            assert!(is_self_coordinated(command));
+            assert!(!is_read_only(command));
+        }
+        assert!(is_read_only(&ControlCommand::RecordSyncSettleOutbound {
+            outcomes: Vec::new(),
+        }));
+    }
+
+    #[test]
+    fn inbound_projection_refreshes_runtime_but_transport_settlement_does_not() {
+        let directory = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(directory.path().join("catalog.sqlite")).unwrap();
+        let mutations = ManagedMutationCoordinator::new();
+        let record_sync = FixtureRecordSyncService::default();
+        let observer = SnapshotObserver {
+            notifications: AtomicUsize::new(0),
+            latest: Mutex::new(None),
+        };
+        let services = DispatchServices {
+            mutations: Some(&mutations),
+            record_sync: Some(&record_sync),
+            ..DispatchServices::default()
+        };
+
+        dispatch_observed(
+            &catalog,
+            services,
+            ControlCommand::RecordSyncApplyInbound {
+                batch: SyncInboundBatch::default(),
+                observed_at: "2026-08-09T12:00:00Z".to_string(),
+            },
+            Some(&observer),
+        )
+        .unwrap();
+        assert_eq!(observer.notifications.load(Ordering::Relaxed), 1);
+
+        dispatch_observed(
+            &catalog,
+            services,
+            ControlCommand::RecordSyncSettleOutbound {
+                outcomes: Vec::new(),
+            },
+            Some(&observer),
+        )
+        .unwrap();
+        assert_eq!(observer.notifications.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
     fn record_sync_rejects_relative_asset_paths_before_the_runtime_reads_them() {
         let dir = tempfile::tempdir().unwrap();
         let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
