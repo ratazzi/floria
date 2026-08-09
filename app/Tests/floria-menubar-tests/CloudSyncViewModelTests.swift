@@ -45,7 +45,7 @@ final class CloudSyncViewModelTests: XCTestCase {
         XCTAssertEqual(model.candidates, [other])
     }
 
-    func testJoiningMacShowsTheRustSignedApprovalCode() async {
+    func testReviewingLibraryDoesNotRequestAccessUntilConfirmed() async {
         let target = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
         let request = SyncEnrollmentRequest(
             deviceID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
@@ -57,14 +57,39 @@ final class CloudSyncViewModelTests: XCTestCase {
             status: status(vaultID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
             candidates: [],
             bootstrap: bootstrap(vaultID: target),
-            enrollment: .request(request))
+            enrollment: .request(request),
+            devices: [
+                SyncVaultDevice(
+                    deviceID: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+                    deviceName: "Mac Studio",
+                    fingerprint: "AB12-CD34-EF56",
+                    enrolledGeneration: 1,
+                    revokedGeneration: nil,
+                    isGenesis: true,
+                    isCurrent: false),
+            ])
         let model = CloudSyncViewModel(service: service, restartDaemon: {})
+        let candidate = CloudVaultCandidate(vaultID: target, vaultDocumentBase64: "dmF1bHQ=")
 
         await model.load()
-        await model.join(
-            CloudVaultCandidate(vaultID: target, vaultDocumentBase64: "dmF1bHQ="))
+        await model.review(candidate)
+
+        XCTAssertEqual(
+            model.libraryReview,
+            SyncLibraryReview(
+                vaultID: target,
+                activeDeviceNames: ["Mac Studio"],
+                activeDeviceCount: 1))
+        XCTAssertNil(model.enrollmentRequest)
+        let requestCountBeforeConfirmation = await service.requestedEnrollmentCount
+        XCTAssertEqual(requestCountBeforeConfirmation, 0)
+
+        await model.joinReviewedLibrary()
 
         XCTAssertEqual(model.enrollmentRequest, request)
+        XCTAssertNil(model.libraryReview)
+        let requestCountAfterConfirmation = await service.requestedEnrollmentCount
+        XCTAssertEqual(requestCountAfterConfirmation, 1)
         XCTAssertNil(model.errorMessage)
     }
 
@@ -87,8 +112,9 @@ final class CloudSyncViewModelTests: XCTestCase {
             })
 
         await model.load()
-        await model.join(
+        await model.review(
             CloudVaultCandidate(vaultID: target, vaultDocumentBase64: "dmF1bHQ="))
+        await model.joinReviewedLibrary()
 
         let restartCount = await restart.count
         XCTAssertEqual(restartCount, 1)
@@ -401,6 +427,7 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
     private var didSync = false
     private(set) var revokedDevices = [SyncVaultDevice]()
     private(set) var requestedAccessDevices = [SyncVaultDevice]()
+    private(set) var requestedEnrollmentCount = 0
     private(set) var attachedProjectIDs = [String]()
     private(set) var resolvedRevisions = [(entityID: String, revisionID: String)]()
 
@@ -525,7 +552,8 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
         deviceName _: String?,
         requestedAt _: String?
     ) async throws -> SyncEnrollmentPreparation {
-        enrollment
+        requestedEnrollmentCount += 1
+        return enrollment
     }
 
     func requestAccessAgain(

@@ -44,6 +44,14 @@ protocol CloudSyncServicing: Sendable {
 
 extension CloudSyncService: CloudSyncServicing {}
 
+struct SyncLibraryReview: Equatable, Identifiable, Sendable {
+    let vaultID: String
+    let activeDeviceNames: [String]
+    let activeDeviceCount: Int
+
+    var id: String { vaultID }
+}
+
 @Observable @MainActor
 final class CloudSyncViewModel {
     private let service: any CloudSyncServicing
@@ -59,6 +67,7 @@ final class CloudSyncViewModel {
     var lastSuccessfulSyncAt: Date?
     var pendingVaultID: String?
     var candidates = [CloudVaultCandidate]()
+    var libraryReview: SyncLibraryReview?
     var enrollmentRequest: SyncEnrollmentRequest?
     var approvals = [SyncEnrollmentReview]()
     var devices = [SyncVaultDevice]()
@@ -141,6 +150,7 @@ final class CloudSyncViewModel {
             await refreshProjectsWithoutLocalFolder()
         } else {
             candidates = []
+            libraryReview = nil
             enrollmentRequest = nil
             approvals = []
             devices = []
@@ -178,6 +188,8 @@ final class CloudSyncViewModel {
     func discover() async {
         await perform {
             let localVaultID = self.status?.vaultID
+            self.libraryReview = nil
+            self.joiningBootstrap = nil
             self.candidates = try await self.service.discoverVaults().filter {
                 $0.vaultID != localVaultID
             }
@@ -187,10 +199,29 @@ final class CloudSyncViewModel {
         }
     }
 
-    func join(_ candidate: CloudVaultCandidate) async {
+    func review(_ candidate: CloudVaultCandidate) async {
         await perform {
             let bootstrap = try await self.service.authenticateVault(candidate.vaultID)
-            try await self.continueJoining(bootstrap)
+            let activeDevices = try await self.service.reviewDevices(in: bootstrap).filter {
+                $0.revokedGeneration == nil
+            }
+            var names = [String]()
+            for name in activeDevices.compactMap(\.deviceName) where !names.contains(name) {
+                names.append(name)
+            }
+            self.joiningBootstrap = bootstrap
+            self.libraryReview = SyncLibraryReview(
+                vaultID: bootstrap.vaultID,
+                activeDeviceNames: names,
+                activeDeviceCount: activeDevices.count)
+        }
+    }
+
+    func joinReviewedLibrary() async {
+        guard let joiningBootstrap else { return }
+        await perform {
+            try await self.continueJoining(joiningBootstrap)
+            self.libraryReview = nil
         }
     }
 
@@ -370,6 +401,7 @@ final class CloudSyncViewModel {
         {
         case .request(let request):
             enrollmentRequest = request
+            candidates = []
             await refreshPersistentState()
             notice = nil
         case .alreadyEnrolled:
@@ -501,6 +533,7 @@ struct SyncView: View {
     @State private var pendingApproval: SyncEnrollmentReview?
     @State private var pendingRemoval: SyncVaultDevice?
     @State private var pendingConflictSelection: ConflictSelection?
+    @State private var pendingLibraryReview: SyncLibraryReview?
 
     init(
         service: any CloudSyncServicing,
@@ -584,6 +617,21 @@ struct SyncView: View {
         }
         .frame(width: 640, height: 500)
         .task { await model.load() }
+        .confirmationDialog(
+            "Use This iCloud Library?",
+            isPresented: Binding(
+                get: { pendingLibraryReview != nil },
+                set: { if !$0 { pendingLibraryReview = nil } }),
+            presenting: pendingLibraryReview
+        ) { _ in
+            Button("Use This Library") {
+                pendingLibraryReview = nil
+                Task { await model.joinReviewedLibrary() }
+            }
+            Button("Cancel", role: .cancel) { pendingLibraryReview = nil }
+        } message: { review in
+            Text(libraryReviewMessage(review))
+        }
         .confirmationDialog(
             "Keep This Version?",
             isPresented: Binding(
@@ -1002,8 +1050,11 @@ struct SyncView: View {
                             .foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Button("Use This Library") {
-                        Task { await model.join(candidate) }
+                    Button("Use This Library…") {
+                        Task {
+                            await model.review(candidate)
+                            pendingLibraryReview = model.libraryReview
+                        }
                     }
                 }
                 .padding(12)
@@ -1015,5 +1066,20 @@ struct SyncView: View {
 
     private func shortIdentifier(_ value: String) -> String {
         String(value.prefix(8))
+    }
+
+    private func libraryReviewMessage(_ review: SyncLibraryReview) -> String {
+        let knownNames = review.activeDeviceNames.joined(separator: ", ")
+        let unnamedCount = max(0, review.activeDeviceCount - review.activeDeviceNames.count)
+        let usedBy: String
+        if knownNames.isEmpty {
+            usedBy = "\(review.activeDeviceCount) active Mac\(review.activeDeviceCount == 1 ? "" : "s")"
+        } else if unnamedCount == 0 {
+            usedBy = knownNames
+        } else {
+            usedBy = "\(knownNames) and \(unnamedCount) other Mac\(unnamedCount == 1 ? "" : "s")"
+        }
+        return "Floria verified Library \(shortIdentifier(review.vaultID)), used by \(usedBy). "
+            + "If this Mac does not have access yet, Floria will create an approval request."
     }
 }
