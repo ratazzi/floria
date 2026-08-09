@@ -22,6 +22,7 @@ use crate::{ReplicationError, ReplicationResult};
 pub struct RecordCaptureReport {
     changed_entities: usize,
     queued_transaction: bool,
+    blocked_by_conflict: bool,
 }
 
 impl RecordCaptureReport {
@@ -31,6 +32,10 @@ impl RecordCaptureReport {
 
     pub fn queued_transaction(&self) -> bool {
         self.queued_transaction
+    }
+
+    pub fn blocked_by_conflict(&self) -> bool {
+        self.blocked_by_conflict
     }
 }
 
@@ -55,7 +60,16 @@ impl<'a> RecordPublisher<'a> {
         created_at: impl Into<String>,
     ) -> ReplicationResult<RecordCaptureReport> {
         let current = self.current_documents(catalog)?;
-        let previous = self.previous_heads()?;
+        let previous = match self.previous_heads() {
+            Ok(previous) => previous,
+            Err(ReplicationError::ProjectionConflict { .. }) => {
+                return Ok(RecordCaptureReport {
+                    blocked_by_conflict: true,
+                    ..RecordCaptureReport::default()
+                });
+            }
+            Err(error) => return Err(error),
+        };
         let mut entity_ids = current.keys().cloned().collect::<BTreeSet<_>>();
         entity_ids.extend(previous.keys().cloned());
 
@@ -89,6 +103,7 @@ impl<'a> RecordPublisher<'a> {
         Ok(RecordCaptureReport {
             changed_entities,
             queued_transaction: true,
+            blocked_by_conflict: false,
         })
     }
 
@@ -336,5 +351,68 @@ mod tests {
         let outbound = fixture.journal.outbound().unwrap();
         assert_eq!(outbound.len(), 1);
         assert_eq!(outbound[0].revisions().len(), 2);
+    }
+
+    #[test]
+    fn conflict_freezes_publication_without_breaking_status_callers() {
+        let fixture = Fixture::new();
+        let secret_id = fixture
+            .store
+            .put(NewSecret::managed("Fixture"), b"first payload")
+            .unwrap();
+        fixture
+            .publisher()
+            .capture(&fixture.catalog, "2026-08-07T00:00:00Z")
+            .unwrap();
+        let root_revision = fixture.journal.analysis().unwrap().heads_for(secret_id.as_str())[0]
+            .clone();
+
+        fixture
+            .store
+            .append_version(&secret_id, b"second payload")
+            .unwrap();
+        fixture
+            .publisher()
+            .capture(&fixture.catalog, "2026-08-07T00:00:01Z")
+            .unwrap();
+
+        let document = ReplicatedEntityDocument::Secret(
+            SecretEntityDocument::from_store(
+                &fixture.store,
+                &secret_id,
+                EntityLifecycle::Active,
+            )
+            .unwrap(),
+        );
+        let cryptor = RecordCryptor::new(Arc::clone(&fixture.store));
+        let concurrent = SealedRecordTransaction::seal(
+            &cryptor,
+            [EntityChange::new(
+                document,
+                Some(root_revision.clone()),
+                vec![root_revision],
+            )
+            .unwrap()],
+        )
+        .unwrap();
+        fixture
+            .journal
+            .receive_inbound(
+                vec![concurrent.commit().clone()],
+                concurrent.revisions().to_vec(),
+                "2026-08-07T00:00:02Z",
+            )
+            .unwrap();
+
+        let outbound_before = fixture.journal.outbound().unwrap().len();
+        let report = fixture
+            .publisher()
+            .capture(&fixture.catalog, "2026-08-07T00:00:03Z")
+            .unwrap();
+
+        assert!(report.blocked_by_conflict());
+        assert!(!report.queued_transaction());
+        assert_eq!(report.changed_entities(), 0);
+        assert_eq!(fixture.journal.outbound().unwrap().len(), outbound_before);
     }
 }
