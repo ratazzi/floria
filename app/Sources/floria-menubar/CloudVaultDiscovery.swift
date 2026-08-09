@@ -46,7 +46,7 @@ struct CloudKitVaultZoneQuery: CloudVaultZoneQuerying, @unchecked Sendable {
                 if let cloudError = error as? CKError, cloudError.code == .unknownItem {
                     return .missing
                 }
-                return .failed(error.localizedDescription)
+                return .failed(CloudSyncErrorPresentation.message(for: error))
             }
         }
     }

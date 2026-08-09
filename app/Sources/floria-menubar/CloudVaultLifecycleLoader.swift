@@ -57,7 +57,8 @@ struct CloudKitVaultLifecycleQuery: CloudVaultLifecycleQuerying, @unchecked Send
                     records.append(record)
                 case .failure(let error):
                     throw CloudVaultLifecycleLoaderError.couldNotReadRecord(
-                        recordID.recordName, error.localizedDescription)
+                        recordID.recordName,
+                        CloudSyncErrorPresentation.message(for: error))
                 }
             }
             guard records.count <= maximumCount else {

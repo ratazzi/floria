@@ -146,7 +146,7 @@ final class CloudRecordSyncSession: NSObject, CKSyncEngineDelegate, @unchecked S
                 }
                 if let error = changes.error {
                     throw CloudRecordSyncSessionError.cloudKit(
-                        "Could not fetch Vault records: \(error.localizedDescription)")
+                        "Could not fetch Vault records: \(CloudSyncErrorPresentation.message(for: error))")
                 }
                 let accepted = try await bootstrapCoordinator.finishFetch()
                 if let accepted {
@@ -169,7 +169,7 @@ final class CloudRecordSyncSession: NSObject, CKSyncEngineDelegate, @unchecked S
             case .sentDatabaseChanges(let changes):
                 if let failure = changes.failedZoneSaves.first {
                     throw CloudRecordSyncSessionError.cloudKit(
-                        "Could not create Vault zone: \(failure.error.localizedDescription)")
+                        "Could not create Vault zone: \(CloudSyncErrorPresentation.message(for: failure.error))")
                 }
                 if !changes.failedZoneDeletes.isEmpty || !changes.deletedZoneIDs.isEmpty {
                     throw CloudRecordSyncSessionError.damaged(
@@ -198,7 +198,8 @@ final class CloudRecordSyncSession: NSObject, CKSyncEngineDelegate, @unchecked S
         } catch let error as CloudVaultBootstrapCodecError {
             await sessionState.record(.damaged(error.localizedDescription))
         } catch {
-            await sessionState.record(.transport(error.localizedDescription))
+            await sessionState.record(
+                .transport(CloudSyncErrorPresentation.message(for: error)))
         }
     }
 
@@ -323,7 +324,7 @@ final class CloudRecordSyncSession: NSObject, CKSyncEngineDelegate, @unchecked S
                 records.append(record)
             case .failure(let error):
                 throw CloudRecordSyncSessionError.cloudKit(
-                    "Could not fetch head \(recordID.recordName): \(error.localizedDescription)")
+                    "Could not fetch head \(recordID.recordName): \(CloudSyncErrorPresentation.message(for: error))")
             }
         }
         _ = try await coordinator.applyInbound(

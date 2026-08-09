@@ -244,7 +244,7 @@ final class CloudSyncViewModel {
             status = try await service.localStatus()
             errorMessage = nil
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = CloudSyncErrorPresentation.message(for: error)
         }
     }
 
@@ -252,7 +252,7 @@ final class CloudSyncViewModel {
         do {
             try await loadProjectsWithoutLocalFolder()
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = CloudSyncErrorPresentation.message(for: error)
         }
     }
 
@@ -264,7 +264,7 @@ final class CloudSyncViewModel {
         do {
             try await loadConflicts(for: status)
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = CloudSyncErrorPresentation.message(for: error)
         }
     }
 
@@ -355,7 +355,7 @@ final class CloudSyncViewModel {
         do {
             try await operation()
         } catch {
-            errorMessage = error.localizedDescription
+            errorMessage = CloudSyncErrorPresentation.message(for: error)
         }
     }
 }
