@@ -51,6 +51,7 @@ impl Drop for GitCheckoutMonitorInner {
 impl GitCheckoutMonitor {
     pub fn start(projects: Vec<MonitoredGitProject>) -> notify::Result<Self> {
         let (commands, receiver) = mpsc::channel();
+        let (watch_commands, watch_receiver) = mpsc::channel();
         let event_commands = commands.clone();
         let watcher =
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| match event {
@@ -62,11 +63,16 @@ impl GitCheckoutMonitor {
                     let _ = event_commands.send(Command::Refresh);
                 }
             })?;
+        let watcher_events = commands.clone();
+        std::thread::Builder::new()
+            .name("floria-git-checkout-watcher".to_string())
+            .spawn(move || run_watcher(watcher, watch_receiver, watcher_events))
+            .map_err(notify::Error::io)?;
         let inventory = Arc::new(RwLock::new(GitCheckoutInventory::default()));
         let worker_inventory = Arc::clone(&inventory);
         std::thread::Builder::new()
             .name("floria-git-checkout-monitor".to_string())
-            .spawn(move || run(watcher, receiver, worker_inventory, projects))
+            .spawn(move || run(receiver, watch_commands, worker_inventory, projects))
             .map_err(notify::Error::io)?;
         Ok(Self {
             inner: Arc::new(GitCheckoutMonitorInner {
@@ -113,14 +119,18 @@ enum Command {
     Shutdown,
 }
 
+enum WatchCommand {
+    Replace(HashSet<PathBuf>),
+    Shutdown,
+}
+
 fn run(
-    mut watcher: RecommendedWatcher,
     receiver: mpsc::Receiver<Command>,
+    watch_commands: mpsc::Sender<WatchCommand>,
     inventory: Arc<RwLock<GitCheckoutInventory>>,
     initial_projects: Vec<MonitoredGitProject>,
 ) {
     let mut projects = project_map(initial_projects);
-    let mut watched = HashSet::new();
     let mut dirty_deadline = Some(Instant::now());
     let mut safety_deadline = Instant::now();
 
@@ -140,32 +150,52 @@ fn run(
             Ok(Command::Refresh) => {
                 dirty_deadline = Some(Instant::now());
             }
-            Ok(Command::Shutdown) => break,
+            Ok(Command::Shutdown) => {
+                let _ = watch_commands.send(WatchCommand::Shutdown);
+                break;
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                reconcile(&mut watcher, &projects, &mut watched, &inventory);
+                let desired = reconcile(&projects, &inventory);
+                let _ = watch_commands.send(WatchCommand::Replace(desired));
                 dirty_deadline = None;
                 safety_deadline = Instant::now() + SAFETY_RESCAN;
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = watch_commands.send(WatchCommand::Shutdown);
+                break;
+            }
         }
     }
 }
 
-fn project_map(projects: Vec<MonitoredGitProject>) -> HashMap<String, PathBuf> {
-    projects
-        .into_iter()
-        .map(|project| (project.id, project.root))
-        .collect()
+fn run_watcher(
+    mut watcher: RecommendedWatcher,
+    receiver: mpsc::Receiver<WatchCommand>,
+    events: mpsc::Sender<Command>,
+) {
+    let mut watched = HashSet::new();
+    while let Ok(command) = receiver.recv() {
+        match command {
+            WatchCommand::Replace(desired) => {
+                if replace_watch_roots(&mut watcher, &mut watched, desired) {
+                    // Rebuild after registration so changes made while the native call was
+                    // blocked cannot remain invisible until the safety rescan.
+                    let _ = events.send(Command::Refresh);
+                }
+            }
+            WatchCommand::Shutdown => break,
+        }
+    }
 }
 
-fn reconcile(
+fn replace_watch_roots(
     watcher: &mut RecommendedWatcher,
-    projects: &HashMap<String, PathBuf>,
     watched: &mut HashSet<PathBuf>,
-    inventory: &RwLock<GitCheckoutInventory>,
-) {
-    let next = scan(projects);
-    let desired = watch_roots(projects, &next);
+    desired: HashSet<PathBuf>,
+) -> bool {
+    if *watched == desired {
+        return false;
+    }
 
     for path in watched.difference(&desired) {
         if let Err(error) = watcher.unwatch(path) {
@@ -178,6 +208,22 @@ fn reconcile(
         }
     }
     *watched = desired;
+    true
+}
+
+fn project_map(projects: Vec<MonitoredGitProject>) -> HashMap<String, PathBuf> {
+    projects
+        .into_iter()
+        .map(|project| (project.id, project.root))
+        .collect()
+}
+
+fn reconcile(
+    projects: &HashMap<String, PathBuf>,
+    inventory: &RwLock<GitCheckoutInventory>,
+) -> HashSet<PathBuf> {
+    let next = scan(projects);
+    let desired = watch_roots(projects, &next);
 
     let mut current = inventory
         .write()
@@ -186,6 +232,7 @@ fn reconcile(
         current.revision = current.revision.wrapping_add(1);
         current.projects = next;
     }
+    desired
 }
 
 fn scan(projects: &HashMap<String, PathBuf>) -> HashMap<String, MonitoredGitCheckout> {
@@ -262,7 +309,15 @@ mod tests {
         monitor: &GitCheckoutMonitor,
         predicate: impl Fn(&GitCheckoutInventory) -> bool,
     ) -> GitCheckoutInventory {
-        let deadline = Instant::now() + Duration::from_secs(3);
+        wait_for_with_timeout(monitor, Duration::from_secs(3), predicate)
+    }
+
+    fn wait_for_with_timeout(
+        monitor: &GitCheckoutMonitor,
+        timeout: Duration,
+        predicate: impl Fn(&GitCheckoutInventory) -> bool,
+    ) -> GitCheckoutInventory {
+        let deadline = Instant::now() + timeout;
         loop {
             let inventory = monitor.inventory();
             if predicate(&inventory) {
@@ -270,7 +325,7 @@ mod tests {
             }
             assert!(
                 Instant::now() < deadline,
-                "checkout monitor did not converge"
+                "checkout monitor did not converge: {inventory:#?}"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -346,7 +401,9 @@ mod tests {
         )
         .unwrap();
 
-        let refreshed = wait_for(&monitor, |inventory| inventory.revision > initial.revision);
+        let refreshed = wait_for_with_timeout(&monitor, Duration::from_secs(15), |inventory| {
+            inventory.revision > initial.revision
+        });
         assert!(matches!(
             refreshed.projects.get("fixture-project"),
             Some(MonitoredGitCheckout::Ready(discovery)) if discovery.checkouts.len() == 2
