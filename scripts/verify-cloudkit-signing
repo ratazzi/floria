@@ -29,6 +29,28 @@ plist_array_contains() {
     grep -Fxq "    ${expected}" <<<"${values}"
 }
 
+entitlement_abstract_contains() {
+    local entitlements="$1"
+    local key="$2"
+    local expected="$3"
+    awk -v expected_key="${key}" -v expected_value="${expected}" '
+        /^[[:space:]]*\[Key\][[:space:]]+/ {
+            key = $0
+            sub(/^[[:space:]]*\[Key\][[:space:]]+/, "", key)
+            selected = key == expected_key
+            next
+        }
+        selected && /^[[:space:]]*\[String\][[:space:]]+/ {
+            value = $0
+            sub(/^[[:space:]]*\[String\][[:space:]]+/, "", value)
+            if (value == expected_value) {
+                found = 1
+            }
+        }
+        END { exit found ? 0 : 1 }
+    ' "${entitlements}"
+}
+
 case "${1:-}" in
     --profile)
         [[ $# -eq 2 ]] || fail "usage: scripts/verify-cloudkit-signing --profile /path/to/profile"
@@ -71,6 +93,7 @@ plist_array_contains \
     "${PROFILE_PLIST}" \
     "Entitlements:com.apple.developer.icloud-services" \
     "CloudKit" ||
+    [[ "$(plist_value "${PROFILE_PLIST}" "Entitlements:com.apple.developer.icloud-services")" == "*" ]] ||
     fail "profile does not authorize CloudKit"
 
 if [[ -z "${APP_BUNDLE}" ]]; then
@@ -78,25 +101,30 @@ if [[ -z "${APP_BUNDLE}" ]]; then
     exit 0
 fi
 
-SIGNED_ENTITLEMENTS="${WORK_DIRECTORY}/signed-entitlements.plist"
-codesign -d --entitlements - "${APP_BUNDLE}" >"${SIGNED_ENTITLEMENTS}" 2>/dev/null ||
+SIGNED_ENTITLEMENTS="${WORK_DIRECTORY}/signed-entitlements.abstract"
+codesign -d --entitlements "${SIGNED_ENTITLEMENTS}" "${APP_BUNDLE}" 2>/dev/null ||
     fail "app entitlements cannot be read"
-SIGNED_APP_ID="$(plist_value "${SIGNED_ENTITLEMENTS}" "com.apple.application-identifier")"
-SIGNED_TEAM_ID="$(plist_value "${SIGNED_ENTITLEMENTS}" "com.apple.developer.team-identifier")"
-SIGNED_ENVIRONMENT="$(plist_value "${SIGNED_ENTITLEMENTS}" "com.apple.developer.icloud-container-environment")"
-
-[[ "${SIGNED_APP_ID}" == "${EXPECTED_TEAM_ID}.${EXPECTED_BUNDLE_ID}" ]] ||
-    fail "signed application identifier is ${SIGNED_APP_ID:-missing}; expected ${EXPECTED_TEAM_ID}.${EXPECTED_BUNDLE_ID}"
-[[ "${SIGNED_TEAM_ID}" == "${EXPECTED_TEAM_ID}" ]] ||
-    fail "signed Team ID is ${SIGNED_TEAM_ID:-missing}; expected ${EXPECTED_TEAM_ID}"
-[[ "${SIGNED_ENVIRONMENT}" == "Production" ]] ||
-    fail "signed CloudKit environment is ${SIGNED_ENVIRONMENT:-missing}; expected Production"
-plist_array_contains \
+entitlement_abstract_contains \
+    "${SIGNED_ENTITLEMENTS}" \
+    "com.apple.application-identifier" \
+    "${EXPECTED_TEAM_ID}.${EXPECTED_BUNDLE_ID}" ||
+    fail "signed app has the wrong application identifier"
+entitlement_abstract_contains \
+    "${SIGNED_ENTITLEMENTS}" \
+    "com.apple.developer.team-identifier" \
+    "${EXPECTED_TEAM_ID}" ||
+    fail "signed app has the wrong Team ID"
+entitlement_abstract_contains \
+    "${SIGNED_ENTITLEMENTS}" \
+    "com.apple.developer.icloud-container-environment" \
+    "Production" ||
+    fail "signed app does not claim the Production CloudKit environment"
+entitlement_abstract_contains \
     "${SIGNED_ENTITLEMENTS}" \
     "com.apple.developer.icloud-container-identifiers" \
     "${EXPECTED_CONTAINER_ID}" ||
     fail "signed app does not claim ${EXPECTED_CONTAINER_ID}"
-plist_array_contains \
+entitlement_abstract_contains \
     "${SIGNED_ENTITLEMENTS}" \
     "com.apple.developer.icloud-services" \
     "CloudKit" ||
