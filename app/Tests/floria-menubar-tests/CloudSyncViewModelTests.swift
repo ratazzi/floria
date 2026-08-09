@@ -155,6 +155,72 @@ final class CloudSyncViewModelTests: XCTestCase {
         XCTAssertNil(model.errorMessage)
     }
 
+    func testLoadRestoresLastSuccessfulSyncAndPendingLibrarySetup() async {
+        let pendingVaultID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        let lastSync = Date(timeIntervalSince1970: 1_787_000_000)
+        let service = CloudSyncViewServiceStub(
+            status: status(vaultID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            candidates: [],
+            lastSuccessfulSyncAt: lastSync,
+            pendingVaultID: pendingVaultID)
+        let model = CloudSyncViewModel(service: service, restartDaemon: {})
+
+        await model.load()
+
+        XCTAssertEqual(model.lastSuccessfulSyncAt, lastSync)
+        XCTAssertEqual(model.pendingVaultID, pendingVaultID)
+    }
+
+    func testPendingLibrarySetupCanResumeAfterTheViewModelIsRecreated() async {
+        let target = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        let request = SyncEnrollmentRequest(
+            deviceID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            deviceName: "Studio",
+            requestedAt: "2026-08-08T12:00:00Z",
+            fingerprint: "sha256:fixture",
+            documentBase64: "cmVxdWVzdA==")
+        let service = CloudSyncViewServiceStub(
+            status: status(vaultID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            candidates: [],
+            bootstrap: bootstrap(vaultID: target),
+            enrollment: .request(request),
+            pendingVaultID: target)
+        let model = CloudSyncViewModel(service: service, restartDaemon: {})
+
+        await model.load()
+        await model.resumePendingSetup()
+
+        XCTAssertEqual(model.enrollmentRequest, request)
+        XCTAssertEqual(model.pendingVaultID, target)
+        XCTAssertNil(model.errorMessage)
+    }
+
+    func testSyncDoesNotClaimUpToDateWhileDomainChangesNeedAttention() async {
+        let conflicted = SyncDomainStatus(
+            vaultID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            keyGeneration: 1,
+            outboundTransactions: 1,
+            inboundTransactions: 0,
+            pendingTransactions: 0,
+            conflictingEntities: 2,
+            projectionPending: false)
+        let service = CloudSyncViewServiceStub(
+            status: conflicted,
+            candidates: [],
+            bootstrap: bootstrap(vaultID: conflicted.vaultID))
+        let model = CloudSyncViewModel(service: service, restartDaemon: {})
+
+        await model.load()
+        await model.syncNow()
+
+        XCTAssertEqual(model.syncStatusSummary, "1 to send · 2 conflicts")
+        XCTAssertEqual(
+            model.syncAttentionMessage,
+            "2 synced items have conflicting changes. Floria kept every version and did not choose one automatically.")
+        XCTAssertNil(model.notice)
+        XCTAssertNil(model.errorMessage)
+    }
+
     private func status(vaultID: String) -> SyncDomainStatus {
         SyncDomainStatus(
             vaultID: vaultID,
@@ -194,6 +260,8 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
     private let activation: SyncVaultActivation
     private let devices: [SyncVaultDevice]
     private let syncFailure: CloudRecordSyncSessionError?
+    private let lastSuccessfulSync: Date?
+    private var pendingVault: String?
     private var projectsWithoutLocalFolder: [SyncedProject]
     private var restartTarget: String?
     private(set) var revokedDevices = [SyncVaultDevice]()
@@ -207,7 +275,9 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
         devices: [SyncVaultDevice] = [],
         activation: SyncVaultActivation? = nil,
         syncFailure: CloudRecordSyncSessionError? = nil,
-        projectsWithoutLocalFolder: [SyncedProject] = []
+        projectsWithoutLocalFolder: [SyncedProject] = [],
+        lastSuccessfulSyncAt: Date? = nil,
+        pendingVaultID: String? = nil
     ) {
         self.status = status
         self.candidates = candidates
@@ -216,6 +286,8 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
         self.devices = devices
         self.syncFailure = syncFailure
         self.projectsWithoutLocalFolder = projectsWithoutLocalFolder
+        lastSuccessfulSync = lastSuccessfulSyncAt
+        pendingVault = pendingVaultID
         self.activation = activation ?? .ready(
             vaultID: status.vaultID,
             keyGeneration: status.keyGeneration,
@@ -231,6 +303,10 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
     func setEnabled(_ enabled: Bool) async {
         self.enabled = enabled
     }
+
+    func lastSuccessfulSyncAt() async -> Date? { lastSuccessfulSync }
+
+    func pendingVaultID() async -> String? { pendingVault }
 
     func localStatus() async throws -> SyncDomainStatus? {
         if let restartTarget {

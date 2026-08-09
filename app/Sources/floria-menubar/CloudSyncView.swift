@@ -4,6 +4,8 @@ import SwiftUI
 protocol CloudSyncServicing: Sendable {
     func isEnabled() async -> Bool
     func setEnabled(_ enabled: Bool) async
+    func lastSuccessfulSyncAt() async -> Date?
+    func pendingVaultID() async -> String?
     func localStatus() async throws -> SyncDomainStatus?
     func projectsWithoutLocalFolder() async throws -> [SyncedProject]
     func attachProject(_ project: SyncedProject, at directory: URL) async throws
@@ -41,6 +43,8 @@ final class CloudSyncViewModel {
     var isEnabled = false
     var isWorking = false
     var status: SyncDomainStatus?
+    var lastSuccessfulSyncAt: Date?
+    var pendingVaultID: String?
     var candidates = [CloudVaultCandidate]()
     var enrollmentRequest: SyncEnrollmentRequest?
     var approvals = [SyncEnrollmentReview]()
@@ -48,6 +52,44 @@ final class CloudSyncViewModel {
     var projectsWithoutLocalFolder = [SyncedProject]()
     var notice: String?
     var errorMessage: String?
+
+    var syncStatusSummary: String {
+        guard let status else { return "Available only on this Mac until you sync." }
+        var parts = [String]()
+        if status.outboundTransactions > 0 {
+            parts.append("\(status.outboundTransactions) to send")
+        }
+        if status.inboundTransactions > 0 {
+            parts.append("\(status.inboundTransactions) received")
+        }
+        if status.pendingTransactions > 0 {
+            parts.append("\(status.pendingTransactions) waiting")
+        }
+        if status.conflictingEntities > 0 {
+            parts.append("\(status.conflictingEntities) conflicts")
+        }
+        if status.projectionPending {
+            parts.append("Applying changes")
+        }
+        return parts.isEmpty ? "Up to date" : parts.joined(separator: " · ")
+    }
+
+    var syncAttentionMessage: String? {
+        guard let status else { return nil }
+        if status.conflictingEntities > 0 {
+            return "\(status.conflictingEntities) synced item\(status.conflictingEntities == 1 ? " has" : "s have") conflicting changes. Floria kept every version and did not choose one automatically."
+        }
+        if status.projectionPending {
+            return "Downloaded changes are waiting for the local Library update to finish."
+        }
+        if status.pendingTransactions > 0 {
+            return "\(status.pendingTransactions) incomplete synced change\(status.pendingTransactions == 1 ? " is" : "s are") waiting for the rest of its data."
+        }
+        if status.outboundTransactions > 0 || status.inboundTransactions > 0 {
+            return "Sync finished, but some encrypted changes still need another Sync Now."
+        }
+        return nil
+    }
 
     init(
         service: any CloudSyncServicing,
@@ -59,6 +101,7 @@ final class CloudSyncViewModel {
 
     func load() async {
         isEnabled = await service.isEnabled()
+        await refreshPersistentState()
         guard isEnabled else { return }
         await refreshLocalStatus()
         await refreshProjectsWithoutLocalFolder()
@@ -70,6 +113,7 @@ final class CloudSyncViewModel {
         notice = nil
         errorMessage = nil
         if enabled {
+            await refreshPersistentState()
             await refreshLocalStatus()
             await refreshProjectsWithoutLocalFolder()
         } else {
@@ -87,7 +131,10 @@ final class CloudSyncViewModel {
             do {
                 let status = try await self.service.syncNow()
                 self.status = status
-                self.notice = "Your encrypted Library is up to date in iCloud."
+                await self.refreshPersistentState()
+                self.notice = self.syncAttentionMessage == nil
+                    ? "Your encrypted Library is up to date in iCloud."
+                    : nil
                 try await self.loadDeviceManagement(for: status.vaultID)
                 try await self.loadProjectsWithoutLocalFolder()
             } catch {
@@ -126,6 +173,14 @@ final class CloudSyncViewModel {
         }
     }
 
+    func resumePendingSetup() async {
+        guard let pendingVaultID else { return }
+        await perform {
+            let bootstrap = try await self.service.authenticateVault(pendingVaultID)
+            try await self.continueJoining(bootstrap)
+        }
+    }
+
     func approve(_ review: SyncEnrollmentReview) async {
         guard let vaultID = status?.vaultID else { return }
         await perform {
@@ -133,6 +188,7 @@ final class CloudSyncViewModel {
             _ = try await self.service.approveEnrollment(review, in: bootstrap)
             let updated = try await self.service.syncNow()
             self.status = updated
+            await self.refreshPersistentState()
             try await self.loadDeviceManagement(for: updated.vaultID)
             self.notice = "\(review.deviceName ?? "The other Mac") can now use this Library."
         }
@@ -145,6 +201,7 @@ final class CloudSyncViewModel {
             _ = try await self.service.revokeDevice(device, in: bootstrap)
             let updated = try await self.service.syncNow()
             self.status = updated
+            await self.refreshPersistentState()
             try await self.loadDeviceManagement(for: updated.vaultID)
             self.notice = "\(device.deviceName ?? "The other Mac") was removed from this Library."
         }
@@ -175,6 +232,11 @@ final class CloudSyncViewModel {
         }
     }
 
+    private func refreshPersistentState() async {
+        lastSuccessfulSyncAt = await service.lastSuccessfulSyncAt()
+        pendingVaultID = await service.pendingVaultID()
+    }
+
     private func loadProjectsWithoutLocalFolder() async throws {
         projectsWithoutLocalFolder = try await service.projectsWithoutLocalFolder()
     }
@@ -188,9 +250,11 @@ final class CloudSyncViewModel {
         {
         case .request(let request):
             enrollmentRequest = request
+            await refreshPersistentState()
             notice = nil
         case .alreadyEnrolled:
             enrollmentRequest = nil
+            await refreshPersistentState()
             try await activate(bootstrap)
         }
     }
@@ -206,6 +270,7 @@ final class CloudSyncViewModel {
             try await waitForActivation(vaultID)
         }
         status = try await service.syncNow()
+        await refreshPersistentState()
         try await loadProjectsWithoutLocalFolder()
         candidates = []
         joiningBootstrap = nil
@@ -291,6 +356,11 @@ struct SyncView: View {
                     enableSection
                     if model.isEnabled {
                         currentLibrarySection
+                        if let pendingVaultID = model.pendingVaultID,
+                           model.enrollmentRequest == nil
+                        {
+                            pendingSetupSection(pendingVaultID)
+                        }
                         if !model.projectsWithoutLocalFolder.isEmpty {
                             projectsFromICloudSection
                         }
@@ -314,6 +384,14 @@ struct SyncView: View {
                     }
                     if let error = model.errorMessage {
                         Label(error, systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                            .font(.callout)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if model.errorMessage == nil,
+                       let attention = model.syncAttentionMessage
+                    {
+                        Label(attention, systemImage: "exclamationmark.triangle.fill")
                             .foregroundStyle(.orange)
                             .font(.callout)
                             .fixedSize(horizontal: false, vertical: true)
@@ -427,15 +505,12 @@ struct SyncView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Current Library")
                         .font(.callout.weight(.medium))
-                    if let status = model.status {
-                        Text("\(status.outboundTransactions) changes to send · \(status.pendingTransactions) waiting")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    } else {
-                        Text("Available only on this Mac until you sync.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
+                    Text(model.syncStatusSummary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text(lastSyncDescription)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
                 Spacer()
                 Button("Sync Now", systemImage: "arrow.clockwise") {
@@ -447,6 +522,37 @@ struct SyncView: View {
                 }
             }
         }
+        .disabled(model.isWorking)
+    }
+
+    private var lastSyncDescription: String {
+        guard let date = model.lastSuccessfulSyncAt else {
+            return "Not synced with iCloud yet."
+        }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return "Last synced \(formatter.localizedString(for: date, relativeTo: Date()))."
+    }
+
+    private func pendingSetupSection(_ vaultID: String) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: "arrow.triangle.2.circlepath.icloud")
+                .foregroundStyle(.orange)
+                .frame(width: 28)
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Finish Library Setup")
+                    .font(.callout.weight(.medium))
+                Text("Continue joining iCloud Library \(shortIdentifier(vaultID)).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button("Continue…") {
+                Task { await model.resumePendingSetup() }
+            }
+        }
+        .padding(12)
+        .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
         .disabled(model.isWorking)
     }
 

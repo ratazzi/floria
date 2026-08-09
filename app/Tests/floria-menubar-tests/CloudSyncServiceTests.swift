@@ -110,6 +110,27 @@ final class CloudSyncServiceTests: XCTestCase {
         XCTAssertEqual(recoveredSyncCount, 1)
     }
 
+    func testSuccessfulSyncRecordsRecencyAndCompletesThePendingLibraryJoin() async throws {
+        let suiteName = "floria-cloud-sync-tests-\(UUID().uuidString)"
+        let preferences = CloudSyncPreferences(suiteName: suiteName)
+        preferences.setEnabled(true)
+        let vaultID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let completedAt = Date(timeIntervalSince1970: 1_787_000_000)
+        preferences.setPendingVaultID(vaultID)
+        let service = CloudSyncService(
+            control: CloudSyncControlStub(status: status()),
+            supportDirectory: FileManager.default.temporaryDirectory,
+            preferences: preferences,
+            sessionFactory: { _, _, _ in CloudSyncSessionStub() },
+            now: { completedAt })
+        defer { UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName) }
+
+        _ = try await service.syncNow()
+
+        XCTAssertEqual(preferences.lastSuccessfulSyncAt, completedAt)
+        XCTAssertNil(preferences.pendingVaultID)
+    }
+
     func testVaultDiscoveryAndAuthenticationAreExplicitAndLazilyConstructed() async throws {
         let suiteName = "floria-cloud-sync-tests-\(UUID().uuidString)"
         let preferences = CloudSyncPreferences(suiteName: suiteName)
@@ -208,6 +229,7 @@ final class CloudSyncServiceTests: XCTestCase {
         XCTAssertEqual(factory.count, 1)
         XCTAssertEqual(record?.recordID.zoneID, try CloudRecordCodec(vaultID: bootstrap.vaultID).zoneID)
         XCTAssertEqual(request.deviceName, "Studio")
+        XCTAssertEqual(preferences.pendingVaultID, bootstrap.vaultID)
     }
 
     func testDifferentVaultActivationBlocksSyncUntilDaemonReportsTheTargetVault() async throws {

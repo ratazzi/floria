@@ -19,6 +19,8 @@ extension CloudRecordSyncSession: CloudSyncSessionRunning {}
 
 struct CloudSyncPreferences: Sendable {
     private static let enabledKey = "cloud-sync.enabled"
+    private static let lastSuccessfulSyncKey = "cloud-sync.last-successful-sync"
+    private static let pendingVaultIDKey = "cloud-sync.pending-vault-id"
     private let suiteName: String?
 
     init(suiteName: String? = nil) {
@@ -31,6 +33,26 @@ struct CloudSyncPreferences: Sendable {
 
     func setEnabled(_ enabled: Bool) {
         defaults.set(enabled, forKey: Self.enabledKey)
+    }
+
+    var lastSuccessfulSyncAt: Date? {
+        defaults.object(forKey: Self.lastSuccessfulSyncKey) as? Date
+    }
+
+    func setLastSuccessfulSyncAt(_ date: Date) {
+        defaults.set(date, forKey: Self.lastSuccessfulSyncKey)
+    }
+
+    var pendingVaultID: String? {
+        defaults.string(forKey: Self.pendingVaultIDKey)
+    }
+
+    func setPendingVaultID(_ vaultID: String?) {
+        if let vaultID {
+            defaults.set(vaultID, forKey: Self.pendingVaultIDKey)
+        } else {
+            defaults.removeObject(forKey: Self.pendingVaultIDKey)
+        }
     }
 
     private var defaults: UserDefaults {
@@ -61,6 +83,7 @@ actor CloudSyncService {
     private let discoveryFactory: DiscoveryFactory
     private let lifecycleLoaderFactory: LifecycleLoaderFactory
     private let enrollmentPublisherFactory: EnrollmentPublisherFactory
+    private let now: @Sendable () -> Date
     private var session: (any CloudSyncSessionRunning)?
     private var sessionVaultID: String?
     private var discovery: (any CloudVaultDiscovering)?
@@ -71,11 +94,13 @@ actor CloudSyncService {
     init(
         control: any CloudSyncControlling,
         supportDirectory: URL,
-        preferences: CloudSyncPreferences = CloudSyncPreferences()
+        preferences: CloudSyncPreferences = CloudSyncPreferences(),
+        now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.control = control
         self.supportDirectory = supportDirectory
         self.preferences = preferences
+        self.now = now
         sessionFactory = { control, supportDirectory, vaultID in
             let container = CKContainer(
                 identifier: ProductIdentity.cloudKitContainerIdentifier)
@@ -118,7 +143,8 @@ actor CloudSyncService {
         },
         enrollmentPublisherFactory: @escaping EnrollmentPublisherFactory = {
             throw CloudSyncServiceError.unconfiguredTestDependency
-        }
+        },
+        now: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.control = control
         self.supportDirectory = supportDirectory
@@ -127,10 +153,19 @@ actor CloudSyncService {
         self.discoveryFactory = discoveryFactory
         self.lifecycleLoaderFactory = lifecycleLoaderFactory
         self.enrollmentPublisherFactory = enrollmentPublisherFactory
+        self.now = now
     }
 
     func isEnabled() -> Bool {
         preferences.isEnabled
+    }
+
+    func lastSuccessfulSyncAt() -> Date? {
+        preferences.lastSuccessfulSyncAt
+    }
+
+    func pendingVaultID() -> String? {
+        preferences.pendingVaultID
     }
 
     /// Enabling records user intent but performs no account lookup and creates no CKContainer.
@@ -182,12 +217,14 @@ actor CloudSyncService {
             activePublisher = try enrollmentPublisherFactory()
             enrollmentPublisher = activePublisher
         }
-        return try await CloudVaultEnrollmentCoordinator(
+        let preparation = try await CloudVaultEnrollmentCoordinator(
             control: control, publisher: activePublisher
         ).requestEnrollment(
             in: bootstrap,
             deviceName: deviceName,
             requestedAt: requestedAt ?? Self.timestamp())
+        preferences.setPendingVaultID(bootstrap.vaultID)
+        return preparation
     }
 
     func reviewEnrollments(
@@ -311,7 +348,12 @@ actor CloudSyncService {
             }
             throw error
         }
-        return try await control.recordSyncStatus()
+        let after = try await control.recordSyncStatus()
+        preferences.setLastSuccessfulSyncAt(now())
+        if preferences.pendingVaultID == after.vaultID {
+            preferences.setPendingVaultID(nil)
+        }
+        return after
     }
 
     private static func timestamp() -> String {
