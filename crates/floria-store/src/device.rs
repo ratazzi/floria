@@ -142,6 +142,17 @@ pub struct DeviceKeyStore {
     keys: Arc<dyn KeyProvider>,
 }
 
+pub(crate) struct PreparedDeviceKeyRotation {
+    material: DeviceKeyMaterial,
+    ciphertext: Vec<u8>,
+}
+
+impl PreparedDeviceKeyRotation {
+    pub(crate) fn material(&self) -> &DeviceKeyMaterial {
+        &self.material
+    }
+}
+
 impl DeviceKeyStore {
     pub fn new(path: impl Into<PathBuf>, keys: Arc<dyn KeyProvider>) -> Self {
         Self { path: path.into(), keys }
@@ -197,11 +208,22 @@ impl DeviceKeyStore {
     /// Replace a revoked local identity with a fresh Device id and keypair. Callers must only
     /// expose this after a signed Vault generation identifies the current identity as revoked.
     pub fn rotate(&self) -> StoreResult<DeviceKeyMaterial> {
+        self.commit_rotation(self.prepare_rotation()?)
+    }
+
+    pub(crate) fn prepare_rotation(&self) -> StoreResult<PreparedDeviceKeyRotation> {
         self.load()?;
         let material = DeviceKeyMaterial::generate()?;
         let ciphertext = self.encrypt_material(&material)?;
-        write_replace_atomic(&self.path, &ciphertext)?;
-        Ok(material)
+        Ok(PreparedDeviceKeyRotation { material, ciphertext })
+    }
+
+    pub(crate) fn commit_rotation(
+        &self,
+        prepared: PreparedDeviceKeyRotation,
+    ) -> StoreResult<DeviceKeyMaterial> {
+        write_replace_atomic(&self.path, &prepared.ciphertext)?;
+        Ok(prepared.material)
     }
 
     fn persist(&self, material: &DeviceKeyMaterial) -> StoreResult<()> {

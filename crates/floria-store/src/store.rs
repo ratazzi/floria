@@ -731,9 +731,10 @@ impl AgeDirStore {
                 reachable.push((generation, identity));
             }
         }
-        let rotated = Arc::new(
-            DeviceKeyStore::new(self.root.join("device.age"), Arc::clone(&self.keys)).rotate()?,
-        );
+        let device_store =
+            DeviceKeyStore::new(self.root.join("device.age"), Arc::clone(&self.keys));
+        let prepared = device_store.prepare_rotation()?;
+        let rotated = prepared.material();
         ensure_private_directory(&state.layout.envelopes_dir(rotated.device_id()))?;
         ensure_private_directory(&state.layout.device_operations_dir(rotated.device_id()))?;
         ensure_private_directory(&state.layout.device_checkpoints_dir(rotated.device_id()))?;
@@ -747,6 +748,10 @@ impl AgeDirStore {
                 &envelope,
             )?;
         }
+        // The new identity becomes authoritative only after every old generation it could read
+        // has been re-wrapped. A crash before this point leaves the old identity intact; a crash
+        // after it leaves a complete, readable replacement.
+        let rotated = Arc::new(device_store.commit_rotation(prepared)?);
         drop(state);
         *self.device.write().expect("device identity poisoned") = Arc::clone(&rotated);
         // The old identity's cached unwraps are stale for cache-keying purposes.
@@ -2531,6 +2536,28 @@ mod tests {
         assert_eq!(vault.genesis_device_id, s.device().device_id());
         assert_eq!(s.current_generation().unwrap(), 1);
         assert!(!s.has_other_enrolled_devices().unwrap());
+    }
+
+    #[test]
+    fn rotating_a_device_keeps_historical_generations_readable_after_reopen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("store");
+        let keys: Arc<dyn KeyProvider> =
+            Arc::new(X25519Keys(age::x25519::Identity::generate()));
+        let s = AgeDirStore::open(root.clone(), Arc::clone(&keys)).unwrap();
+        let previous_device_id = s.device().device_id().to_string();
+        let generation_public = s.generation_identity(1).unwrap().to_public().to_string();
+
+        let replacement = s.rotate_device_identity().unwrap();
+
+        assert_ne!(replacement.device_id(), previous_device_id);
+        drop(s);
+        let reopened = AgeDirStore::open(root, keys).unwrap();
+        assert_eq!(reopened.device().device_id(), replacement.device_id());
+        assert_eq!(
+            reopened.generation_identity(1).unwrap().to_public().to_string(),
+            generation_public
+        );
     }
 
     #[test]
