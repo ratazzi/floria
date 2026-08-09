@@ -65,4 +65,26 @@ final class CloudRecordSyncSessionTests: XCTestCase {
         XCTAssertFalse(
             CloudSendPhase.conflictBranch(commitID: "commit", records: []).atomicByZone)
     }
+
+    func testManualSyncOutcomeReportsOnlyNewlyAppliedRemoteChanges() async throws {
+        let state = CloudRecordSyncSessionState(initialEngineState: nil)
+        let applied = SyncInboundReport(
+            manifestsReceived: 1,
+            revisionsReceived: 1,
+            objectsInstalled: 0,
+            objectsAlreadyPresent: 0,
+            inboundSettled: 1,
+            pendingTransactions: 0,
+            conflictingEntities: 0,
+            projection: .applied)
+
+        try await state.prepareForManualSync()
+        await state.observe(applied)
+        let first = await state.manualSyncOutcome()
+        XCTAssertTrue(first.appliedRemoteChanges)
+
+        try await state.prepareForManualSync()
+        let second = await state.manualSyncOutcome()
+        XCTAssertFalse(second.appliedRemoteChanges)
+    }
 }

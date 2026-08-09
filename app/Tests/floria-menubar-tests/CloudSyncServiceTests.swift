@@ -39,7 +39,8 @@ final class CloudSyncServiceTests: XCTestCase {
         let result = try await service.syncNow()
         let syncCount = await session.syncCount
         let statusCount = await control.statusCount
-        XCTAssertEqual(result, status())
+        XCTAssertEqual(result.status, status())
+        XCTAssertFalse(result.appliedRemoteChanges)
         XCTAssertEqual(factory.count, 1)
         XCTAssertEqual(syncCount, 1)
         XCTAssertEqual(statusCount, 2)
@@ -104,7 +105,8 @@ final class CloudSyncServiceTests: XCTestCase {
         let recovered = try await service.syncNow()
         let failedSyncCount = await failedSession.syncCount
         let recoveredSyncCount = await recoveredSession.syncCount
-        XCTAssertEqual(recovered, status())
+        XCTAssertEqual(recovered.status, status())
+        XCTAssertFalse(recovered.appliedRemoteChanges)
         XCTAssertEqual(factory.count, 2)
         XCTAssertEqual(failedSyncCount, 1)
         XCTAssertEqual(recoveredSyncCount, 1)
@@ -283,7 +285,7 @@ final class CloudSyncServiceTests: XCTestCase {
                 conflictingEntities: 0,
                 projectionPending: false))
         let status = try await service.syncNow()
-        XCTAssertEqual(status.vaultID, targetVaultID)
+        XCTAssertEqual(status.status.vaultID, targetVaultID)
         XCTAssertEqual(factory.vaultIDs, [targetVaultID])
     }
 
@@ -431,14 +433,20 @@ private final class CloudSyncFactoryProbe: @unchecked Sendable {
 private actor CloudSyncSessionStub: CloudSyncSessionRunning {
     private(set) var syncCount = 0
     private let failure: CloudRecordSyncSessionError?
+    private let appliedRemoteChanges: Bool
 
-    init(failure: CloudRecordSyncSessionError? = nil) {
+    init(
+        failure: CloudRecordSyncSessionError? = nil,
+        appliedRemoteChanges: Bool = false
+    ) {
         self.failure = failure
+        self.appliedRemoteChanges = appliedRemoteChanges
     }
 
-    func syncNow() async throws {
+    func syncNow() async throws -> CloudSyncSessionOutcome {
         syncCount += 1
         if let failure { throw failure }
+        return CloudSyncSessionOutcome(appliedRemoteChanges: appliedRemoteChanges)
     }
 }
 

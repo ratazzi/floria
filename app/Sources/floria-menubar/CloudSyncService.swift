@@ -16,10 +16,19 @@ protocol CloudSyncControlling: RecordSyncControlling, VaultBootstrapControlling,
 extension ControlClient: CloudSyncControlling {}
 
 protocol CloudSyncSessionRunning: Sendable {
-    func syncNow() async throws
+    func syncNow() async throws -> CloudSyncSessionOutcome
 }
 
 extension CloudRecordSyncSession: CloudSyncSessionRunning {}
+
+struct CloudSyncSessionOutcome: Equatable, Sendable {
+    let appliedRemoteChanges: Bool
+}
+
+struct CloudSyncOutcome: Equatable, Sendable {
+    let status: SyncDomainStatus
+    let appliedRemoteChanges: Bool
+}
 
 struct CloudSyncPreferences: Sendable {
     private static let enabledKey = "cloud-sync.enabled"
@@ -340,7 +349,7 @@ actor CloudSyncService {
     }
 
     @discardableResult
-    func syncNow() async throws -> SyncDomainStatus {
+    func syncNow() async throws -> CloudSyncOutcome {
         guard preferences.isEnabled else { throw CloudSyncServiceError.disabled }
         let before = try await control.recordSyncStatus()
         if let pendingRestartVaultID {
@@ -357,8 +366,9 @@ actor CloudSyncService {
             session = activeSession
             sessionVaultID = before.vaultID
         }
+        let sessionOutcome: CloudSyncSessionOutcome
         do {
-            try await activeSession.syncNow()
+            sessionOutcome = try await activeSession.syncNow()
         } catch {
             // A failed CKSyncEngine session may have advanced only in-memory tokens or retained a
             // terminal account-change failure. The durable checkpoint and Rust outbox are the
@@ -374,7 +384,9 @@ actor CloudSyncService {
         if preferences.pendingVaultID == after.vaultID {
             preferences.setPendingVaultID(nil)
         }
-        return after
+        return CloudSyncOutcome(
+            status: after,
+            appliedRemoteChanges: sessionOutcome.appliedRemoteChanges)
     }
 
     private static func timestamp() -> String {

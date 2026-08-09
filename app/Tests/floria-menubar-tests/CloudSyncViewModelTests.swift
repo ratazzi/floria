@@ -221,6 +221,21 @@ final class CloudSyncViewModelTests: XCTestCase {
         XCTAssertNil(model.errorMessage)
     }
 
+    func testSyncExplainsWhenChangesFromICloudWereAppliedLocally() async {
+        let service = CloudSyncViewServiceStub(
+            status: status(vaultID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            candidates: [],
+            bootstrap: bootstrap(vaultID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            appliedRemoteChanges: true)
+        let model = CloudSyncViewModel(service: service, restartDaemon: {})
+
+        await model.load()
+        await model.syncNow()
+
+        XCTAssertEqual(model.notice, "Changes from iCloud were applied to this Mac.")
+        XCTAssertNil(model.errorMessage)
+    }
+
     func testReviewedConflictRequiresAnExplicitCandidateAndThenSyncsTheMerge() async {
         let entityID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
         let local = SyncConflictCandidate(
@@ -324,6 +339,7 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
     private let devices: [SyncVaultDevice]
     private var conflicts: [SyncConflictReview]
     private let syncFailure: CloudRecordSyncSessionError?
+    private let appliedRemoteChanges: Bool
     private let lastSuccessfulSync: Date?
     private var pendingVault: String?
     private var projectsWithoutLocalFolder: [SyncedProject]
@@ -341,6 +357,7 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
         conflicts: [SyncConflictReview] = [],
         activation: SyncVaultActivation? = nil,
         syncFailure: CloudRecordSyncSessionError? = nil,
+        appliedRemoteChanges: Bool = false,
         projectsWithoutLocalFolder: [SyncedProject] = [],
         lastSuccessfulSyncAt: Date? = nil,
         pendingVaultID: String? = nil
@@ -352,6 +369,7 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
         self.devices = devices
         self.conflicts = conflicts
         self.syncFailure = syncFailure
+        self.appliedRemoteChanges = appliedRemoteChanges
         self.projectsWithoutLocalFolder = projectsWithoutLocalFolder
         lastSuccessfulSync = lastSuccessfulSyncAt
         pendingVault = pendingVaultID
@@ -418,9 +436,11 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
         projectsWithoutLocalFolder.removeAll { $0.id == project.id }
     }
 
-    func syncNow() async throws -> SyncDomainStatus {
+    func syncNow() async throws -> CloudSyncOutcome {
         if let syncFailure { throw syncFailure }
-        return status
+        return CloudSyncOutcome(
+            status: status,
+            appliedRemoteChanges: appliedRemoteChanges)
     }
 
     func discoverVaults() async throws -> [CloudVaultCandidate] { candidates }

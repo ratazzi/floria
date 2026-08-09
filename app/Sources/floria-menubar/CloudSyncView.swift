@@ -12,7 +12,7 @@ protocol CloudSyncServicing: Sendable {
         -> SyncDomainStatus
     func projectsWithoutLocalFolder() async throws -> [SyncedProject]
     func attachProject(_ project: SyncedProject, at directory: URL) async throws
-    func syncNow() async throws -> SyncDomainStatus
+    func syncNow() async throws -> CloudSyncOutcome
     func discoverVaults() async throws -> [CloudVaultCandidate]
     func authenticateVault(_ vaultID: String) async throws -> SyncVaultBootstrap
     func requestEnrollment(
@@ -136,14 +136,18 @@ final class CloudSyncViewModel {
     func syncNow() async {
         await perform {
             do {
-                let status = try await self.service.syncNow()
-                self.status = status
-                try await self.loadConflicts(for: status)
+                let outcome = try await self.service.syncNow()
+                self.status = outcome.status
+                try await self.loadConflicts(for: outcome.status)
                 await self.refreshPersistentState()
-                self.notice = self.syncAttentionMessage == nil
-                    ? "Your encrypted Library is up to date in iCloud."
-                    : nil
-                try await self.loadDeviceManagement(for: status.vaultID)
+                if self.syncAttentionMessage == nil {
+                    self.notice = outcome.appliedRemoteChanges
+                        ? "Changes from iCloud were applied to this Mac."
+                        : "Your encrypted Library is up to date in iCloud."
+                } else {
+                    self.notice = nil
+                }
+                try await self.loadDeviceManagement(for: outcome.status.vaultID)
                 try await self.loadProjectsWithoutLocalFolder()
             } catch {
                 if await self.detectCurrentMacRemoval() {
@@ -194,10 +198,10 @@ final class CloudSyncViewModel {
         await perform {
             let bootstrap = try await self.service.authenticateVault(vaultID)
             _ = try await self.service.approveEnrollment(review, in: bootstrap)
-            let updated = try await self.service.syncNow()
-            self.status = updated
+            let outcome = try await self.service.syncNow()
+            self.status = outcome.status
             await self.refreshPersistentState()
-            try await self.loadDeviceManagement(for: updated.vaultID)
+            try await self.loadDeviceManagement(for: outcome.status.vaultID)
             self.notice = "\(review.deviceName ?? "The other Mac") can now use this Library."
         }
     }
@@ -207,10 +211,10 @@ final class CloudSyncViewModel {
         await perform {
             let bootstrap = try await self.service.authenticateVault(vaultID)
             _ = try await self.service.revokeDevice(device, in: bootstrap)
-            let updated = try await self.service.syncNow()
-            self.status = updated
+            let outcome = try await self.service.syncNow()
+            self.status = outcome.status
             await self.refreshPersistentState()
-            try await self.loadDeviceManagement(for: updated.vaultID)
+            try await self.loadDeviceManagement(for: outcome.status.vaultID)
             self.notice = "\(device.deviceName ?? "The other Mac") was removed from this Library."
         }
     }
@@ -228,7 +232,8 @@ final class CloudSyncViewModel {
             self.status = try await self.service.resolveConflict(
                 entityID: review.entityID,
                 selectedRevisionID: candidate.revisionID)
-            self.status = try await self.service.syncNow()
+            let outcome = try await self.service.syncNow()
+            self.status = outcome.status
             if let status = self.status {
                 try await self.loadConflicts(for: status)
             }
@@ -311,7 +316,8 @@ final class CloudSyncViewModel {
             try await restartDaemon()
             try await waitForActivation(vaultID)
         }
-        status = try await service.syncNow()
+        let outcome = try await service.syncNow()
+        status = outcome.status
         await refreshPersistentState()
         try await loadProjectsWithoutLocalFolder()
         candidates = []

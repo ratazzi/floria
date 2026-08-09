@@ -56,7 +56,7 @@ final class CloudRecordSyncSession: NSObject, CKSyncEngineDelegate, @unchecked S
         super.init()
     }
 
-    func syncNow() async throws {
+    func syncNow() async throws -> CloudSyncSessionOutcome {
         let engine = syncEngine
         try await sessionState.prepareForManualSync()
 
@@ -85,7 +85,7 @@ final class CloudRecordSyncSession: NSObject, CKSyncEngineDelegate, @unchecked S
         while true {
             switch try await coordinator.nextOutboundAction() {
             case .idle:
-                return
+                return await sessionState.manualSyncOutcome()
 
             case .saveConflictBranch(let commitID, _, let records):
                 try await send(
@@ -159,10 +159,13 @@ final class CloudRecordSyncSession: NSObject, CKSyncEngineDelegate, @unchecked S
                     throw CloudRecordSyncSessionError.damaged(
                         "CloudKit returned Vault records without an authenticated lifecycle")
                 }
-                _ = try await coordinator.applyInbound(
+                if let report = try await coordinator.applyInbound(
                     records: domain.domainRecords,
                     deletedRecordIDs: domain.domainDeletedRecordIDs,
                     observedAt: Self.timestamp())
+                {
+                    await sessionState.observe(report)
+                }
                 let checkpoint = try await sessionState.commitZoneFetch()
                 try await saveCheckpoint(engineState: checkpoint)
 
@@ -373,6 +376,7 @@ actor CloudRecordSyncSessionState {
     private var fetchedDomainRecords = [CKRecord.ID: CKRecord]()
     private var fetchedDomainDeletedRecordIDs = Set<CKRecord.ID>()
     private var latestState: CKSyncEngine.State.Serialization?
+    private var appliedRemoteChanges = false
 
     init(initialEngineState: CKSyncEngine.State.Serialization?) {
         latestState = initialEngineState
@@ -466,12 +470,13 @@ actor CloudRecordSyncSessionState {
         fetchedDomainRecords.removeAll()
         fetchedDomainDeletedRecordIDs.removeAll()
         latestState = nil
+        appliedRemoteChanges = false
     }
 
     func prepareForManualSync() throws {
         switch failure {
         case nil:
-            return
+            break
         case .retryPending:
             failure = nil
         case .some(let failure):
@@ -480,6 +485,17 @@ actor CloudRecordSyncSessionState {
             // from the durable checkpoint, so recovery requires a new session.
             throw failure
         }
+        appliedRemoteChanges = false
+    }
+
+    func observe(_ report: SyncInboundReport) {
+        if report.projection == .applied {
+            appliedRemoteChanges = true
+        }
+    }
+
+    func manualSyncOutcome() -> CloudSyncSessionOutcome {
+        CloudSyncSessionOutcome(appliedRemoteChanges: appliedRemoteChanges)
     }
 }
 
