@@ -1328,6 +1328,9 @@ mod tests {
 
     const KEY_A: &[u8] = b"fixture-public-identity-a-v1";
     const KEY_B: &[u8] = b"fixture-public-identity-b-v1";
+    // Parallel workspace tests can serialize macOS peer/code-signature inspection long enough
+    // to exceed the old five-second client deadline even though the agent remains responsive.
+    const TEST_CLIENT_TIMEOUT: Duration = Duration::from_secs(15);
 
     struct NoManagedKeys;
 
@@ -1781,7 +1784,7 @@ mod tests {
         runtime.replace(&snapshot(&project, &upstream.path)).unwrap();
         assert!(!project.join("agent.sock").exists());
         let mut client = UnixStream::connect(&socket_path).unwrap();
-        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        client.set_read_timeout(Some(TEST_CLIENT_TIMEOUT)).unwrap();
 
         write_frame(&mut client, &[SSH_AGENTC_REQUEST_IDENTITIES]).unwrap();
         let answer = read_frame(&mut client).unwrap();
@@ -1883,7 +1886,7 @@ mod tests {
         }
 
         let mut client = UnixStream::connect(&socket_path).unwrap();
-        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        client.set_read_timeout(Some(TEST_CLIENT_TIMEOUT)).unwrap();
         write_frame(&mut client, &[SSH_AGENTC_REQUEST_IDENTITIES]).unwrap();
         let answer = read_frame(&mut client).unwrap();
         let mut identities = WireReader::new(&answer);
