@@ -10,7 +10,7 @@ protocol CloudSyncControlling: RecordSyncControlling, VaultBootstrapControlling,
         entityID: String, selectedRevisionID: String, resolvedAt: String) async throws
         -> SyncDomainStatus
     func syncedProjectsWithoutLocalFolder() async throws -> [SyncedProject]
-    func attachSyncedProject(_ project: SyncedProject, path: String) async throws
+    func attachSyncedProject(id: String, path: String) async throws
 }
 
 extension ControlClient: CloudSyncControlling {}
@@ -336,7 +336,7 @@ actor CloudSyncService {
         else {
             throw CloudSyncServiceError.invalidProjectDirectory(resolved.path)
         }
-        try await control.attachSyncedProject(project, path: resolved.path)
+        try await control.attachSyncedProject(id: project.id, path: resolved.path)
     }
 
     @discardableResult

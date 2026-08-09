@@ -28,7 +28,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 const MAX_MSG: usize = 8 << 20;
 pub(crate) const MAX_RECORD_SYNC_BATCH_BYTES: usize = 6 << 20;
-pub const CONTROL_PROTOCOL_VERSION: u32 = 19;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 20;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRequest {
@@ -228,6 +228,7 @@ pub enum ControlCommand {
     },
     ProjectCreate { project: Project, environment: Environment, surface: Surface },
     ProjectUpsert { project: Project },
+    ProjectAttach { project_id: String, path: PathBuf },
     ProjectDefaultEnvironmentSet { project_id: String, environment_id: Option<String> },
     ProjectRemove { id: String },
     EnvironmentUpsert { environment: Environment },
@@ -1310,6 +1311,18 @@ mod tests {
         .unwrap();
         assert_eq!(remove["method"], "project_checkout_remove");
         assert_eq!(remove["params"]["id"], "fixture-worktree");
+
+        let attach = serde_json::to_value(ControlRequest {
+            request_id: 35,
+            command: ControlCommand::ProjectAttach {
+                project_id: "synced-project".to_string(),
+                path: PathBuf::from("/workspace/synced-project"),
+            },
+        })
+        .unwrap();
+        assert_eq!(attach["method"], "project_attach");
+        assert_eq!(attach["params"]["project_id"], "synced-project");
+        assert_eq!(attach["params"]["path"], "/workspace/synced-project");
 
         let result = serde_json::to_value(ControlResult::ProjectCheckoutDiscovery(
             ProjectCheckoutDiscovery {

@@ -1,6 +1,6 @@
 import Foundation
 
-let supportedControlProtocolVersion: UInt32 = 19
+let supportedControlProtocolVersion: UInt32 = 20
 
 struct ControlServerInfo: Decodable, Equatable, Sendable {
     let protocolVersion: UInt32?
@@ -1543,6 +1543,7 @@ enum ControlCommand: Sendable {
     case resourceRemove(String)
     case projectCreate(CatalogProject, CatalogEnvironment, CatalogSurface)
     case projectUpsert(CatalogProject)
+    case projectAttach(projectID: String, path: String)
     case projectDefaultEnvironmentSet(projectID: String, environmentID: String?)
     case projectRemove(String)
     case environmentUpsert(CatalogEnvironment)
@@ -1627,6 +1628,7 @@ enum ControlCommand: Sendable {
         case .resourceRemove: "resource_remove"
         case .projectCreate: "project_create"
         case .projectUpsert: "project_upsert"
+        case .projectAttach: "project_attach"
         case .projectDefaultEnvironmentSet: "project_default_environment_set"
         case .projectRemove: "project_remove"
         case .environmentUpsert: "environment_upsert"
@@ -1925,6 +1927,11 @@ enum ControlCommand: Sendable {
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: ProjectUpsertParams(project: project)))
+        case .projectAttach(let projectID, let path):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: ProjectAttachParams(projectID: projectID, path: path)))
         case .projectDefaultEnvironmentSet(let projectID, let environmentID):
             return try encoder.encode(
                 ControlRequest(
@@ -2142,6 +2149,15 @@ private struct ResourceUpsertParams: Encodable {
 }
 
 private struct ProjectUpsertParams: Encodable { let project: CatalogProject }
+private struct ProjectAttachParams: Encodable {
+    let projectID: String
+    let path: String
+
+    enum CodingKeys: String, CodingKey {
+        case projectID = "project_id"
+        case path
+    }
+}
 private struct ProjectDefaultEnvironmentSetParams: Encodable {
     let projectID: String
     let environmentID: String?

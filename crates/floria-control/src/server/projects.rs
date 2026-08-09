@@ -54,3 +54,46 @@ pub(super) fn rollback_project_create(catalog: &Catalog, project_id: &str) {
         tracing::warn!(%project_id, %error, "rolling back project create failed");
     }
 }
+
+/// Attach a replicated Project to one existing folder on this Mac without rewriting any of the
+/// Project's shared fields. The Project must still be unplaced when the request is handled so a
+/// stale UI action cannot silently move a checkout that was attached elsewhere in the meantime.
+pub(super) fn attach_replicated_project(
+    catalog: &Catalog,
+    project_id: &str,
+    path: &Path,
+) -> Result<ControlResult, DispatchError> {
+    let path = std::fs::canonicalize(path).map_err(|source| DispatchError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !path.is_dir() {
+        return Err(DispatchError::Validation(format!(
+            "project folder is not a directory: {}",
+            path.display()
+        )));
+    }
+
+    let replicated = catalog.replicated_catalog()?;
+    if !replicated.projects.iter().any(|project| project.id == project_id) {
+        return Err(DispatchError::Validation(format!(
+            "synced project {project_id:?} is no longer in this Library"
+        )));
+    }
+    let snapshot = catalog.snapshot()?;
+    if snapshot.projects.iter().any(|project| project.id == project_id) {
+        return Err(DispatchError::Validation(format!(
+            "synced project {project_id:?} already has a folder on this Mac"
+        )));
+    }
+
+    catalog.upsert_checkout(&ProjectCheckout {
+        id: project_id.to_string(),
+        project_id: project_id.to_string(),
+        path,
+        environment_id: None,
+        kind: ProjectCheckoutKind::Primary,
+        git_common_dir: None,
+    })?;
+    Ok(ControlResult::Empty)
+}

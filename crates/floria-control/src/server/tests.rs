@@ -8,7 +8,8 @@
     use crate::client::ControlClient;
     use floria_catalog::{
         Binding, BindingScope, EntrySelection, Environment, ItemLink, Project, ProjectCheckout,
-        ProjectCheckoutKind, ReplicatedCatalog, ReplicatedProject, Surface, SurfaceKind,
+        ProjectCheckoutKind, ReplicatedCatalog, ReplicatedProject, ReplicatedSurface, Surface,
+        SurfaceKind,
     };
     use floria_store::{
         SecretOrigin, SecretRecord, StoreResult, VersionRecord,
@@ -3138,7 +3139,23 @@
                 projects: vec![ReplicatedProject {
                     id: "synced-project".to_string(),
                     name: "Synced Project".to_string(),
-                    default_environment_id: None,
+                    default_environment_id: Some("synced-development".to_string()),
+                }],
+                environments: vec![Environment {
+                    id: "synced-development".to_string(),
+                    project_id: "synced-project".to_string(),
+                    name: "Development".to_string(),
+                    position: 0,
+                }],
+                surfaces: vec![ReplicatedSurface {
+                    id: "synced-dotenv".to_string(),
+                    environment_id: "synced-development".to_string(),
+                    name: ".env".to_string(),
+                    kind: SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Dotenv)),
+                    relative_path: Some(PathBuf::from(".env")),
+                    input: SurfaceInput::Bindings { binding_ids: vec![] },
+                    enforcement: Enforcement::Allow,
+                    position: 0,
                 }],
                 ..ReplicatedCatalog::default()
             })
@@ -3159,13 +3176,9 @@
         let checkout = dir.path().join("synced-project");
         std::fs::create_dir(&checkout).unwrap();
         client
-            .request(ControlCommand::ProjectUpsert {
-                project: Project {
-                    id: "synced-project".to_string(),
-                    name: "Synced Project".to_string(),
-                    path: checkout.clone(),
-                    default_environment_id: None,
-                },
+            .request(ControlCommand::ProjectAttach {
+                project_id: "synced-project".to_string(),
+                path: checkout.clone(),
             })
             .unwrap();
         let ControlResult::Snapshot(snapshot) =
@@ -3174,7 +3187,30 @@
             panic!("expected snapshot");
         };
         assert!(snapshot.unplaced_projects.is_empty());
-        assert_eq!(snapshot.projects[0].path, checkout);
+        assert_eq!(
+            snapshot.projects[0].path,
+            std::fs::canonicalize(&checkout).unwrap()
+        );
+        assert_eq!(snapshot.projects[0].name, "Synced Project");
+        assert_eq!(
+            snapshot.projects[0].default_environment_id.as_deref(),
+            Some("synced-development")
+        );
+        let expected_surface_path = std::fs::canonicalize(&checkout).unwrap().join(".env");
+        assert_eq!(
+            file_surface_instances(&snapshot).unwrap()[0].path.as_ref(),
+            Some(&expected_surface_path)
+        );
+
+        let moved = dir.path().join("moved");
+        std::fs::create_dir(&moved).unwrap();
+        let error = client
+            .request(ControlCommand::ProjectAttach {
+                project_id: "synced-project".to_string(),
+                path: moved,
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("already has a folder"));
     }
 
     #[test]

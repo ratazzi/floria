@@ -742,6 +742,9 @@ fn dispatch_uncoordinated(
             catalog.upsert_project(&project)?;
             Ok(ControlResult::Empty)
         }
+        ControlCommand::ProjectAttach { project_id, path } => {
+            attach_replicated_project(catalog, &project_id, &path)
+        }
         ControlCommand::ProjectDefaultEnvironmentSet { project_id, environment_id } => {
             catalog.set_project_default_environment(&project_id, environment_id.as_deref())?;
             Ok(ControlResult::Empty)

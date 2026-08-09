@@ -519,9 +519,9 @@ private actor CloudSyncControlStub: CloudSyncControlling {
         projectsWithoutLocalFolder
     }
 
-    func attachSyncedProject(_ project: SyncedProject, path: String) async throws {
-        attachedProjects.append((project.id, path))
-        projectsWithoutLocalFolder.removeAll { $0.id == project.id }
+    func attachSyncedProject(id: String, path: String) async throws {
+        attachedProjects.append((id, path))
+        projectsWithoutLocalFolder.removeAll { $0.id == id }
     }
 
     func recordSyncVaultBootstrap() async throws -> SyncVaultBootstrap {

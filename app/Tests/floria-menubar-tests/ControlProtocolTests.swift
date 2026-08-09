@@ -15,7 +15,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertNil(request["params"])
 
         let response = Data(
-            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":19,"daemon_version":"0.1.0","schema_version":14,"minimum_schema_version":14,"store_format_version":5,"minimum_store_format_version":5}}}"#.utf8)
+            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":20,"daemon_version":"0.1.0","schema_version":14,"minimum_schema_version":14,"store_format_version":5,"minimum_store_format_version":5}}}"#.utf8)
         let decoded = try JSONDecoder().decode(
             ControlResponseEnvelope<ControlServerInfo>.self, from: response)
         let info = try XCTUnwrap(decoded.result?.value)
@@ -1227,6 +1227,21 @@ final class ControlProtocolTests: XCTestCase {
             XCTAssertEqual(value["method"] as? String, item.1)
             XCTAssertNotNil(params["id"] as? String)
         }
+    }
+
+    func testSyncedProjectAttachMatchesRustWireShape() throws {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let data = try ControlCommand.projectAttach(
+            projectID: "fixture-project", path: "/tmp/fixture-project"
+        ).requestData(requestID: 29, encoder: encoder)
+        let value = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let params = try XCTUnwrap(value["params"] as? [String: Any])
+
+        XCTAssertEqual(value["method"] as? String, "project_attach")
+        XCTAssertEqual(params["project_id"] as? String, "fixture-project")
+        XCTAssertEqual(params["path"] as? String, "/tmp/fixture-project")
     }
 
     func testDecodesRustEmptyResponseWithSnakeCaseRequestID() throws {

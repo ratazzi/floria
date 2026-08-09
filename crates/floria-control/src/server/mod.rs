@@ -8,8 +8,8 @@ use std::sync::Arc;
 use floria_catalog::{
     resolve_catalog_surface, Binding, BindingScope, Catalog, CatalogError, CatalogSnapshot,
     EntrySelection, EntrySpec, Environment, FileBacking, ItemMetadata, OriginKind, OriginSource,
-    Project, ProjectCheckoutKind, Resource, ResourceCodec, ResourceKind, ResourceOrigin,
-    ResourceSource, Surface, SurfaceFormat, SurfaceInput, SurfaceKind, ValueShape,
+    Project, ProjectCheckout, ProjectCheckoutKind, Resource, ResourceCodec, ResourceKind,
+    ResourceOrigin, ResourceSource, Surface, SurfaceFormat, SurfaceInput, SurfaceKind, ValueShape,
 };
 use floria_core::audit::{AuditAccessRecord, AuditLog};
 use floria_core::authz::{Enforcement, PolicyMode, PolicyModeStatus};
