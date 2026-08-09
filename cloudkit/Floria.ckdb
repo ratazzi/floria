@@ -1,0 +1,106 @@
+DEFINE SCHEMA
+
+    RECORD TYPE Users (
+        "___createTime" TIMESTAMP,
+        "___createdBy" REFERENCE,
+        "___etag" STRING,
+        "___modTime" TIMESTAMP,
+        "___modifiedBy" REFERENCE,
+        "___recordID" REFERENCE,
+        roles LIST<INT64>,
+        GRANT WRITE TO "_creator",
+        GRANT READ TO "_world"
+    );
+
+    RECORD TYPE FloriaObjectV1 (
+        "___recordID" REFERENCE QUERYABLE,
+        schemaVersion INT64,
+        digest STRING,
+        ciphertextSize INT64,
+        ciphertext ASSET,
+        GRANT WRITE TO "_creator",
+        GRANT CREATE TO "_icloud",
+        GRANT READ TO "_world"
+    );
+
+    RECORD TYPE FloriaRevisionV1 (
+        "___recordID" REFERENCE QUERYABLE,
+        schemaVersion INT64,
+        entityID STRING,
+        revisionID STRING,
+        envelope BYTES,
+        GRANT WRITE TO "_creator",
+        GRANT CREATE TO "_icloud",
+        GRANT READ TO "_world"
+    );
+
+    RECORD TYPE FloriaCommitV1 (
+        "___recordID" REFERENCE QUERYABLE,
+        schemaVersion INT64,
+        commitID STRING,
+        manifest BYTES,
+        GRANT WRITE TO "_creator",
+        GRANT CREATE TO "_icloud",
+        GRANT READ TO "_world"
+    );
+
+    RECORD TYPE FloriaHeadV1 (
+        "___recordID" REFERENCE QUERYABLE,
+        schemaVersion INT64,
+        entityID STRING,
+        revisionID STRING,
+        GRANT WRITE TO "_creator",
+        GRANT CREATE TO "_icloud",
+        GRANT READ TO "_world"
+    );
+
+    RECORD TYPE FloriaVaultRootV1 (
+        "___recordID" REFERENCE QUERYABLE,
+        schemaVersion INT64,
+        vaultID STRING,
+        payload BYTES,
+        GRANT WRITE TO "_creator",
+        GRANT CREATE TO "_icloud",
+        GRANT READ TO "_world"
+    );
+
+    RECORD TYPE FloriaVaultDeviceV1 (
+        "___recordID" REFERENCE QUERYABLE,
+        schemaVersion INT64,
+        deviceID STRING,
+        payload BYTES,
+        GRANT WRITE TO "_creator",
+        GRANT CREATE TO "_icloud",
+        GRANT READ TO "_world"
+    );
+
+    RECORD TYPE FloriaVaultEnrollmentRequestV1 (
+        "___recordID" REFERENCE QUERYABLE,
+        schemaVersion INT64,
+        deviceID STRING,
+        payload BYTES,
+        GRANT WRITE TO "_creator",
+        GRANT CREATE TO "_icloud",
+        GRANT READ TO "_world"
+    );
+
+    RECORD TYPE FloriaVaultGenerationV1 (
+        "___recordID" REFERENCE QUERYABLE,
+        schemaVersion INT64,
+        generation INT64,
+        payload BYTES,
+        GRANT WRITE TO "_creator",
+        GRANT CREATE TO "_icloud",
+        GRANT READ TO "_world"
+    );
+
+    RECORD TYPE FloriaVaultGenerationEnvelopeV1 (
+        "___recordID" REFERENCE QUERYABLE,
+        schemaVersion INT64,
+        deviceID STRING,
+        generation INT64,
+        payload BYTES,
+        GRANT WRITE TO "_creator",
+        GRANT CREATE TO "_icloud",
+        GRANT READ TO "_world"
+    );
