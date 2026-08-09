@@ -55,22 +55,21 @@ final class CloudRecordSyncCoordinatorTests: XCTestCase {
             commitRecords.contains { $0.recordType == CloudRecordCodec.RecordType.head })
     }
 
-    func testPlannerConflictIsSettledThroughRust() async throws {
+    func testPlannerConflictPublishesItsImmutableBranchBeforeRustSettlement() async throws {
         let existing = try XCTUnwrap(headRecord(revisionID: UUID().uuidString.lowercased()))
         await coordinator.replaceHeads([entityID: existing])
         await control.setOutbound(SyncOutboundBatch(commits: [commit()], objects: []))
 
-        guard case .settleConflict(let plannedID, let entities) =
+        guard case .saveConflictBranch(let plannedID, let entities, let records) =
             try await coordinator.nextOutboundAction()
         else {
             return XCTFail("Expected a domain conflict")
         }
         XCTAssertEqual(plannedID, commitID)
         XCTAssertEqual(entities, [entityID])
+        XCTAssertFalse(records.contains { $0.recordType == CloudRecordCodec.RecordType.head })
         let settlements = await control.settlements
-        XCTAssertEqual(
-            settlements,
-            [SyncDeliveryOutcome(commitID: commitID, disposition: .conflict)])
+        XCTAssertTrue(settlements.isEmpty)
     }
 
     func testInboundIsAppliedBeforeStagingCleanupAndHeadCacheUpdate() async throws {
@@ -120,7 +119,7 @@ final class CloudRecordSyncCoordinatorTests: XCTestCase {
                 SyncOutboundRevision(
                     entityID: entityID,
                     revisionID: revisionID,
-                    expectedHeadRevisionID: nil,
+                    expectedHeadRevisionIDs: [],
                     envelopeBase64: Data("revision".utf8).base64EncodedString())
             ],
             createdAt: "2026-08-07T00:00:00Z")
@@ -134,7 +133,7 @@ final class CloudRecordSyncCoordinatorTests: XCTestCase {
                 SyncOutboundRevision(
                     entityID: entityID,
                     revisionID: revisionID,
-                    expectedHeadRevisionID: nil,
+                    expectedHeadRevisionIDs: [],
                     envelopeBase64: Data("revision".utf8).base64EncodedString())
             ],
             createdAt: "2026-08-07T00:00:00Z")

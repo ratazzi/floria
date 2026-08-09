@@ -19,9 +19,9 @@ use floria_control::{
     ReplicationDevice as ControlReplicationDevice,
     ReplicationEnrollment as ControlReplicationEnrollment, ReplicationMode, ReplicationStatus,
     RuntimeRecordSyncService, RuntimeReplicationService, SshIdentity, SshIdentityDiscovery,
-    SyncDeliveryOutcome, SyncDomainStatus, SyncInboundBatch, SyncInboundReport,
-    SyncEnrollmentPreparation, SyncEnrollmentReview, SyncOutboundBatch, SyncSettlementReport,
-    SyncVaultActivation, SyncVaultBootstrap,
+    SyncConflictReview, SyncDeliveryOutcome, SyncDomainStatus, SyncInboundBatch,
+    SyncInboundReport, SyncEnrollmentPreparation, SyncEnrollmentReview, SyncOutboundBatch,
+    SyncSettlementReport, SyncVaultActivation, SyncVaultBootstrap,
 };
 use floria_core::audit::{AuditAuthority, AuditCheckpoint, AuditLog};
 use floria_core::authz::{Authorizer, PolicyMode, PolicyModeStatus};
@@ -1351,6 +1351,31 @@ impl RuntimeRecordSyncService for DaemonRecordSyncService {
         })
     }
 
+    fn review_conflicts(&self) -> Result<Vec<SyncConflictReview>, String> {
+        self.with_journal(|journal| {
+            RecordSyncControl::new(journal, Arc::clone(&self.store))
+                .review_conflicts(&self.catalog)
+        })
+    }
+
+    fn resolve_conflict(
+        &self,
+        entity_id: &str,
+        selected_revision_id: &str,
+        resolved_at: &str,
+    ) -> Result<SyncDomainStatus, String> {
+        self.mutations.run(|| {
+            self.with_journal(|journal| {
+                RecordSyncControl::new(journal, Arc::clone(&self.store)).resolve_conflict(
+                    &self.catalog,
+                    entity_id,
+                    selected_revision_id,
+                    resolved_at,
+                )
+            })
+        })
+    }
+
     fn vault_bootstrap(&self) -> Result<SyncVaultBootstrap, String> {
         self.with_journal(|journal| {
             RecordSyncControl::new(journal, Arc::clone(&self.store)).vault_bootstrap()
@@ -2636,6 +2661,9 @@ fn cmd_control(command: ControlCmd, socket: Option<PathBuf>, config: &Path) -> R
         }
         ControlResult::RecordSyncStatus(status) => {
             println!("{}", serde_json::to_string_pretty(&status)?);
+        }
+        ControlResult::RecordSyncConflicts(conflicts) => {
+            println!("{}", serde_json::to_string_pretty(&conflicts)?);
         }
         ControlResult::RecordSyncVaultBootstrap(bootstrap) => {
             println!("{}", serde_json::to_string_pretty(&bootstrap)?);

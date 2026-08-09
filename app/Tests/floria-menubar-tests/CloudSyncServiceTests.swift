@@ -505,6 +505,16 @@ private actor CloudSyncControlStub: CloudSyncControlling {
         return status
     }
 
+    func reviewRecordSyncConflicts() async throws -> [SyncConflictReview] { [] }
+
+    func resolveRecordSyncConflict(
+        entityID _: String,
+        selectedRevisionID _: String,
+        resolvedAt _: String
+    ) async throws -> SyncDomainStatus {
+        status
+    }
+
     func syncedProjectsWithoutLocalFolder() async throws -> [SyncedProject] {
         projectsWithoutLocalFolder
     }

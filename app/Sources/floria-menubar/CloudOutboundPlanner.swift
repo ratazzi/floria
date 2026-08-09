@@ -41,7 +41,10 @@ struct CloudOutboundPlanner {
                     codec.recordID(prefix: "head", stableID: $0)
                 })
         case .conflict(let entityIDs):
-            return .settleConflict(commitID: commit.commitID, entityIDs: entityIDs)
+            return .saveConflictBranch(
+                commitID: commit.commitID,
+                entityIDs: entityIDs,
+                records: try codec.immutableRecords(for: commit))
         }
     }
 }
@@ -50,7 +53,7 @@ enum CloudOutboundAction {
     case idle
     case saveObjects([CKRecord])
     case fetchHeads(commitID: String, recordIDs: [CKRecord.ID])
-    case settleConflict(commitID: String, entityIDs: [String])
+    case saveConflictBranch(commitID: String, entityIDs: [String], records: [CKRecord])
     case saveCommit(commitID: String, records: [CKRecord])
 }
 

@@ -119,14 +119,17 @@ struct CloudRecordCodec {
             let entityID = try Self.validatedUUID(revision.entityID, field: Field.entityID)
             let revisionID = try Self.validatedUUID(revision.revisionID, field: Field.revisionID)
 
-            if let expected = revision.expectedHeadRevisionID {
-                let expectedID = try Self.validatedUUID(
-                    expected, field: "expectedHeadRevisionID")
+            if !revision.expectedHeadRevisionIDs.isEmpty {
+                let expectedIDs = Set(try revision.expectedHeadRevisionIDs.map {
+                    try Self.validatedUUID($0, field: "expectedHeadRevisionIDs")
+                })
                 guard let cached = cachedHeads[entityID] else {
                     needsFetch.insert(entityID)
                     continue
                 }
-                guard try headRevisionID(cached, expectedEntityID: entityID) == expectedID else {
+                guard expectedIDs.contains(
+                    try headRevisionID(cached, expectedEntityID: entityID)
+                ) else {
                     conflicts.insert(entityID)
                     continue
                 }

@@ -221,6 +221,52 @@ final class CloudSyncViewModelTests: XCTestCase {
         XCTAssertNil(model.errorMessage)
     }
 
+    func testReviewedConflictRequiresAnExplicitCandidateAndThenSyncsTheMerge() async {
+        let entityID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        let local = SyncConflictCandidate(
+            revisionID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            lifecycle: .active,
+            kind: .secret,
+            label: "Database password",
+            versionID: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            plaintextSize: 24,
+            matchesLocalState: true)
+        let remote = SyncConflictCandidate(
+            revisionID: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            lifecycle: .active,
+            kind: .secret,
+            label: "Database password",
+            versionID: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+            plaintextSize: 28,
+            matchesLocalState: false)
+        let review = SyncConflictReview(entityID: entityID, candidates: [local, remote])
+        let conflicted = SyncDomainStatus(
+            vaultID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            keyGeneration: 1,
+            outboundTransactions: 0,
+            inboundTransactions: 0,
+            pendingTransactions: 0,
+            conflictingEntities: 1,
+            projectionPending: false)
+        let service = CloudSyncViewServiceStub(
+            status: conflicted,
+            candidates: [],
+            conflicts: [review])
+        let model = CloudSyncViewModel(service: service, restartDaemon: {})
+
+        await model.load()
+        XCTAssertEqual(model.conflicts, [review])
+
+        await model.resolve(review, keeping: remote)
+
+        XCTAssertTrue(model.conflicts.isEmpty)
+        let resolved = await service.resolvedRevisions
+        XCTAssertEqual(resolved.count, 1)
+        XCTAssertEqual(resolved.first?.entityID, entityID)
+        XCTAssertEqual(resolved.first?.revisionID, remote.revisionID)
+        XCTAssertNil(model.errorMessage)
+    }
+
     private func status(vaultID: String) -> SyncDomainStatus {
         SyncDomainStatus(
             vaultID: vaultID,
@@ -259,6 +305,7 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
     private let enrollment: SyncEnrollmentPreparation
     private let activation: SyncVaultActivation
     private let devices: [SyncVaultDevice]
+    private var conflicts: [SyncConflictReview]
     private let syncFailure: CloudRecordSyncSessionError?
     private let lastSuccessfulSync: Date?
     private var pendingVault: String?
@@ -266,6 +313,7 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
     private var restartTarget: String?
     private(set) var revokedDevices = [SyncVaultDevice]()
     private(set) var attachedProjectIDs = [String]()
+    private(set) var resolvedRevisions = [(entityID: String, revisionID: String)]()
 
     init(
         status: SyncDomainStatus,
@@ -273,6 +321,7 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
         bootstrap: SyncVaultBootstrap? = nil,
         enrollment: SyncEnrollmentPreparation = .alreadyEnrolled(deviceID: "local"),
         devices: [SyncVaultDevice] = [],
+        conflicts: [SyncConflictReview] = [],
         activation: SyncVaultActivation? = nil,
         syncFailure: CloudRecordSyncSessionError? = nil,
         projectsWithoutLocalFolder: [SyncedProject] = [],
@@ -284,6 +333,7 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
         self.bootstrap = bootstrap
         self.enrollment = enrollment
         self.devices = devices
+        self.conflicts = conflicts
         self.syncFailure = syncFailure
         self.projectsWithoutLocalFolder = projectsWithoutLocalFolder
         lastSuccessfulSync = lastSuccessfulSyncAt
@@ -320,6 +370,25 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
                 projectionPending: false)
             self.restartTarget = nil
         }
+        return status
+    }
+
+    func reviewConflicts() async throws -> [SyncConflictReview] { conflicts }
+
+    func resolveConflict(
+        entityID: String,
+        selectedRevisionID: String
+    ) async throws -> SyncDomainStatus {
+        resolvedRevisions.append((entityID, selectedRevisionID))
+        conflicts.removeAll { $0.entityID == entityID }
+        status = SyncDomainStatus(
+            vaultID: status.vaultID,
+            keyGeneration: status.keyGeneration,
+            outboundTransactions: status.outboundTransactions + 1,
+            inboundTransactions: status.inboundTransactions,
+            pendingTransactions: status.pendingTransactions,
+            conflictingEntities: conflicts.count,
+            projectionPending: false)
         return status
     }
 

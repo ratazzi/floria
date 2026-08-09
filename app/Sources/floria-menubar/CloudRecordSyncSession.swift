@@ -87,8 +87,9 @@ final class CloudRecordSyncSession: NSObject, CKSyncEngineDelegate, @unchecked S
             case .idle:
                 return
 
-            case .settleConflict:
-                continue
+            case .saveConflictBranch(let commitID, _, let records):
+                try await send(
+                    .conflictBranch(commitID: commitID, records: records), through: engine)
 
             case .fetchHeads(_, let recordIDs):
                 try await fetchHeads(recordIDs)
@@ -274,7 +275,11 @@ final class CloudRecordSyncSession: NSObject, CKSyncEngineDelegate, @unchecked S
             _ = try await coordinator.settle(commitID: commitID, disposition: .accepted)
             await finish(phase, syncEngine: syncEngine)
 
-        case .commitConflict(let commitID, _):
+        case .conflictBranchAccepted(let commitID):
+            _ = try await coordinator.settle(commitID: commitID, disposition: .conflict)
+            await finish(phase, syncEngine: syncEngine)
+
+        case .commitConflict:
             let serverHeads = try failures.compactMap { failure -> (String, CKRecord)? in
                 guard let record = failure.serverRecord,
                       record.recordType == CloudRecordCodec.RecordType.head,
@@ -287,7 +292,6 @@ final class CloudRecordSyncSession: NSObject, CKSyncEngineDelegate, @unchecked S
                 fetchedHeads[entityID] = head
             }
             await coordinator.mergeHeads(fetchedHeads)
-            _ = try await coordinator.settle(commitID: commitID, disposition: .conflict)
             await finish(phase, syncEngine: syncEngine)
 
         case .retry:

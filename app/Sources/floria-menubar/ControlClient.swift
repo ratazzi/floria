@@ -208,6 +208,34 @@ final class ControlClient: @unchecked Sendable {
         return status
     }
 
+    func reviewRecordSyncConflicts() async throws -> [SyncConflictReview] {
+        guard let conflicts: [SyncConflictReview] = try await request(
+            .recordSyncReviewConflicts,
+            expecting: "record_sync_conflicts",
+            as: [SyncConflictReview].self)
+        else {
+            throw ControlClientError.missingResult("record_sync_conflicts")
+        }
+        return conflicts
+    }
+
+    func resolveRecordSyncConflict(
+        entityID: String,
+        selectedRevisionID: String,
+        resolvedAt: String = ISO8601DateFormatter().string(from: Date())
+    ) async throws -> SyncDomainStatus {
+        guard let status: SyncDomainStatus = try await request(
+            .recordSyncResolveConflict(
+                entityID: entityID,
+                selectedRevisionID: selectedRevisionID,
+                resolvedAt: resolvedAt),
+            expecting: "record_sync_status", as: SyncDomainStatus.self)
+        else {
+            throw ControlClientError.missingResult("record_sync_status")
+        }
+        return status
+    }
+
     func recordSyncVaultBootstrap() async throws -> SyncVaultBootstrap {
         guard let bootstrap: SyncVaultBootstrap = try await request(
             .recordSyncVaultBootstrap, expecting: "record_sync_vault_bootstrap",

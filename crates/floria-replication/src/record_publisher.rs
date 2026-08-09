@@ -59,7 +59,7 @@ impl<'a> RecordPublisher<'a> {
         catalog: &Catalog,
         created_at: impl Into<String>,
     ) -> ReplicationResult<RecordCaptureReport> {
-        let current = self.current_documents(catalog)?;
+        let current = capture_local_documents(catalog, &self.store)?;
         let previous = match self.previous_heads() {
             Ok(previous) => previous,
             Err(ReplicationError::ProjectionConflict { .. }) => {
@@ -88,9 +88,11 @@ impl<'a> RecordPublisher<'a> {
                 (None, Some((_, previous))) => archived(previous.clone()),
                 (None, None) => continue,
             };
-            let expected_head = previous_head.map(|(revision_id, _)| revision_id.clone());
-            let parents = expected_head.iter().cloned().collect();
-            changes.push(EntityChange::new(next_document, expected_head, parents)?);
+            let expected_heads = previous_head
+                .map(|(revision_id, _)| vec![revision_id.clone()])
+                .unwrap_or_default();
+            let parents = expected_heads.clone();
+            changes.push(EntityChange::new(next_document, expected_heads, parents)?);
         }
 
         if changes.is_empty() {
@@ -105,31 +107,6 @@ impl<'a> RecordPublisher<'a> {
             queued_transaction: true,
             blocked_by_conflict: false,
         })
-    }
-
-    fn current_documents(
-        &self,
-        catalog: &Catalog,
-    ) -> ReplicationResult<BTreeMap<String, ReplicatedEntityDocument>> {
-        let catalog_state = CatalogEntitySet::from_catalog(&catalog.replicated_catalog()?)?;
-        let mut documents = BTreeMap::new();
-        for document in catalog_state.documents() {
-            insert_document(
-                &mut documents,
-                ReplicatedEntityDocument::Catalog(document.clone()),
-            )?;
-        }
-        for record in self.store.list()? {
-            insert_document(
-                &mut documents,
-                ReplicatedEntityDocument::Secret(SecretEntityDocument::from_store(
-                    &self.store,
-                    &record.id,
-                    EntityLifecycle::Active,
-                )?),
-            )?;
-        }
-        Ok(documents)
     }
 
     fn previous_heads(
@@ -162,6 +139,31 @@ impl<'a> RecordPublisher<'a> {
         }
         Ok(heads)
     }
+}
+
+pub(crate) fn capture_local_documents(
+    catalog: &Catalog,
+    store: &AgeDirStore,
+) -> ReplicationResult<BTreeMap<String, ReplicatedEntityDocument>> {
+    let catalog_state = CatalogEntitySet::from_catalog(&catalog.replicated_catalog()?)?;
+    let mut documents = BTreeMap::new();
+    for document in catalog_state.documents() {
+        insert_document(
+            &mut documents,
+            ReplicatedEntityDocument::Catalog(document.clone()),
+        )?;
+    }
+    for record in store.list()? {
+        insert_document(
+            &mut documents,
+            ReplicatedEntityDocument::Secret(SecretEntityDocument::from_store(
+                store,
+                &record.id,
+                EntityLifecycle::Active,
+            )?),
+        )?;
+    }
+    Ok(documents)
 }
 
 fn archived(document: ReplicatedEntityDocument) -> ReplicatedEntityDocument {
@@ -283,8 +285,8 @@ mod tests {
         let outbound = fixture.journal.outbound().unwrap();
         assert_eq!(outbound.len(), 2);
         assert_eq!(
-            outbound[1].expected_heads()[secret_id.as_str()].as_deref(),
-            Some(first_revision.as_str())
+            outbound[1].expected_heads()[secret_id.as_str()],
+            vec![first_revision.clone()]
         );
         assert_eq!(outbound[1].revisions()[0].parents(), &[first_revision]);
     }
@@ -389,7 +391,7 @@ mod tests {
             &cryptor,
             [EntityChange::new(
                 document,
-                Some(root_revision.clone()),
+                vec![root_revision.clone()],
                 vec![root_revision],
             )
             .unwrap()],

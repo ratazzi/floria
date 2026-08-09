@@ -30,7 +30,7 @@ const MAX_PROJECTION_DOCUMENT_BYTES: usize = 64 * 1024 * 1024;
 pub struct OutboundCommit {
     commit: RevisionCommit,
     revisions: Vec<EntityRevision>,
-    expected_heads: BTreeMap<String, Option<String>>,
+    expected_heads: BTreeMap<String, Vec<String>>,
     created_at: String,
 }
 
@@ -43,7 +43,7 @@ impl OutboundCommit {
         &self.revisions
     }
 
-    pub fn expected_heads(&self) -> &BTreeMap<String, Option<String>> {
+    pub fn expected_heads(&self) -> &BTreeMap<String, Vec<String>> {
         &self.expected_heads
     }
 
@@ -68,6 +68,22 @@ pub struct ProjectionRecords {
     commits: Vec<RevisionCommit>,
     revisions: Vec<EntityRevision>,
     head_revision_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ConflictHead {
+    revision: EntityRevision,
+    commit: RevisionCommit,
+}
+
+impl ConflictHead {
+    pub(crate) fn revision(&self) -> &EntityRevision {
+        &self.revision
+    }
+
+    pub(crate) fn commit(&self) -> &RevisionCommit {
+        &self.commit
+    }
 }
 
 /// Exact desired state that must be replayed before a newer projection can begin.
@@ -251,7 +267,7 @@ impl RecordJournal {
         &self,
         commit: RevisionCommit,
         revisions: Vec<EntityRevision>,
-        expected_heads: BTreeMap<String, Option<String>>,
+        expected_heads: BTreeMap<String, Vec<String>>,
         created_at: impl Into<String>,
     ) -> ReplicationResult<()> {
         let commit = canonical_commit(commit)?;
@@ -469,6 +485,12 @@ impl RecordJournal {
     /// would violate a transaction that also changed the conflicted entity.
     pub fn projection_records(&self) -> ReplicationResult<ProjectionRecords> {
         self.with_read(|_, snapshot| projection_records_from(snapshot))
+    }
+
+    pub(crate) fn conflicting_heads(
+        &self,
+    ) -> ReplicationResult<BTreeMap<String, Vec<ConflictHead>>> {
+        self.with_read(|_, snapshot| conflicting_heads_from(snapshot))
     }
 
     /// Durably fence one exact local projection before catalog or store writes begin.
@@ -821,6 +843,33 @@ fn analysis_from(revisions: &[EntityRevision]) -> ReplicationResult<RevisionAnal
 fn projection_records_from(
     snapshot: &JournalSecuritySnapshot,
 ) -> ReplicationResult<ProjectionRecords> {
+    let (commits, revisions, analysis) = eligible_records_from(snapshot)?;
+    let conflicts = analysis
+        .heads()
+        .iter()
+        .filter_map(|(entity_id, heads)| (heads.len() > 1).then_some(entity_id.clone()))
+        .collect::<Vec<_>>();
+    if !conflicts.is_empty() {
+        return Err(ReplicationError::ProjectionConflict {
+            entity_ids: conflicts,
+        });
+    }
+    let head_revision_ids = analysis
+        .heads()
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(ProjectionRecords {
+        commits,
+        revisions,
+        head_revision_ids,
+    })
+}
+
+fn eligible_records_from(
+    snapshot: &JournalSecuritySnapshot,
+) -> ReplicationResult<(Vec<RevisionCommit>, Vec<EntityRevision>, RevisionAnalysis)> {
     let all_revisions = revision_set_from(&snapshot.revisions)?;
     let mut commits = Vec::new();
     let mut revision_ids = BTreeSet::new();
@@ -849,27 +898,47 @@ fn projection_records_from(
             "committed projection history contains missing ancestry".to_string(),
         ));
     }
-    let conflicts = analysis
-        .heads()
-        .iter()
-        .filter_map(|(entity_id, heads)| (heads.len() > 1).then_some(entity_id.clone()))
-        .collect::<Vec<_>>();
-    if !conflicts.is_empty() {
-        return Err(ReplicationError::ProjectionConflict {
-            entity_ids: conflicts,
-        });
+    Ok((commits, revisions, analysis))
+}
+
+fn conflicting_heads_from(
+    snapshot: &JournalSecuritySnapshot,
+) -> ReplicationResult<BTreeMap<String, Vec<ConflictHead>>> {
+    let (commits, revisions, analysis) = eligible_records_from(snapshot)?;
+    let commits_by_id = commits
+        .into_iter()
+        .map(|commit| (commit.commit_id().to_string(), commit))
+        .collect::<BTreeMap<_, _>>();
+    let revisions_by_id = revisions
+        .into_iter()
+        .map(|revision| (revision.revision_id().to_string(), revision))
+        .collect::<BTreeMap<_, _>>();
+    let mut conflicts = BTreeMap::new();
+    for (entity_id, head_ids) in analysis.heads() {
+        if head_ids.len() <= 1 {
+            continue;
+        }
+        let mut heads = Vec::with_capacity(head_ids.len());
+        for revision_id in head_ids {
+            let revision = revisions_by_id.get(revision_id).ok_or_else(|| {
+                ReplicationError::Invalid(format!(
+                    "conflict head revision {revision_id} is missing"
+                ))
+            })?;
+            let commit = commits_by_id.get(revision.commit_id()).ok_or_else(|| {
+                ReplicationError::Invalid(format!(
+                    "conflict head revision {revision_id} has no owning commit {}",
+                    revision.commit_id()
+                ))
+            })?;
+            heads.push(ConflictHead {
+                revision: revision.clone(),
+                commit: commit.clone(),
+            });
+        }
+        conflicts.insert(entity_id.clone(), heads);
     }
-    let head_revision_ids = analysis
-        .heads()
-        .values()
-        .flatten()
-        .cloned()
-        .collect::<Vec<_>>();
-    Ok(ProjectionRecords {
-        commits,
-        revisions,
-        head_revision_ids,
-    })
+    Ok(conflicts)
 }
 
 fn revision_set_from(revisions: &[EntityRevision]) -> ReplicationResult<RevisionSet> {
@@ -943,7 +1012,7 @@ fn canonical_commits(commits: Vec<RevisionCommit>) -> ReplicationResult<Vec<Revi
 fn validate_complete_commit(
     commit: &RevisionCommit,
     revisions: &[EntityRevision],
-    expected_heads: &BTreeMap<String, Option<String>>,
+    expected_heads: &BTreeMap<String, Vec<String>>,
 ) -> ReplicationResult<()> {
     let member_ids = commit.revision_ids().iter().cloned().collect::<BTreeSet<_>>();
     let revision_ids = revisions
@@ -981,23 +1050,22 @@ fn validate_complete_commit(
                 revision.entity_id()
             ))
         })?;
-        match expected {
-            Some(expected) => {
-                require_uuid("expected head revision id", expected)?;
-                if !revision.parents().iter().any(|parent| parent == expected) {
-                    return Err(ReplicationError::Invalid(format!(
-                        "expected head {expected} is not a parent of revision {}",
-                        revision.revision_id()
-                    )));
-                }
-            }
-            None if revision.parents().is_empty() => {}
-            None => {
+        for expected in expected {
+            require_uuid("expected head revision id", expected)?;
+            if !revision.parents().iter().any(|parent| parent == expected) {
                 return Err(ReplicationError::Invalid(format!(
-                    "revision {} has parents but no expected head",
+                    "expected head {expected} is not a parent of revision {}",
                     revision.revision_id()
-                )))
+                )));
             }
+        }
+        let expected = expected.iter().cloned().collect::<BTreeSet<_>>();
+        let parents = revision.parents().iter().cloned().collect::<BTreeSet<_>>();
+        if expected != parents {
+            return Err(ReplicationError::Invalid(format!(
+                "revision {} expected heads do not exactly match its parents",
+                revision.revision_id()
+            )));
         }
     }
     if entities.len() != expected_heads.len() {
@@ -1152,7 +1220,7 @@ fn outbound_from(conn: &Connection) -> ReplicationResult<Vec<OutboundCommit>> {
             ReplicationError::Invalid(format!("outbox commit {commit_id} is missing"))
         })?;
         let revisions = revisions_for_commit(conn, &commit)?;
-        let expected_heads = serde_json::from_slice(&expected_heads_json)?;
+        let expected_heads = decode_expected_heads(&expected_heads_json)?;
         items.push(OutboundCommit {
             commit,
             revisions,
@@ -1161,6 +1229,28 @@ fn outbound_from(conn: &Connection) -> ReplicationResult<Vec<OutboundCommit>> {
         });
     }
     Ok(items)
+}
+
+/// Development journals created before merge revisions stored one optional CAS head per entity.
+/// Normalize that authenticated shape at the read boundary; every new write uses the plural form.
+fn decode_expected_heads(document: &[u8]) -> ReplicationResult<BTreeMap<String, Vec<String>>> {
+    let values = serde_json::from_slice::<BTreeMap<String, serde_json::Value>>(document)?;
+    values
+        .into_iter()
+        .map(|(entity_id, value)| {
+            let heads = match value {
+                serde_json::Value::Null => Vec::new(),
+                serde_json::Value::String(head) => vec![head],
+                serde_json::Value::Array(_) => serde_json::from_value(value)?,
+                _ => {
+                    return Err(ReplicationError::Invalid(format!(
+                        "outbox expected heads for entity {entity_id} have an invalid shape"
+                    )))
+                }
+            };
+            Ok((entity_id, heads))
+        })
+        .collect()
 }
 
 fn outbound_by_id(
@@ -1487,13 +1577,13 @@ mod tests {
 
     fn expected_heads(
         revisions: &[EntityRevision],
-    ) -> BTreeMap<String, Option<String>> {
+    ) -> BTreeMap<String, Vec<String>> {
         revisions
             .iter()
             .map(|revision| {
                 (
                     revision.entity_id().to_string(),
-                    revision.parents().first().cloned(),
+                    revision.parents().to_vec(),
                 )
             })
             .collect()
@@ -1750,7 +1840,7 @@ mod tests {
             .queue_outbound(
                 commit,
                 vec![revision],
-                BTreeMap::from([(entity_id, Some(unrelated.clone()))]),
+                BTreeMap::from([(entity_id, vec![unrelated.clone()])]),
                 "2026-08-07T00:00:00Z",
             )
             .unwrap_err();
@@ -1758,6 +1848,20 @@ mod tests {
             .to_string()
             .contains(&format!("expected head {unrelated} is not a parent")));
         assert!(journal.outbound().unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_optional_expected_heads_normalize_to_plural_cas_candidates() {
+        let decoded = decode_expected_heads(
+            br#"{"root":null,"changed":"11111111-1111-4111-8111-111111111111"}"#,
+        )
+        .unwrap();
+
+        assert!(decoded["root"].is_empty());
+        assert_eq!(
+            decoded["changed"],
+            vec!["11111111-1111-4111-8111-111111111111".to_string()]
+        );
     }
 
     #[test]
@@ -1775,7 +1879,7 @@ mod tests {
             .queue_outbound(
                 commit,
                 vec![revision],
-                BTreeMap::from([(entity_id, None)]),
+                BTreeMap::from([(entity_id, Vec::new())]),
                 "2026-08-07T00:00:00Z",
             )
             .unwrap();

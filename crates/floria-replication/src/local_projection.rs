@@ -422,7 +422,7 @@ mod tests {
     ) {
         let changes = documents
             .into_iter()
-            .map(|document| EntityChange::new(document, None, Vec::new()).unwrap())
+            .map(|document| EntityChange::new(document, Vec::new(), Vec::new()).unwrap())
             .collect::<Vec<_>>();
         SealedRecordTransaction::seal(cryptor, changes)
             .unwrap()

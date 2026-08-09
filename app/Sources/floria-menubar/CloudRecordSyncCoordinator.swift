@@ -39,9 +39,6 @@ actor CloudRecordSyncCoordinator {
             batch: batch,
             verifiedObjectDigests: verifiedObjectDigests,
             cachedHeads: heads)
-        if case .settleConflict(let commitID, _) = action {
-            _ = try await settle(commitID: commitID, disposition: .conflict)
-        }
         return action
     }
 

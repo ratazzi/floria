@@ -238,7 +238,7 @@ mod tests {
         .unwrap();
         let change = EntityChange::new(
             ReplicatedEntityDocument::Secret(secret),
-            None,
+            Vec::new(),
             Vec::new(),
         )
         .unwrap();
@@ -310,7 +310,7 @@ mod tests {
         .archived();
         let archive_change = EntityChange::new(
             ReplicatedEntityDocument::Secret(archived),
-            Some(previous_head.clone()),
+            vec![previous_head.clone()],
             vec![previous_head],
         )
         .unwrap();

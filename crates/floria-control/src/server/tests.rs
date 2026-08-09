@@ -134,6 +134,8 @@
     #[derive(Default)]
     struct FixtureRecordSyncService {
         status_calls: AtomicUsize,
+        conflict_review_calls: AtomicUsize,
+        conflict_resolution_calls: AtomicUsize,
         bootstrap_calls: AtomicUsize,
         bootstrap_validation_calls: AtomicUsize,
         enrollment_preparation_calls: AtomicUsize,
@@ -150,6 +152,21 @@
     impl RuntimeRecordSyncService for FixtureRecordSyncService {
         fn status(&self) -> Result<SyncDomainStatus, String> {
             self.status_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(SyncDomainStatus::default())
+        }
+
+        fn review_conflicts(&self) -> Result<Vec<SyncConflictReview>, String> {
+            self.conflict_review_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(Vec::new())
+        }
+
+        fn resolve_conflict(
+            &self,
+            _entity_id: &str,
+            _selected_revision_id: &str,
+            _resolved_at: &str,
+        ) -> Result<SyncDomainStatus, String> {
+            self.conflict_resolution_calls.fetch_add(1, Ordering::Relaxed);
             Ok(SyncDomainStatus::default())
         }
 
@@ -3182,6 +3199,22 @@
             client.request(ControlCommand::RecordSyncStatus).unwrap(),
             ControlResult::RecordSyncStatus(_)
         ));
+        assert!(matches!(
+            client
+                .request(ControlCommand::RecordSyncReviewConflicts)
+                .unwrap(),
+            ControlResult::RecordSyncConflicts(_)
+        ));
+        assert!(matches!(
+            client
+                .request(ControlCommand::RecordSyncResolveConflict {
+                    entity_id: "11111111-1111-4111-8111-111111111111".to_string(),
+                    selected_revision_id: "22222222-2222-4222-8222-222222222222".to_string(),
+                    resolved_at: "2026-08-09T12:00:00Z".to_string(),
+                })
+                .unwrap(),
+            ControlResult::RecordSyncStatus(_)
+        ));
         let ControlResult::RecordSyncVaultBootstrap(bootstrap) = client
             .request(ControlCommand::RecordSyncVaultBootstrap)
             .unwrap()
@@ -3277,6 +3310,14 @@
         ));
 
         assert_eq!(record_sync.status_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            record_sync.conflict_review_calls.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            record_sync.conflict_resolution_calls.load(Ordering::Relaxed),
+            1
+        );
         assert_eq!(record_sync.bootstrap_calls.load(Ordering::Relaxed), 1);
         assert_eq!(
             record_sync

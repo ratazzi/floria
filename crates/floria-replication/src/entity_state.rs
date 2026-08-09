@@ -31,7 +31,7 @@ pub enum CatalogEntityState {
 }
 
 impl CatalogEntityState {
-    fn kind(&self) -> &'static str {
+    pub fn kind(&self) -> &'static str {
         match self {
             Self::Project(_) => "project",
             Self::Environment(_) => "environment",
@@ -41,7 +41,7 @@ impl CatalogEntityState {
         }
     }
 
-    fn catalog_id(&self) -> &str {
+    pub fn catalog_id(&self) -> &str {
         match self {
             Self::Project(project) => &project.id,
             Self::Environment(environment) => &environment.id,

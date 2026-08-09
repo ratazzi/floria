@@ -214,6 +214,20 @@ fn dispatch_uncoordinated(
             .status()
             .map(ControlResult::RecordSyncStatus)
             .map_err(DispatchError::RecordSync),
+        ControlCommand::RecordSyncReviewConflicts => record_sync
+            .ok_or_else(record_sync_unavailable)?
+            .review_conflicts()
+            .map(ControlResult::RecordSyncConflicts)
+            .map_err(DispatchError::RecordSync),
+        ControlCommand::RecordSyncResolveConflict {
+            entity_id,
+            selected_revision_id,
+            resolved_at,
+        } => record_sync
+            .ok_or_else(record_sync_unavailable)?
+            .resolve_conflict(&entity_id, &selected_revision_id, &resolved_at)
+            .map(ControlResult::RecordSyncStatus)
+            .map_err(DispatchError::RecordSync),
         ControlCommand::RecordSyncVaultBootstrap => record_sync
             .ok_or_else(record_sync_unavailable)?
             .vault_bootstrap()

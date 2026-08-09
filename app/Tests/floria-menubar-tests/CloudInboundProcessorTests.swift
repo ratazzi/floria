@@ -44,7 +44,7 @@ final class CloudInboundProcessorTests: XCTestCase {
                 SyncOutboundRevision(
                     entityID: entityID,
                     revisionID: revisionID,
-                    expectedHeadRevisionID: nil,
+                    expectedHeadRevisionIDs: [],
                     envelopeBase64: Data("revision".utf8).base64EncodedString())
             ],
             createdAt: "2026-08-07T00:00:00Z")
@@ -114,7 +114,7 @@ final class CloudInboundProcessorTests: XCTestCase {
                 SyncOutboundRevision(
                     entityID: entityID,
                     revisionID: revisionID,
-                    expectedHeadRevisionID: nil,
+                    expectedHeadRevisionIDs: [],
                     envelopeBase64: Data("revision".utf8).base64EncodedString())
             ],
             createdAt: "2026-08-07T00:00:00Z")

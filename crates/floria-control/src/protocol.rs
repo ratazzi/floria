@@ -14,6 +14,9 @@ pub use floria_replication::sync_control::{
     SyncObjectAsset, SyncOutboundBatch, SyncOutboundCommit, SyncOutboundRevision,
     SyncProjectionDisposition, SyncSettlementReport,
 };
+pub use floria_replication::record_conflict::{
+    SyncConflictCandidate, SyncConflictEntityKind, SyncConflictReview,
+};
 pub use floria_replication::sync_bootstrap::{
     SyncBootstrapDocument, SyncBootstrapEnvelope, SyncEnrollmentPreparation,
     SyncEnrollmentReview, SyncVaultActivation, SyncVaultBootstrap, SyncVaultDevice,
@@ -25,7 +28,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 const MAX_MSG: usize = 8 << 20;
 pub(crate) const MAX_RECORD_SYNC_BATCH_BYTES: usize = 6 << 20;
-pub const CONTROL_PROTOCOL_VERSION: u32 = 18;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 19;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRequest {
@@ -93,6 +96,12 @@ pub enum ControlCommand {
     /// must have shown the request's key fingerprint for out-of-band comparison first.
     ReplicationApprove { device_id: String },
     RecordSyncStatus,
+    RecordSyncReviewConflicts,
+    RecordSyncResolveConflict {
+        entity_id: String,
+        selected_revision_id: String,
+        resolved_at: String,
+    },
     RecordSyncVaultBootstrap,
     RecordSyncValidateVaultBootstrap {
         expected_vault_id: String,
@@ -270,6 +279,7 @@ pub enum ControlResult {
     ReplicationStatus(ReplicationStatus),
     ReplicationEnrollment(ReplicationEnrollment),
     RecordSyncStatus(SyncDomainStatus),
+    RecordSyncConflicts(Vec<SyncConflictReview>),
     RecordSyncVaultBootstrap(SyncVaultBootstrap),
     RecordSyncEnrollmentPreparation(SyncEnrollmentPreparation),
     RecordSyncEnrollmentReviews(Vec<SyncEnrollmentReview>),
@@ -1674,6 +1684,24 @@ mod tests {
 
     #[test]
     fn coordinated_record_sync_wire_is_opaque_and_transport_neutral() {
+        let resolution_request = serde_json::to_value(ControlRequest {
+            request_id: 40,
+            command: ControlCommand::RecordSyncResolveConflict {
+                entity_id: "11111111-1111-4111-8111-111111111111".to_string(),
+                selected_revision_id: "22222222-2222-4222-8222-222222222222".to_string(),
+                resolved_at: "2026-08-09T12:00:00Z".to_string(),
+            },
+        })
+        .unwrap();
+        assert_eq!(
+            resolution_request["method"],
+            "record_sync_resolve_conflict"
+        );
+        assert_eq!(
+            resolution_request["params"]["selected_revision_id"],
+            "22222222-2222-4222-8222-222222222222"
+        );
+
         let bootstrap_request = serde_json::to_value(ControlRequest {
             request_id: 41,
             command: ControlCommand::RecordSyncVaultBootstrap,

@@ -5,6 +5,10 @@ protocol CloudSyncControlling: RecordSyncControlling, VaultBootstrapControlling,
     VaultEnrollmentControlling, VaultDeviceControlling, VaultActivationControlling
 {
     func recordSyncStatus() async throws -> SyncDomainStatus
+    func reviewRecordSyncConflicts() async throws -> [SyncConflictReview]
+    func resolveRecordSyncConflict(
+        entityID: String, selectedRevisionID: String, resolvedAt: String) async throws
+        -> SyncDomainStatus
     func syncedProjectsWithoutLocalFolder() async throws -> [SyncedProject]
     func attachSyncedProject(_ project: SyncedProject, path: String) async throws
 }
@@ -299,6 +303,23 @@ actor CloudSyncService {
     func localStatus() async throws -> SyncDomainStatus? {
         guard preferences.isEnabled else { return nil }
         return try await control.recordSyncStatus()
+    }
+
+    func reviewConflicts() async throws -> [SyncConflictReview] {
+        guard preferences.isEnabled else { throw CloudSyncServiceError.disabled }
+        return try await control.reviewRecordSyncConflicts()
+    }
+
+    @discardableResult
+    func resolveConflict(
+        entityID: String,
+        selectedRevisionID: String
+    ) async throws -> SyncDomainStatus {
+        guard preferences.isEnabled else { throw CloudSyncServiceError.disabled }
+        return try await control.resolveRecordSyncConflict(
+            entityID: entityID,
+            selectedRevisionID: selectedRevisionID,
+            resolvedAt: Self.timestamp())
     }
 
     func projectsWithoutLocalFolder() async throws -> [SyncedProject] {

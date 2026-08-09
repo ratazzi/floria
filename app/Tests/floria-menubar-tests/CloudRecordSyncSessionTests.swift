@@ -62,5 +62,7 @@ final class CloudRecordSyncSessionTests: XCTestCase {
         XCTAssertTrue(CloudSendPhase.bootstrap([]).atomicByZone)
         XCTAssertTrue(CloudSendPhase.commit(commitID: "commit", records: []).atomicByZone)
         XCTAssertFalse(CloudSendPhase.objects([]).atomicByZone)
+        XCTAssertFalse(
+            CloudSendPhase.conflictBranch(commitID: "commit", records: []).atomicByZone)
     }
 }

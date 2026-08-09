@@ -37,7 +37,8 @@ struct CloudSentBatchResolver {
 
         var acceptedHeads = [String: CKRecord]()
         var hasRetry = false
-        var conflictingEntities = Set<String>()
+        var conflictingEntities = try atomicCommitHeadConflicts(
+            phase: phase, failures: failures)
 
         for (recordID, client) in expected {
             if let server = saved[recordID] {
@@ -90,6 +91,13 @@ struct CloudSentBatchResolver {
                 .zoneNotFound:
                 hasRetry = true
 
+            case .batchRequestFailed
+                where !conflictingEntities.isEmpty
+                    && client.recordType != CloudRecordCodec.RecordType.head:
+                // CloudKit rolls back the immutable siblings of a failed atomic head CAS. The
+                // next phase publishes those siblings without the head before Rust settles it.
+                continue
+
             default:
                 return .damaged(
                     "CloudKit could not save \(recordID.recordName): \(failure.code.rawValue)")
@@ -113,7 +121,28 @@ struct CloudSentBatchResolver {
             return .objectsVerified(records)
         case .commit(let commitID, _):
             return .commitAccepted(commitID: commitID, heads: acceptedHeads)
+        case .conflictBranch(let commitID, _):
+            return .conflictBranchAccepted(commitID: commitID)
         }
+    }
+
+    private func atomicCommitHeadConflicts(
+        phase: CloudSendPhase,
+        failures: [CloudRecordSaveFailure]
+    ) throws -> Set<String> {
+        guard case .commit = phase else { return [] }
+        var entityIDs = Set<String>()
+        for failure in failures where failure.code == .serverRecordChanged {
+            guard failure.record.recordType == CloudRecordCodec.RecordType.head,
+                  let server = failure.serverRecord
+            else { continue }
+            if case .headConflict(let entityID) = try CloudRecordCollisionResolver(codec: codec)
+                .classify(client: failure.record, server: server)
+            {
+                entityIDs.insert(entityID)
+            }
+        }
+        return entityIDs
     }
 
     private func bootstrapMatches(client: CKRecord, server: CKRecord) throws -> Bool {
@@ -129,10 +158,12 @@ enum CloudSendPhase {
     case bootstrap([CKRecord])
     case objects([CKRecord])
     case commit(commitID: String, records: [CKRecord])
+    case conflictBranch(commitID: String, records: [CKRecord])
 
     var records: [CKRecord] {
         switch self {
-        case .bootstrap(let records), .objects(let records), .commit(_, let records):
+        case .bootstrap(let records), .objects(let records), .commit(_, let records),
+            .conflictBranch(_, let records):
             records
         }
     }
@@ -141,7 +172,7 @@ enum CloudSendPhase {
         switch self {
         case .bootstrap, .commit:
             return true
-        case .objects:
+        case .objects, .conflictBranch:
             return false
         }
     }
@@ -157,6 +188,7 @@ enum CloudSentBatchResolution {
     case bootstrapAccepted
     case objectsVerified([CKRecord])
     case commitAccepted(commitID: String, heads: [String: CKRecord])
+    case conflictBranchAccepted(commitID: String)
     case commitConflict(commitID: String, entityIDs: [String])
     case retry
     case damaged(String)

@@ -38,6 +38,20 @@ final class CloudSentBatchResolverTests: XCTestCase {
         XCTAssertEqual(acceptedID, commitID)
     }
 
+    func testConflictBranchSettlesOnlyAfterItsImmutableHistoryExists() throws {
+        let records = try codec.immutableRecords(for: commit(expectedHead: oldRevisionID))
+        let result = try resolver.resolve(
+            phase: .conflictBranch(commitID: commitID, records: records),
+            savedRecords: records,
+            failures: [])
+
+        guard case .conflictBranchAccepted(let acceptedID) = result else {
+            return XCTFail("Expected the immutable branch to be durable")
+        }
+        XCTAssertEqual(acceptedID, commitID)
+        XCTAssertFalse(records.contains { $0.recordType == CloudRecordCodec.RecordType.head })
+    }
+
     func testSameDesiredHeadIsPriorSuccessButDifferentHeadIsConflict() throws {
         let desired = head(revisionID: newRevisionID)
 
@@ -67,6 +81,32 @@ final class CloudSentBatchResolverTests: XCTestCase {
             ])
         guard case .commitConflict(let conflictID, let entities) = conflict else {
             return XCTFail("Expected a head conflict")
+        }
+        XCTAssertEqual(conflictID, commitID)
+        XCTAssertEqual(entities, [entityID])
+    }
+
+    func testAtomicHeadConflictTreatsRolledBackImmutableSiblingsAsTheSameConflict() throws {
+        let immutable = try codec.immutableRecords(for: commit(expectedHead: oldRevisionID))
+        let desiredHead = head(revisionID: newRevisionID)
+        let records = immutable + [desiredHead]
+        let failures = immutable.map {
+            CloudRecordSaveFailure(
+                record: $0, code: .batchRequestFailed, serverRecord: nil)
+        } + [
+            CloudRecordSaveFailure(
+                record: desiredHead,
+                code: .serverRecordChanged,
+                serverRecord: head(revisionID: oldRevisionID))
+        ]
+
+        let result = try resolver.resolve(
+            phase: .commit(commitID: commitID, records: records),
+            savedRecords: [],
+            failures: failures)
+
+        guard case .commitConflict(let conflictID, let entities) = result else {
+            return XCTFail("Expected one atomic CAS conflict")
         }
         XCTAssertEqual(conflictID, commitID)
         XCTAssertEqual(entities, [entityID])
@@ -176,7 +216,7 @@ final class CloudSentBatchResolverTests: XCTestCase {
                 SyncOutboundRevision(
                     entityID: entityID,
                     revisionID: newRevisionID,
-                    expectedHeadRevisionID: expectedHead,
+                    expectedHeadRevisionIDs: expectedHead.map { [$0] } ?? [],
                     envelopeBase64: Data("revision".utf8).base64EncodedString())
             ],
             createdAt: "2026-08-07T12:00:00Z")

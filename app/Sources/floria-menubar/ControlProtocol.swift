@@ -1,6 +1,6 @@
 import Foundation
 
-let supportedControlProtocolVersion: UInt32 = 18
+let supportedControlProtocolVersion: UInt32 = 19
 
 struct ControlServerInfo: Decodable, Equatable, Sendable {
     let protocolVersion: UInt32?
@@ -1108,13 +1108,13 @@ struct SyncObjectAsset: Codable, Equatable, Sendable {
 struct SyncOutboundRevision: Codable, Equatable, Sendable {
     let entityID: String
     let revisionID: String
-    let expectedHeadRevisionID: String?
+    let expectedHeadRevisionIDs: [String]
     let envelopeBase64: String
 
     enum CodingKeys: String, CodingKey {
         case entityID = "entity_id"
         case revisionID = "revision_id"
-        case expectedHeadRevisionID = "expected_head_revision_id"
+        case expectedHeadRevisionIDs = "expected_head_revision_ids"
         case envelopeBase64 = "envelope_base64"
     }
 }
@@ -1247,6 +1247,52 @@ struct SyncDomainStatus: Codable, Equatable, Sendable {
         case pendingTransactions = "pending_transactions"
         case conflictingEntities = "conflicting_entities"
         case projectionPending = "projection_pending"
+    }
+}
+
+enum SyncConflictEntityKind: String, Codable, Sendable {
+    case project
+    case environment
+    case resource
+    case binding
+    case surface
+    case secret
+}
+
+enum SyncEntityLifecycle: String, Codable, Sendable {
+    case active
+    case archived
+}
+
+struct SyncConflictCandidate: Codable, Equatable, Identifiable, Sendable {
+    let revisionID: String
+    let lifecycle: SyncEntityLifecycle
+    let kind: SyncConflictEntityKind
+    let label: String
+    let versionID: String?
+    let plaintextSize: UInt64?
+    let matchesLocalState: Bool
+
+    var id: String { revisionID }
+
+    enum CodingKeys: String, CodingKey {
+        case lifecycle, kind, label
+        case revisionID = "revision_id"
+        case versionID = "version_id"
+        case plaintextSize = "plaintext_size"
+        case matchesLocalState = "matches_local_state"
+    }
+}
+
+struct SyncConflictReview: Codable, Equatable, Identifiable, Sendable {
+    let entityID: String
+    let candidates: [SyncConflictCandidate]
+
+    var id: String { entityID }
+
+    enum CodingKeys: String, CodingKey {
+        case candidates
+        case entityID = "entity_id"
     }
 }
 
@@ -1429,6 +1475,9 @@ enum ControlCommand: Sendable {
     case replicationEnroll(ReplicationEnrollment)
     case replicationApprove(deviceID: String)
     case recordSyncStatus
+    case recordSyncReviewConflicts
+    case recordSyncResolveConflict(
+        entityID: String, selectedRevisionID: String, resolvedAt: String)
     case recordSyncVaultBootstrap
     case recordSyncValidateVaultBootstrap(expectedVaultID: String, bootstrap: SyncVaultBootstrap)
     case recordSyncPrepareVaultEnrollment(
@@ -1529,6 +1578,8 @@ enum ControlCommand: Sendable {
         case .replicationEnroll: "replication_enroll"
         case .replicationApprove: "replication_approve"
         case .recordSyncStatus: "record_sync_status"
+        case .recordSyncReviewConflicts: "record_sync_review_conflicts"
+        case .recordSyncResolveConflict: "record_sync_resolve_conflict"
         case .recordSyncVaultBootstrap: "record_sync_vault_bootstrap"
         case .recordSyncValidateVaultBootstrap: "record_sync_validate_vault_bootstrap"
         case .recordSyncPrepareVaultEnrollment: "record_sync_prepare_vault_enrollment"
@@ -1592,7 +1643,7 @@ enum ControlCommand: Sendable {
         case .ping, .health, .policyModeGet, .grantList, .grantClear, .replicationStatus,
             .replicationSync, .replicationResolveWithCurrent, .replicationDisable,
             .replicationRequestReenrollment, .replicationEnrollment, .recordSyncStatus, .snapshot,
-            .recordSyncVaultBootstrap,
+            .recordSyncVaultBootstrap, .recordSyncReviewConflicts,
             .projectCheckoutInventory, .sshConfigStatus, .sshConfigInstall, .sshConfigRemove,
             .protectedFiles:
             return try encoder.encode(ControlRequestWithoutParams(requestID: requestID, method: method))
@@ -1659,6 +1710,13 @@ enum ControlCommand: Sendable {
                     requestID: requestID, method: method,
                     params: RecordSyncValidateVaultBootstrapParams(
                         expectedVaultID: expectedVaultID, bootstrap: bootstrap)))
+        case .recordSyncResolveConflict(let entityID, let selectedRevisionID, let resolvedAt):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: RecordSyncResolveConflictParams(
+                        entityID: entityID, selectedRevisionID: selectedRevisionID,
+                        resolvedAt: resolvedAt)))
         case .recordSyncPrepareVaultEnrollment(let bootstrap, let deviceName, let requestedAt):
             return try encoder.encode(
                 ControlRequest(
@@ -1922,6 +1980,17 @@ private struct ReplicationRevokeDeviceParams: Encodable {
     enum CodingKeys: String, CodingKey { case deviceID = "device_id" }
 }
 private struct RecordSyncNextOutboundParams: Encodable { let limit: Int }
+private struct RecordSyncResolveConflictParams: Encodable {
+    let entityID: String
+    let selectedRevisionID: String
+    let resolvedAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case entityID = "entity_id"
+        case selectedRevisionID = "selected_revision_id"
+        case resolvedAt = "resolved_at"
+    }
+}
 private struct RecordSyncValidateVaultBootstrapParams: Encodable {
     let expectedVaultID: String
     let bootstrap: SyncVaultBootstrap

@@ -47,9 +47,9 @@ use crate::protocol::{
     ManagedLinkStatus, ProjectCheckoutCandidate, ProjectCheckoutDiscovery,
     ProjectCheckoutInventory, ProtectedFile, ProtectedFileVersion, SecretValue, SshConfigStatus,
     RecoveryKeyReport, ReplicationEnrollment, ReplicationStatus, SshIdentity, WorkspaceSnapshot,
-    SyncDeliveryOutcome, SyncDomainStatus, SyncInboundBatch, SyncInboundReport, SyncOutboundBatch,
-    SyncEnrollmentPreparation, SyncEnrollmentReview, SyncSettlementReport, SyncVaultActivation,
-    SyncVaultBootstrap, SyncVaultDevice,
+    SyncConflictReview, SyncDeliveryOutcome, SyncDomainStatus, SyncInboundBatch, SyncInboundReport,
+    SyncOutboundBatch, SyncEnrollmentPreparation, SyncEnrollmentReview, SyncSettlementReport,
+    SyncVaultActivation, SyncVaultBootstrap, SyncVaultDevice,
 };
 
 pub struct ControlServer {
@@ -152,6 +152,13 @@ pub trait RuntimeReplicationService: Send + Sync + 'static {
 /// Swift never receives Catalog or Store authority through this interface.
 pub trait RuntimeRecordSyncService: Send + Sync + 'static {
     fn status(&self) -> Result<SyncDomainStatus, String>;
+    fn review_conflicts(&self) -> Result<Vec<SyncConflictReview>, String>;
+    fn resolve_conflict(
+        &self,
+        entity_id: &str,
+        selected_revision_id: &str,
+        resolved_at: &str,
+    ) -> Result<SyncDomainStatus, String>;
     fn vault_bootstrap(&self) -> Result<SyncVaultBootstrap, String>;
     fn validate_vault_bootstrap(
         &self,
@@ -536,6 +543,7 @@ fn is_read_only(command: &ControlCommand) -> bool {
             | ControlCommand::ReplicationStatus
             | ControlCommand::ReplicationEnrollment
             | ControlCommand::RecordSyncStatus
+            | ControlCommand::RecordSyncReviewConflicts
             | ControlCommand::RecordSyncVaultBootstrap
             | ControlCommand::RecordSyncValidateVaultBootstrap { .. }
             | ControlCommand::RecordSyncPrepareVaultEnrollment { .. }

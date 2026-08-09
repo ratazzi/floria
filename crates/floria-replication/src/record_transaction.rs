@@ -12,14 +12,14 @@ use crate::{ReplicationError, ReplicationResult};
 #[derive(Debug)]
 pub struct EntityChange {
     document: ReplicatedEntityDocument,
-    expected_head: Option<String>,
+    expected_heads: Vec<String>,
     parents: Vec<String>,
 }
 
 impl EntityChange {
     pub fn new(
         document: ReplicatedEntityDocument,
-        expected_head: Option<String>,
+        mut expected_heads: Vec<String>,
         parents: Vec<String>,
     ) -> ReplicationResult<Self> {
         uuid::Uuid::parse_str(document.entity_id()).map_err(|_| {
@@ -40,31 +40,37 @@ impl EntityChange {
                 )));
             }
         }
-        match &expected_head {
-            Some(expected) => {
-                uuid::Uuid::parse_str(expected).map_err(|_| {
-                    ReplicationError::Invalid(format!(
-                        "expected head revision id is not a UUID: {expected:?}"
-                    ))
-                })?;
-                if !unique_parents.contains(expected) {
-                    return Err(ReplicationError::Invalid(format!(
-                        "expected head {expected} is not a parent of entity {}",
-                        document.entity_id()
-                    )));
-                }
-            }
-            None if parents.is_empty() => {}
-            None => {
+        expected_heads.sort();
+        if expected_heads.windows(2).any(|window| window[0] == window[1]) {
+            return Err(ReplicationError::Invalid(format!(
+                "entity {} names one expected head more than once",
+                document.entity_id()
+            )));
+        }
+        for expected in &expected_heads {
+            uuid::Uuid::parse_str(expected).map_err(|_| {
+                ReplicationError::Invalid(format!(
+                    "expected head revision id is not a UUID: {expected:?}"
+                ))
+            })?;
+            if !unique_parents.contains(expected) {
                 return Err(ReplicationError::Invalid(format!(
-                    "entity {} has parents but no expected head",
+                    "expected head {expected} is not a parent of entity {}",
                     document.entity_id()
-                )))
+                )));
             }
+        }
+        let parent_set = parents.iter().cloned().collect::<BTreeSet<_>>();
+        let expected_set = expected_heads.iter().cloned().collect::<BTreeSet<_>>();
+        if parent_set != expected_set {
+            return Err(ReplicationError::Invalid(format!(
+                "entity {} expected heads must exactly match its parents",
+                document.entity_id()
+            )));
         }
         Ok(Self {
             document,
-            expected_head,
+            expected_heads,
             parents,
         })
     }
@@ -78,7 +84,7 @@ impl EntityChange {
 pub struct SealedRecordTransaction {
     commit: RevisionCommit,
     revisions: Vec<EntityRevision>,
-    expected_heads: BTreeMap<String, Option<String>>,
+    expected_heads: BTreeMap<String, Vec<String>>,
 }
 
 impl SealedRecordTransaction {
@@ -111,7 +117,7 @@ impl SealedRecordTransaction {
                 &commit_id,
                 change.parents,
             )?;
-            expected_heads.insert(entity_id, change.expected_head);
+            expected_heads.insert(entity_id, change.expected_heads);
             revisions.push(revision);
         }
         let commit = cryptor.seal_commit(
@@ -136,7 +142,7 @@ impl SealedRecordTransaction {
         &self.revisions
     }
 
-    pub fn expected_heads(&self) -> &BTreeMap<String, Option<String>> {
+    pub fn expected_heads(&self) -> &BTreeMap<String, Vec<String>> {
         &self.expected_heads
     }
 
@@ -212,13 +218,13 @@ mod tests {
             [
                 EntityChange::new(
                     ReplicatedEntityDocument::Catalog(project),
-                    None,
+                    Vec::new(),
                     Vec::new(),
                 )
                 .unwrap(),
                 EntityChange::new(
                     ReplicatedEntityDocument::Secret(secret),
-                    None,
+                    Vec::new(),
                     Vec::new(),
                 )
                 .unwrap(),
@@ -252,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn expected_head_must_be_one_of_the_revision_parents() {
+    fn expected_heads_must_exactly_match_the_revision_parents() {
         let project = CatalogEntityDocument::active(CatalogEntityState::Project(
             ReplicatedProject {
                 id: "project-11111111-1111-4111-8111-111111111111".to_string(),
@@ -262,7 +268,7 @@ mod tests {
         ));
         let error = EntityChange::new(
             ReplicatedEntityDocument::Catalog(project),
-            Some(uuid::Uuid::new_v4().to_string()),
+            vec![uuid::Uuid::new_v4().to_string()],
             vec![uuid::Uuid::new_v4().to_string()],
         )
         .unwrap_err();

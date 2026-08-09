@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::local_projection::LocalProjectionPlan;
 use crate::projection_applicator::{ProjectionApplicator, ProjectionApplyOutcome};
 use crate::record::{EntityRevision, ImmutableObjectRef, RevisionCommit, RECORD_FORMAT_VERSION};
+use crate::record_conflict::{RecordConflictManager, SyncConflictReview};
 use crate::record_crypto::RecordCryptor;
 use crate::record_journal::{OutboundCommit, RecordJournal};
 use crate::sync_bootstrap::{
@@ -75,12 +76,12 @@ impl SyncObjectAsset {
     }
 }
 
-/// One opaque encrypted revision and the CAS head expected by its local transaction.
+/// One opaque encrypted revision and the CAS heads accepted by its local transaction.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncOutboundRevision {
     entity_id: String,
     revision_id: String,
-    expected_head_revision_id: Option<String>,
+    expected_head_revision_ids: Vec<String>,
     envelope_base64: String,
 }
 
@@ -93,8 +94,8 @@ impl SyncOutboundRevision {
         &self.revision_id
     }
 
-    pub fn expected_head_revision_id(&self) -> Option<&str> {
-        self.expected_head_revision_id.as_deref()
+    pub fn expected_head_revision_ids(&self) -> &[String] {
+        &self.expected_head_revision_ids
     }
 
     pub fn envelope_base64(&self) -> &str {
@@ -683,6 +684,46 @@ impl<'a> RecordSyncControl<'a> {
         })
     }
 
+    /// Return authenticated, redacted candidates for every concurrent entity head.
+    pub fn review_conflicts(&self, catalog: &Catalog) -> ReplicationResult<Vec<SyncConflictReview>> {
+        RecordConflictManager::new(self.journal, std::sync::Arc::clone(&self.store))
+            .review(catalog)
+    }
+
+    /// Commit the user's reviewed winner as a multi-parent revision.
+    ///
+    /// Projection remains blocked while any other entity is still conflicted. The final resolution
+    /// applies the complete conflict-free graph, so resolving one item never reports a false
+    /// failure merely because another item still needs the user's choice.
+    pub fn resolve_conflict(
+        &self,
+        catalog: &Catalog,
+        entity_id: &str,
+        selected_revision_id: &str,
+        resolved_at: impl Into<String>,
+    ) -> ReplicationResult<SyncDomainStatus> {
+        let resolved_at = resolved_at.into();
+        RecordConflictManager::new(self.journal, std::sync::Arc::clone(&self.store)).resolve(
+            entity_id,
+            selected_revision_id,
+            resolved_at.clone(),
+        )?;
+        if !self.journal.conflicting_heads()?.is_empty() {
+            return self.status();
+        }
+        let records = self.journal.projection_records()?;
+        let plan = LocalProjectionPlan::build(
+            &RecordCryptor::new(std::sync::Arc::clone(&self.store)),
+            &records,
+        )?;
+        ProjectionApplicator::new(self.journal, catalog, &self.store).apply(
+            &plan,
+            resolved_at.clone(),
+            resolved_at,
+        )?;
+        self.status()
+    }
+
     fn pending_transaction_count(&self) -> ReplicationResult<usize> {
         self.journal.pending_transactions()
     }
@@ -694,7 +735,7 @@ impl<'a> RecordSyncControl<'a> {
     ) -> ReplicationResult<SyncOutboundCommit> {
         let mut revisions = Vec::with_capacity(item.revisions().len());
         for revision in item.revisions() {
-            let expected_head_revision_id = item
+            let expected_head_revision_ids = item
                 .expected_heads()
                 .get(revision.entity_id())
                 .ok_or_else(|| {
@@ -729,7 +770,7 @@ impl<'a> RecordSyncControl<'a> {
             revisions.push(SyncOutboundRevision {
                 entity_id: revision.entity_id().to_string(),
                 revision_id: revision.revision_id().to_string(),
-                expected_head_revision_id,
+                expected_head_revision_ids,
                 envelope_base64: encode_revision(revision)?,
             });
         }
@@ -1013,7 +1054,7 @@ mod tests {
                 &cryptor,
                 [EntityChange::new(
                     ReplicatedEntityDocument::Secret(document),
-                    None,
+                    Vec::new(),
                     Vec::new(),
                 )
                 .unwrap()],
@@ -1287,7 +1328,7 @@ mod tests {
             &cryptor,
             [EntityChange::new(
                 ReplicatedEntityDocument::Secret(document),
-                None,
+                Vec::new(),
                 Vec::new(),
             )
             .unwrap()],
@@ -1336,5 +1377,103 @@ mod tests {
         assert_eq!(inbound_journal.inbound().unwrap().len(), 2);
         assert!(inbound_journal.projection_checkpoint().unwrap().is_none());
         assert_eq!(control.status().unwrap().conflicting_entities(), 1);
+    }
+
+    #[test]
+    fn resolving_multiple_conflicts_projects_only_after_the_final_choice() {
+        let fixture = Fixture::new();
+        let second_secret = fixture
+            .store
+            .put(NewSecret::managed("Second fixture"), b"second left")
+            .unwrap();
+        let seal_current = || {
+            let changes = [&fixture.secret_id, &second_secret].map(|secret_id| {
+                let document = SecretEntityDocument::from_store(
+                    &fixture.store,
+                    secret_id,
+                    EntityLifecycle::Active,
+                )
+                .unwrap();
+                EntityChange::new(
+                    ReplicatedEntityDocument::Secret(document),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .unwrap()
+            });
+            SealedRecordTransaction::seal(
+                &RecordCryptor::new(Arc::clone(&fixture.store)),
+                changes,
+            )
+            .unwrap()
+        };
+        let left = seal_current();
+        fixture
+            .store
+            .append_version(&fixture.secret_id, b"first right")
+            .unwrap();
+        fixture
+            .store
+            .append_version(&second_secret, b"second right")
+            .unwrap();
+        let right = seal_current();
+
+        let journal = RecordJournal::open(
+            fixture._directory.path().join("multiple-conflicts.sqlite"),
+            &fixture.store.vault_document().vault_id,
+            Arc::new(StateAuthenticator::for_tests([75; 32])),
+        )
+        .unwrap();
+        journal
+            .receive_inbound(
+                vec![left.commit().clone(), right.commit().clone()],
+                left.revisions()
+                    .iter()
+                    .chain(right.revisions())
+                    .cloned()
+                    .collect(),
+                "2026-08-09T00:00:00Z",
+            )
+            .unwrap();
+        let catalog =
+            Catalog::open(fixture._directory.path().join("multiple-conflicts-catalog.sqlite"))
+                .unwrap();
+        let control = RecordSyncControl::new(&journal, Arc::clone(&fixture.store));
+        let first_review = control.review_conflicts(&catalog).unwrap().remove(0);
+        let first_choice = first_review
+            .candidates()
+            .iter()
+            .find(|candidate| candidate.matches_local_state())
+            .unwrap();
+
+        let status = control
+            .resolve_conflict(
+                &catalog,
+                first_review.entity_id(),
+                first_choice.revision_id(),
+                "2026-08-09T00:00:01Z",
+            )
+            .unwrap();
+        assert_eq!(status.conflicting_entities(), 1);
+        assert!(journal.projection_checkpoint().unwrap().is_none());
+
+        let second_review = control.review_conflicts(&catalog).unwrap().remove(0);
+        let second_choice = second_review
+            .candidates()
+            .iter()
+            .find(|candidate| candidate.matches_local_state())
+            .unwrap();
+        let status = control
+            .resolve_conflict(
+                &catalog,
+                second_review.entity_id(),
+                second_choice.revision_id(),
+                "2026-08-09T00:00:02Z",
+            )
+            .unwrap();
+
+        assert_eq!(status.conflicting_entities(), 0);
+        assert!(journal.projection_checkpoint().unwrap().is_some());
+        assert_eq!(journal.outbound().unwrap().len(), 2);
     }
 }

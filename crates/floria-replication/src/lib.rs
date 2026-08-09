@@ -11,6 +11,7 @@ pub mod entity_state;
 pub mod local_projection;
 pub mod projection_applicator;
 pub mod record;
+pub mod record_conflict;
 pub mod record_crypto;
 pub mod record_journal;
 pub mod record_publisher;

@@ -71,7 +71,7 @@ final class CloudOutboundPlannerTests: XCTestCase {
             SyncOutboundRevision(
                 entityID: uuid(index * 2 + 1),
                 revisionID: uuid(index * 2 + 2),
-                expectedHeadRevisionID: nil,
+                expectedHeadRevisionIDs: [],
                 envelopeBase64: Data("revision".utf8).base64EncodedString())
         }
         let oversized = SyncOutboundCommit(
@@ -113,7 +113,8 @@ final class CloudOutboundPlannerTests: XCTestCase {
 
         let changed = headRecord(
             revisionID: "55555555-5555-4555-8555-555555555555")
-        guard case .settleConflict(let conflictCommitID, let entities) =
+        guard case .saveConflictBranch(
+            let conflictCommitID, let entities, let branchRecords) =
             try planner.nextAction(
                 batch: batch,
                 verifiedObjectDigests: [],
@@ -123,6 +124,9 @@ final class CloudOutboundPlannerTests: XCTestCase {
         }
         XCTAssertEqual(conflictCommitID, commitID)
         XCTAssertEqual(entities, [entityID])
+        XCTAssertFalse(
+            branchRecords.contains { $0.recordType == CloudRecordCodec.RecordType.head })
+        XCTAssertEqual(branchRecords.count, 2)
     }
 
     func testImmutableRetryIsAcceptedOnlyWhenExactRemoteBytesMatch() throws {
@@ -172,7 +176,7 @@ final class CloudOutboundPlannerTests: XCTestCase {
                 SyncOutboundRevision(
                     entityID: entityID,
                     revisionID: newRevisionID,
-                    expectedHeadRevisionID: expectedHead,
+                    expectedHeadRevisionIDs: expectedHead.map { [$0] } ?? [],
                     envelopeBase64: Data("revision".utf8).base64EncodedString())
             ],
             createdAt: "2026-08-07T12:00:00Z")

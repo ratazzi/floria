@@ -7,6 +7,9 @@ protocol CloudSyncServicing: Sendable {
     func lastSuccessfulSyncAt() async -> Date?
     func pendingVaultID() async -> String?
     func localStatus() async throws -> SyncDomainStatus?
+    func reviewConflicts() async throws -> [SyncConflictReview]
+    func resolveConflict(entityID: String, selectedRevisionID: String) async throws
+        -> SyncDomainStatus
     func projectsWithoutLocalFolder() async throws -> [SyncedProject]
     func attachProject(_ project: SyncedProject, at directory: URL) async throws
     func syncNow() async throws -> SyncDomainStatus
@@ -50,6 +53,7 @@ final class CloudSyncViewModel {
     var approvals = [SyncEnrollmentReview]()
     var devices = [SyncVaultDevice]()
     var projectsWithoutLocalFolder = [SyncedProject]()
+    var conflicts = [SyncConflictReview]()
     var notice: String?
     var errorMessage: String?
 
@@ -104,6 +108,7 @@ final class CloudSyncViewModel {
         await refreshPersistentState()
         guard isEnabled else { return }
         await refreshLocalStatus()
+        await refreshConflicts()
         await refreshProjectsWithoutLocalFolder()
     }
 
@@ -115,6 +120,7 @@ final class CloudSyncViewModel {
         if enabled {
             await refreshPersistentState()
             await refreshLocalStatus()
+            await refreshConflicts()
             await refreshProjectsWithoutLocalFolder()
         } else {
             candidates = []
@@ -122,6 +128,7 @@ final class CloudSyncViewModel {
             approvals = []
             devices = []
             projectsWithoutLocalFolder = []
+            conflicts = []
             joiningBootstrap = nil
         }
     }
@@ -131,6 +138,7 @@ final class CloudSyncViewModel {
             do {
                 let status = try await self.service.syncNow()
                 self.status = status
+                try await self.loadConflicts(for: status)
                 await self.refreshPersistentState()
                 self.notice = self.syncAttentionMessage == nil
                     ? "Your encrypted Library is up to date in iCloud."
@@ -215,6 +223,22 @@ final class CloudSyncViewModel {
         }
     }
 
+    func resolve(_ review: SyncConflictReview, keeping candidate: SyncConflictCandidate) async {
+        await perform {
+            self.status = try await self.service.resolveConflict(
+                entityID: review.entityID,
+                selectedRevisionID: candidate.revisionID)
+            self.status = try await self.service.syncNow()
+            if let status = self.status {
+                try await self.loadConflicts(for: status)
+            }
+            await self.refreshPersistentState()
+            self.notice = self.conflicts.isEmpty
+                ? "The conflict was resolved and every version remains in encrypted history."
+                : nil
+        }
+    }
+
     private func refreshLocalStatus() async {
         do {
             status = try await service.localStatus()
@@ -230,6 +254,24 @@ final class CloudSyncViewModel {
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    private func refreshConflicts() async {
+        guard let status else {
+            conflicts = []
+            return
+        }
+        do {
+            try await loadConflicts(for: status)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func loadConflicts(for status: SyncDomainStatus) async throws {
+        conflicts = status.conflictingEntities == 0
+            ? []
+            : try await service.reviewConflicts()
     }
 
     private func refreshPersistentState() async {
@@ -332,11 +374,32 @@ enum CloudSyncViewError: LocalizedError {
     }
 }
 
+private struct ConflictSelection: Identifiable {
+    let review: SyncConflictReview
+    let candidate: SyncConflictCandidate
+
+    var id: String { "\(review.entityID)/\(candidate.revisionID)" }
+}
+
+private extension SyncConflictEntityKind {
+    var displayName: String {
+        switch self {
+        case .project: "Project"
+        case .environment: "Environment"
+        case .resource: "Resource"
+        case .binding: "Binding"
+        case .surface: "Managed file"
+        case .secret: "Secret"
+        }
+    }
+}
+
 struct SyncView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var model: CloudSyncViewModel
     @State private var pendingApproval: SyncEnrollmentReview?
     @State private var pendingRemoval: SyncVaultDevice?
+    @State private var pendingConflictSelection: ConflictSelection?
 
     init(
         service: any CloudSyncServicing,
@@ -356,6 +419,9 @@ struct SyncView: View {
                     enableSection
                     if model.isEnabled {
                         currentLibrarySection
+                        if !model.conflicts.isEmpty {
+                            conflictsSection
+                        }
                         if let pendingVaultID = model.pendingVaultID,
                            model.enrollmentRequest == nil
                         {
@@ -414,6 +480,23 @@ struct SyncView: View {
         }
         .frame(width: 640, height: 500)
         .task { await model.load() }
+        .confirmationDialog(
+            "Keep This Version?",
+            isPresented: Binding(
+                get: { pendingConflictSelection != nil },
+                set: { if !$0 { pendingConflictSelection = nil } }),
+            presenting: pendingConflictSelection
+        ) { selection in
+            Button("Keep This Version") {
+                pendingConflictSelection = nil
+                Task {
+                    await model.resolve(selection.review, keeping: selection.candidate)
+                }
+            }
+            Button("Cancel", role: .cancel) { pendingConflictSelection = nil }
+        } message: { selection in
+            Text(conflictConfirmationMessage(selection))
+        }
         .confirmationDialog(
             "Approve This Mac?",
             isPresented: Binding(
@@ -523,6 +606,65 @@ struct SyncView: View {
             }
         }
         .disabled(model.isWorking)
+    }
+
+    private var conflictsSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Choose which version to keep")
+                    .font(.headline)
+                Text("Floria found changes made on different Macs and kept every version.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(model.conflicts) { review in
+                VStack(alignment: .leading, spacing: 10) {
+                    Text(review.candidates.first?.label ?? "Synced item")
+                        .font(.callout.weight(.semibold))
+                    ForEach(review.candidates) { candidate in
+                        HStack(spacing: 10) {
+                            Image(systemName: candidate.matchesLocalState
+                                ? "laptopcomputer" : "icloud.and.arrow.down")
+                                .foregroundStyle(candidate.matchesLocalState ? .blue : .secondary)
+                                .frame(width: 24)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(candidate.matchesLocalState ? "On this Mac" : "From iCloud")
+                                    .font(.callout.weight(.medium))
+                                Text(conflictCandidateDetail(candidate))
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            Spacer()
+                            Button("Keep…") {
+                                pendingConflictSelection = ConflictSelection(
+                                    review: review, candidate: candidate)
+                            }
+                        }
+                    }
+                }
+                .padding(14)
+                .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+            }
+        }
+        .disabled(model.isWorking)
+    }
+
+    private func conflictCandidateDetail(_ candidate: SyncConflictCandidate) -> String {
+        var parts = [candidate.kind.displayName]
+        if candidate.lifecycle == .archived {
+            parts.append("Archived")
+        }
+        if let size = candidate.plaintextSize {
+            parts.append(ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file))
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private func conflictConfirmationMessage(_ selection: ConflictSelection) -> String {
+        let source = selection.candidate.matchesLocalState
+            ? "currently on this Mac"
+            : "received from iCloud"
+        return "Floria will use the version \(source). All versions remain in encrypted history."
     }
 
     private var lastSyncDescription: String {

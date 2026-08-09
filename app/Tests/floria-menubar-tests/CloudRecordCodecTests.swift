@@ -99,6 +99,40 @@ final class CloudRecordCodecTests: XCTestCase {
         XCTAssertEqual(existingIDs, [entityID])
     }
 
+    func testMergeRevisionCanReplaceEitherReviewedConcurrentHead() throws {
+        let otherHead = "55555555-5555-4555-8555-555555555555"
+        let merge = SyncOutboundCommit(
+            commitID: commitID,
+            manifestBase64: Data("manifest".utf8).base64EncodedString(),
+            revisions: [
+                SyncOutboundRevision(
+                    entityID: entityID,
+                    revisionID: newRevisionID,
+                    expectedHeadRevisionIDs: [oldRevisionID, otherHead],
+                    envelopeBase64: Data("revision".utf8).base64EncodedString())
+            ],
+            createdAt: "2026-08-07T12:00:00Z")
+
+        for current in [oldRevisionID, otherHead] {
+            let plan = try codec.planCommit(
+                merge,
+                cachedHeads: [entityID: headRecord(revisionID: current)])
+            let records = try readyRecords(plan)
+            XCTAssertEqual(
+                records.last?[CloudRecordCodec.Field.revisionID] as? String,
+                newRevisionID)
+        }
+
+        let unrelated = headRecord(
+            revisionID: "66666666-6666-4666-8666-666666666666")
+        guard case .conflict(let entityIDs) = try codec.planCommit(
+            merge, cachedHeads: [entityID: unrelated])
+        else {
+            return XCTFail("Expected an unrelated head to remain a conflict")
+        }
+        XCTAssertEqual(entityIDs, [entityID])
+    }
+
     func testDecodesFetchedRecordsBackToOpaqueInboundPayloads() throws {
         let records = try codec.immutableRecords(for: outboundCommit())
 
@@ -150,7 +184,7 @@ final class CloudRecordCodecTests: XCTestCase {
         let invalidRevision = SyncOutboundRevision(
             entityID: "not-a-uuid",
             revisionID: newRevisionID,
-            expectedHeadRevisionID: nil,
+            expectedHeadRevisionIDs: [],
             envelopeBase64: Data("revision".utf8).base64EncodedString())
         let invalidCommit = SyncOutboundCommit(
             commitID: commitID,
@@ -204,7 +238,7 @@ final class CloudRecordCodecTests: XCTestCase {
                 SyncOutboundRevision(
                     entityID: entityID,
                     revisionID: newRevisionID,
-                    expectedHeadRevisionID: expectedHead,
+                    expectedHeadRevisionIDs: expectedHead.map { [$0] } ?? [],
                     envelopeBase64: Data("revision".utf8).base64EncodedString())
             ],
             createdAt: "2026-08-07T12:00:00Z")
