@@ -267,6 +267,19 @@ final class CloudSyncViewModelTests: XCTestCase {
         XCTAssertNil(model.errorMessage)
     }
 
+    func testConflictCandidatesExposeAStableVersionLabel() {
+        let candidate = SyncConflictCandidate(
+            revisionID: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+            lifecycle: .active,
+            kind: .secret,
+            label: "Database password",
+            versionID: "ffffffff-ffff-4fff-8fff-ffffffffffff",
+            plaintextSize: 28,
+            matchesLocalState: false)
+
+        XCTAssertEqual(candidate.conflictVersionLabel, "Version eeeeeeee")
+    }
+
     private func status(vaultID: String) -> SyncDomainStatus {
         SyncDomainStatus(
             vaultID: vaultID,

@@ -394,6 +394,12 @@ private extension SyncConflictEntityKind {
     }
 }
 
+extension SyncConflictCandidate {
+    var conflictVersionLabel: String {
+        "Version \(revisionID.prefix(8))"
+    }
+}
+
 struct SyncView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var model: CloudSyncViewModel
@@ -630,7 +636,7 @@ struct SyncView: View {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(candidate.matchesLocalState ? "On this Mac" : "From iCloud")
                                     .font(.callout.weight(.medium))
-                                Text(conflictCandidateDetail(candidate))
+                                Text("\(candidate.conflictVersionLabel) · \(conflictCandidateDetail(candidate))")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
