@@ -36,6 +36,21 @@ wait_for_app_to_stop() {
     return 1
 }
 
+stop_installed_daemon() {
+    if ! /bin/launchctl print "${SERVICE_TARGET}" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    echo "==> Stopping previous ${APP_NAME} daemon"
+    /bin/launchctl bootout "${SERVICE_TARGET}" >/dev/null 2>&1 || true
+
+    # launchd terminates the process without unwinding Rust's mount session. Detach the exact
+    # previous mount before replacing the bundle so the new daemon never inherits a stale volume.
+    if [[ -x "${INSTALLED_DAEMON}" && -f "${CONFIG_PATH}" ]]; then
+        "${INSTALLED_DAEMON}" unmount --config "${CONFIG_PATH}" >/dev/null 2>&1 || true
+    fi
+}
+
 start_installed_app() {
     local deadline=$((SECONDS + WAIT_SECONDS))
 
@@ -93,6 +108,11 @@ if pgrep -x "${APP_NAME}" >/dev/null; then
     killall "${APP_NAME}"
     wait_for_app_to_stop
 fi
+
+# An ad-hoc signature's designated requirement contains its exact cdhash. Reusing a daemon from
+# the previous local bundle would therefore reject the newly installed GUI even when two builds
+# happen to share the same minute-based bundle revision.
+stop_installed_daemon
 
 if /bin/launchctl print "${LEGACY_SERVICE_TARGET}" >/dev/null 2>&1 ||
     [[ -e "${LEGACY_LAUNCH_AGENT_PLIST}" ]]; then
