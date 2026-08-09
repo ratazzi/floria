@@ -395,8 +395,16 @@ private extension SyncConflictEntityKind {
 }
 
 extension SyncConflictCandidate {
+    var conflictSourceLabel: String {
+        matchesLocalState ? "On this Mac" : "From iCloud"
+    }
+
     var conflictVersionLabel: String {
         "Version \(revisionID.prefix(8))"
+    }
+
+    var conflictConfirmationSummary: String {
+        "“\(label)” — \(conflictSourceLabel), \(conflictVersionLabel)"
     }
 }
 
@@ -625,7 +633,7 @@ struct SyncView: View {
             }
             ForEach(model.conflicts) { review in
                 VStack(alignment: .leading, spacing: 10) {
-                    Text(review.candidates.first?.label ?? "Synced item")
+                    Text(review.candidates.first?.kind.displayName ?? "Synced item")
                         .font(.callout.weight(.semibold))
                     ForEach(review.candidates) { candidate in
                         HStack(spacing: 10) {
@@ -634,9 +642,10 @@ struct SyncView: View {
                                 .foregroundStyle(candidate.matchesLocalState ? .blue : .secondary)
                                 .frame(width: 24)
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(candidate.matchesLocalState ? "On this Mac" : "From iCloud")
+                                Text(candidate.label)
                                     .font(.callout.weight(.medium))
-                                Text("\(candidate.conflictVersionLabel) · \(conflictCandidateDetail(candidate))")
+                                    .lineLimit(1)
+                                Text("\(candidate.conflictSourceLabel) · \(candidate.conflictVersionLabel) · \(conflictCandidateDetail(candidate))")
                                     .font(.caption)
                                     .foregroundStyle(.secondary)
                             }
@@ -667,10 +676,7 @@ struct SyncView: View {
     }
 
     private func conflictConfirmationMessage(_ selection: ConflictSelection) -> String {
-        let source = selection.candidate.matchesLocalState
-            ? "currently on this Mac"
-            : "received from iCloud"
-        return "Floria will use the version \(source). All versions remain in encrypted history."
+        "Floria will use \(selection.candidate.conflictConfirmationSummary). All versions remain in encrypted history."
     }
 
     private var lastSyncDescription: String {
