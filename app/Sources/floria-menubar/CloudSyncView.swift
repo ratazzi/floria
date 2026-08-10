@@ -117,6 +117,18 @@ final class CloudSyncViewModel {
         return nil
     }
 
+    func lastSyncDescription(relativeTo now: Date = Date()) -> String {
+        guard let lastSuccessfulSyncAt else {
+            return "Not synced with iCloud yet."
+        }
+        if abs(lastSuccessfulSyncAt.timeIntervalSince(now)) < 1 {
+            return "Last synced just now."
+        }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return "Last synced \(formatter.localizedString(for: lastSuccessfulSyncAt, relativeTo: now))."
+    }
+
     init(
         service: any CloudSyncServicing,
         restartDaemon: @escaping @Sendable () async throws -> Void
@@ -765,7 +777,7 @@ struct SyncView: View {
                     Text(model.syncStatusSummary)
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    Text(lastSyncDescription)
+                    Text(model.lastSyncDescription())
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -867,15 +879,6 @@ struct SyncView: View {
 
     private func conflictConfirmationMessage(_ selection: ConflictSelection) -> String {
         "Floria will use \(selection.candidate.conflictConfirmationSummary). All versions remain in encrypted history."
-    }
-
-    private var lastSyncDescription: String {
-        guard let date = model.lastSuccessfulSyncAt else {
-            return "Not synced with iCloud yet."
-        }
-        let formatter = RelativeDateTimeFormatter()
-        formatter.unitsStyle = .full
-        return "Last synced \(formatter.localizedString(for: date, relativeTo: Date()))."
     }
 
     private func pendingSetupSection(_ vaultID: String) -> some View {

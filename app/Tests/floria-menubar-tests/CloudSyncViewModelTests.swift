@@ -246,6 +246,19 @@ final class CloudSyncViewModelTests: XCTestCase {
         XCTAssertEqual(model.pendingVaultID, pendingVaultID)
     }
 
+    func testImmediateSuccessfulSyncUsesJustNowInsteadOfInZeroSeconds() async {
+        let now = Date(timeIntervalSince1970: 1_787_000_000)
+        let service = CloudSyncViewServiceStub(
+            status: status(vaultID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            candidates: [],
+            lastSuccessfulSyncAt: now)
+        let model = CloudSyncViewModel(service: service, restartDaemon: {})
+
+        await model.load()
+
+        XCTAssertEqual(model.lastSyncDescription(relativeTo: now), "Last synced just now.")
+    }
+
     func testPendingLibrarySetupCanResumeAfterTheViewModelIsRecreated() async {
         let target = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
         let request = SyncEnrollmentRequest(
