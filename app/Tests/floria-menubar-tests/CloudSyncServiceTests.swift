@@ -77,6 +77,39 @@ final class CloudSyncServiceTests: XCTestCase {
         XCTAssertEqual(statusCount, 2)
     }
 
+    func testOneExplicitSyncDrainsFollowUpOutboundWorkBeforeReturning() async throws {
+        let suiteName = "floria-cloud-sync-tests-\(UUID().uuidString)"
+        let preferences = CloudSyncPreferences(suiteName: suiteName)
+        preferences.setEnabled(true)
+        let queued = SyncDomainStatus(
+            vaultID: status().vaultID,
+            keyGeneration: 1,
+            outboundTransactions: 1,
+            inboundTransactions: 0,
+            pendingTransactions: 0,
+            conflictingEntities: 0,
+            projectionPending: false)
+        let settled = status()
+        let control = CloudSyncControlStub(
+            status: settled,
+            statusSequence: [queued, queued, settled])
+        let session = CloudSyncSessionStub()
+        let service = CloudSyncService(
+            control: control,
+            supportDirectory: FileManager.default.temporaryDirectory,
+            preferences: preferences,
+            sessionFactory: { _, _, _ in session })
+        defer { UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName) }
+
+        let result = try await service.syncNow()
+
+        let syncCount = await session.syncCount
+        let statusCount = await control.statusCount
+        XCTAssertEqual(result.status, settled)
+        XCTAssertEqual(syncCount, 2)
+        XCTAssertEqual(statusCount, 3)
+    }
+
     func testDisabledSyncNowDoesNotTouchRustOrCloudKit() async throws {
         let suiteName = "floria-cloud-sync-tests-\(UUID().uuidString)"
         let control = CloudSyncControlStub(status: status())
@@ -552,6 +585,7 @@ private final class CloudSyncSequenceFactory: @unchecked Sendable {
 
 private actor CloudSyncControlStub: CloudSyncControlling {
     private var status: SyncDomainStatus
+    private var statusSequence: [SyncDomainStatus]
     private let activation: SyncVaultActivation
     private let reviews: [SyncEnrollmentReview]
     private let devices: [SyncVaultDevice]
@@ -564,12 +598,14 @@ private actor CloudSyncControlStub: CloudSyncControlling {
 
     init(
         status: SyncDomainStatus,
+        statusSequence: [SyncDomainStatus] = [],
         activation: SyncVaultActivation? = nil,
         reviews: [SyncEnrollmentReview] = [],
         devices: [SyncVaultDevice] = [],
         projectsWithoutLocalFolder: [SyncedProject] = []
     ) {
         self.status = status
+        self.statusSequence = statusSequence
         self.reviews = reviews
         self.devices = devices
         self.projectsWithoutLocalFolder = projectsWithoutLocalFolder
@@ -585,6 +621,11 @@ private actor CloudSyncControlStub: CloudSyncControlling {
 
     func recordSyncStatus() async throws -> SyncDomainStatus {
         statusCount += 1
+        if !statusSequence.isEmpty {
+            let next = statusSequence.removeFirst()
+            status = next
+            return next
+        }
         return status
     }
 

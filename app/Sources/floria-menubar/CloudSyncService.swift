@@ -79,6 +79,8 @@ struct CloudSyncPreferences: Sendable {
 /// Explicit opt-in boundary for CloudKit. Constructing this service and reading its disabled
 /// state are local-only; CloudKit dependencies are created only by an explicit user operation.
 actor CloudSyncService {
+    private static let maximumManualSyncPasses = 4
+
     typealias SessionFactory = @Sendable (
         _ control: any CloudSyncControlling,
         _ supportDirectory: URL,
@@ -406,27 +408,32 @@ actor CloudSyncService {
             session = activeSession
             sessionVaultID = before.vaultID
         }
-        let sessionOutcome: CloudSyncSessionOutcome
-        do {
-            sessionOutcome = try await activeSession.syncNow()
-        } catch {
-            // A failed CKSyncEngine session may have advanced only in-memory tokens or retained a
-            // terminal account-change failure. The durable checkpoint and Rust outbox are the
-            // recovery boundary, so the user's next explicit Sync Now must start a fresh session.
-            if sessionVaultID == before.vaultID {
-                session = nil
-                sessionVaultID = nil
+        var after = before
+        var appliedRemoteChanges = false
+        for _ in 0..<Self.maximumManualSyncPasses {
+            do {
+                let outcome = try await activeSession.syncNow()
+                appliedRemoteChanges = appliedRemoteChanges || outcome.appliedRemoteChanges
+            } catch {
+                // A failed CKSyncEngine session may have advanced only in-memory tokens or retained
+                // a terminal account-change failure. The durable checkpoint and Rust outbox are the
+                // recovery boundary, so the user's next explicit Sync Now starts a fresh session.
+                if sessionVaultID == before.vaultID {
+                    session = nil
+                    sessionVaultID = nil
+                }
+                throw error
             }
-            throw error
+            after = try await control.recordSyncStatus()
+            guard after.outboundTransactions > 0 else { break }
         }
-        let after = try await control.recordSyncStatus()
         preferences.setLastSuccessfulSyncAt(now())
         if preferences.pendingVaultID == after.vaultID {
             preferences.setPendingVaultID(nil)
         }
         return CloudSyncOutcome(
             status: after,
-            appliedRemoteChanges: sessionOutcome.appliedRemoteChanges)
+            appliedRemoteChanges: appliedRemoteChanges)
     }
 
     private static func timestamp() -> String {
