@@ -21,10 +21,19 @@ cleanup() {
     local cleanup_status=$?
     trap - EXIT INT TERM
     if ((MOUNTED == 1)); then
-        hdiutil detach "${MOUNT_DIRECTORY}" -quiet || true
+        if hdiutil detach "${MOUNT_DIRECTORY}" -quiet; then
+            MOUNTED=0
+        else
+            echo "Could not detach DMG verification mount: ${MOUNT_DIRECTORY}" >&2
+        fi
     fi
-    rm -rf "${STAGING_DIRECTORY}" "${MOUNT_DIRECTORY}"
-    rm -f "${PARTIAL_DMG}" "${WRITABLE_DMG}"
+    rm -rf "${STAGING_DIRECTORY}"
+    if ((MOUNTED == 0)); then
+        rm -rf "${MOUNT_DIRECTORY}"
+        rm -f "${PARTIAL_DMG}" "${WRITABLE_DMG}"
+    else
+        echo "Preserving the partial image and mount directory for safe manual cleanup." >&2
+    fi
     exit "${cleanup_status}"
 }
 trap cleanup EXIT INT TERM
@@ -116,7 +125,6 @@ hdiutil attach \
 MOUNTED=1
 
 MOUNTED_APP="${MOUNT_DIRECTORY}/${APP_NAME}.app"
-MOUNTED_DAEMON="${MOUNTED_APP}/Contents/Resources/floria"
 MOUNTED_BUNDLE_IDENTIFIER="$(
     /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "${MOUNTED_APP}/Contents/Info.plist"
 )"
@@ -134,7 +142,10 @@ if [[ "${MOUNTED_BUNDLE_IDENTIFIER}" != "floria.hola.ac" ]]; then
     exit 1
 fi
 codesign --verify --deep --strict "${MOUNTED_APP}"
-"${MOUNTED_DAEMON}" --version >/dev/null
+# scripts/build-app already executes the packaged daemon before creating the
+# image. Running an unnotarized Developer ID helper directly from a read-only
+# DMG can block in Gatekeeper evaluation, so mounted-image verification stays
+# byte- and signature-based here.
 
 hdiutil detach "${MOUNT_DIRECTORY}" -quiet
 MOUNTED=0
