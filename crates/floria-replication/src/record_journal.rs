@@ -31,6 +31,7 @@ const MAX_PROJECTION_DOCUMENT_BYTES: usize = 64 * 1024 * 1024;
 pub struct OutboundCommit {
     commit: RevisionCommit,
     revisions: Vec<EntityRevision>,
+    #[serde(deserialize_with = "deserialize_expected_heads")]
     expected_heads: BTreeMap<String, Vec<String>>,
     created_at: String,
 }
@@ -1236,6 +1237,22 @@ fn outbound_from(conn: &Connection) -> ReplicationResult<Vec<OutboundCommit>> {
 /// Normalize that authenticated shape at the read boundary; every new write uses the plural form.
 fn decode_expected_heads(document: &[u8]) -> ReplicationResult<BTreeMap<String, Vec<String>>> {
     let values = serde_json::from_slice::<BTreeMap<String, serde_json::Value>>(document)?;
+    normalize_expected_heads(values)
+}
+
+fn deserialize_expected_heads<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let values = BTreeMap::<String, serde_json::Value>::deserialize(deserializer)?;
+    normalize_expected_heads(values).map_err(serde::de::Error::custom)
+}
+
+fn normalize_expected_heads(
+    values: BTreeMap<String, serde_json::Value>,
+) -> ReplicationResult<BTreeMap<String, Vec<String>>> {
     values
         .into_iter()
         .map(|(entity_id, value)| {
@@ -1863,6 +1880,25 @@ mod tests {
             decoded["changed"],
             vec!["11111111-1111-4111-8111-111111111111".to_string()]
         );
+    }
+
+    #[test]
+    fn authenticated_snapshot_accepts_legacy_optional_expected_heads() {
+        let entity_id = id();
+        let commit_id = id();
+        let revision = revision(&entity_id, &id(), &commit_id, Vec::new());
+        let outbound = OutboundCommit {
+            commit: make_commit(&commit_id, std::slice::from_ref(&revision)),
+            revisions: vec![revision],
+            expected_heads: BTreeMap::from([(entity_id.clone(), Vec::new())]),
+            created_at: "2026-08-07T00:00:00Z".to_string(),
+        };
+        let mut document = serde_json::to_value(outbound).unwrap();
+        document["expected_heads"][entity_id.as_str()] = serde_json::Value::Null;
+
+        let decoded = serde_json::from_value::<OutboundCommit>(document).unwrap();
+
+        assert!(decoded.expected_heads()[&entity_id].is_empty());
     }
 
     #[test]
