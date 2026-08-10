@@ -559,6 +559,7 @@ struct SyncView: View {
                     enableSection
                     if model.isEnabled && model.isAvailable {
                         currentLibrarySection
+                        syncFeedback
                         if let removed = model.removedCurrentMac {
                             removedMacSection(removed)
                         }
@@ -585,25 +586,8 @@ struct SyncView: View {
                         if !model.candidates.isEmpty {
                             candidatesSection
                         }
-                    }
-                    if let notice = model.notice {
-                        Label(notice, systemImage: "checkmark.circle.fill")
-                            .foregroundStyle(.green)
-                            .font(.callout)
-                    }
-                    if let error = model.errorMessage {
-                        Label(error, systemImage: "exclamationmark.triangle.fill")
-                            .foregroundStyle(.orange)
-                            .font(.callout)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                    if model.errorMessage == nil,
-                       let attention = model.syncAttentionMessage
-                    {
-                        Label(attention, systemImage: "exclamationmark.triangle.fill")
-                            .foregroundStyle(.orange)
-                            .font(.callout)
-                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        syncFeedback
                     }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -688,6 +672,26 @@ struct SyncView: View {
             Text(
                 "\(device.deviceName ?? "This Mac") will keep data it already received, but cannot decrypt future changes. Floria will rotate the Library encryption key."
             )
+        }
+    }
+
+    @ViewBuilder
+    private var syncFeedback: some View {
+        if let notice = model.notice {
+            Label(notice, systemImage: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+                .font(.callout)
+        }
+        if let error = model.errorMessage {
+            Label(error, systemImage: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .font(.callout)
+                .fixedSize(horizontal: false, vertical: true)
+        } else if let attention = model.syncAttentionMessage {
+            Label(attention, systemImage: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .font(.callout)
+                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
