@@ -115,7 +115,16 @@ final class CloudRecordSyncSession: NSObject, CKSyncEngineDelegate, @unchecked S
                     try await saveCheckpoint(engineState: checkpoint)
                 }
 
-            case .accountChange:
+            case .accountChange(let change):
+                guard Self.accountChangeRequiresRestart(
+                    change.changeType,
+                    startedWithTransportCheckpoint: restoredEngineState != nil)
+                else {
+                    // A fresh CKSyncEngine reports the already-signed-in account as its first
+                    // account event. With no restored token or record cache, there is nothing
+                    // account-bound to invalidate and the explicit manual sync can continue.
+                    return
+                }
                 try stateStore.resetTransportState()
                 await coordinator.resetTransportCache()
                 await bootstrapCoordinator.resetTransportCache()
@@ -366,6 +375,20 @@ final class CloudRecordSyncSession: NSObject, CKSyncEngineDelegate, @unchecked S
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter.string(from: Date())
+    }
+
+    static func accountChangeRequiresRestart(
+        _ changeType: CKSyncEngine.Event.AccountChange.ChangeType,
+        startedWithTransportCheckpoint: Bool
+    ) -> Bool {
+        switch changeType {
+        case .signIn:
+            startedWithTransportCheckpoint
+        case .signOut, .switchAccounts:
+            true
+        @unknown default:
+            true
+        }
     }
 }
 

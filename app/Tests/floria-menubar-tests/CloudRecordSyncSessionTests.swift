@@ -4,6 +4,28 @@ import XCTest
 @testable import floria_menubar
 
 final class CloudRecordSyncSessionTests: XCTestCase {
+    func testInitialAccountSignInWithoutCheckpointDoesNotInterruptManualSync() {
+        let firstUser = CKRecord.ID(recordName: "first-user")
+        let secondUser = CKRecord.ID(recordName: "second-user")
+
+        XCTAssertFalse(
+            CloudRecordSyncSession.accountChangeRequiresRestart(
+                .signIn(currentUser: firstUser),
+                startedWithTransportCheckpoint: false))
+        XCTAssertTrue(
+            CloudRecordSyncSession.accountChangeRequiresRestart(
+                .signIn(currentUser: firstUser),
+                startedWithTransportCheckpoint: true))
+        XCTAssertTrue(
+            CloudRecordSyncSession.accountChangeRequiresRestart(
+                .signOut(previousUser: firstUser),
+                startedWithTransportCheckpoint: false))
+        XCTAssertTrue(
+            CloudRecordSyncSession.accountChangeRequiresRestart(
+                .switchAccounts(previousUser: firstUser, currentUser: secondUser),
+                startedWithTransportCheckpoint: false))
+    }
+
     func testZoneFetchBuffersDomainRecordsUntilCommitted() async throws {
         let state = CloudRecordSyncSessionState(initialEngineState: nil)
         let record = CKRecord(
