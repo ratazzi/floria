@@ -329,6 +329,21 @@ final class CloudSyncViewModelTests: XCTestCase {
             "Sync completed, but Floria could not refresh Macs and Projects. Try Sync Now again.")
     }
 
+    func testFailedSyncClearsAStaleSuccessNotice() async {
+        let service = CloudSyncViewServiceStub(
+            status: status(vaultID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            candidates: [],
+            syncFailure: .transport("iCloud is offline"))
+        let model = CloudSyncViewModel(service: service, restartDaemon: {})
+
+        await model.load()
+        model.notice = "Your encrypted Library is up to date in iCloud."
+        await model.syncNow()
+
+        XCTAssertNil(model.notice)
+        XCTAssertEqual(model.errorMessage, "iCloud is offline")
+    }
+
     func testReviewedConflictRequiresAnExplicitCandidateAndThenSyncsTheMerge() async {
         let entityID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
         let local = SyncConflictCandidate(

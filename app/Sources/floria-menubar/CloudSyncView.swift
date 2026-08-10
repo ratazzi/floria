@@ -471,6 +471,7 @@ final class CloudSyncViewModel {
     private func perform(_ operation: @escaping () async throws -> Void) async {
         guard !isWorking else { return }
         isWorking = true
+        notice = nil
         errorMessage = nil
         defer { isWorking = false }
         do {
