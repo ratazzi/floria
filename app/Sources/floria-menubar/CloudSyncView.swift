@@ -62,6 +62,7 @@ final class CloudSyncViewModel {
     var isEnabled = false
     var isAvailable = false
     var isAvailabilityLoaded = false
+    var isLocalStatusLoaded = false
     var isWorking = false
     var status: SyncDomainStatus?
     var lastSuccessfulSyncAt: Date?
@@ -78,6 +79,7 @@ final class CloudSyncViewModel {
     var errorMessage: String?
 
     var syncStatusSummary: String {
+        guard isLocalStatusLoaded else { return "Checking this Mac…" }
         guard let status else { return "Available only on this Mac until you sync." }
         var parts = [String]()
         if status.outboundTransactions > 0 {
@@ -144,12 +146,14 @@ final class CloudSyncViewModel {
         notice = nil
         errorMessage = nil
         if enabled {
+            isLocalStatusLoaded = false
             await refreshPersistentState()
             await refreshLocalStatus()
             await refreshConflicts()
             await refreshProjectsWithoutLocalFolder()
         } else {
             candidates = []
+            isLocalStatusLoaded = false
             libraryReview = nil
             enrollmentRequest = nil
             approvals = []
@@ -314,6 +318,7 @@ final class CloudSyncViewModel {
     }
 
     private func refreshLocalStatus() async {
+        defer { isLocalStatusLoaded = true }
         do {
             status = try await service.localStatus()
             errorMessage = nil

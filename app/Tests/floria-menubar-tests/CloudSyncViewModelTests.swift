@@ -5,6 +5,21 @@ import XCTest
 
 @MainActor
 final class CloudSyncViewModelTests: XCTestCase {
+    func testSyncSummaryDoesNotClaimLibraryIsLocalOnlyBeforeStatusLoads() async {
+        let service = CloudSyncViewServiceStub(
+            status: status(vaultID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            candidates: [])
+        let model = CloudSyncViewModel(service: service, restartDaemon: {})
+
+        XCTAssertEqual(model.syncStatusSummary, "Checking this Mac…")
+        XCTAssertFalse(model.isLocalStatusLoaded)
+
+        await model.load()
+
+        XCTAssertEqual(model.syncStatusSummary, "Up to date")
+        XCTAssertTrue(model.isLocalStatusLoaded)
+    }
+
     func testUnavailableBuildCannotEnableICloudSync() async {
         let service = CloudSyncViewServiceStub(
             available: false,
