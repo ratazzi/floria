@@ -3286,8 +3286,8 @@ fn run(program: &str, args: &[&str]) -> bool {
 mod tests {
     use super::*;
     use floria_catalog::{
-        Binding, BindingScope, EntrySelection, EntrySpec, FileBacking, Resource, ResourceCodec,
-        ResourceKind, SurfaceFormat, SurfaceInput, SurfaceKind, ValueShape,
+        Binding, BindingScope, EntrySelection, EntrySpec, FileBacking, Project, Resource,
+        ResourceCodec, ResourceKind, SurfaceFormat, SurfaceInput, SurfaceKind, ValueShape,
     };
     use floria_core::authz::Enforcement;
     use floria_store::SecretOrigin;
@@ -3514,6 +3514,145 @@ mod tests {
             .unwrap();
         let journal = service.journal.lock().unwrap();
         assert_eq!(journal.as_ref().unwrap().outbound().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn populated_library_joins_an_approved_vault_through_scheduled_activation() {
+        let directory = tempfile::tempdir().unwrap();
+        let support = directory.path().join("support");
+        std::fs::create_dir_all(&support).unwrap();
+        let authenticator = Arc::new(floria_integrity::StateAuthenticator::for_tests([95; 32]));
+        let keys = test_store_key(directory.path());
+        let catalog_path = support.join("catalog.sqlite");
+        let catalog = Catalog::open_authenticated(
+            &catalog_path,
+            Arc::clone(&authenticator),
+        )
+        .unwrap();
+        catalog
+            .upsert_project(&Project {
+                id: "local-project".to_string(),
+                name: "Local project".to_string(),
+                path: directory.path().join("local-project"),
+                default_environment_id: None,
+            })
+            .unwrap();
+        let store_root = support.join("store");
+        let store = Arc::new(
+            AgeDirStore::open(store_root.clone(), Arc::clone(&keys))
+                .unwrap()
+                .authenticate(Arc::clone(&authenticator))
+                .unwrap(),
+        );
+        let secret_id = store
+            .put(
+                floria_store::NewSecret::managed("Local fixture"),
+                b"first fixture payload",
+            )
+            .unwrap();
+        store
+            .append_version(&secret_id, b"second fixture payload")
+            .unwrap();
+        store.set_head(&secret_id, 1).unwrap();
+        let source_vault_id = store.vault_document().vault_id;
+
+        let target = Arc::new(
+            AgeDirStore::open(directory.path().join("target-store"), Arc::clone(&keys)).unwrap(),
+        );
+        let target_vault_id = target.vault_document().vault_id;
+        assert_ne!(source_vault_id, target_vault_id);
+        let bootstrap = SyncVaultBootstrap::capture(&target).unwrap();
+        let SyncEnrollmentPreparation::Request(request) = bootstrap
+            .prepare_enrollment(
+                &store.device(),
+                Some("Joining Mac".to_string()),
+                "2026-08-10T00:00:00Z",
+            )
+            .unwrap()
+        else {
+            panic!("source Device unexpectedly enrolled in the target Vault")
+        };
+        let mut bootstrap_value = serde_json::to_value(&bootstrap).unwrap();
+        bootstrap_value["enrollment_requests"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({
+                "route": request.device_id(),
+                "document_base64": request.document_base64(),
+            }));
+        let requested: SyncVaultBootstrap = serde_json::from_value(bootstrap_value).unwrap();
+        let approved = requested
+            .approve_enrollment(
+                Arc::clone(&target),
+                request.device_id(),
+                request.fingerprint(),
+            )
+            .unwrap();
+
+        let activation_path = support.join("vault-activation.json");
+        let service = DaemonRecordSyncService::new(
+            support.join("record-sync/records.sqlite"),
+            source_vault_id.clone(),
+            Arc::clone(&authenticator),
+            catalog,
+            Arc::clone(&store),
+            Arc::new(floria_surface::ManagedMutationCoordinator::new()),
+        );
+        assert_eq!(
+            service.activate_vault(approved).unwrap(),
+            SyncVaultActivation::Ready {
+                vault_id: target_vault_id.clone(),
+                key_generation: 1,
+                restart_required: true,
+            }
+        );
+        assert_eq!(store.vault_document().vault_id, source_vault_id);
+        assert_eq!(store.get(&secret_id).unwrap().as_slice(), b"first fixture payload");
+        assert!(activation_path.is_file());
+
+        let report = floria_backup::activate_scheduled_data(
+            &activation_path,
+            &catalog_path,
+            &store,
+            Arc::clone(&authenticator),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(report.active.projects, 1);
+        assert_eq!(report.active.secrets, 1);
+        assert_eq!(report.active.versions, 2);
+        assert_eq!(report.safety_backup.secrets, 1);
+        assert!(report.safety_backup.path.is_dir());
+
+        let reopened = AgeDirStore::open_authenticated(
+            store_root,
+            keys,
+            Arc::clone(&authenticator),
+        )
+        .unwrap();
+        assert_eq!(reopened.vault_document().vault_id, target_vault_id);
+        assert_eq!(
+            reopened.get(&secret_id).unwrap().as_slice(),
+            b"first fixture payload"
+        );
+        assert_eq!(reopened.version_refs(&secret_id).unwrap().len(), 2);
+        assert_eq!(
+            Catalog::open_authenticated(&catalog_path, Arc::clone(&authenticator))
+                .unwrap()
+                .snapshot()
+                .unwrap()
+                .projects[0]
+                .id,
+            "local-project"
+        );
+        assert!(floria_backup::activate_scheduled_data(
+            &activation_path,
+            &catalog_path,
+            &reopened,
+            authenticator,
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]
