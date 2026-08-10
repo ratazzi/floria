@@ -30,8 +30,7 @@ run = "scripts/notarize-dmg"
 raw = true
 
 [tasks.smoke-app]
-description = "Install Floria.app and verify startup, runtime, and interrupted-read recovery"
-depends = ["install-app"]
+description = "Verify the currently installed Floria.app without rebuilding or replacing it"
 run = "scripts/smoke-daemon-recovery"
 
 [tasks.check-rust-fixtures]

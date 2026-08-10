@@ -16,6 +16,7 @@ WAIT_SECONDS="${FLORIA_SMOKE_WAIT_SECONDS:-20}"
 READ_FAILURE_SECONDS="${FLORIA_SMOKE_READ_FAILURE_SECONDS:-3}"
 CRASH_FIXTURE_DIRECTORY=""
 CRASH_FIXTURE_PATH=""
+CRASH_FIXTURE_OWNED=0
 CRASH_READER_PID=0
 
 for required_path in "${APP_PATH}" "${DAEMON_PATH}" "${INFO_PLIST}" "${CONFIG_PATH}"; do
@@ -308,7 +309,8 @@ restore_environment() {
         cleanup_failed=1
     fi
 
-    if [[ -n "${CRASH_FIXTURE_PATH}" && -L "${CRASH_FIXTURE_PATH}" ]]; then
+    if ((CRASH_FIXTURE_OWNED != 0)) &&
+        [[ -n "${CRASH_FIXTURE_PATH}" && -L "${CRASH_FIXTURE_PATH}" ]]; then
         local unprotect_output=""
         if ! unprotect_output="$(
             "${DAEMON_PATH}" unprotect "${CRASH_FIXTURE_PATH}" \
@@ -410,15 +412,36 @@ fi
 assert_daemon_owns_socket "${new_daemon_pid}" "${AGENT_SOCKET}"
 assert_daemon_owns_socket "${new_daemon_pid}" "${CONTROL_SOCKET}"
 
-echo "==> Verifying an open read fails promptly after a daemon crash"
-CRASH_FIXTURE_DIRECTORY="$(mktemp -d /private/tmp/floria-daemon-crash.XXXXXX)"
-CRASH_FIXTURE_PATH="${CRASH_FIXTURE_DIRECTORY}/managed-fixture"
-printf 'floria-daemon-crash-fixture\n' >"${CRASH_FIXTURE_PATH}"
-"${DAEMON_PATH}" protect "${CRASH_FIXTURE_PATH}" --config "${CONFIG_PATH}" >/dev/null
+run_crash_read=1
+if [[ -n "${FLORIA_SMOKE_MANAGED_READ_PATH:-}" ]]; then
+    CRASH_FIXTURE_PATH="${FLORIA_SMOKE_MANAGED_READ_PATH}"
+    if [[ ! -e "${CRASH_FIXTURE_PATH}" ]]; then
+        echo "Managed read fixture does not exist: ${CRASH_FIXTURE_PATH}" >&2
+        exit 1
+    fi
+elif codesign -dv --verbose=4 "${DAEMON_PATH}" 2>&1 |
+    awk -F= '$1 == "TeamIdentifier" && $2 != "not set" { found = 1 } END { exit !found }'; then
+    run_crash_read=0
+    echo "==> Skipping interrupted-read fixture for the signed packaged helper"
+    echo "    Pass FLORIA_SMOKE_MANAGED_READ_PATH to exercise an existing Managed file without changing Library data."
+else
+    echo "==> Preparing an isolated interrupted-read fixture"
+    CRASH_FIXTURE_DIRECTORY="$(mktemp -d /private/tmp/floria-daemon-crash.XXXXXX)"
+    CRASH_FIXTURE_PATH="${CRASH_FIXTURE_DIRECTORY}/managed-fixture"
+    CRASH_FIXTURE_OWNED=1
+    printf 'floria-daemon-crash-fixture\n' >"${CRASH_FIXTURE_PATH}"
+    "${DAEMON_PATH}" protect "${CRASH_FIXTURE_PATH}" --config "${CONFIG_PATH}" >/dev/null
+fi
 
-reader_ready="${CRASH_FIXTURE_DIRECTORY}/reader-ready"
-reader_continue="${CRASH_FIXTURE_DIRECTORY}/reader-continue"
-reader_result="${CRASH_FIXTURE_DIRECTORY}/reader-result"
+if ((run_crash_read != 0)); then
+    echo "==> Verifying an open read fails promptly after a daemon crash"
+
+    if [[ -z "${CRASH_FIXTURE_DIRECTORY}" ]]; then
+        CRASH_FIXTURE_DIRECTORY="$(mktemp -d /private/tmp/floria-daemon-crash.XXXXXX)"
+    fi
+    reader_ready="${CRASH_FIXTURE_DIRECTORY}/reader-ready"
+    reader_continue="${CRASH_FIXTURE_DIRECTORY}/reader-continue"
+    reader_result="${CRASH_FIXTURE_DIRECTORY}/reader-result"
 /bin/zsh -c '
     zmodload zsh/system || exit 91
     fixture_path="$1"
@@ -495,6 +518,7 @@ if [[ "${recovered_daemon_pid}" == "0" ||
 fi
 wait_for_doctor "the installation to recover after daemon SIGKILL"
 echo "Old fd failed with status ${second_status}; daemon ${crashed_daemon_pid} recovered as ${recovered_daemon_pid}"
+fi
 
 echo "==> Verifying recovered installation health"
 wait_for_doctor "the recovered Floria installation to become healthy"
