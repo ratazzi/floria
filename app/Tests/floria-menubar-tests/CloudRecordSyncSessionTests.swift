@@ -109,4 +109,24 @@ final class CloudRecordSyncSessionTests: XCTestCase {
         let second = await state.manualSyncOutcome()
         XCTAssertFalse(second.appliedRemoteChanges)
     }
+
+    func testPartialCloudKitFailureIsSuppressedOnlyAfterDelegateAcceptsBatch() async throws {
+        let state = CloudRecordSyncSessionState(initialEngineState: nil)
+        let phase = CloudSendPhase.bootstrap([])
+
+        try await state.begin(phase)
+        let unresolved = await state.engineSendFailureDisposition(isPartialFailure: true)
+        XCTAssertEqual(unresolved, .unhandled)
+
+        await state.finish(phase)
+        let accepted = await state.engineSendFailureDisposition(isPartialFailure: true)
+        let nonPartial = await state.engineSendFailureDisposition(isPartialFailure: false)
+        XCTAssertEqual(accepted, .delegateAccepted)
+        XCTAssertEqual(nonPartial, .unhandled)
+
+        try await state.begin(phase)
+        await state.record(.retryPending)
+        let recorded = await state.engineSendFailureDisposition(isPartialFailure: true)
+        XCTAssertEqual(recorded, .recorded(.retryPending))
+    }
 }

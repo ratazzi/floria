@@ -244,8 +244,22 @@ final class CloudRecordSyncSession: NSObject, CKSyncEngineDelegate, @unchecked S
             try await engine.sendChanges(
                 .init(scope: .recordIDs(phase.records.map(\.recordID))))
         } catch {
-            await finish(phase, syncEngine: engine)
-            throw error
+            let nsError = error as NSError
+            let disposition = await sessionState.engineSendFailureDisposition(
+                isPartialFailure: nsError.domain == CKErrorDomain
+                    && nsError.code == CKError.partialFailure.rawValue)
+            switch disposition {
+            case .delegateAccepted:
+                // CKSyncEngine still throws the aggregate partial failure after its delegate has
+                // verified every create-only collision as an exact, idempotent match.
+                return
+            case .recorded(let failure):
+                await finish(phase, syncEngine: engine)
+                throw failure
+            case .unhandled:
+                await finish(phase, syncEngine: engine)
+                throw error
+            }
         }
         try await throwRecordedFailure()
         guard await sessionState.phase == nil else {
@@ -419,6 +433,13 @@ actor CloudRecordSyncSessionState {
         if failure == nil { failure = error }
     }
 
+    func engineSendFailureDisposition(
+        isPartialFailure: Bool
+    ) -> CloudEngineSendFailureDisposition {
+        if let failure { return .recorded(failure) }
+        return isPartialFailure && phase == nil ? .delegateAccepted : .unhandled
+    }
+
     func beginZoneFetch() throws {
         guard !fetchInProgress else {
             throw CloudRecordSyncSessionError.damaged(
@@ -520,6 +541,12 @@ actor CloudRecordSyncSessionState {
     func manualSyncOutcome() -> CloudSyncSessionOutcome {
         CloudSyncSessionOutcome(appliedRemoteChanges: appliedRemoteChanges)
     }
+}
+
+enum CloudEngineSendFailureDisposition: Equatable {
+    case delegateAccepted
+    case recorded(CloudRecordSyncSessionError)
+    case unhandled
 }
 
 enum CloudRecordSyncSessionError: Error, Equatable, LocalizedError {
