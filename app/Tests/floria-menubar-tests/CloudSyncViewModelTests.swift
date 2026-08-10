@@ -138,6 +138,50 @@ final class CloudSyncViewModelTests: XCTestCase {
         XCTAssertNil(model.errorMessage)
     }
 
+    func testCheckAgainActivatesLibraryAfterAnotherMacApprovesTheRequest() async {
+        let target = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+        let deviceID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
+        let request = SyncEnrollmentRequest(
+            deviceID: deviceID,
+            deviceName: "Studio",
+            requestedAt: "2026-08-10T12:00:00Z",
+            fingerprint: "AB12-CD34-EF56",
+            documentBase64: "cmVxdWVzdA==")
+        let restart = RestartProbe()
+        let service = CloudSyncViewServiceStub(
+            status: status(vaultID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+            candidates: [],
+            bootstrap: bootstrap(vaultID: target),
+            enrollment: .request(request),
+            activation: .ready(
+                vaultID: target, keyGeneration: 1, restartRequired: true))
+        let model = CloudSyncViewModel(
+            service: service,
+            restartDaemon: {
+                await restart.record()
+                await service.completeRestart(target)
+            })
+
+        await model.load()
+        await model.review(
+            CloudVaultCandidate(vaultID: target, vaultDocumentBase64: "dmF1bHQ="))
+        await model.joinReviewedLibrary()
+
+        XCTAssertEqual(model.enrollmentRequest, request)
+        let restartCountBeforeApproval = await restart.count
+        XCTAssertEqual(restartCountBeforeApproval, 0)
+
+        await service.setEnrollment(.alreadyEnrolled(deviceID: deviceID))
+        await model.checkEnrollment()
+
+        let restartCountAfterApproval = await restart.count
+        XCTAssertEqual(restartCountAfterApproval, 1)
+        XCTAssertEqual(model.status?.vaultID, target)
+        XCTAssertNil(model.enrollmentRequest)
+        XCTAssertEqual(model.notice, "This Mac now uses your iCloud Library.")
+        XCTAssertNil(model.errorMessage)
+    }
+
     func testRevokingAMacUsesTheReviewedDeviceFingerprint() async {
         let vaultID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         let device = SyncVaultDevice(
@@ -456,7 +500,7 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
     private var status: SyncDomainStatus
     private let candidates: [CloudVaultCandidate]
     private let bootstrap: SyncVaultBootstrap?
-    private let enrollment: SyncEnrollmentPreparation
+    private var enrollment: SyncEnrollmentPreparation
     private let activation: SyncVaultActivation
     private let devices: [SyncVaultDevice]
     private var conflicts: [SyncConflictReview]
@@ -513,6 +557,10 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
 
     func completeRestart(_ vaultID: String) {
         restartTarget = vaultID
+    }
+
+    func setEnrollment(_ enrollment: SyncEnrollmentPreparation) {
+        self.enrollment = enrollment
     }
 
     func isAvailable() async -> Bool { available }
