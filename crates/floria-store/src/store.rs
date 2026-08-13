@@ -510,10 +510,54 @@ impl AgeDirStore {
 
     pub fn authenticate(mut self, authenticator: Arc<StateAuthenticator>) -> StoreResult<Self> {
         let sidecar = self.root.join("local/.integrity.json");
-        let loaded = authenticator.load::<StoreSecuritySnapshot>(&sidecar, INTEGRITY_DOMAIN)?;
+        let legacy_sidecar = self.root.join(".integrity.json");
+        // Format 5 moved device-local state under `local/`. A pre-format-5 sidecar may be
+        // relocated only after the normal authenticator and the current Store snapshot both
+        // prove it is the exact state previously sealed in the Keychain checkpoint.
+        let load_legacy = match std::fs::symlink_metadata(&sidecar) {
+            Ok(_) => false,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(&legacy_sidecar) {
+                    Ok(_) => true,
+                    Err(source) if source.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(source) => return Err(StoreError::io(&legacy_sidecar, source)),
+                }
+            }
+            Err(source) => return Err(StoreError::io(&sidecar, source)),
+        };
+        let loaded = authenticator.load::<StoreSecuritySnapshot>(
+            if load_legacy {
+                &legacy_sidecar
+            } else {
+                &sidecar
+            },
+            INTEGRITY_DOMAIN,
+        )?;
         let current = self.security_snapshot()?;
         let generation = match loaded.value {
-            Some(authenticated) if authenticated == current => loaded.generation,
+            Some(authenticated) if authenticated == current => {
+                if load_legacy {
+                    let bytes = read_untrusted_file(&legacy_sidecar, 1024 * 1024)?;
+                    write_new_atomic(&sidecar, &bytes)?;
+                    let copied = authenticator
+                        .load::<StoreSecuritySnapshot>(&sidecar, INTEGRITY_DOMAIN)?;
+                    if copied.generation != loaded.generation
+                        || copied.value.as_ref() != Some(&current)
+                    {
+                        return Err(StoreError::Corrupt {
+                            id: "store".to_string(),
+                            reason: "relocated integrity sidecar did not preserve the authenticated store snapshot"
+                                .to_string(),
+                        });
+                    }
+                    tracing::info!(
+                        source = %legacy_sidecar.display(),
+                        destination = %sidecar.display(),
+                        "relocated the verified pre-format-5 store integrity sidecar"
+                    );
+                }
+                loaded.generation
+            }
             Some(_) => {
                 return Err(StoreError::Corrupt {
                     id: "store".to_string(),
@@ -593,6 +637,24 @@ impl AgeDirStore {
 
     pub fn vault_document(&self) -> VaultDocument {
         self.state.read().expect("shared state poisoned").vault.clone()
+    }
+
+    /// Return the Vault id preserved in the Store's original `shared/` half, when present.
+    ///
+    /// Cross-Vault activation deliberately leaves that directory in place for rollback. Local
+    /// authenticated adapters can use its signed Vault identity to rehome pre-Vault-scoped state
+    /// without guessing which authentication domain originally owned it.
+    pub fn preserved_default_vault_id(&self) -> StoreResult<Option<String>> {
+        let layout = SharedLayout::new(self.root.join("shared"));
+        match vault::read_vault(&layout) {
+            Ok(document) => Ok(Some(document.vault_id)),
+            Err(StoreError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub fn device(&self) -> Arc<DeviceKeyMaterial> {
@@ -2542,8 +2604,7 @@ mod tests {
     fn rotating_a_device_keeps_historical_generations_readable_after_reopen() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("store");
-        let keys: Arc<dyn KeyProvider> =
-            Arc::new(X25519Keys(age::x25519::Identity::generate()));
+        let keys: Arc<dyn KeyProvider> = Arc::new(X25519Keys(age::x25519::Identity::generate()));
         let s = AgeDirStore::open(root.clone(), Arc::clone(&keys)).unwrap();
         let previous_device_id = s.device().device_id().to_string();
         let generation_public = s.generation_identity(1).unwrap().to_public().to_string();
@@ -3147,6 +3208,69 @@ mod tests {
         store.append_version(&id, b"version-two").unwrap();
         std::fs::write(&sidecar, old_sidecar).unwrap();
         assert!(store.get(&id).is_err());
+    }
+
+    #[test]
+    fn authenticated_store_rehomes_a_verified_legacy_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let keys: Arc<dyn KeyProvider> =
+            Arc::new(X25519Keys(age::x25519::Identity::generate()));
+        let auth = Arc::new(StateAuthenticator::for_tests([33; 32]));
+        let store = AgeDirStore::open(root.clone(), Arc::clone(&keys))
+            .unwrap()
+            .authenticate(Arc::clone(&auth))
+            .unwrap();
+        let id = store
+            .put(NewSecret::managed("legacy sidecar fixture"), b"preserved")
+            .unwrap();
+        drop(store);
+
+        let current = root.join("local/.integrity.json");
+        let legacy = root.join(".integrity.json");
+        std::fs::rename(&current, &legacy).unwrap();
+
+        let reopened = AgeDirStore::open(root.clone(), keys)
+            .unwrap()
+            .authenticate(auth)
+            .unwrap();
+        assert_eq!(reopened.get(&id).unwrap().as_slice(), b"preserved");
+        assert!(current.is_file());
+        assert!(legacy.is_file());
+        assert_eq!(
+            std::fs::read(current).unwrap(),
+            std::fs::read(legacy).unwrap()
+        );
+    }
+
+    #[test]
+    fn authenticated_store_rejects_a_tampered_legacy_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let keys: Arc<dyn KeyProvider> = Arc::new(X25519Keys(age::x25519::Identity::generate()));
+        let auth = Arc::new(StateAuthenticator::for_tests([34; 32]));
+        let store = AgeDirStore::open(root.clone(), Arc::clone(&keys))
+            .unwrap()
+            .authenticate(Arc::clone(&auth))
+            .unwrap();
+        store
+            .put(NewSecret::managed("tampered legacy sidecar fixture"), b"preserved")
+            .unwrap();
+        drop(store);
+
+        let current = root.join("local/.integrity.json");
+        let legacy = root.join(".integrity.json");
+        std::fs::rename(&current, &legacy).unwrap();
+        let mut bytes = std::fs::read(&legacy).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0x01;
+        std::fs::write(&legacy, bytes).unwrap();
+
+        assert!(AgeDirStore::open(root, keys)
+            .unwrap()
+            .authenticate(auth)
+            .is_err());
+        assert!(!current.exists());
     }
 
     #[test]

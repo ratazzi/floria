@@ -206,6 +206,39 @@ pub struct RecordJournal {
 }
 
 impl RecordJournal {
+    /// Open the authenticated journal owned by one Vault.
+    ///
+    /// Before Vault-scoped paths existed, every Vault reused `records.sqlite` in the parent
+    /// directory even though the sidecar authentication domain already contained the Vault id.
+    /// A Library switch therefore made the valid old sidecar look corrupt under the new domain.
+    /// The compatibility copy below identifies the old owner only by successfully authenticating
+    /// the legacy pair, copies it into that Vault's private namespace, verifies the copy, and
+    /// leaves the original untouched for rollback.
+    pub fn open_vault_scoped(
+        directory: impl AsRef<Path>,
+        vault_id: &str,
+        legacy_vault_ids: &[String],
+        authenticator: Arc<StateAuthenticator>,
+    ) -> ReplicationResult<Self> {
+        require_uuid("vault id", vault_id)?;
+        let directory = directory.as_ref();
+        let target = scoped_journal_path(directory, vault_id);
+        if target.exists() {
+            return Self::open(target, vault_id, authenticator);
+        }
+
+        let legacy = directory.join("records.sqlite");
+        if legacy.exists() {
+            migrate_legacy_journal(
+                directory,
+                &legacy,
+                legacy_vault_ids,
+                Arc::clone(&authenticator),
+            )?;
+        }
+        Self::open(target, vault_id, authenticator)
+    }
+
     pub fn open(
         path: impl Into<PathBuf>,
         vault_id: &str,
@@ -657,6 +690,105 @@ impl RecordJournal {
         }
         Ok(loaded.generation)
     }
+
+    fn checkpoint_for_copy(&self) -> ReplicationResult<()> {
+        let _mutation = self.mutation.lock().expect("record journal lock poisoned");
+        let conn = open_connection(&self.path)?;
+        let current = security_snapshot_from(&conn)?;
+        self.verify_snapshot(&current)?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode = DELETE;")?;
+        Ok(())
+    }
+}
+
+fn scoped_journal_path(directory: &Path, vault_id: &str) -> PathBuf {
+    directory.join("vaults").join(vault_id).join("records.sqlite")
+}
+
+fn migrate_legacy_journal(
+    directory: &Path,
+    legacy: &Path,
+    candidate_vault_ids: &[String],
+    authenticator: Arc<StateAuthenticator>,
+) -> ReplicationResult<()> {
+    let mut candidates = candidate_vault_ids.to_vec();
+    candidates.sort();
+    candidates.dedup();
+    let mut first_error = None;
+
+    for candidate in candidates {
+        require_uuid("legacy vault id", &candidate)?;
+        let legacy_journal = match RecordJournal::open(
+            legacy,
+            &candidate,
+            Arc::clone(&authenticator),
+        ) {
+            Ok(journal) => journal,
+            Err(error) => {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+                continue;
+            }
+        };
+        legacy_journal.checkpoint_for_copy()?;
+        drop(legacy_journal);
+
+        let target = scoped_journal_path(directory, &candidate);
+        if target.exists() {
+            RecordJournal::open(target, &candidate, authenticator)?;
+            return Ok(());
+        }
+        let target_directory = target
+            .parent()
+            .expect("scoped record journal always has a parent");
+        if target_directory.exists() {
+            return Err(ReplicationError::Invalid(format!(
+                "record journal Vault directory {} exists without its database",
+                target_directory.display()
+            )));
+        }
+
+        let staging_directory = directory.join("vaults").join(format!(
+            ".journal-migration-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let staging = staging_directory.join("records.sqlite");
+        ensure_parent(&staging)?;
+        copy_private_file(legacy, &staging)?;
+        copy_private_file(
+            &legacy.with_extension("integrity.json"),
+            &staging.with_extension("integrity.json"),
+        )?;
+        let copied = RecordJournal::open(&staging, &candidate, Arc::clone(&authenticator))?;
+        drop(copied);
+        fs::rename(&staging_directory, target_directory).map_err(|source| {
+            ReplicationError::Io {
+                path: target_directory.to_path_buf(),
+                source,
+            }
+        })?;
+        return Ok(());
+    }
+
+    Err(first_error.unwrap_or_else(|| {
+        ReplicationError::Invalid(
+            "legacy record journal exists but no candidate Vault id was provided".to_string(),
+        )
+    }))
+}
+
+fn copy_private_file(source: &Path, destination: &Path) -> ReplicationResult<()> {
+    fs::copy(source, destination).map_err(|source_error| ReplicationError::Io {
+        path: source.to_path_buf(),
+        source: source_error,
+    })?;
+    fs::set_permissions(destination, fs::Permissions::from_mode(0o600)).map_err(|source| {
+        ReplicationError::Io {
+            path: destination.to_path_buf(),
+            source,
+        }
+    })
 }
 
 fn initialize_or_require_schema(conn: &mut Connection, created: bool) -> ReplicationResult<()> {
@@ -1605,6 +1737,55 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn vault_scoped_open_rehomes_a_verified_legacy_journal_to_its_original_vault() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_vault_id = id();
+        let target_vault_id = id();
+        let authenticator = authenticator();
+        let legacy_path = directory.path().join("records.sqlite");
+        let legacy = RecordJournal::open(
+            &legacy_path,
+            &source_vault_id,
+            Arc::clone(&authenticator),
+        )
+        .unwrap();
+        let entity_id = id();
+        let revision = revision(&entity_id, &id(), &id(), Vec::new());
+        let commit = make_commit(revision.commit_id(), std::slice::from_ref(&revision));
+        legacy
+            .queue_outbound(
+                commit,
+                vec![revision],
+                BTreeMap::from([(entity_id, Vec::new())]),
+                "2026-08-11T00:00:00Z",
+            )
+            .unwrap();
+        drop(legacy);
+
+        let target = RecordJournal::open_vault_scoped(
+            directory.path(),
+            &target_vault_id,
+            &[target_vault_id.clone(), source_vault_id.clone()],
+            Arc::clone(&authenticator),
+        )
+        .unwrap();
+        assert!(target.outbound().unwrap().is_empty());
+        drop(target);
+
+        let source = RecordJournal::open_vault_scoped(
+            directory.path(),
+            &source_vault_id,
+            &[source_vault_id.clone()],
+            authenticator,
+        )
+        .unwrap();
+        assert_eq!(source.outbound().unwrap().len(), 1);
+        assert!(legacy_path.is_file());
+        assert!(scoped_journal_path(directory.path(), &source_vault_id).is_file());
+        assert!(scoped_journal_path(directory.path(), &target_vault_id).is_file());
     }
 
     #[test]

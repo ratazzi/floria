@@ -1567,6 +1567,10 @@ mod tests {
         assert_eq!(joining.vault_document().vault_id, genesis.vault_document().vault_id);
         assert_ne!(joining.shared_root(), previous_shared);
         assert_eq!(
+            joining.preserved_default_vault_id().unwrap().as_deref(),
+            Some(previous_vault_id.as_str())
+        );
+        assert_eq!(
             vault::read_vault(&vault::SharedLayout::new(&previous_shared))
                 .unwrap()
                 .vault_id,

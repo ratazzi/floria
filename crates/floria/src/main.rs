@@ -1024,9 +1024,20 @@ fn cmd_mount(config: &Path) -> Result<()> {
     );
     let replication_mutation_observer: Arc<dyn ManagedMutationObserver> = replication.clone();
     mutations.observe(Arc::downgrade(&replication_mutation_observer));
+    let active_vault_id = concrete_store.vault_document().vault_id.clone();
+    let mut legacy_record_vault_ids = vec![active_vault_id.clone()];
+    match concrete_store.preserved_default_vault_id() {
+        Ok(Some(vault_id)) => legacy_record_vault_ids.push(vault_id),
+        Ok(None) => {}
+        Err(error) => tracing::warn!(
+            %error,
+            "could not inspect the preserved default Vault for record-journal recovery"
+        ),
+    }
     let record_sync = Arc::new(DaemonRecordSyncService::new(
-        support_dir.join("record-sync/records.sqlite"),
-        concrete_store.vault_document().vault_id.clone(),
+        support_dir.join("record-sync"),
+        active_vault_id,
+        legacy_record_vault_ids,
         Arc::clone(&state_authenticator),
         catalog.clone(),
         Arc::clone(&concrete_store),
@@ -1197,8 +1208,9 @@ fn cmd_mount(config: &Path) -> Result<()> {
 /// Lazily activates the coordinated-record journal when the opted-in Swift adapter first asks.
 /// Normal daemon startup and local file access never create or open this database.
 struct DaemonRecordSyncService {
-    path: PathBuf,
+    directory: PathBuf,
     vault_id: String,
+    legacy_vault_ids: Vec<String>,
     authenticator: Arc<floria_integrity::StateAuthenticator>,
     catalog: Catalog,
     store: Arc<AgeDirStore>,
@@ -1208,16 +1220,18 @@ struct DaemonRecordSyncService {
 
 impl DaemonRecordSyncService {
     fn new(
-        path: PathBuf,
+        directory: PathBuf,
         vault_id: String,
+        legacy_vault_ids: Vec<String>,
         authenticator: Arc<floria_integrity::StateAuthenticator>,
         catalog: Catalog,
         store: Arc<AgeDirStore>,
         mutations: Arc<floria_surface::ManagedMutationCoordinator>,
     ) -> Self {
         Self {
-            path,
+            directory,
             vault_id,
+            legacy_vault_ids,
             authenticator,
             catalog,
             store,
@@ -1236,9 +1250,10 @@ impl DaemonRecordSyncService {
             .map_err(|_| "record sync journal lock is poisoned".to_string())?;
         if journal.is_none() {
             *journal = Some(
-                RecordJournal::open(
-                    &self.path,
+                RecordJournal::open_vault_scoped(
+                    &self.directory,
                     &self.vault_id,
+                    &self.legacy_vault_ids,
                     Arc::clone(&self.authenticator),
                 )
                 .map_err(|error| error.to_string())?,
@@ -1270,9 +1285,8 @@ impl DaemonRecordSyncService {
         target_vault_id: &str,
     ) -> Result<SyncVaultActivation, String> {
         let support_dir = self
-            .path
+            .directory
             .parent()
-            .and_then(Path::parent)
             .ok_or_else(|| "record sync database has no support directory".to_string())?;
         let migration_id = uuid::Uuid::new_v4().to_string();
         let migration_root = support_dir.join("cloudkit-migrations").join(&migration_id);
@@ -3484,10 +3498,16 @@ mod tests {
         );
         let catalog = Catalog::open(directory.path().join("catalog.sqlite")).unwrap();
         let mutations = Arc::new(floria_surface::ManagedMutationCoordinator::new());
-        let records_path = directory.path().join("record-sync/records.sqlite");
+        let record_sync_directory = directory.path().join("record-sync");
+        let vault_id = store.vault_document().vault_id.clone();
+        let records_path = record_sync_directory
+            .join("vaults")
+            .join(&vault_id)
+            .join("records.sqlite");
         let service = Arc::new(DaemonRecordSyncService::new(
-            records_path.clone(),
-            store.vault_document().vault_id.clone(),
+            record_sync_directory,
+            vault_id.clone(),
+            vec![vault_id],
             Arc::new(floria_integrity::StateAuthenticator::for_tests([94; 32])),
             catalog,
             Arc::clone(&store),
@@ -3591,8 +3611,9 @@ mod tests {
 
         let activation_path = support.join("vault-activation.json");
         let service = DaemonRecordSyncService::new(
-            support.join("record-sync/records.sqlite"),
+            support.join("record-sync"),
             source_vault_id.clone(),
+            vec![source_vault_id.clone()],
             Arc::clone(&authenticator),
             catalog,
             Arc::clone(&store),
