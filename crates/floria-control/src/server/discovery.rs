@@ -207,47 +207,87 @@ pub(super) fn apply_discovery(
                     }
                 }
                 DiscoveredFileAction::ImportSshIdentity => {
-                    let resource_id = generated_id("ssh-identity");
+                    let origin_project_id = match &import.destination {
+                        DiscoveryImportDestination::ProjectFile { project_path, .. } => {
+                            Some(project_states[project_path].0.clone())
+                        }
+                        DiscoveryImportDestination::Library
+                        | DiscoveryImportDestination::ProjectOutput { .. }
+                        | DiscoveryImportDestination::ProjectOutputs { .. } => None,
+                    };
                     let name = file
                         .path
                         .file_name()
                         .and_then(|value| value.to_str())
                         .unwrap_or("SSH identity")
                         .to_string();
-                    let imported = import_ssh_identity(
-                        catalog,
-                        store,
-                        resource_id,
-                        name,
-                        &file.path,
-                        None,
-                        ManagedItemSettings {
-                            enforcement: SecurityDefaults::discovered_resource(file.kind),
-                            metadata: ItemMetadata::default(),
-                        },
-                        ResourceOrigin {
-                            kind: OriginKind::Discovered,
-                            sources: vec![OriginSource {
-                                path: file.path.clone(),
-                                project_id: None,
-                                environment: None,
-                                imported_at: now_rfc3339(),
-                            }],
-                        },
-                    );
+                    let origin_source = OriginSource {
+                        path: file.path.clone(),
+                        project_id: origin_project_id.clone(),
+                        environment: file.environment.clone(),
+                        imported_at: now_rfc3339(),
+                    };
+                    let existing_identity = existing_ssh_identity(catalog, &file.path)?;
+                    let imported = if let Some(resource) = &existing_identity {
+                        catalog.append_resource_origin(&resource.id, &origin_source)?;
+                        Ok(ControlResult::SshIdentityCreated {
+                            resource: resource.clone(),
+                        })
+                    } else {
+                        import_ssh_identity(
+                            catalog,
+                            store,
+                            generated_id("ssh-identity"),
+                            name,
+                            &file.path,
+                            None,
+                            ManagedItemSettings {
+                                enforcement: SecurityDefaults::discovered_resource(
+                                    file.kind,
+                                    file.environment.as_deref(),
+                                ),
+                                metadata: ItemMetadata::default(),
+                            },
+                            ResourceOrigin {
+                                kind: OriginKind::Discovered,
+                                sources: vec![origin_source],
+                            },
+                        )
+                    };
                     match imported {
                         Ok(_) => {
-                            result.imported_ssh_identities += 1;
+                            if existing_identity.is_some() {
+                                result.reused_resources += 1;
+                            } else {
+                                result.imported_ssh_identities += 1;
+                            }
                             if import.source_disposition
                                 == DiscoverySourceDisposition::ProtectInPlace
                             {
-                                protect_discovered_file(catalog, store, mount_path, &file)?;
+                                let protected =
+                                    protect_discovered_file(catalog, store, mount_path, &file)?;
+                                if let Some(project_id) = &origin_project_id {
+                                    apply_protected_file_environment_scope(
+                                        catalog,
+                                        store,
+                                        &protected,
+                                        project_id,
+                                        file.environment.as_deref(),
+                                    )?;
+                                }
                                 result.protected_files += 1;
                             }
                             result.files.push(DiscoveryAppliedFile {
                                 path: file.path,
                                 outcome: DiscoveryApplyOutcome::Imported,
-                                detail: "Imported as a managed SSH identity".to_string(),
+                                detail: if import.source_disposition
+                                    == DiscoverySourceDisposition::ProtectInPlace
+                                {
+                                    "Imported as an SSH identity and managed the original file"
+                                        .to_string()
+                                } else {
+                                    "Imported as a managed SSH identity".to_string()
+                                },
                             });
                         }
                         // The private-key heuristic can misread other PEM credentials (JWT/TLS
@@ -261,7 +301,17 @@ pub(super) fn apply_discovery(
                                     | ManagedKeyError::DecryptionFailed
                             ) =>
                         {
-                            protect_discovered_file(catalog, store, mount_path, &file)?;
+                            let protected =
+                                protect_discovered_file(catalog, store, mount_path, &file)?;
+                            if let Some(project_id) = &origin_project_id {
+                                apply_protected_file_environment_scope(
+                                    catalog,
+                                    store,
+                                    &protected,
+                                    project_id,
+                                    file.environment.as_deref(),
+                                )?;
+                            }
                             result.protected_files += 1;
                             result.files.push(DiscoveryAppliedFile {
                                 path: file.path,
@@ -274,7 +324,10 @@ pub(super) fn apply_discovery(
                         }
                         Err(error) => return Err(error),
                     }
-                    Ok(Vec::new())
+                    Ok(import_project_paths(&import.destination)
+                        .into_iter()
+                        .cloned()
+                        .collect())
                 }
                 DiscoveredFileAction::Compose => match import.destination {
                     DiscoveryImportDestination::ProjectFile { project_path, .. } => {
@@ -458,11 +511,22 @@ fn resolve_discovery_imports(
                         source_disposition: DiscoverySourceDisposition::ProtectInPlace,
                     }
                 }
-                DiscoveredFileAction::ImportSshIdentity => DiscoveryImport {
-                    path: file.path.clone(),
-                    destination: DiscoveryImportDestination::Library,
-                    source_disposition: DiscoverySourceDisposition::LeaveUnchanged,
-                },
+                DiscoveredFileAction::ImportSshIdentity => {
+                    let destination = file
+                        .assignment
+                        .project_path
+                        .clone()
+                        .map(|project_path| DiscoveryImportDestination::ProjectFile {
+                            project_path,
+                            project_id: None,
+                        })
+                        .unwrap_or(DiscoveryImportDestination::Library);
+                    DiscoveryImport {
+                        path: file.path.clone(),
+                        destination,
+                        source_disposition: DiscoverySourceDisposition::ProtectInPlace,
+                    }
+                }
                 DiscoveredFileAction::Review | DiscoveredFileAction::Reference => return None,
             };
             Some(Ok(import))
@@ -512,7 +576,9 @@ fn validate_discovery_import(
             DiscoverySourceDisposition::ProtectInPlace,
         ) if matches!(
             file.action,
-            DiscoveredFileAction::Compose | DiscoveredFileAction::Protect
+            DiscoveredFileAction::Compose
+                | DiscoveredFileAction::Protect
+                | DiscoveredFileAction::ImportSshIdentity
         ) => {
             if !valid_project_paths.contains(project_path) {
                 return Err(invalid(format!(
@@ -908,7 +974,10 @@ fn materialize_discovered_resources(
                     (resource_id, enforcement)
                 } else {
                     let resource_id = generated_id("secret");
-                    let enforcement = SecurityDefaults::discovered_resource(file.kind);
+                    let enforcement = SecurityDefaults::discovered_resource(
+                        file.kind,
+                        file.environment.as_deref(),
+                    );
                     create_shared_secret(
                         catalog,
                         store,
@@ -957,7 +1026,10 @@ fn materialize_discovered_resources(
                     ))
                 })?;
                 let resource_id = generated_id("env-file");
-                let enforcement = SecurityDefaults::discovered_resource(file.kind);
+                let enforcement = SecurityDefaults::discovered_resource(
+                    file.kind,
+                    file.environment.as_deref(),
+                );
                 create_env_file(
                     catalog,
                     store,
@@ -994,7 +1066,10 @@ fn materialize_discovered_resources(
                 ))
             })?;
             let resource_id = generated_id("env-file");
-            let enforcement = SecurityDefaults::discovered_resource(file.kind);
+            let enforcement = SecurityDefaults::discovered_resource(
+                file.kind,
+                file.environment.as_deref(),
+            );
             create_env_file(
                 catalog,
                 store,
@@ -1095,6 +1170,7 @@ fn discovered_surface(
         input: SurfaceInput::Bindings { binding_ids },
         enforcement: SecurityDefaults::composed_surface(
             resources.iter().map(|resource| resource.enforcement),
+            file.environment.as_deref(),
         ),
         position: 0,
     })
@@ -1522,6 +1598,40 @@ pub(super) fn discovered_source(
 
 pub(super) fn generated_id(prefix: &str) -> String {
     format!("{prefix}-{}", SecretId::generate())
+}
+
+fn existing_ssh_identity(
+    catalog: &Catalog,
+    path: &Path,
+) -> Result<Option<Resource>, DispatchError> {
+    let resources = catalog.snapshot()?.resources;
+    if let Some(resource) = resources.iter().find(|resource| {
+        resource.kind == ResourceKind::SshIdentity
+            && resource
+                .origin
+                .sources
+                .iter()
+                .any(|source| source.path == path)
+    }) {
+        return Ok(Some(resource.clone()));
+    }
+
+    let encoded = zeroize::Zeroizing::new(
+        std::fs::read(path).map_err(|source| DispatchError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?,
+    );
+    let Ok(imported) = floria_ssh::import_private_key(&encoded, None) else {
+        return Ok(None);
+    };
+    Ok(resources.into_iter().find(|resource| {
+        resource.kind == ResourceKind::SshIdentity
+            && resource
+                .entries
+                .iter()
+                .any(|entry| entry.address == imported.identity.address)
+    }))
 }
 
 pub(super) fn existing_discovery_projects(

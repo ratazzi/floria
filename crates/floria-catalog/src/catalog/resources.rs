@@ -44,10 +44,11 @@ impl Catalog {
         })
     }
 
-    /// Record one more source file on a resource's origin, deduplicated by path.
+    /// Record one more source file on a resource's origin, keyed by path.
     ///
     /// The origin kind is left untouched: reusing a manual secret from discovery
-    /// keeps it manual while still remembering where it is used from.
+    /// keeps it manual while still remembering where it is used from. Rediscovery refreshes
+    /// project/environment attribution for an existing path instead of adding a duplicate.
     pub fn append_resource_origin(&self, id: &str, source: &OriginSource) -> CatalogResult<()> {
         require_id(id, "resource id")?;
         self.with_authenticated_mutation(|tx| {
@@ -60,10 +61,19 @@ impl Catalog {
                 .optional()?
                 .ok_or_else(|| CatalogError::NotFound(format!("resource {id}")))?;
             let mut origin: ResourceOrigin = serde_json::from_str(&origin_json)?;
-            if origin.sources.iter().any(|existing| existing.path == source.path) {
-                return Ok(());
+            if let Some(existing) =
+                origin.sources.iter_mut().find(|existing| existing.path == source.path)
+            {
+                if source.project_id.is_some() {
+                    existing.project_id = source.project_id.clone();
+                }
+                if source.environment.is_some() {
+                    existing.environment = source.environment.clone();
+                }
+                existing.imported_at.clone_from(&source.imported_at);
+            } else {
+                origin.sources.push(source.clone());
             }
-            origin.sources.push(source.clone());
             tx.execute(
                 "UPDATE resources SET origin_json = ?2, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
                 params![id, serde_json::to_string(&origin)?],

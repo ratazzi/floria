@@ -655,7 +655,11 @@ pub(super) fn protect_discovered_file(
         store,
         mount_path,
         &file.path,
-        SecurityDefaults::discovered_file(file.kind, &file.path),
+        SecurityDefaults::discovered_file(
+            file.kind,
+            &file.path,
+            file.environment.as_deref(),
+        ),
     )
 }
 

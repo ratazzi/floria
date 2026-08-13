@@ -302,6 +302,7 @@
     }
 
     const FIXTURE_SECRET_ID: &str = "00000000-0000-0000-0000-000000000101";
+    const FIXTURE_FILE_SECRET_ID: &str = "00000000-0000-0000-0000-000000000102";
 
     struct FixtureSecretMetadata {
         origin: SecretOrigin,
@@ -581,9 +582,20 @@
                         | "DEBUG"
                         | ".env"
                         | ".env.shared"
+                        | "prod.key"
                 ));
             }
-            let id: SecretId = FIXTURE_SECRET_ID.parse().unwrap();
+            let id: SecretId = if matches!(
+                &meta.origin,
+                SecretOrigin::File { source_path }
+                    if source_path.file_name().is_some_and(|name| name == "prod.key")
+            )
+                && self.entries.lock().unwrap().contains_key(FIXTURE_SECRET_ID)
+            {
+                FIXTURE_FILE_SECRET_ID.parse().unwrap()
+            } else {
+                FIXTURE_SECRET_ID.parse().unwrap()
+            };
             self.entries
                 .lock()
                 .unwrap()
@@ -2376,6 +2388,51 @@
     }
 
     #[test]
+    fn discovery_protects_a_production_env_file_with_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("fixture-project");
+        let source_path = project_path.join(".env.production");
+        let mount_path = dir.path().join("mount");
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
+        std::fs::create_dir_all(&mount_path).unwrap();
+        std::fs::write(&source_path, "PRODUCTION_TOKEN=fixture-production\n").unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let store = FixtureStore::new();
+
+        dispatch(
+            &catalog,
+            DispatchServices {
+                store: Some(&store),
+                mount_path: Some(&mount_path),
+                ..DispatchServices::default()
+            },
+            ControlCommand::DiscoverApply {
+                paths: vec![project_path.clone()],
+                imports: Some(vec![project_file_import(&source_path, &project_path)]),
+                separate_entries: Vec::new(),
+                promote_entries: Vec::new(),
+                demote_entries: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let records = store.list().unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.enforcement, Enforcement::Prompt);
+        assert!(std::fs::symlink_metadata(&source_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let snapshot = catalog.snapshot().unwrap();
+        assert_eq!(snapshot.environments[0].name, "Production");
+        assert_eq!(
+            record.environment_ids,
+            Some(vec![snapshot.environments[0].id.clone()])
+        );
+    }
+
+    #[test]
     fn discovery_apply_leaves_dotenv_reference_files_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let project_path = dir.path().join("fixture-project");
@@ -2870,6 +2927,139 @@
         assert_eq!(snapshot.resources.len(), 1);
         assert_eq!(snapshot.resources[0].kind, ResourceKind::SshIdentity);
         assert_eq!(snapshot.resources[0].enforcement, Enforcement::TouchId);
+    }
+
+    #[test]
+    fn discovery_imports_project_ssh_identity_and_protects_its_source_path() {
+        use ssh_key::{Algorithm, LineEnding, PrivateKey};
+
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("fixture-project");
+        let ssh_path = project_path.join("config/credentials/prod.key");
+        let mount_path = dir.path().join("mount");
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
+        std::fs::create_dir_all(ssh_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&mount_path).unwrap();
+        let private_key =
+            PrivateKey::random(&mut ssh_key::rand_core::OsRng, Algorithm::Ed25519).unwrap();
+        std::fs::write(&ssh_path, private_key.to_openssh(LineEnding::LF).unwrap()).unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let store = FixtureStore::new();
+
+        let applied = dispatch(
+            &catalog,
+            DispatchServices {
+                store: Some(&store),
+                mount_path: Some(&mount_path),
+                ..DispatchServices::default()
+            },
+            ControlCommand::DiscoverApply {
+                paths: vec![project_path.clone()],
+                imports: Some(vec![project_file_import(&ssh_path, &project_path)]),
+                separate_entries: Vec::new(),
+                promote_entries: Vec::new(),
+                demote_entries: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let ControlResult::DiscoveryApplied(result) = applied else {
+            panic!("expected discovery apply result");
+        };
+        assert_eq!(result.imported_ssh_identities, 1);
+        assert_eq!(result.protected_files, 1);
+        assert_eq!(result.project_ids.len(), 1);
+        assert_eq!(
+            std::fs::read_link(&ssh_path).unwrap(),
+            mount_path
+                .join(floria_core::config::ITEMS_DIR)
+                .join(FIXTURE_FILE_SECRET_ID)
+                .join("prod.key")
+        );
+        let snapshot = catalog.snapshot().unwrap();
+        assert_eq!(snapshot.projects.len(), 1);
+        assert_eq!(snapshot.resources.len(), 1);
+        assert_eq!(snapshot.resources[0].kind, ResourceKind::SshIdentity);
+        assert_eq!(
+            snapshot.resources[0].origin.sources[0].project_id.as_deref(),
+            Some(snapshot.projects[0].id.as_str())
+        );
+        let secret_id: SecretId = FIXTURE_FILE_SECRET_ID.parse().unwrap();
+        assert_eq!(
+            store.record(&secret_id).unwrap().unwrap().environment_ids,
+            Some(vec![snapshot.environments[0].id.clone()])
+        );
+    }
+
+    #[test]
+    fn rediscovery_protects_a_source_previously_imported_only_as_an_ssh_identity() {
+        use ssh_key::{Algorithm, LineEnding, PrivateKey};
+
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("fixture-project");
+        let ssh_path = project_path.join("config/credentials/prod.key");
+        let mount_path = dir.path().join("mount");
+        std::fs::create_dir_all(project_path.join(".git")).unwrap();
+        std::fs::create_dir_all(ssh_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&mount_path).unwrap();
+        let private_key =
+            PrivateKey::random(&mut ssh_key::rand_core::OsRng, Algorithm::Ed25519).unwrap();
+        std::fs::write(&ssh_path, private_key.to_openssh(LineEnding::LF).unwrap()).unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let store = FixtureStore::new();
+        let services = DispatchServices {
+            store: Some(&store),
+            mount_path: Some(&mount_path),
+            ..DispatchServices::default()
+        };
+
+        dispatch(
+            &catalog,
+            services,
+            ControlCommand::DiscoverApply {
+                paths: vec![project_path.clone()],
+                imports: Some(vec![library_import(
+                    &ssh_path,
+                    DiscoverySourceDisposition::LeaveUnchanged,
+                )]),
+                separate_entries: Vec::new(),
+                promote_entries: Vec::new(),
+                demote_entries: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert!(std::fs::symlink_metadata(&ssh_path).unwrap().is_file());
+
+        let applied = dispatch(
+            &catalog,
+            services,
+            ControlCommand::DiscoverApply {
+                paths: vec![project_path.clone()],
+                imports: Some(vec![project_file_import(&ssh_path, &project_path)]),
+                separate_entries: Vec::new(),
+                promote_entries: Vec::new(),
+                demote_entries: Vec::new(),
+            },
+        )
+        .unwrap();
+
+        let ControlResult::DiscoveryApplied(result) = applied else {
+            panic!("expected discovery apply result");
+        };
+        assert_eq!(result.imported_ssh_identities, 0);
+        assert_eq!(result.reused_resources, 1);
+        assert_eq!(result.protected_files, 1);
+        assert!(std::fs::symlink_metadata(&ssh_path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let snapshot = catalog.snapshot().unwrap();
+        assert_eq!(snapshot.resources.len(), 1);
+        assert_eq!(snapshot.projects.len(), 1);
+        assert_eq!(
+            snapshot.resources[0].origin.sources[0].project_id.as_deref(),
+            Some(snapshot.projects[0].id.as_str())
+        );
     }
 
     #[test]

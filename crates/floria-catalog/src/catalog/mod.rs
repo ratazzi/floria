@@ -1232,7 +1232,13 @@ mod tests {
         };
 
         catalog.append_resource_origin("fixture-secret", &source).unwrap();
-        catalog.append_resource_origin("fixture-secret", &source).unwrap();
+        let refreshed = OriginSource {
+            project_id: Some("floria-renamed".to_string()),
+            environment: Some("staging".to_string()),
+            imported_at: "2026-07-25T00:00:00Z".to_string(),
+            ..source.clone()
+        };
+        catalog.append_resource_origin("fixture-secret", &refreshed).unwrap();
         let other = OriginSource {
             path: PathBuf::from("/workspace/floria/.env.production"),
             ..source.clone()
@@ -1244,6 +1250,9 @@ mod tests {
             snapshot.resources.iter().find(|resource| resource.id == "fixture-secret").unwrap();
         assert_eq!(resource.origin.sources.len(), 2);
         assert_eq!(resource.origin.sources[0].path, Path::new("/workspace/floria/.env"));
+        assert_eq!(resource.origin.sources[0].project_id.as_deref(), Some("floria-renamed"));
+        assert_eq!(resource.origin.sources[0].environment.as_deref(), Some("staging"));
+        assert_eq!(resource.origin.sources[0].imported_at, "2026-07-25T00:00:00Z");
         assert!(catalog
             .append_resource_origin("missing", &source)
             .is_err());

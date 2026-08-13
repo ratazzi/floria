@@ -20,7 +20,8 @@ impl SecurityDefaults {
             .unwrap_or_default()
             .to_ascii_lowercase();
 
-        if file_name == ".pgpass"
+        if Self::production_environment([file_name.as_str()])
+            || file_name == ".pgpass"
             || (parent_name == ".aws" && file_name == "credentials")
             || (parent_name == ".kube" && file_name == "config")
             || matches!(
@@ -40,6 +41,7 @@ impl SecurityDefaults {
     pub(super) fn discovered_file(
         kind: DiscoveredFileKind,
         path: &Path,
+        environment: Option<&str>,
     ) -> Enforcement {
         let semantic = match kind {
             DiscoveredFileKind::SshPrivateKey => Enforcement::TouchId,
@@ -53,11 +55,18 @@ impl SecurityDefaults {
             | DiscoveredFileKind::PublicKey
             | DiscoveredFileKind::ProtectedFile => Enforcement::Allow,
         };
-        Self::strictest([semantic, Self::managed_file(path)])
+        Self::strictest([
+            semantic,
+            Self::managed_file(path),
+            Self::environment(environment),
+        ])
     }
 
-    pub(super) fn discovered_resource(kind: DiscoveredFileKind) -> Enforcement {
-        match kind {
+    pub(super) fn discovered_resource(
+        kind: DiscoveredFileKind,
+        environment: Option<&str>,
+    ) -> Enforcement {
+        let semantic = match kind {
             DiscoveredFileKind::SshPrivateKey => Enforcement::TouchId,
             DiscoveredFileKind::AwsCredentials
             | DiscoveredFileKind::Pgpass
@@ -68,13 +77,37 @@ impl SecurityDefaults {
             | DiscoveredFileKind::Certificate
             | DiscoveredFileKind::PublicKey
             | DiscoveredFileKind::ProtectedFile => Enforcement::Allow,
-        }
+        };
+        Self::strictest([semantic, Self::environment(environment)])
     }
 
     pub(super) fn composed_surface(
         members: impl IntoIterator<Item = Enforcement>,
+        environment: Option<&str>,
     ) -> Enforcement {
-        Self::strictest(members)
+        Self::strictest(
+            members
+                .into_iter()
+                .chain(std::iter::once(Self::environment(environment))),
+        )
+    }
+
+    fn environment(environment: Option<&str>) -> Enforcement {
+        if Self::production_environment(environment) {
+            Enforcement::Prompt
+        } else {
+            Enforcement::Allow
+        }
+    }
+
+    fn production_environment<'a>(parts: impl IntoIterator<Item = &'a str>) -> bool {
+        parts.into_iter().any(|part| {
+            part.split(|character: char| !character.is_ascii_alphanumeric())
+                .any(|word| {
+                    word.eq_ignore_ascii_case("production")
+                        || word.eq_ignore_ascii_case("prod")
+                })
+        })
     }
 
     fn strictest(levels: impl IntoIterator<Item = Enforcement>) -> Enforcement {
@@ -124,15 +157,45 @@ mod tests {
     }
 
     #[test]
+    fn discovered_production_files_start_with_confirmation() {
+        assert_eq!(
+            SecurityDefaults::discovered_file(
+                DiscoveredFileKind::Dotenv,
+                Path::new("/workspace/project/.env.production"),
+                Some("production"),
+            ),
+            Enforcement::Prompt
+        );
+        assert_eq!(
+            SecurityDefaults::discovered_resource(
+                DiscoveredFileKind::Dotenv,
+                Some("Production")
+            ),
+            Enforcement::Prompt
+        );
+        assert_eq!(
+            SecurityDefaults::discovered_resource(
+                DiscoveredFileKind::Dotenv,
+                Some("development")
+            ),
+            Enforcement::Allow
+        );
+    }
+
+    #[test]
     fn discovered_ssh_identity_starts_with_touch_id() {
         assert_eq!(
-            SecurityDefaults::discovered_resource(DiscoveredFileKind::SshPrivateKey),
+            SecurityDefaults::discovered_resource(
+                DiscoveredFileKind::SshPrivateKey,
+                None
+            ),
             Enforcement::TouchId
         );
         assert_eq!(
             SecurityDefaults::discovered_file(
                 DiscoveredFileKind::SshPrivateKey,
-                Path::new("/Users/example/.ssh/deploy")
+                Path::new("/Users/example/.ssh/deploy"),
+                None,
             ),
             Enforcement::TouchId
         );
@@ -141,16 +204,19 @@ mod tests {
     #[test]
     fn composed_surface_uses_its_strictest_member() {
         assert_eq!(
-            SecurityDefaults::composed_surface([
-                Enforcement::Allow,
-                Enforcement::TouchId,
-                Enforcement::Prompt,
-            ]),
+            SecurityDefaults::composed_surface(
+                [Enforcement::Allow, Enforcement::TouchId, Enforcement::Prompt],
+                None,
+            ),
             Enforcement::TouchId
         );
         assert_eq!(
-            SecurityDefaults::composed_surface(std::iter::empty()),
+            SecurityDefaults::composed_surface(std::iter::empty(), None),
             Enforcement::Allow
+        );
+        assert_eq!(
+            SecurityDefaults::composed_surface([Enforcement::Allow], Some("production")),
+            Enforcement::Prompt
         );
     }
 }

@@ -2785,7 +2785,9 @@ private struct DiscoveryReviewSheet: View {
                             .project($0)
                         } ?? .library(protectOriginal: true)
                     case .importSshIdentity:
-                        destination = .library(protectOriginal: false)
+                        destination = file.assignment.projectPath.map {
+                            .project($0)
+                        } ?? .library(protectOriginal: true)
                     case .reference, .review:
                         destination = nil
                     }
@@ -3192,16 +3194,22 @@ private struct DiscoveryReviewSheet: View {
                     sourceDisposition: .protectInPlace)
             }
         case .importSshIdentity:
-            let protectOriginal =
-                if case .library(let protectOriginal) = destinations[file.path] {
-                    protectOriginal
-                } else {
-                    false
-                }
-            return DiscoveryImport(
-                path: file.path,
-                destination: .library,
-                sourceDisposition: protectOriginal ? .protectInPlace : .leaveUnchanged)
+            switch destinations[file.path] {
+            case .project(let projectPath):
+                return DiscoveryImport(
+                    path: file.path,
+                    destination: .projectFile(
+                        projectPath: projectPath,
+                        projectID: selectedProjectID(for: projectPath)),
+                    sourceDisposition: .protectInPlace)
+            case .library(let protectOriginal):
+                return DiscoveryImport(
+                    path: file.path,
+                    destination: .library,
+                    sourceDisposition: protectOriginal ? .protectInPlace : .leaveUnchanged)
+            case nil:
+                return nil
+            }
         case .compose:
             guard let destination = destinations[file.path] else { return nil }
             switch destination {
