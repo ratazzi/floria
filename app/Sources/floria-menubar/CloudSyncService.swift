@@ -126,6 +126,7 @@ actor CloudSyncService {
     private var lifecycleLoader: (any CloudVaultLifecycleLoading)?
     private var enrollmentPublisher: (any CloudVaultEnrollmentPublishing)?
     private var pendingRestartVaultID: String?
+    private var syncTask: (id: UUID, task: Task<CloudSyncOutcome, Error>)?
 
     init(
         control: any CloudSyncControlling,
@@ -215,6 +216,8 @@ actor CloudSyncService {
     func setEnabled(_ enabled: Bool) {
         preferences.setEnabled(enabled)
         if !enabled {
+            syncTask?.task.cancel()
+            syncTask = nil
             session = nil
             sessionVaultID = nil
             discovery = nil
@@ -411,6 +414,21 @@ actor CloudSyncService {
 
     @discardableResult
     func syncNow() async throws -> CloudSyncOutcome {
+        if let syncTask {
+            return try await syncTask.task.value
+        }
+        let id = UUID()
+        let task = Task { try await self.performSyncNow() }
+        syncTask = (id, task)
+        defer {
+            if syncTask?.id == id {
+                syncTask = nil
+            }
+        }
+        return try await task.value
+    }
+
+    private func performSyncNow() async throws -> CloudSyncOutcome {
         guard preferences.isEnabled else { throw CloudSyncServiceError.disabled }
         try requireCloudKit()
         let before = try await control.recordSyncStatus()
@@ -432,6 +450,7 @@ actor CloudSyncService {
         var appliedRemoteChanges = false
         var authenticatedBootstrap: SyncVaultBootstrap?
         for _ in 0..<Self.maximumManualSyncPasses {
+            try Task.checkCancellation()
             do {
                 let outcome = try await activeSession.syncNow()
                 appliedRemoteChanges = appliedRemoteChanges || outcome.appliedRemoteChanges
@@ -449,6 +468,7 @@ actor CloudSyncService {
             after = try await control.recordSyncStatus()
             guard after.outboundTransactions > 0 else { break }
         }
+        try Task.checkCancellation()
         preferences.setLastSuccessfulSyncAt(now())
         if preferences.pendingVaultID == after.vaultID {
             preferences.setPendingVaultID(nil)

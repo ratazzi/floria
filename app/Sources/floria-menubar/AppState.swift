@@ -94,10 +94,12 @@ final class AppState {
     @ObservationIgnored private var client: AgentClient!
     @ObservationIgnored private let controlClient: ControlClient
     @ObservationIgnored let cloudSyncService: CloudSyncService
+    @ObservationIgnored private var automaticCloudSyncCoordinator: AutomaticCloudSyncCoordinator?
     @ObservationIgnored private var policyRefreshTask: Task<Void, Never>?
     @ObservationIgnored private var healthRefreshTask: Task<Void, Never>?
     @ObservationIgnored private var checkoutRefreshTask: Task<Void, Never>?
     @ObservationIgnored private let prompter = PromptPresenter()
+    @ObservationIgnored private let enrollmentPresenter = DeviceEnrollmentPresenter()
     @ObservationIgnored private let daemonManager = DaemonManager()
     @ObservationIgnored private var accessHistoryLoaded = false
     @ObservationIgnored private var macFuseProbeTask: Task<Void, Never>?
@@ -118,6 +120,7 @@ final class AppState {
             control: controlClient,
             supportDirectory: URL(fileURLWithPath: supportDirectory, isDirectory: true))
         workspace = WorkspaceStore(controlClient: controlClient)
+        automaticCloudSyncCoordinator = nil
 
         client = AgentClient(socketPath: sock)
         client.onStateChange = { [weak self] up in
@@ -161,6 +164,29 @@ final class AppState {
         }
 
         client.start()
+        let coordinator = AutomaticCloudSyncCoordinator(
+            service: cloudSyncService,
+            restartDaemon: { [weak self] in
+                await self?.restartDaemonForCloudSync()
+            })
+        coordinator.onRemoteChangesApplied = { [weak self] in
+            guard let self else { return }
+            await self.workspace.reload()
+            await self.workspace.refreshProjectCheckoutDiscoveries()
+        }
+        coordinator.onEnrollmentReview = { [weak self, weak coordinator] review in
+            guard let self, let coordinator else { return }
+            self.enrollmentPresenter.show(review) { review in
+                try await coordinator.approve(review)
+                await self.workspace.reload()
+                await self.workspace.refreshProjectCheckoutDiscoveries()
+            }
+        }
+        coordinator.onEnrollmentReviewsChanged = { [weak self] reviews in
+            self?.enrollmentPresenter.reconcile(reviews)
+        }
+        automaticCloudSyncCoordinator = coordinator
+        coordinator.start()
         Task {
             await refreshDaemonState()
         }

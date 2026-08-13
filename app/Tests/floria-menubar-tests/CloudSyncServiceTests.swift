@@ -110,6 +110,30 @@ final class CloudSyncServiceTests: XCTestCase {
         XCTAssertEqual(statusCount, 3)
     }
 
+    func testConcurrentManualAndAutomaticSyncShareOneTransportRun() async throws {
+        let suiteName = "floria-cloud-sync-tests-\(UUID().uuidString)"
+        let preferences = CloudSyncPreferences(suiteName: suiteName)
+        preferences.setEnabled(true)
+        let control = CloudSyncControlStub(status: status())
+        let session = CloudSyncSessionStub(delayNanoseconds: 20_000_000)
+        let service = CloudSyncService(
+            control: control,
+            supportDirectory: FileManager.default.temporaryDirectory,
+            preferences: preferences,
+            sessionFactory: { _, _, _ in session })
+        defer { UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName) }
+
+        async let manual = service.syncNow()
+        async let automatic = service.syncNow()
+        let outcomes = try await [manual, automatic]
+        let sessionCount = await session.count()
+        let statusCount = await control.observedStatusCount()
+
+        XCTAssertEqual(outcomes[0], outcomes[1])
+        XCTAssertEqual(sessionCount, 1)
+        XCTAssertEqual(statusCount, 2)
+    }
+
     func testSuccessfulSyncReturnsTheSessionAuthenticatedBootstrap() async throws {
         let suiteName = "floria-cloud-sync-tests-\(UUID().uuidString)"
         let preferences = CloudSyncPreferences(suiteName: suiteName)
@@ -567,24 +591,32 @@ private actor CloudSyncSessionStub: CloudSyncSessionRunning {
     private let failure: CloudRecordSyncSessionError?
     private let appliedRemoteChanges: Bool
     private let authenticatedBootstrap: SyncVaultBootstrap?
+    private let delayNanoseconds: UInt64
 
     init(
         failure: CloudRecordSyncSessionError? = nil,
         appliedRemoteChanges: Bool = false,
-        authenticatedBootstrap: SyncVaultBootstrap? = nil
+        authenticatedBootstrap: SyncVaultBootstrap? = nil,
+        delayNanoseconds: UInt64 = 0
     ) {
         self.failure = failure
         self.appliedRemoteChanges = appliedRemoteChanges
         self.authenticatedBootstrap = authenticatedBootstrap
+        self.delayNanoseconds = delayNanoseconds
     }
 
     func syncNow() async throws -> CloudSyncSessionOutcome {
         syncCount += 1
+        if delayNanoseconds > 0 {
+            try await Task.sleep(nanoseconds: delayNanoseconds)
+        }
         if let failure { throw failure }
         return CloudSyncSessionOutcome(
             appliedRemoteChanges: appliedRemoteChanges,
             authenticatedBootstrap: authenticatedBootstrap)
     }
+
+    func count() -> Int { syncCount }
 }
 
 private final class CloudSyncSequenceFactory: @unchecked Sendable {
@@ -648,6 +680,8 @@ private actor CloudSyncControlStub: CloudSyncControlling {
     func setStatus(_ status: SyncDomainStatus) {
         self.status = status
     }
+
+    func observedStatusCount() -> Int { statusCount }
 
     func recordSyncStatus() async throws -> SyncDomainStatus {
         statusCount += 1

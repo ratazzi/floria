@@ -9,6 +9,7 @@ final class DockVisibilityController {
     private weak var dashboardWindow: NSWindow?
     private var closeObserver: NSObjectProtocol?
     private var authorizationPromptVisible = false
+    private var backgroundAttentionWindowCount = 0
 
     init(
         setActivationPolicy: @escaping @MainActor (NSApplication.ActivationPolicy) -> Void = {
@@ -56,6 +57,16 @@ final class DockVisibilityController {
         updateActivationPolicy()
     }
 
+    func backgroundAttentionWindowDidOpen() {
+        backgroundAttentionWindowCount += 1
+        updateActivationPolicy()
+    }
+
+    func backgroundAttentionWindowDidClose() {
+        backgroundAttentionWindowCount = max(0, backgroundAttentionWindowCount - 1)
+        updateActivationPolicy()
+    }
+
     private func dashboardWindowWillClose(_ window: NSWindow) {
         guard dashboardWindow === window else { return }
         dashboardDidClose()
@@ -68,7 +79,10 @@ final class DockVisibilityController {
     }
 
     private func updateActivationPolicy() {
-        setActivationPolicy(dashboardWindow != nil || authorizationPromptVisible ? .regular : .accessory)
+        setActivationPolicy(
+            dashboardWindow != nil || authorizationPromptVisible
+                || backgroundAttentionWindowCount > 0
+                ? .regular : .accessory)
     }
 }
 

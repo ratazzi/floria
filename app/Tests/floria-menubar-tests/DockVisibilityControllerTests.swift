@@ -25,4 +25,15 @@ final class DockVisibilityControllerTests: XCTestCase {
 
         XCTAssertEqual(policies, [.regular, .regular, .accessory])
     }
+
+    func testBackgroundAttentionWindowKeepsDockReachable() {
+        var policies: [NSApplication.ActivationPolicy] = []
+        let controller = DockVisibilityController { policies.append($0) }
+
+        controller.backgroundAttentionWindowDidOpen()
+        controller.dashboardDidClose()
+        controller.backgroundAttentionWindowDidClose()
+
+        XCTAssertEqual(policies, [.regular, .regular, .accessory])
+    }
 }

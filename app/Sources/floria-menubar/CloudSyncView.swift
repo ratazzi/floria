@@ -210,9 +210,8 @@ final class CloudSyncViewModel {
         }
     }
 
-    /// Keep the access-request list current while the user is looking at Sync. This deliberately
-    /// refreshes only authenticated Vault lifecycle data; it does not upload or apply Library
-    /// contents. Closing the Sync window cancels the view task and stops all checks.
+    /// Keep this view's access-request list current in addition to the app-wide automatic sync
+    /// coordinator. This is presentation refresh only; the coordinator owns background work.
     func watchEnrollmentRequests() async {
         while !Task.isCancelled {
             await refreshEnrollmentRequests()
@@ -670,7 +669,7 @@ struct SyncView: View {
             }
             Divider()
             HStack {
-                Text("Floria checks iCloud while this Sync window is open.")
+                Text("Floria syncs automatically while the app is running.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -826,7 +825,9 @@ struct SyncView: View {
         if !model.isAvailable {
             return "Requires a CloudKit-enabled signed build."
         }
-        return model.isEnabled ? "Manual sync is ready." : "Off by default. Nothing is uploaded."
+        return model.isEnabled
+            ? "Automatic sync is on. Sync Now remains available when you need it."
+            : "Off by default. Nothing is uploaded."
     }
 
     private var currentLibrarySection: some View {
