@@ -23,11 +23,31 @@ extension CloudRecordSyncSession: CloudSyncSessionRunning {}
 
 struct CloudSyncSessionOutcome: Equatable, Sendable {
     let appliedRemoteChanges: Bool
+    let authenticatedBootstrap: SyncVaultBootstrap?
+
+    init(
+        appliedRemoteChanges: Bool,
+        authenticatedBootstrap: SyncVaultBootstrap? = nil
+    ) {
+        self.appliedRemoteChanges = appliedRemoteChanges
+        self.authenticatedBootstrap = authenticatedBootstrap
+    }
 }
 
 struct CloudSyncOutcome: Equatable, Sendable {
     let status: SyncDomainStatus
     let appliedRemoteChanges: Bool
+    let authenticatedBootstrap: SyncVaultBootstrap?
+
+    init(
+        status: SyncDomainStatus,
+        appliedRemoteChanges: Bool,
+        authenticatedBootstrap: SyncVaultBootstrap? = nil
+    ) {
+        self.status = status
+        self.appliedRemoteChanges = appliedRemoteChanges
+        self.authenticatedBootstrap = authenticatedBootstrap
+    }
 }
 
 struct CloudSyncPreferences: Sendable {
@@ -410,10 +430,12 @@ actor CloudSyncService {
         }
         var after = before
         var appliedRemoteChanges = false
+        var authenticatedBootstrap: SyncVaultBootstrap?
         for _ in 0..<Self.maximumManualSyncPasses {
             do {
                 let outcome = try await activeSession.syncNow()
                 appliedRemoteChanges = appliedRemoteChanges || outcome.appliedRemoteChanges
+                authenticatedBootstrap = outcome.authenticatedBootstrap ?? authenticatedBootstrap
             } catch {
                 // A failed CKSyncEngine session may have advanced only in-memory tokens or retained
                 // a terminal account-change failure. The durable checkpoint and Rust outbox are the
@@ -433,7 +455,8 @@ actor CloudSyncService {
         }
         return CloudSyncOutcome(
             status: after,
-            appliedRemoteChanges: appliedRemoteChanges)
+            appliedRemoteChanges: appliedRemoteChanges,
+            authenticatedBootstrap: authenticatedBootstrap)
     }
 
     private static func timestamp() -> String {

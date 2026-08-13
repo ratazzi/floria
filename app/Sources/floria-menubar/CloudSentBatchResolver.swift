@@ -37,6 +37,7 @@ struct CloudSentBatchResolver {
 
         var acceptedHeads = [String: CKRecord]()
         var hasRetry = false
+        var objectCollisionsNeedingFetch = Set<CKRecord.ID>()
         var conflictingEntities = try atomicCommitHeadConflicts(
             phase: phase, failures: failures)
 
@@ -71,6 +72,10 @@ struct CloudSentBatchResolver {
                         return .damaged(
                             "CloudKit lifecycle record \(recordID.recordName) changed unexpectedly")
                     }
+                    continue
+                }
+                if objectCollisionNeedsFetch(client: client, server: server) {
+                    objectCollisionsNeedingFetch.insert(recordID)
                     continue
                 }
                 switch try CloudRecordCollisionResolver(codec: codec).classify(
@@ -112,6 +117,12 @@ struct CloudSentBatchResolver {
                 commitID: commitID,
                 entityIDs: conflictingEntities.sorted())
         }
+        if !objectCollisionsNeedingFetch.isEmpty {
+            return .fetchObjectCollisions(
+                objectCollisionsNeedingFetch.sorted {
+                    $0.recordName < $1.recordName
+                })
+        }
         if hasRetry { return .retry }
 
         switch phase {
@@ -152,6 +163,20 @@ struct CloudSentBatchResolver {
         else { return false }
         return try bootstrapCodec.equivalent(client, server)
     }
+
+    /// `CKError.serverRecordChanged` may carry an object record without a local URL for its
+    /// `CKAsset`. That conflict envelope is not evidence that ciphertext is missing in iCloud;
+    /// an explicit fetch is required before exact-byte collision verification can run.
+    private func objectCollisionNeedsFetch(client: CKRecord, server: CKRecord) -> Bool {
+        guard client.recordID == server.recordID,
+              client.recordType == CloudRecordCodec.RecordType.object,
+              server.recordType == CloudRecordCodec.RecordType.object
+        else { return false }
+        guard let asset = server[CloudRecordCodec.Field.ciphertext] as? CKAsset else {
+            return true
+        }
+        return asset.fileURL == nil
+    }
 }
 
 enum CloudSendPhase {
@@ -190,6 +215,7 @@ enum CloudSentBatchResolution {
     case commitAccepted(commitID: String, heads: [String: CKRecord])
     case conflictBranchAccepted(commitID: String)
     case commitConflict(commitID: String, entityIDs: [String])
+    case fetchObjectCollisions([CKRecord.ID])
     case retry
     case damaged(String)
 }

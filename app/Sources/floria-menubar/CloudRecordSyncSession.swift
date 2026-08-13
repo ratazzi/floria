@@ -74,7 +74,9 @@ final class CloudRecordSyncSession: NSObject, CKSyncEngineDelegate, @unchecked S
             throw CloudRecordSyncSessionError.damaged(
                 "Vault lifecycle exceeds the CloudKit atomic record limit")
         }
-        try await send(.bootstrap(bootstrapRecords), through: engine)
+        if !bootstrapRecords.isEmpty {
+            try await send(.bootstrap(bootstrapRecords), through: engine)
+        }
         _ = try await bootstrapCoordinator.stageFetched(
             records: bootstrapRecords, deletedRecordIDs: [])
         if let accepted = try await bootstrapCoordinator.finishFetch() {
@@ -85,7 +87,9 @@ final class CloudRecordSyncSession: NSObject, CKSyncEngineDelegate, @unchecked S
         while true {
             switch try await coordinator.nextOutboundAction() {
             case .idle:
-                return await sessionState.manualSyncOutcome()
+                let authenticatedBootstrap = await bootstrapCoordinator.cachedBootstrap()
+                return await sessionState.manualSyncOutcome(
+                    authenticatedBootstrap: authenticatedBootstrap)
 
             case .saveConflictBranch(let commitID, _, let records):
                 try await send(
@@ -276,18 +280,38 @@ final class CloudRecordSyncSession: NSObject, CKSyncEngineDelegate, @unchecked S
             throw CloudRecordSyncSessionError.damaged(
                 "CloudKit returned a record batch that Floria did not send")
         }
-        let failures = changes.failedRecordSaves.map {
+        var failures = changes.failedRecordSaves.map {
             CloudRecordSaveFailure(
                 record: $0.record,
                 code: $0.error.code,
                 serverRecord: $0.error.serverRecord)
         }
-        let resolution = try CloudSentBatchResolver(
+        let resolver = CloudSentBatchResolver(
             codec: codec, bootstrapCodec: bootstrapCodec
-        ).resolve(
+        )
+        var resolution = try resolver.resolve(
             phase: phase,
             savedRecords: changes.savedRecords,
             failures: failures)
+
+        if case .fetchObjectCollisions(let recordIDs) = resolution {
+            let fetched = try await fetchRecords(recordIDs, kind: "object")
+            failures = failures.map { failure in
+                guard recordIDs.contains(failure.record.recordID) else { return failure }
+                return CloudRecordSaveFailure(
+                    record: failure.record,
+                    code: failure.code,
+                    serverRecord: fetched[failure.record.recordID])
+            }
+            resolution = try resolver.resolve(
+                phase: phase,
+                savedRecords: changes.savedRecords,
+                failures: failures)
+            if case .fetchObjectCollisions(let unresolved) = resolution {
+                throw CloudRecordSyncSessionError.damaged(
+                    "CloudKit fetched object \(unresolved[0].recordName) without ciphertext")
+            }
+        }
 
         switch resolution {
         case .bootstrapAccepted:
@@ -321,6 +345,10 @@ final class CloudRecordSyncSession: NSObject, CKSyncEngineDelegate, @unchecked S
             await coordinator.mergeHeads(fetchedHeads)
             await finish(phase, syncEngine: syncEngine)
 
+        case .fetchObjectCollisions:
+            throw CloudRecordSyncSessionError.damaged(
+                "CloudKit object collision verification did not finish")
+
         case .retry:
             await finish(phase, syncEngine: syncEngine)
             await sessionState.record(.retryPending)
@@ -338,23 +366,37 @@ final class CloudRecordSyncSession: NSObject, CKSyncEngineDelegate, @unchecked S
     }
 
     private func fetchHeads(_ recordIDs: [CKRecord.ID]) async throws {
-        let results = try await database.records(for: recordIDs)
+        let fetched = try await fetchRecords(recordIDs, kind: "head")
         var records = [CKRecord]()
         for recordID in recordIDs {
-            guard let result = results[recordID] else {
-                throw CloudRecordSyncSessionError.transport(
-                    "CloudKit omitted head \(recordID.recordName)")
-            }
-            switch result {
-            case .success(let record):
+            if let record = fetched[recordID] {
                 records.append(record)
-            case .failure(let error):
-                throw CloudRecordSyncSessionError.cloudKit(
-                    "Could not fetch head \(recordID.recordName): \(CloudSyncErrorPresentation.message(for: error))")
             }
         }
         _ = try await coordinator.applyInbound(
             records: records, deletedRecordIDs: [], observedAt: Self.timestamp())
+    }
+
+    private func fetchRecords(
+        _ recordIDs: [CKRecord.ID],
+        kind: String
+    ) async throws -> [CKRecord.ID: CKRecord] {
+        let results = try await database.records(for: recordIDs)
+        var fetched = [CKRecord.ID: CKRecord]()
+        for recordID in recordIDs {
+            guard let result = results[recordID] else {
+                throw CloudRecordSyncSessionError.transport(
+                    "CloudKit omitted \(kind) \(recordID.recordName)")
+            }
+            switch result {
+            case .success(let record):
+                fetched[recordID] = record
+            case .failure(let error):
+                throw CloudRecordSyncSessionError.cloudKit(
+                    "Could not fetch \(kind) \(recordID.recordName): \(CloudSyncErrorPresentation.message(for: error))")
+            }
+        }
+        return fetched
     }
 
     private func validateDatabaseChanges(
@@ -538,8 +580,12 @@ actor CloudRecordSyncSessionState {
         }
     }
 
-    func manualSyncOutcome() -> CloudSyncSessionOutcome {
-        CloudSyncSessionOutcome(appliedRemoteChanges: appliedRemoteChanges)
+    func manualSyncOutcome(
+        authenticatedBootstrap: SyncVaultBootstrap? = nil
+    ) -> CloudSyncSessionOutcome {
+        CloudSyncSessionOutcome(
+            appliedRemoteChanges: appliedRemoteChanges,
+            authenticatedBootstrap: authenticatedBootstrap)
     }
 }
 

@@ -1,4 +1,5 @@
 import CloudKit
+import CryptoKit
 import Foundation
 import XCTest
 
@@ -148,6 +149,49 @@ final class CloudSentBatchResolverTests: XCTestCase {
         XCTAssertTrue(message.contains(client.recordID.recordName))
     }
 
+    func testObjectCollisionWithoutDownloadedAssetRequestsExplicitFetch() throws {
+        let object = try objectFixture()
+        defer { try? FileManager.default.removeItem(atPath: object.file) }
+        let client = try codec.objectRecord(object)
+        let partialServer = CKRecord(
+            recordType: CloudRecordCodec.RecordType.object,
+            recordID: client.recordID)
+        partialServer[CloudRecordCodec.Field.schemaVersion] = NSNumber(
+            value: CloudRecordCodec.schemaVersion)
+        partialServer[CloudRecordCodec.Field.digest] = object.digest as NSString
+        partialServer[CloudRecordCodec.Field.ciphertextSize] = NSNumber(
+            value: Int64(object.ciphertextSize))
+
+        let needsFetch = try resolver.resolve(
+            phase: .objects([client]),
+            savedRecords: [],
+            failures: [
+                CloudRecordSaveFailure(
+                    record: client,
+                    code: .serverRecordChanged,
+                    serverRecord: partialServer)
+            ])
+        guard case .fetchObjectCollisions(let recordIDs) = needsFetch else {
+            return XCTFail("Expected an explicit object fetch")
+        }
+        XCTAssertEqual(recordIDs, [client.recordID])
+
+        let fetchedServer = try codec.objectRecord(object)
+        let verified = try resolver.resolve(
+            phase: .objects([client]),
+            savedRecords: [],
+            failures: [
+                CloudRecordSaveFailure(
+                    record: client,
+                    code: .serverRecordChanged,
+                    serverRecord: fetchedServer)
+            ])
+        guard case .objectsVerified(let records) = verified else {
+            return XCTFail("Expected fetched ciphertext to verify the prior upload")
+        }
+        XCTAssertEqual(records.map(\.recordID), [client.recordID])
+    }
+
     func testBootstrapCollisionIsAcceptedOnlyWhenLifecycleBytesMatch() throws {
         let bootstrapCodec = try CloudVaultBootstrapCodec(vaultID: codec.vaultID)
         let client = try XCTUnwrap(
@@ -231,6 +275,18 @@ final class CloudSentBatchResolverTests: XCTestCase {
         record[CloudRecordCodec.Field.entityID] = entityID as NSString
         record[CloudRecordCodec.Field.revisionID] = revisionID as NSString
         return record
+    }
+
+    private func objectFixture() throws -> SyncObjectAsset {
+        let bytes = Data("encrypted object bytes".utf8)
+        let digest = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "floria-sent-object-\(UUID().uuidString).age")
+        try bytes.write(to: file)
+        return SyncObjectAsset(
+            digest: digest,
+            ciphertextSize: UInt64(bytes.count),
+            file: file.path)
     }
 
     private func bootstrap() -> SyncVaultBootstrap {

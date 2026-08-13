@@ -95,6 +95,51 @@ final class CloudVaultBootstrapCoordinatorTests: XCTestCase {
         XCTAssertEqual(captureCount, 1)
     }
 
+    func testOutboundRecordsContainOnlyAppendOnlyDeltaFromAcceptedBootstrap() async throws {
+        let accepted = fixtureBootstrap()
+        let request = SyncBootstrapDocument(
+            route: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            documentBase64: encoded("enrollment request"))
+        let updated = SyncVaultBootstrap(
+            vaultID: accepted.vaultID,
+            vaultDocumentBase64: accepted.vaultDocumentBase64,
+            deviceIdentities: accepted.deviceIdentities,
+            enrollmentRequests: [request],
+            keyGenerations: accepted.keyGenerations,
+            generationEnvelopes: accepted.generationEnvelopes)
+        let control = VaultBootstrapControlStub(bootstrap: updated)
+        let coordinator = try CloudVaultBootstrapCoordinator(
+            control: control, vaultID: vaultID, restoredBootstrap: accepted)
+
+        let records = try await coordinator.outboundRecords()
+
+        XCTAssertEqual(records.count, 1)
+        XCTAssertEqual(
+            records.first?.recordType,
+            CloudVaultBootstrapCodec.RecordType.enrollmentRequest)
+    }
+
+    func testOutboundRecordsRejectChangedAcceptedLifecycleBytes() async throws {
+        let accepted = fixtureBootstrap()
+        let changed = SyncVaultBootstrap(
+            vaultID: accepted.vaultID,
+            vaultDocumentBase64: encoded("different signed Vault"),
+            deviceIdentities: accepted.deviceIdentities,
+            enrollmentRequests: accepted.enrollmentRequests,
+            keyGenerations: accepted.keyGenerations,
+            generationEnvelopes: accepted.generationEnvelopes)
+        let control = VaultBootstrapControlStub(bootstrap: changed)
+        let coordinator = try CloudVaultBootstrapCoordinator(
+            control: control, vaultID: vaultID, restoredBootstrap: accepted)
+
+        do {
+            _ = try await coordinator.outboundRecords()
+            XCTFail("Expected changed immutable lifecycle history")
+        } catch let error as CloudVaultBootstrapCoordinatorError {
+            XCTAssertEqual(error, .lifecycleRecordChanged("vault-root"))
+        }
+    }
+
     func testRemoteNewerGenerationIsActivatedBeforeEntityImport() async throws {
         let local = fixtureBootstrap()
         let remote = SyncVaultBootstrap(

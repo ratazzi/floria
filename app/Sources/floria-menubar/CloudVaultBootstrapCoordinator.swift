@@ -74,10 +74,34 @@ actor CloudVaultBootstrapCoordinator {
         acceptedBootstrap = restoredBootstrap
     }
 
-    /// Capture the local authenticated snapshot immediately before an explicit upload.
+    /// Capture the local authenticated snapshot immediately before an explicit upload, then
+    /// publish only records that are not already part of the accepted immutable history.
+    ///
+    /// CloudKit rejects a create-only record that already exists. Mixing that collision with a
+    /// new device/envelope in one atomic batch rolls back the new records as `batchRequestFailed`.
+    /// The accepted bootstrap is therefore also the authenticated publication checkpoint: shared
+    /// records must still match byte-for-byte, while only the append-only delta is sent.
     func outboundRecords() async throws -> [CKRecord] {
         let bootstrap = try await control.recordSyncVaultBootstrap()
-        return try codec.records(for: bootstrap)
+        let localRecords = try codec.records(for: bootstrap)
+        guard let acceptedBootstrap else { return localRecords }
+
+        let acceptedRecords = Dictionary(
+            uniqueKeysWithValues: try codec.records(for: acceptedBootstrap).map {
+                ($0.recordID, $0)
+            })
+        var additions = [CKRecord]()
+        for record in localRecords {
+            guard let accepted = acceptedRecords[record.recordID] else {
+                additions.append(record)
+                continue
+            }
+            guard try codec.equivalent(record, accepted) else {
+                throw CloudVaultBootstrapCoordinatorError.lifecycleRecordChanged(
+                    record.recordID.recordName)
+            }
+        }
+        return additions
     }
 
     /// Keep lifecycle records out of the ordinary entity decoder. Per-record outer validation is

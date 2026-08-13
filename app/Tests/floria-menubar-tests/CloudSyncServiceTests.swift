@@ -110,6 +110,31 @@ final class CloudSyncServiceTests: XCTestCase {
         XCTAssertEqual(statusCount, 3)
     }
 
+    func testSuccessfulSyncReturnsTheSessionAuthenticatedBootstrap() async throws {
+        let suiteName = "floria-cloud-sync-tests-\(UUID().uuidString)"
+        let preferences = CloudSyncPreferences(suiteName: suiteName)
+        preferences.setEnabled(true)
+        let localStatus = status()
+        let bootstrap = SyncVaultBootstrap(
+            vaultID: localStatus.vaultID,
+            vaultDocumentBase64: "dmF1bHQ=",
+            deviceIdentities: [],
+            enrollmentRequests: [],
+            keyGenerations: [],
+            generationEnvelopes: [])
+        let session = CloudSyncSessionStub(authenticatedBootstrap: bootstrap)
+        let service = CloudSyncService(
+            control: CloudSyncControlStub(status: localStatus),
+            supportDirectory: FileManager.default.temporaryDirectory,
+            preferences: preferences,
+            sessionFactory: { _, _, _ in session })
+        defer { UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName) }
+
+        let result = try await service.syncNow()
+
+        XCTAssertEqual(result.authenticatedBootstrap, bootstrap)
+    }
+
     func testDisabledSyncNowDoesNotTouchRustOrCloudKit() async throws {
         let suiteName = "floria-cloud-sync-tests-\(UUID().uuidString)"
         let control = CloudSyncControlStub(status: status())
@@ -541,19 +566,24 @@ private actor CloudSyncSessionStub: CloudSyncSessionRunning {
     private(set) var syncCount = 0
     private let failure: CloudRecordSyncSessionError?
     private let appliedRemoteChanges: Bool
+    private let authenticatedBootstrap: SyncVaultBootstrap?
 
     init(
         failure: CloudRecordSyncSessionError? = nil,
-        appliedRemoteChanges: Bool = false
+        appliedRemoteChanges: Bool = false,
+        authenticatedBootstrap: SyncVaultBootstrap? = nil
     ) {
         self.failure = failure
         self.appliedRemoteChanges = appliedRemoteChanges
+        self.authenticatedBootstrap = authenticatedBootstrap
     }
 
     func syncNow() async throws -> CloudSyncSessionOutcome {
         syncCount += 1
         if let failure { throw failure }
-        return CloudSyncSessionOutcome(appliedRemoteChanges: appliedRemoteChanges)
+        return CloudSyncSessionOutcome(
+            appliedRemoteChanges: appliedRemoteChanges,
+            authenticatedBootstrap: authenticatedBootstrap)
     }
 }
 
