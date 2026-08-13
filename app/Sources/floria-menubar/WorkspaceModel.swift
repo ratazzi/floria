@@ -854,8 +854,12 @@ final class WorkspaceStore {
             _ = try await controlClient.checkCompatibility()
             async let catalog = controlClient.snapshot()
             async let files = controlClient.protectedFiles()
-            apply(try await catalog)
-            protectedFiles = protectedFileModels(try await files)
+            let (nextCatalog, nextFiles) = try await (catalog, files)
+            // A project snapshot is composed from both catalog items and opaque protected files.
+            // Publishing either half early leaves a misleading partial Library when daemon startup
+            // is still waiting on Keychain or the control socket. Commit both halves together.
+            apply(nextCatalog)
+            protectedFiles = protectedFileModels(nextFiles)
             lastError = nil
         } catch {
             let compatibilityFailure =

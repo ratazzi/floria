@@ -46,6 +46,18 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertTrue(setup.contains("No recoveryOS or System Settings action is needed"))
     }
 
+    func testMountReadinessRefreshesOneAtomicWorkspaceSnapshot() throws {
+        let state = try source("AppState.swift")
+        let workspace = try source("WorkspaceModel.swift")
+
+        XCTAssertTrue(state.contains("observed the live Floria mount"))
+        XCTAssertTrue(state.contains("await self.refreshDaemonState()"))
+        XCTAssertTrue(workspace.contains("let (nextCatalog, nextFiles) = try await (catalog, files)"))
+        XCTAssertTrue(workspace.contains("apply(nextCatalog)"))
+        XCTAssertTrue(workspace.contains("protectedFiles = protectedFileModels(nextFiles)"))
+        XCTAssertFalse(workspace.contains("apply(try await catalog)"))
+    }
+
     func testDashboardOffersSafeBackupActionsWithoutDataReplacement() throws {
         let source = try source("CompactDashboardView.swift")
 

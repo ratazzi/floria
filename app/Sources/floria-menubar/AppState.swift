@@ -126,12 +126,7 @@ final class AppState {
                 self.connected = up
                 if up {
                     Task {
-                        await self.workspace.reload()
-                        await self.workspace.refreshProjectCheckoutDiscoveries()
-                        await self.reloadSystemHealth()
-                        await self.reloadPolicyMode()
-                        await self.reloadActiveGrants()
-                        await self.loadAccessHistoryIfNeeded()
+                        await self.refreshDaemonState()
                     }
                 } else {
                     self.systemHealth = nil
@@ -167,12 +162,7 @@ final class AppState {
 
         client.start()
         Task {
-            await workspace.reload()
-            await workspace.refreshProjectCheckoutDiscoveries()
-            await reloadSystemHealth()
-            await reloadPolicyMode()
-            await reloadActiveGrants()
-            await loadAccessHistoryIfNeeded()
+            await refreshDaemonState()
         }
         policyRefreshTask = Task { [weak self] in
             while !Task.isCancelled {
@@ -245,6 +235,11 @@ final class AppState {
                 {
                     Self.setupLog.notice("macFUSE setup probe observed the live Floria mount")
                     self.macFuseSetupStage = nil
+                    // The agent socket becomes available before the daemon finishes opening its
+                    // control socket and mounting macFUSE. Its earlier connection callback may
+                    // therefore have observed an empty Workspace. Mount readiness is the first
+                    // point where a successful snapshot is guaranteed, so refresh explicitly.
+                    await self.refreshDaemonState()
                     return
                 }
                 if self.connected && !floriaMounted && !loggedPremountConnection {
@@ -318,6 +313,15 @@ final class AppState {
             await probe?.value
             self?.macFuseRechecking = false
         }
+    }
+
+    private func refreshDaemonState() async {
+        await workspace.reload()
+        await workspace.refreshProjectCheckoutDiscoveries()
+        await reloadSystemHealth()
+        await reloadPolicyMode()
+        await reloadActiveGrants()
+        await loadAccessHistoryIfNeeded()
     }
 
     /// Finish a durable cross-Vault activation scheduled by Rust. The service blocks further
