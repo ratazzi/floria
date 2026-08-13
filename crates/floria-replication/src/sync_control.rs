@@ -473,7 +473,6 @@ impl<'a> RecordSyncControl<'a> {
         &self,
         bootstrap: SyncVaultBootstrap,
     ) -> ReplicationResult<Vec<SyncEnrollmentReview>> {
-        bootstrap.validate_for_vault(self.store.vault_document().vault_id.as_str())?;
         bootstrap.review_enrollments()
     }
 
@@ -482,7 +481,6 @@ impl<'a> RecordSyncControl<'a> {
         &self,
         bootstrap: SyncVaultBootstrap,
     ) -> ReplicationResult<Vec<SyncVaultDevice>> {
-        bootstrap.validate_for_vault(self.store.vault_document().vault_id.as_str())?;
         bootstrap.review_devices(self.store.device().device_id())
     }
 
@@ -1158,6 +1156,30 @@ mod tests {
             .is_err());
         assert_eq!(fixture.store.vault_document().vault_id, original_vault.vault_id);
         assert_eq!(fixture.store.current_generation().unwrap(), original_generation);
+    }
+
+    #[test]
+    fn foreign_vault_can_be_reviewed_without_activating_it() {
+        let current = Fixture::new();
+        let foreign = Fixture::new();
+        let current_vault = current.store.vault_document().vault_id;
+        let foreign_vault = foreign.store.vault_document().vault_id;
+        let bootstrap = foreign.control().vault_bootstrap().unwrap();
+
+        let devices = current
+            .control()
+            .review_vault_devices(bootstrap.clone())
+            .unwrap();
+        let enrollments = current
+            .control()
+            .review_vault_enrollments(bootstrap)
+            .unwrap();
+
+        assert_ne!(current_vault, foreign_vault);
+        assert_eq!(devices.len(), 1);
+        assert!(devices.iter().all(|device| !device.is_current()));
+        assert!(enrollments.is_empty());
+        assert_eq!(current.store.vault_document().vault_id, current_vault);
     }
 
     #[test]
