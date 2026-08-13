@@ -4491,6 +4491,11 @@
             b"export FIXTURE_VALUE='fixture-value'\n"
         );
 
+        // Simulate a development-era file record created before portable Project placements.
+        // A normal metadata edit must repair that declaration rather than leaving the file local
+        // to the Mac whose absolute source path happens to be stored in its origin.
+        store.update_placements(&secret_id, Vec::new()).unwrap();
+
         let listed = client.request(ControlCommand::ProtectedFiles).unwrap();
         let ControlResult::ProtectedFiles(files) = listed else {
             panic!("expected protected files result");
@@ -4524,6 +4529,17 @@
         assert_eq!(files[0].environment_ids, vec!["fixture-production"]);
         assert_eq!(files[0].enforcement, Enforcement::TouchId);
         assert_eq!(files[0].current_version, 1);
+        assert!(std::fs::symlink_metadata(worktree.join(".envrc")).is_err());
+        assert!(matches!(
+            store.record(&secret_id).unwrap().unwrap().placements.as_slice(),
+            [floria_store::ManagedPlacement::Project {
+                project_id,
+                relative_path,
+                environment_ids,
+            }] if project_id == "fixture-project"
+                && relative_path == Path::new(".envrc")
+                && environment_ids == &["fixture-production".to_string()]
+        ));
 
         let mut expected_file = file.clone();
         expected_file.metadata = file_metadata;

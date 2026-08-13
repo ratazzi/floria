@@ -985,6 +985,20 @@ pub(super) fn update_protected_file_metadata(
         protected_checkout_links(&snapshot, std::slice::from_ref(&record), mount_path);
     let mut updated_record = record.clone();
     updated_record.environment_ids = environment_ids.clone();
+    if updated_record.placements.is_empty() {
+        updated_record.placements = portable_file_placements(&snapshot, &source_path)?;
+    }
+    for placement in &mut updated_record.placements {
+        if let ManagedPlacement::Project {
+            environment_ids: placement_environment_ids,
+            ..
+        } = placement
+        {
+            *placement_environment_ids = environment_ids.clone().unwrap_or_default();
+        }
+    }
+    updated_record.placements.sort();
+    updated_record.placements.dedup();
     let next_links =
         protected_checkout_links(&snapshot, std::slice::from_ref(&updated_record), mount_path);
     remove_excluded_protected_checkout_links(&current_links, &next_links).map_err(|source| {
@@ -994,6 +1008,9 @@ pub(super) fn update_protected_file_metadata(
         }
     })?;
     store.update_settings(&id, metadata, enforcement, environment_ids)?;
+    if record.placements.is_empty() && !updated_record.placements.is_empty() {
+        store.update_placements(&id, updated_record.placements)?;
+    }
     Ok(ControlResult::Empty)
 }
 
