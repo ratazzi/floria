@@ -182,6 +182,29 @@ final class CloudSyncViewModelTests: XCTestCase {
         XCTAssertNil(model.errorMessage)
     }
 
+    func testEnrollmentRefreshFindsRequestCreatedWhileSyncViewStaysOpen() async {
+        let vaultID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let review = SyncEnrollmentReview(
+            deviceID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            deviceName: "Mac mini",
+            requestedAt: "2026-08-11T12:00:00Z",
+            fingerprint: "AB12-CD34-EF56")
+        let service = CloudSyncViewServiceStub(
+            status: status(vaultID: vaultID),
+            candidates: [],
+            bootstrap: bootstrap(vaultID: vaultID))
+        let model = CloudSyncViewModel(service: service, restartDaemon: {})
+
+        await model.load()
+        XCTAssertTrue(model.approvals.isEmpty)
+
+        await service.setEnrollmentReviews([review])
+        await model.refreshEnrollmentRequests()
+
+        XCTAssertEqual(model.approvals, [review])
+        XCTAssertNil(model.errorMessage)
+    }
+
     func testRevokingAMacUsesTheReviewedDeviceFingerprint() async {
         let vaultID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         let device = SyncVaultDevice(
@@ -303,6 +326,24 @@ final class CloudSyncViewModelTests: XCTestCase {
         XCTAssertEqual(model.lastSyncDescription(relativeTo: now), "Last synced just now.")
     }
 
+    func testOnlyANeverSyncedMacOffersToUseAnICloudLibrary() async {
+        let vaultID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let newMacService = CloudSyncViewServiceStub(
+            status: status(vaultID: vaultID), candidates: [])
+        let joinedMacService = CloudSyncViewServiceStub(
+            status: status(vaultID: vaultID),
+            candidates: [],
+            lastSuccessfulSyncAt: Date(timeIntervalSince1970: 1_787_000_000))
+        let newMac = CloudSyncViewModel(service: newMacService, restartDaemon: {})
+        let joinedMac = CloudSyncViewModel(service: joinedMacService, restartDaemon: {})
+
+        await newMac.load()
+        await joinedMac.load()
+
+        XCTAssertTrue(newMac.canUseICloudLibrary)
+        XCTAssertFalse(joinedMac.canUseICloudLibrary)
+    }
+
     func testPendingLibrarySetupCanResumeAfterTheViewModelIsRecreated() async {
         let target = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
         let request = SyncEnrollmentRequest(
@@ -384,6 +425,33 @@ final class CloudSyncViewModelTests: XCTestCase {
         XCTAssertEqual(
             model.errorMessage,
             "Sync completed, but Floria could not refresh Macs and Projects. Try Sync Now again.")
+    }
+
+    func testSuccessfulSyncUsesItsAuthenticatedBootstrapForMacRefresh() async {
+        let vaultID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        let authenticated = bootstrap(vaultID: vaultID)
+        let device = SyncVaultDevice(
+            deviceID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            deviceName: "Mac mini",
+            fingerprint: "AB12-CD34-EF56",
+            enrolledGeneration: 1,
+            revokedGeneration: nil,
+            isGenesis: true,
+            isCurrent: true)
+        let service = CloudSyncViewServiceStub(
+            status: status(vaultID: vaultID),
+            candidates: [],
+            bootstrap: authenticated,
+            devices: [device],
+            syncBootstrap: authenticated,
+            failAuthenticationAfterSync: true)
+        let model = CloudSyncViewModel(service: service, restartDaemon: {})
+
+        await model.load()
+        await model.syncNow()
+
+        XCTAssertEqual(model.devices, [device])
+        XCTAssertNil(model.errorMessage)
     }
 
     func testFailedSyncClearsAStaleSuccessNotice() async {
@@ -500,9 +568,11 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
     private var status: SyncDomainStatus
     private let candidates: [CloudVaultCandidate]
     private let bootstrap: SyncVaultBootstrap?
+    private let syncBootstrap: SyncVaultBootstrap?
     private var enrollment: SyncEnrollmentPreparation
     private let activation: SyncVaultActivation
     private let devices: [SyncVaultDevice]
+    private var enrollmentReviews: [SyncEnrollmentReview]
     private var conflicts: [SyncConflictReview]
     private let syncFailure: CloudRecordSyncSessionError?
     private let appliedRemoteChanges: Bool
@@ -511,6 +581,7 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
     private var projectsWithoutLocalFolder: [SyncedProject]
     private var restartTarget: String?
     private let failAccessoryRefreshAfterSync: Bool
+    private let failAuthenticationAfterSync: Bool
     private var didSync = false
     private(set) var revokedDevices = [SyncVaultDevice]()
     private(set) var requestedAccessDevices = [SyncVaultDevice]()
@@ -525,6 +596,7 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
         candidates: [CloudVaultCandidate],
         bootstrap: SyncVaultBootstrap? = nil,
         enrollment: SyncEnrollmentPreparation = .alreadyEnrolled(deviceID: "local"),
+        enrollmentReviews: [SyncEnrollmentReview] = [],
         devices: [SyncVaultDevice] = [],
         conflicts: [SyncConflictReview] = [],
         activation: SyncVaultActivation? = nil,
@@ -533,14 +605,18 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
         projectsWithoutLocalFolder: [SyncedProject] = [],
         lastSuccessfulSyncAt: Date? = nil,
         pendingVaultID: String? = nil,
-        failAccessoryRefreshAfterSync: Bool = false
+        failAccessoryRefreshAfterSync: Bool = false,
+        syncBootstrap: SyncVaultBootstrap? = nil,
+        failAuthenticationAfterSync: Bool = false
     ) {
         self.available = available
         self.enabled = enabled
         self.status = status
         self.candidates = candidates
         self.bootstrap = bootstrap
+        self.syncBootstrap = syncBootstrap
         self.enrollment = enrollment
+        self.enrollmentReviews = enrollmentReviews
         self.devices = devices
         self.conflicts = conflicts
         self.syncFailure = syncFailure
@@ -549,6 +625,7 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
         lastSuccessfulSync = lastSuccessfulSyncAt
         pendingVault = pendingVaultID
         self.failAccessoryRefreshAfterSync = failAccessoryRefreshAfterSync
+        self.failAuthenticationAfterSync = failAuthenticationAfterSync
         self.activation = activation ?? .ready(
             vaultID: status.vaultID,
             keyGeneration: status.keyGeneration,
@@ -561,6 +638,10 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
 
     func setEnrollment(_ enrollment: SyncEnrollmentPreparation) {
         self.enrollment = enrollment
+    }
+
+    func setEnrollmentReviews(_ reviews: [SyncEnrollmentReview]) {
+        enrollmentReviews = reviews
     }
 
     func isAvailable() async -> Bool { available }
@@ -626,12 +707,16 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
         didSync = true
         return CloudSyncOutcome(
             status: status,
-            appliedRemoteChanges: appliedRemoteChanges)
+            appliedRemoteChanges: appliedRemoteChanges,
+            authenticatedBootstrap: syncBootstrap)
     }
 
     func discoverVaults() async throws -> [CloudVaultCandidate] { candidates }
 
     func authenticateVault(_ vaultID: String) async throws -> SyncVaultBootstrap {
+        if failAuthenticationAfterSync, didSync {
+            throw CloudSyncServiceError.unconfiguredTestDependency
+        }
         guard let bootstrap, bootstrap.vaultID == vaultID else {
             throw CloudSyncServiceError.unconfiguredTestDependency
         }
@@ -660,7 +745,7 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
     func reviewEnrollments(
         in _: SyncVaultBootstrap
     ) async throws -> [SyncEnrollmentReview] {
-        []
+        enrollmentReviews
     }
 
     func approveEnrollment(

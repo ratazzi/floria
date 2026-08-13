@@ -117,6 +117,13 @@ final class CloudSyncViewModel {
         return nil
     }
 
+    var canUseICloudLibrary: Bool {
+        isLocalStatusLoaded
+            && status != nil
+            && lastSuccessfulSyncAt == nil
+            && pendingVaultID == nil
+    }
+
     func lastSyncDescription(relativeTo now: Date = Date()) -> String {
         guard let lastSuccessfulSyncAt else {
             return "Not synced with iCloud yet."
@@ -191,13 +198,46 @@ final class CloudSyncViewModel {
                 } else {
                     self.notice = nil
                 }
-                await self.refreshPostSyncDetails(for: outcome.status)
+                await self.refreshPostSyncDetails(
+                    for: outcome.status,
+                    authenticatedBootstrap: outcome.authenticatedBootstrap)
             } catch {
                 if await self.detectCurrentMacRemoval() {
                     throw CloudSyncViewError.currentMacRemoved
                 }
                 throw error
             }
+        }
+    }
+
+    /// Keep the access-request list current while the user is looking at Sync. This deliberately
+    /// refreshes only authenticated Vault lifecycle data; it does not upload or apply Library
+    /// contents. Closing the Sync window cancels the view task and stops all checks.
+    func watchEnrollmentRequests() async {
+        while !Task.isCancelled {
+            await refreshEnrollmentRequests()
+            do {
+                try await Task.sleep(nanoseconds: 3_000_000_000)
+            } catch {
+                return
+            }
+        }
+    }
+
+    func refreshEnrollmentRequests() async {
+        guard !isWorking,
+              isEnabled,
+              isAvailable,
+              let vaultID = status?.vaultID
+        else { return }
+        do {
+            let bootstrap = try await service.authenticateVault(vaultID)
+            approvals = try await service.reviewEnrollments(in: bootstrap)
+        } catch is CancellationError {
+            return
+        } catch {
+            // This is a passive check while the Sync window is open. Keep the last authenticated
+            // list and let explicit sync actions present actionable transport errors.
         }
     }
 
@@ -286,7 +326,9 @@ final class CloudSyncViewModel {
             let outcome = try await self.service.syncNow()
             self.status = outcome.status
             await self.refreshPersistentState()
-            await self.refreshPostSyncDetails(for: outcome.status)
+            await self.refreshPostSyncDetails(
+                for: outcome.status,
+                authenticatedBootstrap: outcome.authenticatedBootstrap)
             self.notice = "\(review.deviceName ?? "The other Mac") can now use this Library."
         }
     }
@@ -299,7 +341,9 @@ final class CloudSyncViewModel {
             let outcome = try await self.service.syncNow()
             self.status = outcome.status
             await self.refreshPersistentState()
-            await self.refreshPostSyncDetails(for: outcome.status)
+            await self.refreshPostSyncDetails(
+                for: outcome.status,
+                authenticatedBootstrap: outcome.authenticatedBootstrap)
             self.notice = "\(device.deviceName ?? "The other Mac") was removed from this Library."
         }
     }
@@ -367,7 +411,10 @@ final class CloudSyncViewModel {
 
     /// The CloudKit transport has already settled when this runs. These views are useful, but a
     /// failed refresh must not turn a successful sync into an apparent sync failure.
-    private func refreshPostSyncDetails(for status: SyncDomainStatus) async {
+    private func refreshPostSyncDetails(
+        for status: SyncDomainStatus,
+        authenticatedBootstrap: SyncVaultBootstrap?
+    ) async {
         var failedSections = [String]()
         do {
             try await loadConflicts(for: status)
@@ -376,7 +423,9 @@ final class CloudSyncViewModel {
             failedSections.append("Conflicts")
         }
         do {
-            try await loadDeviceManagement(for: status.vaultID)
+            try await loadDeviceManagement(
+                for: status.vaultID,
+                authenticatedBootstrap: authenticatedBootstrap)
         } catch {
             approvals = []
             devices = []
@@ -458,8 +507,19 @@ final class CloudSyncViewModel {
         throw CloudSyncViewError.daemonRestartTimedOut
     }
 
-    private func loadDeviceManagement(for vaultID: String) async throws {
-        let bootstrap = try await service.authenticateVault(vaultID)
+    private func loadDeviceManagement(
+        for vaultID: String,
+        authenticatedBootstrap: SyncVaultBootstrap? = nil
+    ) async throws {
+        let bootstrap: SyncVaultBootstrap
+        if let authenticatedBootstrap {
+            guard authenticatedBootstrap.vaultID == vaultID else {
+                throw CloudSyncViewError.authenticatedBootstrapVaultMismatch
+            }
+            bootstrap = authenticatedBootstrap
+        } else {
+            bootstrap = try await service.authenticateVault(vaultID)
+        }
         approvals = try await service.reviewEnrollments(in: bootstrap)
         devices = try await service.reviewDevices(in: bootstrap)
     }
@@ -495,12 +555,15 @@ final class CloudSyncViewModel {
 }
 
 enum CloudSyncViewError: LocalizedError {
+    case authenticatedBootstrapVaultMismatch
     case daemonRestartTimedOut
     case currentMacRemoved
     case reenrollmentDidNotCreateRequest
 
     var errorDescription: String? {
         switch self {
+        case .authenticatedBootstrapVaultMismatch:
+            "The synchronized Library details do not match this Mac. Try Sync Now again."
         case .daemonRestartTimedOut:
             "Floria could not finish switching Libraries. Reopen Floria and try Sync Now."
         case .currentMacRemoved:
@@ -607,7 +670,7 @@ struct SyncView: View {
             }
             Divider()
             HStack {
-                Text("Floria connects to iCloud only when you use a sync action.")
+                Text("Floria checks iCloud while this Sync window is open.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -618,7 +681,10 @@ struct SyncView: View {
             .frame(height: 58)
         }
         .frame(width: 640, height: 500)
-        .task { await model.load() }
+        .task {
+            await model.load()
+            await model.watchEnrollmentRequests()
+        }
         .confirmationDialog(
             "Use This iCloud Library?",
             isPresented: Binding(
@@ -786,8 +852,10 @@ struct SyncView: View {
                     Task { await model.syncNow() }
                 }
                 .buttonStyle(.borderedProminent)
-                Button("Use Existing…") {
-                    Task { await model.discover() }
+                if model.canUseICloudLibrary {
+                    Button("Use iCloud Library…") {
+                        Task { await model.discover() }
+                    }
                 }
             }
         }
