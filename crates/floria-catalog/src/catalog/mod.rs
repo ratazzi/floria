@@ -21,6 +21,7 @@ use crate::domain::{
 use crate::error::{CatalogError, CatalogResult};
 
 const SCHEMA_VERSION: i64 = 14;
+const PREVIOUS_SCHEMA_VERSION: i64 = 13;
 const INTEGRITY_DOMAIN: &str = "catalog-security-state";
 
 #[derive(Clone)]
@@ -54,6 +55,17 @@ struct SchemaObject {
     sql: String,
 }
 
+/// The authenticated schema-13 snapshot written before the replication outbox became part of
+/// the catalog. Unknown fields are rejected so a malformed current snapshot cannot fall back to
+/// this compatibility shape and silently discard newer authenticated state.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreviousCatalogSecuritySnapshot {
+    schema_version: i64,
+    schema: Vec<SchemaObject>,
+    catalog: CatalogSnapshot,
+}
+
 /// Compatibility reader for the short-lived development checkpoint that authenticated rows but
 /// not schema. It is accepted only when the live schema exactly matches a freshly-created v14
 /// schema, then immediately upgraded to `CatalogSecuritySnapshot`.
@@ -61,6 +73,7 @@ struct SchemaObject {
 #[serde(untagged)]
 enum AuthenticatedCatalogState {
     Current(CatalogSecuritySnapshot),
+    Previous(PreviousCatalogSecuritySnapshot),
     Legacy(CatalogSnapshot),
 }
 
@@ -154,7 +167,31 @@ impl Catalog {
         let sidecar = self.path.with_extension("integrity.json");
         let loaded = authenticator
             .load::<AuthenticatedCatalogState>(&sidecar, INTEGRITY_DOMAIN)?;
-        let current = security_snapshot_from(&self.raw_connection()?)?;
+        let mut conn = self.raw_connection()?;
+        let schema_version: i64 =
+            conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if schema_version == PREVIOUS_SCHEMA_VERSION {
+            let previous = previous_security_snapshot_from(&conn)?;
+            match loaded.value.as_ref() {
+                Some(AuthenticatedCatalogState::Previous(authenticated))
+                    if authenticated.schema_version == previous.schema_version
+                        && schema_objects_equivalent(
+                            &authenticated.schema,
+                            &previous.schema,
+                        )
+                        && authenticated.catalog == previous.catalog => {}
+                Some(AuthenticatedCatalogState::Legacy(authenticated))
+                    if authenticated == &previous.catalog => {}
+                _ => {
+                    return Err(CatalogError::Validation(
+                        "schema-13 catalog does not match its authenticated security-state snapshot"
+                            .to_string(),
+                    ))
+                }
+            }
+            migrate_authenticated_v13_to_v14(&mut conn)?;
+        }
+        let current = security_snapshot_from(&conn)?;
         match loaded.value {
             Some(AuthenticatedCatalogState::Current(authenticated)) => {
                 if authenticated == current {
@@ -186,6 +223,15 @@ impl Catalog {
                             .to_string(),
                     ));
                 }
+                authenticator.persist(
+                    &sidecar,
+                    INTEGRITY_DOMAIN,
+                    loaded.generation,
+                    &current,
+                )?;
+            }
+            Some(AuthenticatedCatalogState::Previous(authenticated)) => {
+                require_exact_previous_schema_upgrade(&authenticated, &current)?;
                 authenticator.persist(
                     &sidecar,
                     INTEGRITY_DOMAIN,
@@ -485,6 +531,37 @@ fn security_snapshot_from(conn: &Connection) -> CatalogResult<CatalogSecuritySna
     })
 }
 
+fn previous_security_snapshot_from(
+    conn: &Connection,
+) -> CatalogResult<PreviousCatalogSecuritySnapshot> {
+    let schema_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if schema_version != PREVIOUS_SCHEMA_VERSION {
+        return Err(CatalogError::UnsupportedSchema {
+            found: schema_version,
+            expected: PREVIOUS_SCHEMA_VERSION,
+        });
+    }
+    let schema = schema_objects_from(conn)?;
+    if let Some(object) = schema
+        .iter()
+        .find(|object| matches!(object.kind.as_str(), "trigger" | "view"))
+    {
+        return Err(CatalogError::Validation(format!(
+            "catalog contains unsupported {} {:?}",
+            object.kind, object.name
+        )));
+    }
+    let catalog = snapshot_from(conn)?;
+    validate_snapshot_conflicts(&catalog)?;
+    let previous = PreviousCatalogSecuritySnapshot {
+        schema_version,
+        schema,
+        catalog,
+    };
+    require_canonical_previous_schema(&previous)?;
+    Ok(previous)
+}
+
 fn schema_objects_from(conn: &Connection) -> CatalogResult<Vec<SchemaObject>> {
     let mut statement = conn.prepare(
         "SELECT type, name, tbl_name, COALESCE(sql, '')
@@ -514,6 +591,49 @@ fn require_canonical_schema(snapshot: &CatalogSecuritySnapshot) -> CatalogResult
     {
         return Err(CatalogError::Validation(
             "catalog schema does not exactly match the supported schema".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_canonical_previous_schema(
+    snapshot: &PreviousCatalogSecuritySnapshot,
+) -> CatalogResult<()> {
+    let mut expected = Connection::open_in_memory()?;
+    migrate(&mut expected)?;
+    let expected = schema_objects_from(&expected)?
+        .into_iter()
+        .filter(|object| object.table_name != "replication_outbox")
+        .collect::<Vec<_>>();
+    if snapshot.schema_version != PREVIOUS_SCHEMA_VERSION
+        || !schema_objects_equivalent(&snapshot.schema, &expected)
+    {
+        return Err(CatalogError::Validation(
+            "catalog schema does not exactly match authenticated schema 13".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_exact_previous_schema_upgrade(
+    previous: &PreviousCatalogSecuritySnapshot,
+    current: &CatalogSecuritySnapshot,
+) -> CatalogResult<()> {
+    require_canonical_schema(current)?;
+    let expected_previous_schema = current
+        .schema
+        .iter()
+        .filter(|object| object.table_name != "replication_outbox")
+        .cloned()
+        .collect::<Vec<_>>();
+    if previous.schema_version != PREVIOUS_SCHEMA_VERSION
+        || !schema_objects_equivalent(&previous.schema, &expected_previous_schema)
+        || previous.catalog != current.catalog
+        || !current.outbox.is_empty()
+    {
+        return Err(CatalogError::Validation(
+            "catalog contents are not the exact authenticated schema-13 to schema-14 upgrade"
+                .to_string(),
         ));
     }
     Ok(())
@@ -588,7 +708,7 @@ mod validation;
 use outbox::outbox_from;
 pub use replication::validate_replicated_catalog;
 use replication::replicated_catalog_from;
-use schema::migrate;
+use schema::{migrate, migrate_authenticated_v13_to_v14};
 use snapshot::{snapshot_from, validate_snapshot_conflicts};
 pub use snapshot::{
     catalog_surface_semantic_revision, resolve_catalog_snapshot, resolve_catalog_surface,
@@ -974,6 +1094,111 @@ mod tests {
 
         let authenticated = Catalog::open_authenticated(&path, auth).unwrap();
         assert_eq!(authenticated.snapshot().unwrap(), snapshot);
+    }
+
+    #[test]
+    fn authenticated_open_upgrades_the_v13_security_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.sqlite");
+        let auth = Arc::new(StateAuthenticator::for_tests([48; 32]));
+        let catalog = Catalog::open_authenticated(&path, Arc::clone(&auth)).unwrap();
+        let current = security_snapshot_from(&catalog.raw_connection().unwrap()).unwrap();
+        let previous_schema = current
+            .schema
+            .iter()
+            .filter(|object| object.table_name != "replication_outbox")
+            .cloned()
+            .collect::<Vec<_>>();
+        let previous = serde_json::json!({
+            "schema_version": 13,
+            "schema": previous_schema,
+            "catalog": current.catalog,
+        });
+        auth.persist(
+            &path.with_extension("integrity.json"),
+            INTEGRITY_DOMAIN,
+            1,
+            &previous,
+        )
+        .unwrap();
+        drop(catalog);
+
+        let authenticated = Catalog::open_authenticated(&path, auth).unwrap();
+        assert_eq!(authenticated.snapshot().unwrap(), current.catalog);
+    }
+
+    #[test]
+    fn authenticated_open_migrates_an_exact_v13_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.sqlite");
+        let catalog = Catalog::open(&path).unwrap();
+        catalog.upsert_project(&project()).unwrap();
+        drop(catalog);
+
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP INDEX replication_outbox_created_idx;
+             DROP TABLE replication_outbox;
+             PRAGMA user_version = 13;",
+        )
+        .unwrap();
+        let previous_schema = schema_objects_from(&conn).unwrap();
+        let previous_catalog = snapshot_from(&conn).unwrap();
+        drop(conn);
+
+        let auth = Arc::new(StateAuthenticator::for_tests([50; 32]));
+        let previous = serde_json::json!({
+            "schema_version": 13,
+            "schema": previous_schema,
+            "catalog": previous_catalog,
+        });
+        auth.persist(
+            &path.with_extension("integrity.json"),
+            INTEGRITY_DOMAIN,
+            0,
+            &previous,
+        )
+        .unwrap();
+
+        let authenticated = Catalog::open_authenticated(&path, auth).unwrap();
+        assert_eq!(authenticated.schema_version(), SCHEMA_VERSION);
+        assert_eq!(authenticated.snapshot().unwrap(), previous_catalog);
+        assert!(authenticated.replication_outbox().unwrap().is_empty());
+    }
+
+    #[test]
+    fn authenticated_open_does_not_upgrade_v13_over_a_pending_outbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.sqlite");
+        let auth = Arc::new(StateAuthenticator::for_tests([49; 32]));
+        let catalog = Catalog::open_authenticated(&path, Arc::clone(&auth)).unwrap();
+        catalog.enqueue_replication_outbox(&replication_outbox_entry()).unwrap();
+        let current = security_snapshot_from(&catalog.raw_connection().unwrap()).unwrap();
+        let previous_schema = current
+            .schema
+            .iter()
+            .filter(|object| object.table_name != "replication_outbox")
+            .cloned()
+            .collect::<Vec<_>>();
+        let previous = serde_json::json!({
+            "schema_version": 13,
+            "schema": previous_schema,
+            "catalog": current.catalog,
+        });
+        auth.persist(
+            &path.with_extension("integrity.json"),
+            INTEGRITY_DOMAIN,
+            2,
+            &previous,
+        )
+        .unwrap();
+        drop(catalog);
+
+        let error = match Catalog::open_authenticated(&path, auth) {
+            Ok(_) => panic!("schema-13 snapshot discarded a pending replication outbox"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("exact authenticated"));
     }
 
     #[test]

@@ -117,3 +117,36 @@ pub(super) fn migrate(conn: &mut Connection) -> CatalogResult<()> {
     tx.commit()?;
     Ok(())
 }
+
+/// Add the schema-14 replication outbox after the caller has authenticated the complete live
+/// schema-13 database against its HMAC sidecar and Keychain checkpoint.
+///
+/// This stays separate from `migrate`: an arbitrary existing schema-13 database must never be
+/// upgraded before its security state has been proven.
+pub(super) fn migrate_authenticated_v13_to_v14(
+    conn: &mut Connection,
+) -> CatalogResult<()> {
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if version != PREVIOUS_SCHEMA_VERSION {
+        return Err(CatalogError::UnsupportedSchema {
+            found: version,
+            expected: SCHEMA_VERSION,
+        });
+    }
+    let tx = conn.transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE replication_outbox (
+            intent_id TEXT PRIMARY KEY,
+            logical_id TEXT NOT NULL,
+            parents_json TEXT NOT NULL,
+            store_versions_json TEXT NOT NULL,
+            catalog_payload BLOB NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX replication_outbox_created_idx
+            ON replication_outbox(created_at, intent_id);
+        PRAGMA user_version = 14;",
+    )?;
+    tx.commit()?;
+    Ok(())
+}
