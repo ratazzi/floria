@@ -3,13 +3,17 @@ set -euo pipefail
 
 VERSION="$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')"
 BUILD_NUMBER="${BUILD_NUMBER:-$(date +%Y%m%d%H%M)}"
-SIGN_IDENTITY="${SIGN_IDENTITY:--}"
+INSTALL_VARIANT="${FLORIA_INSTALL_VARIANT:-cloudkit}"
+SIGN_IDENTITY="${SIGN_IDENTITY:-}"
+FLORIA_SIGNING_TEAM_ID="${FLORIA_SIGNING_TEAM_ID:-}"
+FLORIA_APP_PROVISIONING_PROFILE="${FLORIA_APP_PROVISIONING_PROFILE:-}"
 APP_NAME="Floria"
 APP_BUNDLE="app/.build/${APP_NAME}.app"
 INSTALL_DIR="${INSTALL_DIR:-/Applications}"
 INSTALLED_APP="${INSTALL_DIR}/${APP_NAME}.app"
 INSTALLED_DAEMON="${INSTALLED_APP}/Contents/Resources/floria"
 INFO_PLIST="${INSTALLED_APP}/Contents/Info.plist"
+BUILT_INFO_PLIST="${APP_BUNDLE}/Contents/Info.plist"
 RUNTIME_DIRECTORY="${HOME}/Library/Application Support/floria"
 CONFIG_PATH="${RUNTIME_DIRECTORY}/floria.toml"
 SERVICE_LABEL="floria.hola.ac.daemon"
@@ -21,6 +25,106 @@ LEGACY_LAUNCH_AGENT_PLIST="${HOME}/Library/LaunchAgents/${LEGACY_SERVICE_LABEL}.
 WAIT_SECONDS="${FLORIA_INSTALL_WAIT_SECONDS:-20}"
 DAEMON_WAIT_SECONDS="${FLORIA_INSTALL_DAEMON_WAIT_SECONDS:-60}"
 EXPECTED_REVISION="${VERSION}+${BUILD_NUMBER}"
+ALLOW_CLOUDKIT_DOWNGRADE="${FLORIA_ALLOW_CLOUDKIT_DOWNGRADE:-0}"
+
+configure_signing() {
+    local profile_plist
+    local profile_team_id
+    local identities
+
+    case "${INSTALL_VARIANT}" in
+        cloudkit)
+            if [[ -z "${FLORIA_APP_PROVISIONING_PROFILE}" ]]; then
+                FLORIA_APP_PROVISIONING_PROFILE="${HOME}/Downloads/Floria_Developer_ID_Production.provisionprofile"
+            fi
+            if [[ ! -f "${FLORIA_APP_PROVISIONING_PROFILE}" ]]; then
+                echo "CloudKit provisioning profile not found: ${FLORIA_APP_PROVISIONING_PROFILE}" >&2
+                echo "Set FLORIA_APP_PROVISIONING_PROFILE to the production profile for floria.hola.ac." >&2
+                return 1
+            fi
+
+            profile_plist="$(mktemp "${TMPDIR:-/private/tmp}/floria-install-profile.XXXXXX")"
+            if ! security cms -D -i "${FLORIA_APP_PROVISIONING_PROFILE}" >"${profile_plist}"; then
+                rm -f "${profile_plist}"
+                echo "Cannot decode CloudKit provisioning profile: ${FLORIA_APP_PROVISIONING_PROFILE}" >&2
+                return 1
+            fi
+            profile_team_id="$(
+                /usr/libexec/PlistBuddy \
+                    -c 'Print :Entitlements:com.apple.developer.team-identifier' \
+                    "${profile_plist}" 2>/dev/null || true
+            )"
+            rm -f "${profile_plist}"
+            if [[ ! "${profile_team_id}" =~ ^[A-Z0-9]{10}$ ]]; then
+                echo "CloudKit provisioning profile has no valid Apple Team ID." >&2
+                return 1
+            fi
+            if [[ -n "${FLORIA_SIGNING_TEAM_ID}" &&
+                "${FLORIA_SIGNING_TEAM_ID}" != "${profile_team_id}" ]]; then
+                echo "FLORIA_SIGNING_TEAM_ID does not match the provisioning profile Team ID." >&2
+                return 1
+            fi
+            FLORIA_SIGNING_TEAM_ID="${profile_team_id}"
+
+            if [[ -z "${SIGN_IDENTITY}" ]]; then
+                identities="$(security find-identity -v -p codesigning 2>/dev/null || true)"
+                SIGN_IDENTITY="$(
+                    sed -nE \
+                        "s/^[[:space:]]*[0-9]+\) [A-F0-9]+ \"(Developer ID Application: .+ \\(${FLORIA_SIGNING_TEAM_ID}\\))\"$/\\1/p" \
+                        <<<"${identities}" | head -1
+                )"
+            fi
+            if [[ -z "${SIGN_IDENTITY}" || "${SIGN_IDENTITY}" == "-" ]]; then
+                echo "No Developer ID Application identity found for Team ${FLORIA_SIGNING_TEAM_ID}." >&2
+                echo "Import the certificate and private key, or set SIGN_IDENTITY explicitly." >&2
+                return 1
+            fi
+            ;;
+        development)
+            SIGN_IDENTITY="-"
+            FLORIA_SIGNING_TEAM_ID=""
+            FLORIA_APP_PROVISIONING_PROFILE=""
+            ;;
+        *)
+            echo "Unknown FLORIA_INSTALL_VARIANT: ${INSTALL_VARIANT} (expected cloudkit or development)" >&2
+            return 1
+            ;;
+    esac
+}
+
+cloudkit_enabled() {
+    local info_plist="$1"
+
+    [[ -f "${info_plist}" ]] &&
+        [[ "$(plutil -extract FloriaCloudKitEnabled raw "${info_plist}" 2>/dev/null || true)" == "true" ]]
+}
+
+cloudkit_downgrade_error() {
+    cat >&2 <<'EOF'
+Refusing to replace the installed CloudKit-enabled Floria app with an ad-hoc build.
+
+Build with SIGN_IDENTITY, FLORIA_SIGNING_TEAM_ID, and
+FLORIA_APP_PROVISIONING_PROFILE to preserve iCloud Sync. If disabling CloudKit is
+intentional, rerun with FLORIA_ALLOW_CLOUDKIT_DOWNGRADE=1.
+EOF
+    return 1
+}
+
+preflight_cloudkit_downgrade() {
+    if cloudkit_enabled "${INFO_PLIST}" &&
+        [[ -z "${FLORIA_APP_PROVISIONING_PROFILE:-}" ]] &&
+        [[ "${ALLOW_CLOUDKIT_DOWNGRADE}" != "1" ]]; then
+        cloudkit_downgrade_error
+    fi
+}
+
+refuse_built_cloudkit_downgrade() {
+    if cloudkit_enabled "${INFO_PLIST}" &&
+        ! cloudkit_enabled "${BUILT_INFO_PLIST}" &&
+        [[ "${ALLOW_CLOUDKIT_DOWNGRADE}" != "1" ]]; then
+        cloudkit_downgrade_error
+    fi
+}
 
 wait_for_app_to_stop() {
     local deadline=$((SECONDS + WAIT_SECONDS))
@@ -101,7 +205,14 @@ wait_for_current_daemon() {
     return 1
 }
 
-BUILD_NUMBER="${BUILD_NUMBER}" SIGN_IDENTITY="${SIGN_IDENTITY}" scripts/build-app
+configure_signing
+preflight_cloudkit_downgrade
+BUILD_NUMBER="${BUILD_NUMBER}" \
+    SIGN_IDENTITY="${SIGN_IDENTITY}" \
+    FLORIA_SIGNING_TEAM_ID="${FLORIA_SIGNING_TEAM_ID}" \
+    FLORIA_APP_PROVISIONING_PROFILE="${FLORIA_APP_PROVISIONING_PROFILE}" \
+    scripts/build-app
+refuse_built_cloudkit_downgrade
 
 if pgrep -x "${APP_NAME}" >/dev/null; then
     echo "==> Stopping previous ${APP_NAME} app"

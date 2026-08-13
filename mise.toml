@@ -15,9 +15,14 @@ depends = ["check-rust-fixtures"]
 run = "scripts/build-app"
 
 [tasks.install-app]
-description = "Build Floria.app (Rust daemon + Swift UI) and install it in /Applications"
+description = "Build a CloudKit-enabled Floria.app and install it in /Applications"
 depends = ["check-rust-fixtures"]
-run = "scripts/install-app"
+run = "FLORIA_INSTALL_VARIANT=cloudkit scripts/install-app"
+
+[tasks.install-development-app]
+description = "Explicitly replace Floria.app with an ad-hoc build without CloudKit"
+depends = ["check-rust-fixtures"]
+run = "FLORIA_INSTALL_VARIANT=development FLORIA_ALLOW_CLOUDKIT_DOWNGRADE=1 scripts/install-app"
 
 [tasks.package-dmg]
 description = "Build, sign, package, and verify a Floria DMG without overwriting an existing image"
