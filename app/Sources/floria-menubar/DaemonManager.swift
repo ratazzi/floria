@@ -262,6 +262,7 @@ struct DaemonManager: Sendable {
 
         let plist: [String: Any] = [
             "Label": serviceLabel,
+            "AssociatedBundleIdentifiers": Self.bundleIdentifier,
             "Program": daemonPath,
             "ProgramArguments": expectedArguments(daemonPath: daemonPath),
             "WorkingDirectory": runtimeDirectory.path,
