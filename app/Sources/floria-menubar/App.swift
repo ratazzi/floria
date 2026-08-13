@@ -35,8 +35,8 @@ private struct DashboardCommands: Commands {
     }
 }
 
-/// Menubar app with a full workspace window and modal authorization prompts.
-/// The Dock icon follows the workspace window rather than the background app lifetime.
+/// Menubar app with a full workspace window and non-modal authorization windows.
+/// The Dock icon follows user-facing windows rather than the background app lifetime.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let icon = FloriaImages.applicationIcon {

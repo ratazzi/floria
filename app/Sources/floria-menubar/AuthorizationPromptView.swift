@@ -8,7 +8,7 @@ private enum AuthorizationPromptLayout {
     static let processVisualWidth = visualColumnWidth - cardPadding
 }
 
-enum PromptGrantScope: Equatable {
+enum PromptGrantScope: Equatable, Sendable {
     case once
     case timed(seconds: UInt64)
 

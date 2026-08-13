@@ -14,4 +14,15 @@ final class DockVisibilityControllerTests: XCTestCase {
 
         XCTAssertEqual(policies, [.regular, .accessory])
     }
+
+    func testAuthorizationPromptKeepsDockReachableWithoutDashboard() {
+        var policies: [NSApplication.ActivationPolicy] = []
+        let controller = DockVisibilityController { policies.append($0) }
+
+        controller.authorizationPromptDidOpen()
+        controller.dashboardDidClose()
+        controller.authorizationPromptDidClose()
+
+        XCTAssertEqual(policies, [.regular, .regular, .accessory])
+    }
 }

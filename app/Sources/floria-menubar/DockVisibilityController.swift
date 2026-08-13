@@ -8,10 +8,11 @@ final class DockVisibilityController {
     private let setActivationPolicy: @MainActor (NSApplication.ActivationPolicy) -> Void
     private weak var dashboardWindow: NSWindow?
     private var closeObserver: NSObjectProtocol?
+    private var authorizationPromptVisible = false
 
     init(
         setActivationPolicy: @escaping @MainActor (NSApplication.ActivationPolicy) -> Void = {
-            NSApp.setActivationPolicy($0)
+            NSApplication.shared.setActivationPolicy($0)
         }
     ) {
         self.setActivationPolicy = setActivationPolicy
@@ -42,7 +43,17 @@ final class DockVisibilityController {
     func dashboardDidClose() {
         dashboardWindow = nil
         stopObservingDashboardWindow()
-        setActivationPolicy(.accessory)
+        updateActivationPolicy()
+    }
+
+    func authorizationPromptDidOpen() {
+        authorizationPromptVisible = true
+        updateActivationPolicy()
+    }
+
+    func authorizationPromptDidClose() {
+        authorizationPromptVisible = false
+        updateActivationPolicy()
     }
 
     private func dashboardWindowWillClose(_ window: NSWindow) {
@@ -54,6 +65,10 @@ final class DockVisibilityController {
         guard let closeObserver else { return }
         NotificationCenter.default.removeObserver(closeObserver)
         self.closeObserver = nil
+    }
+
+    private func updateActivationPolicy() {
+        setActivationPolicy(dashboardWindow != nil || authorizationPromptVisible ? .regular : .accessory)
     }
 }
 
