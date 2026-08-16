@@ -1122,10 +1122,8 @@ fn cmd_mount(config: &Path) -> Result<()> {
     let managed_keys: Arc<dyn floria_agent::ManagedKeyReader> =
         Arc::new(StoreManagedKeyReader { store: Arc::clone(&store) });
     let generated_ssh_config = support_dir.join("ssh/config");
-    let ssh_runtime_dir = support_dir.join("runtime/sockets");
     let ssh_runtime = Arc::new(
         floria_agent::SshAgentRuntime::new(
-            ssh_runtime_dir.clone(),
             &generated_ssh_config,
             ssh_authorizer,
             Arc::clone(&audit),

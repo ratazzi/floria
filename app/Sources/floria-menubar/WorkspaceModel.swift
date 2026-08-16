@@ -2417,8 +2417,10 @@ enum WorkspaceStoreError: LocalizedError {
 
 extension WorkspaceStore {
     static func preview() -> WorkspaceStore {
-        let home = NSHomeDirectory()
-        let socketPath = "\(home)/Library/Application Support/floria/runtime/sockets/floria-web-dev.sock"
+        let socketPath = FileManager.default.temporaryDirectory
+            .appendingPathComponent("floria-ssh-agent-\(getuid())", isDirectory: true)
+            .appendingPathComponent("floria-web-dev.sock")
+            .path
         let resources = [
             WorkspaceResource(
                 id: "cloudflare-token", name: "Cloudflare API Token", kind: .sharedSecret,

@@ -98,6 +98,16 @@ pub struct SshAgentRuntime {
 
 impl SshAgentRuntime {
     pub fn new(
+        config_path: impl Into<PathBuf>,
+        authorizer: Arc<dyn Authorizer>,
+        audit: Arc<AuditLog>,
+        managed_keys: Arc<dyn ManagedKeyReader>,
+    ) -> io::Result<Self> {
+        let runtime_dir = default_runtime_directory();
+        Self::new_in(runtime_dir, config_path, authorizer, audit, managed_keys)
+    }
+
+    fn new_in(
         runtime_dir: impl Into<PathBuf>,
         config_path: impl Into<PathBuf>,
         authorizer: Arc<dyn Authorizer>,
@@ -106,8 +116,7 @@ impl SshAgentRuntime {
     ) -> io::Result<Self> {
         let runtime_dir = runtime_dir.into();
         let config_path = config_path.into();
-        fs::create_dir_all(&runtime_dir)?;
-        fs::set_permissions(&runtime_dir, fs::Permissions::from_mode(0o700))?;
+        prepare_runtime_directory(&runtime_dir)?;
         Ok(SshAgentRuntime {
             runtime_dir,
             config_path,
@@ -122,6 +131,7 @@ impl SshAgentRuntime {
     /// Reconcile listeners against a complete catalog snapshot. Unchanged surfaces keep their
     /// listener and active sessions; changed/removed surfaces stop accepting immediately.
     pub fn replace(&self, snapshot: &CatalogSnapshot) -> io::Result<()> {
+        prepare_runtime_directory(&self.runtime_dir)?;
         let desired = compile_surface_specs(snapshot, &self.runtime_dir)?;
         let desired_ids = desired
             .iter()
@@ -174,9 +184,47 @@ impl SshAgentRuntime {
         }
     }
 
-    pub fn socket_path(&self, surface_id: &str) -> PathBuf {
+    #[cfg(test)]
+    fn socket_path(&self, surface_id: &str) -> PathBuf {
         floria_ssh::agent_runtime_socket_path(&self.runtime_dir, surface_id)
     }
+}
+
+fn default_runtime_directory() -> PathBuf {
+    // macOS resolves `temp_dir()` to the current user's private Darwin temporary directory. The
+    // uid suffix also keeps the fallback safe on platforms where the base is a shared `/tmp`.
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    std::env::temp_dir().join(format!("floria-ssh-agent-{uid}"))
+}
+
+fn prepare_runtime_directory(path: &Path) -> io::Result<()> {
+    match fs::create_dir(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() {
+        return Err(invalid(format!(
+            "SSH agent runtime path {} is not a directory",
+            path.display()
+        )));
+    }
+    // SAFETY: geteuid has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    if metadata.uid() != uid {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "SSH agent runtime directory {} belongs to uid {} instead of {uid}",
+                path.display(),
+                metadata.uid()
+            ),
+        ));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
 }
 
 impl Drop for SshAgentRuntime {
@@ -1319,6 +1367,7 @@ fn remove_exact_socket(path: &Path, inode: u64) {
 mod tests {
     use super::*;
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use floria_catalog::{
@@ -1331,6 +1380,44 @@ mod tests {
     // Parallel workspace tests can serialize macOS peer/code-signature inspection long enough
     // to exceed the old five-second client deadline even though the agent remains responsive.
     const TEST_CLIENT_TIMEOUT: Duration = Duration::from_secs(15);
+
+    #[test]
+    fn default_runtime_directory_is_user_scoped_and_temporary() {
+        let path = default_runtime_directory();
+        // SAFETY: geteuid has no preconditions.
+        let uid = unsafe { libc::geteuid() };
+
+        assert!(path.starts_with(std::env::temp_dir()));
+        assert_eq!(
+            path.file_name().unwrap().to_string_lossy(),
+            format!("floria-ssh-agent-{uid}")
+        );
+    }
+
+    #[test]
+    fn runtime_directory_is_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runtime");
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).unwrap();
+
+        prepare_runtime_directory(&path).unwrap();
+
+        assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn runtime_directory_rejects_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let path = dir.path().join("runtime");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &path).unwrap();
+
+        let error = prepare_runtime_directory(&path).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
 
     struct NoManagedKeys;
 
@@ -1752,7 +1839,7 @@ mod tests {
         let audit_path = dir.path().join("audit.jsonl");
         let audit = Arc::new(AuditLog::open(&audit_path).unwrap());
         let policy = Arc::new(RecordingAuthorizer::allowing());
-        let runtime = SshAgentRuntime::new(
+        let runtime = SshAgentRuntime::new_in(
             dir.path().join("runtime"),
             dir.path().join("ssh/config"),
             Arc::clone(&policy) as Arc<dyn Authorizer>,
@@ -1850,7 +1937,7 @@ mod tests {
         });
         let policy = Arc::new(RecordingAuthorizer::allowing());
         let audit_path = dir.path().join("audit.jsonl");
-        let runtime = SshAgentRuntime::new(
+        let runtime = SshAgentRuntime::new_in(
             dir.path().join("runtime"),
             dir.path().join("ssh/config"),
             Arc::clone(&policy) as Arc<dyn Authorizer>,
@@ -1958,7 +2045,7 @@ mod tests {
             .collect(),
         });
         let policy = Arc::new(RecordingAuthorizer::allowing());
-        let runtime = SshAgentRuntime::new(
+        let runtime = SshAgentRuntime::new_in(
             dir.path().join("runtime"),
             dir.path().join("ssh/config"),
             Arc::clone(&policy) as Arc<dyn Authorizer>,
@@ -2016,7 +2103,7 @@ mod tests {
             .into_iter()
             .collect(),
         });
-        let runtime = SshAgentRuntime::new(
+        let runtime = SshAgentRuntime::new_in(
             dir.path().join("runtime"),
             dir.path().join("ssh/config"),
             Arc::new(RecordingAuthorizer::allowing()),
