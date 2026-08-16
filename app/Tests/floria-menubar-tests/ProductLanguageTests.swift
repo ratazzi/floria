@@ -220,6 +220,21 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertFalse(workspace.contains("The Unix socket stays"))
     }
 
+    func testSshIdentityCanManageAProjectIndependentSourceFile() throws {
+        let model = try source("WorkspaceModel.swift")
+        let workspace = try source("WorkspaceView.swift")
+
+        XCTAssertTrue(workspace.contains(#"Text("Add SSH Identity")"#))
+        XCTAssertTrue(workspace.contains(#"Toggle("Manage original file", isOn: $manageSource)"#))
+        XCTAssertTrue(workspace.contains("A project is not required"))
+        XCTAssertTrue(workspace.contains("store.sshIdentitySourceFileIDs"))
+        XCTAssertTrue(model.contains("manageSource: Bool, securityLevel"))
+        XCTAssertTrue(model.contains("protectedSourceFiles(for resource: WorkspaceResource)"))
+        XCTAssertFalse(
+            workspace.contains(
+                "The original imported file is not changed or removed."))
+    }
+
     func testManagedFileEnvironmentScopeIsEditableFromItsDetails() throws {
         let workspace = try source("WorkspaceView.swift")
 

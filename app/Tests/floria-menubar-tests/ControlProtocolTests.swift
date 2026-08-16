@@ -851,7 +851,7 @@ final class ControlProtocolTests: XCTestCase {
         let imported = try ControlCommand.sshIdentityImport(
             resourceID: "fixture-identity", name: "Fixture identity",
             path: "/private/tmp/fixture-id_ed25519", passphrase: "fixture passphrase",
-            enforcement: "touchid", metadata: .empty
+            manageSource: true, enforcement: "touchid", metadata: .empty
         ).requestData(requestID: 75, encoder: encoder)
         let value = try XCTUnwrap(
             JSONSerialization.jsonObject(with: imported) as? [String: Any])
@@ -860,6 +860,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(params["resource_id"] as? String, "fixture-identity")
         XCTAssertEqual(params["path"] as? String, "/private/tmp/fixture-id_ed25519")
         XCTAssertEqual(params["passphrase"] as? String, "fixture passphrase")
+        XCTAssertEqual(params["manage_source"] as? Bool, true)
         XCTAssertNil(params["private_key"])
 
         let removed = try ControlCommand.sshIdentityRemove(resourceID: "fixture-identity")

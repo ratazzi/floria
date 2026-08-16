@@ -189,6 +189,7 @@ struct WorkspaceResource: Identifiable, Hashable, Sendable {
     let securityLevel: WorkspaceSecurityLevel
     let metadata: ItemMetadata
     let origin: CatalogResourceOrigin?
+    let managedSourceIDs: [WorkspaceProtectedFile.ID]
     let usageCount: Int
 
     init(
@@ -199,6 +200,7 @@ struct WorkspaceResource: Identifiable, Hashable, Sendable {
         securityLevel: WorkspaceSecurityLevel = .confirmation,
         metadata: ItemMetadata = .empty,
         origin: CatalogResourceOrigin? = nil,
+        managedSourceIDs: [WorkspaceProtectedFile.ID] = [],
         usageCount: Int
     ) {
         self.id = id
@@ -218,6 +220,7 @@ struct WorkspaceResource: Identifiable, Hashable, Sendable {
         self.securityLevel = securityLevel
         self.metadata = metadata
         self.origin = origin
+        self.managedSourceIDs = managedSourceIDs
         self.usageCount = usageCount
     }
 
@@ -1458,7 +1461,8 @@ final class WorkspaceStore {
     @discardableResult
     func importSshIdentity(
         name: String, path: String, passphrase: String?,
-        securityLevel: WorkspaceSecurityLevel, metadata: ItemMetadata = .empty
+        manageSource: Bool, securityLevel: WorkspaceSecurityLevel,
+        metadata: ItemMetadata = .empty
     ) async throws -> WorkspaceResource.ID {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1472,8 +1476,10 @@ final class WorkspaceStore {
         _ = try await controlClient.importSshIdentity(
             resourceID: resourceID, name: name, path: path,
             passphrase: passphrase?.isEmpty == false ? passphrase : nil,
+            manageSource: manageSource,
             enforcement: securityLevel.rawValue, metadata: metadata)
         apply(try await controlClient.snapshot())
+        protectedFiles = protectedFileModels(try await controlClient.protectedFiles())
         lastError = nil
         return resourceID
     }
@@ -1543,7 +1549,18 @@ final class WorkspaceStore {
             try await controlClient.removeResource(id)
         }
         apply(try await controlClient.snapshot())
+        protectedFiles = protectedFileModels(try await controlClient.protectedFiles())
         lastError = nil
+    }
+
+    func protectedSourceFiles(for resource: WorkspaceResource) -> [WorkspaceProtectedFile] {
+        guard resource.kind == .sshIdentity else { return [] }
+        let ids = Set(resource.managedSourceIDs)
+        return protectedFiles.filter { ids.contains($0.id) }
+    }
+
+    var sshIdentitySourceFileIDs: Set<WorkspaceProtectedFile.ID> {
+        Set(resources.flatMap { protectedSourceFiles(for: $0).map(\.id) })
     }
 
     @discardableResult
@@ -2168,6 +2185,7 @@ final class WorkspaceStore {
                 securityLevel: WorkspaceSecurityLevel(catalogValue: resource.enforcement),
                 metadata: resource.metadata,
                 origin: resource.origin,
+                managedSourceIDs: resource.source.managedSourceIDs ?? [],
                 usageCount: projectUsage[resource.id] ?? 0)
         }
 

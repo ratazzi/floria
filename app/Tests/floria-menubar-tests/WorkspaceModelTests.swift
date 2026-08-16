@@ -82,6 +82,33 @@ final class WorkspaceModelTests: XCTestCase {
         XCTAssertTrue(store.resolvedExports.isEmpty)
     }
 
+    func testGlobalSshIdentityOwnsItsManagedSourceWithoutAProject() throws {
+        let sourcePath = "/fixture/.ssh/id_ed25519"
+        let resource = WorkspaceResource(
+            id: "fixture-identity", name: "Personal SSH", kind: .sshIdentity,
+            shape: .sshIdentity, exports: [],
+            origin: CatalogResourceOrigin(
+                kind: "ssh_import",
+                sources: [
+                    CatalogOriginSource(
+                        path: sourcePath, projectID: nil, environment: nil,
+                        importedAt: "2026-08-16T00:00:00Z")
+                ]),
+            managedSourceIDs: ["fixture-source"],
+            usageCount: 0)
+        let source = WorkspaceProtectedFile(
+            id: "fixture-source", path: sourcePath, mode: 0o600, size: 411,
+            currentVersion: 1,
+            managedLink: WorkspaceManagedLink(path: sourcePath, status: .linked),
+            securityLevel: .confirmation, environmentIDs: [], metadata: .empty)
+        let store = WorkspaceStore(projects: [], resources: [resource])
+        store.protectedFiles = [source]
+
+        XCTAssertEqual(store.protectedSourceFiles(for: resource), [source])
+        XCTAssertEqual(store.sshIdentitySourceFileIDs, Set([source.id]))
+        XCTAssertEqual(resource.usageCount, 0)
+    }
+
     func testConfiguredFileResolvesItsHiddenBackingResource() throws {
         let path = "/fixture/project/.env"
         let resource = WorkspaceResource(

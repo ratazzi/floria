@@ -200,17 +200,19 @@ struct CatalogEntry: Codable, Sendable {
 struct CatalogResourceSource: Codable, Sendable {
     let type: String
     let secretID: String?
+    let managedSourceIDs: [String]?
     let value: String?
     let argv: [String]?
 
     enum CodingKeys: String, CodingKey {
         case type, value, argv
         case secretID = "secret_id"
+        case managedSourceIDs = "managed_source_ids"
     }
 
     static var socket: CatalogResourceSource {
         CatalogResourceSource(
-            type: "socket", secretID: nil, value: nil, argv: nil)
+            type: "socket", secretID: nil, managedSourceIDs: nil, value: nil, argv: nil)
     }
 }
 
@@ -1514,7 +1516,7 @@ enum ControlCommand: Sendable {
     case sshAgentDiscover(endpoint: String)
     case sshIdentityImport(
         resourceID: String, name: String, path: String, passphrase: String?,
-        enforcement: String, metadata: ItemMetadata)
+        manageSource: Bool, enforcement: String, metadata: ItemMetadata)
     case sshIdentityRemove(resourceID: String)
     case sshConfigStatus
     case sshConfigInstall
@@ -1841,13 +1843,15 @@ enum ControlCommand: Sendable {
                     requestID: requestID, method: method,
                     params: SshAgentDiscoverParams(endpoint: endpoint)))
         case .sshIdentityImport(
-            let resourceID, let name, let path, let passphrase, let enforcement, let metadata):
+            let resourceID, let name, let path, let passphrase, let manageSource,
+            let enforcement, let metadata):
             return try encoder.encode(
                 ControlRequest(
                     requestID: requestID, method: method,
                     params: SshIdentityImportParams(
                         resourceID: resourceID, name: name, path: path,
-                        passphrase: passphrase, enforcement: enforcement, metadata: metadata)))
+                        passphrase: passphrase, manageSource: manageSource,
+                        enforcement: enforcement, metadata: metadata)))
         case .sshIdentityRemove(let resourceID):
             return try encoder.encode(
                 ControlRequest(
@@ -2081,8 +2085,15 @@ private struct SshIdentityImportParams: Encodable {
     let name: String
     let path: String
     let passphrase: String?
+    let manageSource: Bool
     let enforcement: String
     let metadata: ItemMetadata
+
+    enum CodingKeys: String, CodingKey {
+        case name, path, passphrase, enforcement, metadata
+        case resourceID = "resource_id"
+        case manageSource = "manage_source"
+    }
 }
 
 private struct SshIdentityRemoveParams: Encodable { let resourceID: String }

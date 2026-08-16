@@ -545,12 +545,12 @@ final class ControlClient: @unchecked Sendable {
 
     func importSshIdentity(
         resourceID: String, name: String, path: String, passphrase: String?,
-        enforcement: String, metadata: ItemMetadata
+        manageSource: Bool, enforcement: String, metadata: ItemMetadata
     ) async throws -> CatalogResource {
         guard let result: SshIdentityCreated = try await request(
             .sshIdentityImport(
                 resourceID: resourceID, name: name, path: path, passphrase: passphrase,
-                enforcement: enforcement, metadata: metadata),
+                manageSource: manageSource, enforcement: enforcement, metadata: metadata),
             expecting: "ssh_identity_created", as: SshIdentityCreated.self)
         else {
             throw ControlClientError.missingResult("ssh_identity_created")

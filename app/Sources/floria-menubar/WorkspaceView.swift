@@ -2112,8 +2112,11 @@ private struct LibraryCatalogView: View {
 
     private var items: [LibraryCatalogItem] {
         let surfaces = store.allSurfaces
+        let sshIdentitySourceFileIDs = store.sshIdentitySourceFileIDs
         let all =
-            store.protectedFiles.map(LibraryCatalogItem.file)
+            store.protectedFiles
+                .filter { !sshIdentitySourceFileIDs.contains($0.id) }
+                .map(LibraryCatalogItem.file)
             + store.resources
                 .filter { !store.representedFileResourceIDs.contains($0.id) }
                 .map(LibraryCatalogItem.resource)
@@ -2164,7 +2167,7 @@ private struct LibraryCatalogView: View {
                                     Text(item.title)
                                         .font(.body.weight(.medium))
                                         .lineLimit(1)
-                                    if item.managedLink?.needsAttention == true {
+                                    if managedLinks(for: item).contains(where: \.needsAttention) {
                                         Image(systemName: "exclamationmark.triangle.fill")
                                             .font(.caption)
                                             .foregroundStyle(Color.orange)
@@ -2196,9 +2199,13 @@ private struct LibraryCatalogView: View {
                         Button("Details…", systemImage: "info.circle") {
                             selectedItem = item
                         }
-                        if item.managedLink?.needsAttention == true {
-                            Button("Repair Link", systemImage: "wrench.and.screwdriver") {
-                                repairManagedLink(item)
+                        let linksNeedingAttention = managedLinks(for: item).filter(\.needsAttention)
+                        if !linksNeedingAttention.isEmpty {
+                            Button(
+                                linksNeedingAttention.count > 1 ? "Repair Links" : "Repair Link",
+                                systemImage: "wrench.and.screwdriver"
+                            ) {
+                                repairManagedLinks(linksNeedingAttention)
                             }
                         }
                         switch item {
@@ -2288,15 +2295,23 @@ private struct LibraryCatalogView: View {
         }
     }
 
-    private func repairManagedLink(_ item: LibraryCatalogItem) {
-        guard let path = item.managedLink?.path else { return }
+    private func repairManagedLinks(_ links: [WorkspaceManagedLink]) {
+        guard !links.isEmpty else { return }
         Task {
             do {
-                try await store.repairManagedLink(at: path)
+                for link in links {
+                    try await store.repairManagedLink(at: link.path)
+                }
             } catch {
                 errorMessage = error.localizedDescription
             }
         }
+    }
+
+    private func managedLinks(for item: LibraryCatalogItem) -> [WorkspaceManagedLink] {
+        if let link = item.managedLink { return [link] }
+        guard case .resource(let resource) = item else { return [] }
+        return store.protectedSourceFiles(for: resource).map(\.managedLink)
     }
 }
 
@@ -2380,6 +2395,19 @@ struct LibraryItemDetailSheet: View {
         }
     }
 
+    private var managedSourceFiles: [WorkspaceProtectedFile] {
+        guard case .resource(let resource) = currentItem else { return [] }
+        return store.protectedSourceFiles(for: resource)
+    }
+
+    private var currentManagedLink: WorkspaceManagedLink? {
+        currentItem.managedLink ?? managedSourceFiles.first?.managedLink
+    }
+
+    private var managedSourceFilesNeedingAttention: [WorkspaceProtectedFile] {
+        managedSourceFiles.filter(\.managedLink.needsAttention)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack(alignment: .top, spacing: 14) {
@@ -2442,10 +2470,31 @@ struct LibraryItemDetailSheet: View {
                             if let key = resource.defaultEnvKey {
                                 LabeledContent("Default key", value: key)
                             }
-                            if let origin = resource.originSummary {
-                                LabeledContent("Source") {
-                                    Text(origin)
-                                        .textSelection(.enabled)
+                            if !managedSourceFiles.isEmpty {
+                                LabeledContent(
+                                    managedSourceFiles.count == 1 ? "Managed file" : "Managed files"
+                                ) {
+                                    VStack(alignment: .trailing, spacing: 6) {
+                                        ForEach(managedSourceFiles) { source in
+                                            HStack(spacing: 6) {
+                                                Text(
+                                                    (source.path as NSString)
+                                                        .abbreviatingWithTildeInPath
+                                                )
+                                                .lineLimit(1)
+                                                .truncationMode(.middle)
+                                                Text(source.managedLink.statusTitle)
+                                                    .foregroundStyle(
+                                                        source.managedLink.needsAttention
+                                                            ? Color.orange : Color.secondary)
+                                            }
+                                            .textSelection(.enabled)
+                                        }
+                                    }
+                                }
+                            } else if let origin = resource.originSummary {
+                                LabeledContent("Imported from") {
+                                    Text(origin).textSelection(.enabled)
                                 }
                             }
                         case .surface(let surface):
@@ -2483,9 +2532,15 @@ struct LibraryItemDetailSheet: View {
 
                     InspectorSection(title: "Actions") {
                         HStack(spacing: 10) {
-                            if currentItem.managedLink?.needsAttention == true {
-                                Button("Repair Link", systemImage: "wrench.and.screwdriver") {
-                                    repairManagedLink()
+                            if currentManagedLink?.needsAttention == true
+                                || !managedSourceFilesNeedingAttention.isEmpty
+                            {
+                                Button(
+                                    managedSourceFilesNeedingAttention.count > 1
+                                        ? "Repair Links" : "Repair Link",
+                                    systemImage: "wrench.and.screwdriver"
+                                ) {
+                                    repairManagedLinks()
                                 }
                                 .disabled(isWorking)
                             }
@@ -2523,7 +2578,28 @@ struct LibraryItemDetailSheet: View {
                                 Button("Edit Info…", systemImage: "pencil") {
                                     editCurrentItem()
                                 }
-                                if let source = resource.originSources.first {
+                                if managedSourceFiles.count == 1,
+                                    let source = managedSourceFiles.first
+                                {
+                                    Button("Reveal Source", systemImage: "folder") {
+                                        NSWorkspace.shared.activateFileViewerSelecting([
+                                            URL(fileURLWithPath: source.path)
+                                        ])
+                                    }
+                                } else if managedSourceFiles.count > 1 {
+                                    Menu("Reveal Sources", systemImage: "folder") {
+                                        ForEach(managedSourceFiles) { source in
+                                            Button(
+                                                (source.path as NSString)
+                                                    .abbreviatingWithTildeInPath
+                                            ) {
+                                                NSWorkspace.shared.activateFileViewerSelecting([
+                                                    URL(fileURLWithPath: source.path)
+                                                ])
+                                            }
+                                        }
+                                    }
+                                } else if let source = resource.originSources.first {
                                     Button("Reveal Source", systemImage: "folder") {
                                         NSWorkspace.shared.activateFileViewerSelecting([
                                             URL(fileURLWithPath: source.path)
@@ -2661,6 +2737,7 @@ struct LibraryItemDetailSheet: View {
         var height: CGFloat = removalTitle == nil ? 420 : 470
         if metadata.note != nil { height += 38 }
         height += min(CGFloat(metadata.links.count) * 28, 84)
+        height += min(CGFloat(max(managedSourceFiles.count - 1, 0)) * 24, 72)
         return min(height, 540)
     }
 
@@ -2689,6 +2766,11 @@ struct LibraryItemDetailSheet: View {
             "Remove it from \(resource.usageCount) project\(resource.usageCount == 1 ? "" : "s") first."
         case .resource(let resource) where resource.kind == .sshAgent:
             "The external agent is not changed."
+        case .resource(let resource) where resource.kind == .sshIdentity
+            && !managedSourceFiles.isEmpty:
+            managedSourceFiles.count == 1
+                ? "Restore the original private-key file, then remove its encrypted identity and history."
+                : "Restore all \(managedSourceFiles.count) original private-key files, then remove the encrypted identity and history."
         case .resource:
             "This permanently removes the encrypted value and version history."
         case .surface(let surface) where surface.kind == .unixSocket:
@@ -2711,7 +2793,10 @@ struct LibraryItemDetailSheet: View {
     private var removalIsBlocked: Bool {
         switch currentItem {
         case .file(let file): file.managedLink.needsAttention
-        case .resource(let resource): resource.usageCount > 0
+        case .resource(let resource):
+            resource.usageCount > 0
+                || (resource.kind == .sshIdentity
+                    && managedSourceFiles.contains(where: \.managedLink.needsAttention))
         case .surface: false
         }
     }
@@ -2737,7 +2822,13 @@ struct LibraryItemDetailSheet: View {
         case .file(let file):
             "Floria will restore version \(file.currentVersion) at \(file.path), then permanently delete every encrypted version."
         case .resource(let resource) where resource.kind == .sshIdentity:
-            "This permanently removes the encrypted private-key copy from Floria. The original imported file is not changed."
+            if managedSourceFiles.count == 1, let source = managedSourceFiles.first {
+                "Floria will restore the private key at \(source.path), then permanently remove its encrypted identity and history."
+            } else if managedSourceFiles.count > 1 {
+                "Floria will restore all \(managedSourceFiles.count) original private-key files, then permanently remove the encrypted identity and history."
+            } else {
+                "This permanently removes the encrypted private-key copy from Floria. The imported source file is not changed."
+            }
         case .resource(let resource) where resource.kind == .sshAgent:
             "Floria removes only its saved identity metadata. The external agent is not changed."
         case .resource:
@@ -2835,13 +2926,22 @@ struct LibraryItemDetailSheet: View {
         }
     }
 
-    private func repairManagedLink() {
-        guard let path = currentItem.managedLink?.path else { return }
+    private func repairManagedLinks() {
+        let paths: [String]
+        if !managedSourceFilesNeedingAttention.isEmpty {
+            paths = managedSourceFilesNeedingAttention.map(\.path)
+        } else if let path = currentManagedLink?.path {
+            paths = [path]
+        } else {
+            return
+        }
         isWorking = true
         Task {
             defer { isWorking = false }
             do {
-                try await store.repairManagedLink(at: path)
+                for path in paths {
+                    try await store.repairManagedLink(at: path)
+                }
             } catch {
                 errorMessage = error.localizedDescription
             }
@@ -3437,6 +3537,7 @@ private struct ImportSshIdentitySheet: View {
     @State private var name = "SSH Identity"
     @State private var path = ""
     @State private var passphrase = ""
+    @State private var manageSource = true
     @State private var securityLevel = WorkspaceSecurityLevel.confirmation
     @State private var note = ""
     @State private var links: [EditableItemLink] = []
@@ -3446,8 +3547,8 @@ private struct ImportSshIdentitySheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Import SSH Identity").font(.title2.bold())
-                Text("Use a private key directly from Floria's encrypted store.")
+                Text("Add SSH Identity").font(.title2.bold())
+                Text("Add a reusable private key to your Library. A project is not required.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -3468,9 +3569,8 @@ private struct ImportSshIdentitySheet: View {
                 }
                 SecureField("Passphrase, if the source key is encrypted", text: $passphrase)
                     .textFieldStyle(.roundedBorder)
-                Label(
-                    "Floria copies the key into encrypted storage. The original file is not changed or removed.",
-                    systemImage: "lock.shield")
+                Toggle("Manage original file", isOn: $manageSource)
+                Label(manageSource ? managedSourceDetail : copiedSourceDetail, systemImage: "lock.shield")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Text("Supports OpenSSH Ed25519/RSA and unencrypted EC2-style RSA PEM keys.")
@@ -3486,7 +3586,7 @@ private struct ImportSshIdentitySheet: View {
                 Spacer()
                 Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
-                Button("Import Identity", action: importIdentity)
+                Button("Add Identity", action: importIdentity)
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
                     .disabled(
@@ -3530,6 +3630,7 @@ private struct ImportSshIdentitySheet: View {
             do {
                 try await store.importSshIdentity(
                     name: name, path: path, passphrase: passphrase,
+                    manageSource: manageSource,
                     securityLevel: securityLevel,
                     metadata: itemMetadata(note: note, links: links))
                 passphrase = ""
@@ -3538,6 +3639,14 @@ private struct ImportSshIdentitySheet: View {
                 errorMessage = error.localizedDescription
             }
         }
+    }
+
+    private var managedSourceDetail: String {
+        "After the key is safely imported, Floria replaces the original with a managed link at the same path."
+    }
+
+    private var copiedSourceDetail: String {
+        "Floria imports an encrypted copy and leaves the original file unchanged."
     }
 }
 
@@ -4244,7 +4353,20 @@ private struct ResourceCatalogView: View {
                 if resource.usageCount > 0 {
                     Text("Remove this identity provider from its project bindings first.")
                 } else if resource.kind == .sshIdentity {
-                    Text("This permanently removes the encrypted private-key copy from Floria. The original imported file is not changed.")
+                    let sources = store.protectedSourceFiles(for: resource)
+                    if sources.count == 1, let source = sources.first {
+                        Text(
+                            "Floria restores the private key at \(source.path), then removes its encrypted identity and history."
+                        )
+                    } else if sources.count > 1 {
+                        Text(
+                            "Floria restores all \(sources.count) original private-key files, then removes the encrypted identity and history."
+                        )
+                    } else {
+                        Text(
+                            "This permanently removes the encrypted private-key copy from Floria. The imported source file is not changed."
+                        )
+                    }
                 } else {
                     Text("Floria removes only the saved public identity metadata. The external agent is not changed.")
                 }
