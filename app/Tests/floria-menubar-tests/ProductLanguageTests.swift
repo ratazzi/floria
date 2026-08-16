@@ -200,6 +200,26 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertTrue(workspace.contains("store.restoreManagedFile(surface.id)"))
     }
 
+    func testProjectSshAccessHidesFloriaRuntimeSocketDetails() throws {
+        let model = try source("WorkspaceModel.swift")
+        let workspace = try source("WorkspaceView.swift")
+
+        XCTAssertTrue(model.contains(#"case .unixSocket: "SSH Access""#))
+        XCTAssertTrue(model.contains(#"case .unixSocket: "SSH access""#))
+        XCTAssertTrue(model.contains(#"kind == .unixSocket ? "SSH Access" : name"#))
+        XCTAssertTrue(workspace.contains(#"case (.ssh, .surface(let surface))"#))
+        XCTAssertTrue(workspace.contains(#"surface.kind == .unixSocket"#))
+        XCTAssertTrue(workspace.contains(#"Text("Add SSH Access")"#))
+        XCTAssertTrue(workspace.contains(#"Button("Add SSH Access", action: create)"#))
+        XCTAssertTrue(workspace.contains(#"? "Remove from Project…" : "Stop Protecting…""#))
+        XCTAssertTrue(workspace.contains(#"Button(isSocketSurface ? "Save SSH Access" : "Save Changes""#))
+        XCTAssertTrue(workspace.contains(#"throw WorkspaceStoreError.invalid("Add at least one SSH Host pattern")"#))
+        XCTAssertFalse(workspace.contains(#""SSH Agent Socket""#))
+        XCTAssertFalse(workspace.contains(#""Remove Socket…""#))
+        XCTAssertFalse(workspace.contains(#""Remove managed socket?""#))
+        XCTAssertFalse(workspace.contains("The Unix socket stays"))
+    }
+
     func testManagedFileEnvironmentScopeIsEditableFromItsDetails() throws {
         let workspace = try source("WorkspaceView.swift")
 

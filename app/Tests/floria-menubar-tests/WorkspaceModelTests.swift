@@ -276,6 +276,7 @@ final class WorkspaceModelTests: XCTestCase {
         XCTAssertEqual(routed.sshRoute?.hostPatterns, ["ec2-*", "bastion"])
         XCTAssertNil(routed.path)
         XCTAssertNil(routed.managedLink)
+        XCTAssertEqual(routed.displayName, "SSH Access")
 
         let managed = WorkspaceResource(
             id: "fixture-managed", name: "Fixture managed identity", kind: .sshIdentity,

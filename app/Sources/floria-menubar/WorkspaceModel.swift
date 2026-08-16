@@ -325,7 +325,7 @@ enum WorkspaceSurfaceKind: String, CaseIterable, Sendable {
         case .iniFile: "INI File"
         case .envFileDirect: "Direct Env File"
         case .linesFile: "Lines File"
-        case .unixSocket: "Unix Socket"
+        case .unixSocket: "SSH Access"
         }
     }
 
@@ -334,7 +334,7 @@ enum WorkspaceSurfaceKind: String, CaseIterable, Sendable {
         case .dotenvFile, .direnvFile, .envFileDirect: "Env file"
         case .iniFile: "Credentials file"
         case .linesFile: "Text file"
-        case .unixSocket: "Socket"
+        case .unixSocket: "SSH access"
         }
     }
 
@@ -345,7 +345,7 @@ enum WorkspaceSurfaceKind: String, CaseIterable, Sendable {
         case .iniFile: "list.bullet.rectangle"
         case .envFileDirect: "doc.text.fill"
         case .linesFile: "text.line.first.and.arrowtriangle.forward"
-        case .unixSocket: "point.3.connected.trianglepath.dotted"
+        case .unixSocket: "key.horizontal"
         }
     }
 
@@ -426,6 +426,10 @@ struct WorkspaceSurface: Identifiable, Hashable, Sendable {
         case .bindings(let ids), .sshAgent(let ids, _): ids
         case .resource: []
         }
+    }
+
+    var displayName: String {
+        kind == .unixSocket ? "SSH Access" : name
     }
 
     var resourceID: WorkspaceResource.ID? {
@@ -1756,7 +1760,7 @@ final class WorkspaceStore {
     @discardableResult
     func createSshAgentSurface(
         resourceID: WorkspaceResource.ID, selectedEntries: Set<String>,
-        securityLevel: WorkspaceSecurityLevel, route: WorkspaceSshRoute?
+        securityLevel: WorkspaceSecurityLevel, route: WorkspaceSshRoute
     ) async throws -> WorkspaceSurface.ID {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
         guard let project = selectedProject, let environment = selectedEnvironment else {
@@ -1783,7 +1787,7 @@ final class WorkspaceStore {
                 CatalogSurface(
                     id: surfaceID, environmentID: environment.id, name: resource.name,
                     kind: WorkspaceSurfaceKind.unixSocket.catalogValue, path: nil,
-                    input: .sshAgent([bindingID], route: route?.catalogValue),
+                    input: .sshAgent([bindingID], route: route.catalogValue),
                     enforcement: securityLevel.rawValue,
                     position: Int64(environment.surfaces.count)))
         } catch {
@@ -1934,7 +1938,7 @@ final class WorkspaceStore {
             let position = environment.surfaces.firstIndex(where: { $0.id == id }),
             let surface = environment.surfaces.first(where: { $0.id == id })
         else {
-            throw WorkspaceStoreError.invalid("Select an output first")
+            throw WorkspaceStoreError.invalid("Select a managed item first")
         }
         try await controlClient.upsertSurface(
             CatalogSurface(
@@ -1981,19 +1985,27 @@ final class WorkspaceStore {
                 throw WorkspaceStoreError.invalid(
                     "One or more bindings cannot feed the selected format")
             }
-            input = kind == .unixSocket
-                ? .sshAgent(bindingIDs, route: sshRoute?.catalogValue)
-                : .bindings(bindingIDs)
+            if kind == .unixSocket {
+                guard let sshRoute else {
+                    throw WorkspaceStoreError.invalid("Add at least one SSH Host pattern")
+                }
+                input = .sshAgent(bindingIDs, route: sshRoute.catalogValue)
+            } else {
+                input = .bindings(bindingIDs)
+            }
         case .sshAgent:
             guard surface.kind == .unixSocket, kind == .unixSocket else {
-                throw WorkspaceStoreError.invalid("SSH routes require a Unix Socket output")
+                throw WorkspaceStoreError.invalid("SSH access must keep its SSH Access type")
             }
             let allowed = Set(compatibleBindings(for: .unixSocket).map(\.id))
             guard bindingIDs.allSatisfy(allowed.contains) else {
                 throw WorkspaceStoreError.invalid(
                     "One or more bindings cannot feed the selected SSH agent")
             }
-            input = .sshAgent(bindingIDs, route: sshRoute?.catalogValue)
+            guard let sshRoute else {
+                throw WorkspaceStoreError.invalid("Add at least one SSH Host pattern")
+            }
+            input = .sshAgent(bindingIDs, route: sshRoute.catalogValue)
         case .resource(let resourceID):
             guard kind == surface.kind else {
                 throw WorkspaceStoreError.invalid("Direct outputs keep their source format")

@@ -1493,7 +1493,8 @@ private enum CompactManagedItem: Identifiable {
     var title: String {
         switch self {
         case .surface(let surface):
-            surface.path.map { URL(fileURLWithPath: $0).lastPathComponent } ?? surface.name
+            surface.path.map { URL(fileURLWithPath: $0).lastPathComponent }
+                ?? surface.displayName
         case .file(let file): URL(fileURLWithPath: file.path).lastPathComponent
         }
     }
@@ -1544,7 +1545,10 @@ private enum CompactManagedItem: Identifiable {
                 state.workspace.resource($0.resourceID)
             }
             return (
-                [surface.name, surface.path, surface.kind.managedTitle, surface.securityLevel.title]
+                [
+                    surface.displayName, surface.name, surface.path,
+                    surface.kind.managedTitle, surface.securityLevel.title,
+                ]
                     .compactMap { $0 }
                 + resources.flatMap { [$0.name, $0.kind.title, $0.exportSummary] }
             ).joined(separator: " ")

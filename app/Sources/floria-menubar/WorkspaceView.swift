@@ -456,7 +456,7 @@ struct AdvancedWorkspaceView: View {
                 Button("Import SSH Private Key", systemImage: "key.horizontal.fill") {
                     showingImportSshIdentity = true
                 }
-                Button("Connect External SSH Agent", systemImage: "network") {
+                Button("Connect External Agent", systemImage: "network") {
                     showingConnectExternalAgent = true
                 }
             } label: {
@@ -1131,7 +1131,7 @@ private struct SurfaceInspector: View {
                                     set: { store.selectedSurfaceID = $0 })
                             ) {
                                 ForEach(environment.surfaces) { surface in
-                                    Label(surface.name, systemImage: surface.kind.systemImage)
+                                    Label(surface.displayName, systemImage: surface.kind.systemImage)
                                         .tag(surface.id)
                                 }
                             }
@@ -1155,16 +1155,21 @@ private struct SurfaceInspector: View {
                                 Button("Lines Output", systemImage: "text.line.first.and.arrowtriangle.forward") {
                                     addLinesFile()
                                 }
-                                Button("SSH Agent Socket", systemImage: "network") {
+                                Divider()
+                                Button("SSH Access", systemImage: "key.horizontal") {
                                     addSshAgent()
                                 }
                             } label: {
                                 Image(systemName: "plus")
                             }
                             .buttonStyle(.borderless)
-                            .help("Add output surface")
+                            .help("Add managed item")
                             Menu {
-                                Button("Edit Output…", systemImage: "pencil") {
+                                Button(
+                                    surface.kind == .unixSocket
+                                        ? "Configure SSH Access…" : "Configure…",
+                                    systemImage: "pencil"
+                                ) {
                                     showingManageSurface = true
                                 }
                                 if surface.path != nil {
@@ -1174,8 +1179,9 @@ private struct SurfaceInspector: View {
                                 }
                                 Divider()
                                 Button(
-                                    "Delete Output…", systemImage: "trash",
-                                    role: .destructive
+                                    surface.kind == .unixSocket
+                                        ? "Remove from Project…" : "Stop Managing…",
+                                    systemImage: "trash", role: .destructive
                                 ) {
                                     confirmingRemoval = true
                                 }
@@ -1185,7 +1191,9 @@ private struct SurfaceInspector: View {
                             }
                             .menuStyle(.borderlessButton)
                             .fixedSize()
-                            .accessibilityLabel("Output actions")
+                            .accessibilityLabel(
+                                surface.kind == .unixSocket
+                                    ? "SSH access actions" : "Managed file actions")
                             if let link = surface.managedLink {
                                 SurfaceStatusBadge(link: link, readyTitle: "Ready")
                             }
@@ -1238,14 +1246,15 @@ private struct SurfaceInspector: View {
                 .background(Color.primary.opacity(0.018))
             } else {
                 VStack(spacing: 12) {
-                    ContentUnavailableView("No output surface", systemImage: "doc.badge.plus")
-                    Menu("Add Output", systemImage: "plus") {
+                    ContentUnavailableView("No managed item", systemImage: "doc.badge.plus")
+                    Menu("Add Managed Item", systemImage: "plus") {
                         Button("Composed Env Output", action: addDotenvFile)
                         Button("direnv Output", action: addDirenvFile)
                         Button("INI Output", action: addIniFile)
                         Button("Direct EnvFile Output", action: addDirectEnvFile)
                         Button("Lines Output", action: addLinesFile)
-                        Button("SSH Agent Socket", action: addSshAgent)
+                        Divider()
+                        Button("SSH Access", action: addSshAgent)
                     }
                     .buttonStyle(.borderedProminent)
                 }
@@ -1258,9 +1267,17 @@ private struct SurfaceInspector: View {
                 ManageSurfaceSheet(store: store, surface: surface)
             }
         }
-        .alert("Delete output?", isPresented: $confirmingRemoval) {
+        .alert(
+            store.selectedSurface?.kind == .unixSocket
+                ? "Remove SSH access from this project?" : "Stop managing this file?",
+            isPresented: $confirmingRemoval
+        ) {
             Button("Cancel", role: .cancel) { }
-            Button("Delete Output", role: .destructive) {
+            Button(
+                store.selectedSurface?.kind == .unixSocket
+                    ? "Remove from Project" : "Stop Managing",
+                role: .destructive
+            ) {
                 guard let surface = store.selectedSurface else { return }
                 Task {
                     do {
@@ -1271,7 +1288,11 @@ private struct SurfaceInspector: View {
                 }
             }
         } message: {
-            Text("Its resources and project bindings are kept. Floria removes only its managed link.")
+            if store.selectedSurface?.kind == .unixSocket {
+                Text("The project route and identity selection are removed. Reusable SSH identities stay in the Library.")
+            } else {
+                Text("Its reusable resources and project bindings are kept. Floria removes only the managed file.")
+            }
         }
         .alert(
             "Could not delete output",
@@ -1508,7 +1529,7 @@ private struct SocketSurfacePreview: View {
                             .font(.callout)
                             .foregroundStyle(.secondary)
                     }
-                    Text("The Unix socket stays in Floria's private runtime directory, not in the project.")
+                    Text("Floria creates and maintains the local agent endpoint automatically.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -1519,7 +1540,7 @@ private struct SocketSurfacePreview: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
-                Button("Manage SSH Agent", action: manageSocket)
+                Button("Configure SSH Access", action: manageSocket)
                     .buttonStyle(.borderedProminent)
             }
             .padding(16)
@@ -1639,7 +1660,11 @@ private struct ManageSurfaceSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Configure \(surface.path.map { URL(fileURLWithPath: $0).lastPathComponent } ?? surface.name)")
+                Text(
+                    isSocketSurface
+                        ? "Configure SSH Access"
+                        : "Configure \(surface.path.map { URL(fileURLWithPath: $0).lastPathComponent } ?? surface.name)"
+                )
                     .font(.title2.bold())
                 if let linkIssue {
                     Label(linkIssue, systemImage: "exclamationmark.triangle.fill")
@@ -1649,7 +1674,7 @@ private struct ManageSurfaceSheet: View {
             }
 
             if isManagedSurface {
-                InspectorSection(title: isSocketSurface ? "Socket" : "File") {
+                InspectorSection(title: "File") {
                     TextField("File name", text: $fileName)
                         .textFieldStyle(.roundedBorder)
                         .font(.body.monospaced())
@@ -1694,8 +1719,8 @@ private struct ManageSurfaceSheet: View {
             }
 
             if isSocketSurface {
-                InspectorSection(title: "SSH host route") {
-                    TextField("Host patterns", text: $sshHostPatterns)
+                InspectorSection(title: "Host routing") {
+                    TextField("Host patterns, e.g. ec2-* github.com", text: $sshHostPatterns)
                         .textFieldStyle(.roundedBorder)
                         .font(.body.monospaced())
                     TextField("HostName override", text: $sshHostname)
@@ -1707,8 +1732,8 @@ private struct ManageSurfaceSheet: View {
                             .textFieldStyle(.roundedBorder)
                             .frame(width: 80)
                     }
-                    Toggle("Forward Agent", isOn: $sshForwardAgent)
-                    Text("Space-separated patterns compile to one generated OpenSSH Host block.")
+                    Toggle("Allow agent forwarding from these hosts", isOn: $sshForwardAgent)
+                    Text("Required. Space-separated patterns become one generated OpenSSH Host block.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -1722,12 +1747,17 @@ private struct ManageSurfaceSheet: View {
                 Spacer()
                 Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
-                if isManagedSurface {
-                    Button("Save Changes", action: saveChanges)
+                if isManagedSurface || isSocketSurface {
+                    Button(isSocketSurface ? "Save SSH Access" : "Save Changes", action: saveChanges)
                         .buttonStyle(.borderedProminent)
                         .disabled(
                             isWorking
-                                || fileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                                || (isFileSurface
+                                    && fileName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                                || (isSocketSurface
+                                    && sshHostPatterns.trimmingCharacters(
+                                        in: .whitespacesAndNewlines
+                                    ).isEmpty))
                 }
             }
 
@@ -1804,11 +1834,10 @@ private struct ManageSurfaceSheet: View {
         }
         let hostname = sshHostname.trimmingCharacters(in: .whitespacesAndNewlines)
         let user = sshUser.trimmingCharacters(in: .whitespacesAndNewlines)
-        let hasOptions = !hostname.isEmpty || !user.isEmpty || port != nil || sshForwardAgent
-        guard !patterns.isEmpty || !hasOptions else {
-            throw WorkspaceStoreError.invalid("Add a Host pattern before route options")
+        guard !patterns.isEmpty else {
+            throw WorkspaceStoreError.invalid("Add at least one SSH Host pattern")
         }
-        return patterns.isEmpty ? nil : WorkspaceSshRoute(
+        return WorkspaceSshRoute(
             hostPatterns: patterns, hostname: hostname.nilIfEmpty, user: user.nilIfEmpty,
             port: port, forwardAgent: sshForwardAgent)
     }
@@ -1936,14 +1965,16 @@ private enum LibraryCatalogFilter: String, CaseIterable, Identifiable {
         switch (self, item) {
         case (.all, _), (.files, .file):
             true
-        case (.files, .surface):
-            true
+        case (.files, .surface(let surface)):
+            surface.kind != .unixSocket
         case (.files, .resource(let resource)):
             resource.kind == .envFile
         case (.secrets, .resource(let resource)):
             resource.kind == .sharedSecret || resource.kind == .secret
         case (.ssh, .resource(let resource)):
             resource.kind == .sshIdentity || resource.kind == .sshAgent
+        case (.ssh, .surface(let surface)):
+            surface.kind == .unixSocket
         default:
             false
         }
@@ -1970,7 +2001,8 @@ enum LibraryCatalogItem: Identifiable {
         case .resource(let resource):
             resource.name
         case .surface(let surface):
-            surface.path.map { URL(fileURLWithPath: $0).lastPathComponent } ?? surface.name
+            surface.path.map { URL(fileURLWithPath: $0).lastPathComponent }
+                ?? surface.displayName
         }
     }
 
@@ -2644,7 +2676,7 @@ struct LibraryItemDetailSheet: View {
             nil
         case .surface(let surface):
             surface.kind == .unixSocket
-                ? "Remove this socket"
+                ? "Remove SSH access from this project"
                 : "Stop protecting this file"
         }
     }
@@ -2660,7 +2692,7 @@ struct LibraryItemDetailSheet: View {
         case .resource:
             "This permanently removes the encrypted value and version history."
         case .surface(let surface) where surface.kind == .unixSocket:
-            "Remove the local socket. Its reusable SSH identities stay in the Library."
+            "The project route and identity selection are removed. Reusable SSH identities stay in the Library."
         case .surface:
             "Restore the current generated content at this path. Reusable content used elsewhere stays in the Library."
         }
@@ -2672,7 +2704,7 @@ struct LibraryItemDetailSheet: View {
         case .resource(let resource) where resource.kind == .sshAgent: "Disconnect…"
         case .resource: "Delete…"
         case .surface(let surface):
-            surface.kind == .unixSocket ? "Remove Socket…" : "Stop Protecting…"
+            surface.kind == .unixSocket ? "Remove from Project…" : "Stop Protecting…"
         }
     }
 
@@ -2695,7 +2727,7 @@ struct LibraryItemDetailSheet: View {
             "Delete secret?"
         case .surface(let surface):
             surface.kind == .unixSocket
-                ? "Remove managed socket?"
+                ? "Remove SSH access from this project?"
                 : "Restore plaintext and stop protecting?"
         }
     }
@@ -3531,8 +3563,8 @@ private struct NewSshAgentSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Connect External SSH Agent").font(.title2.bold())
-                Text("Advanced provider: forward signing to an existing agent socket.")
+                Text("Connect External Agent").font(.title2.bold())
+                Text("Advanced: use identities from an existing agent such as 1Password.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -3594,7 +3626,7 @@ private struct NewSshAgentSheet: View {
                 Spacer()
                 Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
-                Button("Connect Agent", action: create)
+                Button("Connect External Agent", action: create)
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
                     .disabled(
@@ -3608,7 +3640,7 @@ private struct NewSshAgentSheet: View {
             if value != discoveredEndpoint { identities = [] }
         }
         .alert(
-            "Could not connect SSH agent",
+            "Could not connect external agent",
             isPresented: Binding(
                 get: { errorMessage != nil },
                 set: { if !$0 { errorMessage = nil } })
@@ -3675,8 +3707,8 @@ private struct AddSshAgentSurfaceSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Add SSH Agent").font(.title2.bold())
-                Text("Choose which identities this project can use. Floria manages the agent endpoint.")
+                Text("Add SSH Access").font(.title2.bold())
+                Text("Choose which identities this project can use and the hosts they apply to.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -3684,14 +3716,16 @@ private struct AddSshAgentSurfaceSheet: View {
             if store.sshIdentityProviders.isEmpty {
                 ContentUnavailableView(
                     "No SSH Identities", systemImage: "key.horizontal",
-                    description: Text("Import a private key from the SSH Identities section first."))
+                    description: Text("Import a private key or connect an external agent in the Library first."))
                     .frame(maxWidth: .infinity, minHeight: 180)
             } else {
                 VStack(alignment: .leading, spacing: 7) {
-                    Text("Signing identity provider").font(.callout.weight(.medium))
-                    Picker("Signing identity provider", selection: $resourceID) {
+                    Text("Identity source").font(.callout.weight(.medium))
+                    Picker("Identity source", selection: $resourceID) {
                         ForEach(store.sshIdentityProviders) { resource in
-                            Text("\(resource.name) · \(resource.entries.count) identities")
+                            Text(
+                                "\(resource.name) · \(resource.entries.count) identit\(resource.entries.count == 1 ? "y" : "ies")"
+                            )
                                 .tag(resource.id)
                         }
                     }
@@ -3700,7 +3734,7 @@ private struct AddSshAgentSurfaceSheet: View {
                 }
 
                 if let resource {
-                    GroupBox("Exposed identities") {
+                    GroupBox("Allowed identities") {
                         ScrollView {
                             VStack(alignment: .leading, spacing: 7) {
                                 ForEach(resource.entries) { entry in
@@ -3714,7 +3748,7 @@ private struct AddSshAgentSurfaceSheet: View {
                     }
                 }
 
-                GroupBox("SSH host route (optional)") {
+                GroupBox("Host routing") {
                     VStack(alignment: .leading, spacing: 9) {
                         TextField("Host patterns, e.g. ec2-* github.com", text: $hostPatterns)
                             .textFieldStyle(.roundedBorder)
@@ -3729,8 +3763,8 @@ private struct AddSshAgentSurfaceSheet: View {
                                 .textFieldStyle(.roundedBorder)
                                 .frame(width: 75)
                         }
-                        Toggle("Forward this filtered agent to the remote host", isOn: $forwardAgent)
-                        Text("Floria writes a generated Include file; it does not edit ~/.ssh/config.")
+                        Toggle("Allow agent forwarding from these hosts", isOn: $forwardAgent)
+                        Text("Host patterns are required. Floria writes the matching route to its generated SSH config.")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
@@ -3745,10 +3779,12 @@ private struct AddSshAgentSurfaceSheet: View {
                 Spacer()
                 Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
-                Button("Add SSH Agent", action: create)
+                Button("Add SSH Access", action: create)
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(isSaving || resourceID.isEmpty || selectedEntries.isEmpty)
+                    .disabled(
+                        isSaving || resourceID.isEmpty || selectedEntries.isEmpty
+                            || hostPatterns.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
         .padding(24)
@@ -3758,7 +3794,7 @@ private struct AddSshAgentSurfaceSheet: View {
         }
         .onChange(of: resourceID) { _, value in selectResource(value) }
         .alert(
-            "Could not create SSH agent socket",
+            "Could not add SSH access",
             isPresented: Binding(
                 get: { errorMessage != nil },
                 set: { if !$0 { errorMessage = nil } })
@@ -3798,11 +3834,10 @@ private struct AddSshAgentSurfaceSheet: View {
                 } else {
                     throw WorkspaceStoreError.invalid("SSH port must be between 1 and 65535")
                 }
-                let hasOptions = !hostname.isEmpty || !user.isEmpty || portValue != nil || forwardAgent
-                guard !patterns.isEmpty || !hasOptions else {
-                    throw WorkspaceStoreError.invalid("Add a Host pattern before route options")
+                guard !patterns.isEmpty else {
+                    throw WorkspaceStoreError.invalid("Add at least one SSH Host pattern")
                 }
-                let route = patterns.isEmpty ? nil : WorkspaceSshRoute(
+                let route = WorkspaceSshRoute(
                     hostPatterns: patterns,
                     hostname: hostname.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
                     user: user.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
@@ -3900,10 +3935,10 @@ private struct SshAgentsCatalogView: View {
         VStack(spacing: 0) {
             ResourceCatalogView(
                 store: store, title: "SSH Identities",
-                subtitle: "Private keys managed by Floria, with optional external signing providers",
+                subtitle: "Reusable signing identities for project SSH access",
                 kinds: [.sshIdentity, .sshAgent], search: search,
                 addResourceTitle: "Import Private Key", addResource: importIdentity,
-                secondaryResourceTitle: "External Agent",
+                secondaryResourceTitle: "Connect External Agent",
                 secondaryResource: connectExternalAgent)
                 .frame(maxHeight: .infinity)
             Divider()
@@ -4552,7 +4587,7 @@ private struct AddBindingSheet: View {
             Divider()
             Picker("Output", selection: $outputSurfaceID) {
                 ForEach(outputs) { surface in
-                    Label(surface.name, systemImage: surface.kind.systemImage).tag(surface.id)
+                    Label(surface.displayName, systemImage: surface.kind.systemImage).tag(surface.id)
                 }
             }
             .pickerStyle(.menu)
