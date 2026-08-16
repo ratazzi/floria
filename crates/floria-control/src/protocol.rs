@@ -172,6 +172,7 @@ pub enum ControlCommand {
         name: String,
         path: PathBuf,
         passphrase: Option<SecretValue>,
+        manage_source: bool,
         enforcement: Enforcement,
         metadata: ItemMetadata,
     },
@@ -1552,6 +1553,7 @@ mod tests {
                 name: "Fixture identity".to_string(),
                 path: PathBuf::from("/private/tmp/fixture-id_ed25519"),
                 passphrase: Some(SecretValue::new("fixture passphrase")),
+                manage_source: true,
                 enforcement: Enforcement::Prompt,
                 metadata: ItemMetadata::default(),
             },
@@ -1562,6 +1564,7 @@ mod tests {
         assert_eq!(value["method"], "ssh_identity_import");
         assert_eq!(value["params"]["path"], "/private/tmp/fixture-id_ed25519");
         assert_eq!(value["params"]["passphrase"], "fixture passphrase");
+        assert_eq!(value["params"]["manage_source"], true);
         assert!(value["params"].get("private_key").is_none());
     }
 

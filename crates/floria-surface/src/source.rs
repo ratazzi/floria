@@ -16,7 +16,7 @@ pub fn compile_source(
     store: &Arc<dyn SecretStore>,
 ) -> SurfaceResult<Arc<dyn ContentSource>> {
     let source: Arc<dyn ContentSource> = match source {
-        ResourceSource::SecretRef { secret_id } => {
+        ResourceSource::SecretRef { secret_id, .. } => {
             let id: SecretId = secret_id.parse()?;
             Arc::new(StoreSource::new(Arc::clone(store), id))
         }
@@ -120,6 +120,7 @@ mod tests {
         let secret = compile_source(
             &ResourceSource::SecretRef {
                 secret_id: "00000000-0000-0000-0000-000000000901".to_string(),
+                managed_source_ids: Vec::new(),
             },
             &store,
         )

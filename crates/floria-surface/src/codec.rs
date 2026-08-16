@@ -204,7 +204,10 @@ pub fn validate_secret_bytes(
     for resource in snapshot.resources.iter().filter(|resource| {
         matches!(
             &resource.source,
-            ResourceSource::SecretRef { secret_id: referenced } if referenced == secret_id
+            ResourceSource::SecretRef {
+                secret_id: referenced,
+                ..
+            } if referenced == secret_id
         )
     }) {
         let decoded = decode_resource(resource, bytes)?;
@@ -300,7 +303,10 @@ mod tests {
                 key: Some("FIXTURE".to_string()),
                 sensitive: true,
             }],
-            source: ResourceSource::SecretRef { secret_id: "fixture-secret".to_string() },
+            source: ResourceSource::SecretRef {
+                secret_id: "fixture-secret".to_string(),
+                managed_source_ids: Vec::new(),
+            },
             enforcement: Default::default(),
             metadata: Default::default(),
             origin: Default::default(),
@@ -327,7 +333,10 @@ mod tests {
                 key: None,
                 sensitive: true,
             }],
-            source: ResourceSource::SecretRef { secret_id: "fixture-secret".to_string() },
+            source: ResourceSource::SecretRef {
+                secret_id: "fixture-secret".to_string(),
+                managed_source_ids: Vec::new(),
+            },
             enforcement: Default::default(),
             metadata: Default::default(),
             origin: Default::default(),

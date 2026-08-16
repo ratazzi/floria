@@ -2365,6 +2365,7 @@ mod tests {
                 }],
                 source: ResourceSource::SecretRef {
                     secret_id: INI_SECRET_ID.to_string(),
+                    managed_source_ids: Vec::new(),
                 },
                 enforcement: Enforcement::Prompt,
                 metadata: Default::default(),
@@ -2411,6 +2412,7 @@ mod tests {
                 }],
                 source: ResourceSource::SecretRef {
                     secret_id: DIRECT_SECRET_ID.to_string(),
+                    managed_source_ids: Vec::new(),
                 },
                 enforcement: Enforcement::Prompt,
                 metadata: Default::default(),
@@ -2434,6 +2436,7 @@ mod tests {
                 }],
                 source: ResourceSource::SecretRef {
                     secret_id: RAW_SECRET_ID.to_string(),
+                    managed_source_ids: Vec::new(),
                 },
                 enforcement: Enforcement::Prompt,
                 metadata: Default::default(),
@@ -2946,6 +2949,7 @@ mod tests {
             .unwrap();
         rebound_resource.source = ResourceSource::SecretRef {
             secret_id: RAW_SECRET_ID.to_string(),
+            managed_source_ids: Vec::new(),
         };
         catalog.upsert_resource(&rebound_resource).unwrap();
         registry.replace(&catalog.snapshot().unwrap());

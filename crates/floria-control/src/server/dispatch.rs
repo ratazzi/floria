@@ -568,15 +568,18 @@ fn dispatch_uncoordinated(
             name,
             path,
             passphrase,
+            manage_source,
             enforcement,
             metadata,
-        } => import_ssh_identity(
+        } => import_ssh_identity_from_file(
             catalog,
             store.ok_or(DispatchError::StoreUnavailable)?,
+            mount_path.ok_or(DispatchError::StoreUnavailable)?,
             resource_id,
             name,
             &path,
             passphrase.as_ref(),
+            manage_source,
             ManagedItemSettings { enforcement, metadata },
             ResourceOrigin {
                 kind: OriginKind::SshImport,
@@ -591,6 +594,7 @@ fn dispatch_uncoordinated(
         ControlCommand::SshIdentityRemove { resource_id } => remove_ssh_identity(
             catalog,
             store.ok_or(DispatchError::StoreUnavailable)?,
+            mount_path.ok_or(DispatchError::StoreUnavailable)?,
             resource_id,
         ),
         ControlCommand::SshConfigStatus => ssh_config
@@ -763,7 +767,7 @@ fn dispatch_uncoordinated(
             ResourceOrigin { kind: OriginKind::Manual, sources: Vec::new() },
         ),
         ControlCommand::ResourceMetadataUpdate { resource_id, name, enforcement, metadata } => {
-            update_resource_metadata(catalog, &resource_id, name, enforcement, metadata)
+            update_resource_metadata(catalog, store, &resource_id, name, enforcement, metadata)
         }
         ControlCommand::ProjectCreate { project, environment, surface } => {
             create_project_workspace(catalog, project, environment, surface)

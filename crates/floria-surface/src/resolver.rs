@@ -538,7 +538,7 @@ fn direct_env_file_target(
         .ok_or_else(|| SurfaceError::NotFound(format!("resource {resource_id}")))?
         .clone();
     let secret_id = match &resource.source {
-        ResourceSource::SecretRef { secret_id } => secret_id.clone(),
+        ResourceSource::SecretRef { secret_id, .. } => secret_id.clone(),
         _ => {
             return Err(SurfaceError::IncompatibleResource {
                 resource_id: resource.id.clone(),
@@ -873,7 +873,10 @@ mod tests {
                     key: Some("SERVICE_TOKEN".to_string()),
                     sensitive: true,
                 }],
-                source: ResourceSource::SecretRef { secret_id: TOKEN_ID.to_string() },
+                source: ResourceSource::SecretRef {
+                    secret_id: TOKEN_ID.to_string(),
+                    managed_source_ids: Vec::new(),
+                },
                 enforcement: Default::default(),
                 metadata: Default::default(),
                 origin: Default::default(),
@@ -902,7 +905,10 @@ mod tests {
                         sensitive: false,
                     },
                 ],
-                source: ResourceSource::SecretRef { secret_id: ENV_FILE_ID.to_string() },
+                source: ResourceSource::SecretRef {
+                    secret_id: ENV_FILE_ID.to_string(),
+                    managed_source_ids: Vec::new(),
+                },
                 enforcement: Default::default(),
                 metadata: Default::default(),
                 origin: Default::default(),
@@ -1180,6 +1186,7 @@ mod tests {
                 entries: Vec::new(),
                 source: ResourceSource::SecretRef {
                     secret_id: ENV_FILE_ID.to_string(),
+                    managed_source_ids: Vec::new(),
                 },
                 enforcement: Default::default(),
                 metadata: Default::default(),
@@ -1262,7 +1269,10 @@ mod tests {
                         sensitive: true,
                     },
                 ],
-                source: ResourceSource::SecretRef { secret_id: INI_FILE_ID.to_string() },
+                source: ResourceSource::SecretRef {
+                    secret_id: INI_FILE_ID.to_string(),
+                    managed_source_ids: Vec::new(),
+                },
                 enforcement: Default::default(),
                 metadata: Default::default(),
                 origin: Default::default(),
@@ -1476,6 +1486,7 @@ mod tests {
                 ],
                 source: ResourceSource::SecretRef {
                     secret_id: INI_FILE_ID.to_string(),
+                    managed_source_ids: Vec::new(),
                 },
                 enforcement: Default::default(),
                 metadata: Default::default(),
@@ -1499,6 +1510,7 @@ mod tests {
                 }],
                 source: ResourceSource::SecretRef {
                     secret_id: INI_COMMON_ID.to_string(),
+                    managed_source_ids: Vec::new(),
                 },
                 enforcement: Default::default(),
                 metadata: Default::default(),
@@ -1522,6 +1534,7 @@ mod tests {
                 }],
                 source: ResourceSource::SecretRef {
                     secret_id: INI_ROOT_ID.to_string(),
+                    managed_source_ids: Vec::new(),
                 },
                 enforcement: Default::default(),
                 metadata: Default::default(),
@@ -1744,7 +1757,10 @@ mod tests {
                         key: None,
                         sensitive: true,
                     }],
-                    source: ResourceSource::SecretRef { secret_id: secret_id.to_string() },
+                    source: ResourceSource::SecretRef {
+                        secret_id: secret_id.to_string(),
+                        managed_source_ids: Vec::new(),
+                    },
                     enforcement: Default::default(),
                     metadata: Default::default(),
                     origin: Default::default(),

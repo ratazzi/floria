@@ -2492,7 +2492,7 @@ fn managed_policy_items(
                 enforcement: resource.enforcement,
             });
         }
-        let ResourceSource::SecretRef { secret_id } = &resource.source else { continue };
+        let ResourceSource::SecretRef { secret_id, .. } = &resource.source else { continue };
         items.push(ManagedPolicyItem {
             object: ManagedObject::Secret { secret_id: secret_id.clone() },
             enforcement: resource.enforcement,
@@ -3333,7 +3333,10 @@ mod tests {
                 key: Some(id.to_uppercase()),
                 sensitive: true,
             }],
-            source: ResourceSource::SecretRef { secret_id: secret_id.to_string() },
+            source: ResourceSource::SecretRef {
+                secret_id: secret_id.to_string(),
+                managed_source_ids: Vec::new(),
+            },
             enforcement,
             metadata: Default::default(),
             origin: Default::default(),

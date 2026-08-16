@@ -105,7 +105,7 @@ fn file_surfaces(snapshot: &CatalogSnapshot) -> BTreeMap<String, ResolvedAccessP
                         );
                         return None;
                     };
-                    let ResourceSource::SecretRef { secret_id } = &resource.source else {
+                    let ResourceSource::SecretRef { secret_id, .. } = &resource.source else {
                         tracing::warn!(
                             surface_id = %surface.id,
                             resource_id,
@@ -205,7 +205,10 @@ mod tests {
                 key: Some("FIXTURE".to_string()),
                 sensitive: true,
             }],
-            source: ResourceSource::SecretRef { secret_id: "fixture-secret".to_string() },
+            source: ResourceSource::SecretRef {
+                secret_id: "fixture-secret".to_string(),
+                managed_source_ids: Vec::new(),
+            },
             enforcement: Default::default(),
             metadata: Default::default(),
             origin: Default::default(),
@@ -257,6 +260,7 @@ mod tests {
             .to_string();
         env_resource.source = ResourceSource::SecretRef {
             secret_id: "fixture-rebound-secret".to_string(),
+            managed_source_ids: Vec::new(),
         };
         registry.replace(&snapshot(vec![direct], vec![env_resource]));
         assert_ne!(

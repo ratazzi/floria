@@ -439,7 +439,7 @@ fn ssh_provider(
         (
             ResourceKind::SshIdentity,
             ValueShape::SshIdentity,
-            ResourceSource::SecretRef { secret_id },
+            ResourceSource::SecretRef { secret_id, .. },
         ) => Ok(ProviderSpec::ManagedPrivateKey {
             resource_id: resource.id.clone(),
             secret_id: secret_id.clone(),
@@ -1698,6 +1698,7 @@ mod tests {
             }],
             source: ResourceSource::SecretRef {
                 secret_id: "fixture-managed-key".to_string(),
+                managed_source_ids: Vec::new(),
             },
             enforcement: Enforcement::Prompt,
             metadata: Default::default(),

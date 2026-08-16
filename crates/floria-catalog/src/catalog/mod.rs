@@ -752,7 +752,10 @@ mod tests {
                 key: Some(key.to_string()),
                 sensitive: true,
             }],
-            source: ResourceSource::SecretRef { secret_id: format!("secret-{id}") },
+            source: ResourceSource::SecretRef {
+                secret_id: format!("secret-{id}"),
+                managed_source_ids: Vec::new(),
+            },
             enforcement: Enforcement::Prompt,
             metadata: Default::default(),
             origin: Default::default(),
@@ -781,7 +784,10 @@ mod tests {
                     sensitive: true,
                 },
             ],
-            source: ResourceSource::SecretRef { secret_id: format!("secret-{id}") },
+            source: ResourceSource::SecretRef {
+                secret_id: format!("secret-{id}"),
+                managed_source_ids: Vec::new(),
+            },
             enforcement: Enforcement::Prompt,
             metadata: Default::default(),
             origin: Default::default(),
@@ -1315,7 +1321,10 @@ mod tests {
                 key: Some("credential-process".to_string()),
                 sensitive: true,
             }],
-            source: ResourceSource::SecretRef { secret_id: "fixture-ini-secret".to_string() },
+            source: ResourceSource::SecretRef {
+                secret_id: "fixture-ini-secret".to_string(),
+                managed_source_ids: Vec::new(),
+            },
             enforcement: Enforcement::Prompt,
             metadata: Default::default(),
             origin: Default::default(),
@@ -1364,6 +1373,7 @@ mod tests {
         duplicate.id = "fixture-ini-duplicate".to_string();
         duplicate.source = ResourceSource::SecretRef {
             secret_id: "fixture-ini-secret-two".to_string(),
+            managed_source_ids: Vec::new(),
         };
         catalog.upsert_resource(&duplicate).unwrap();
         catalog
@@ -1957,7 +1967,10 @@ mod tests {
                     key: Some("LOG_LEVEL".to_string()),
                     sensitive: false,
                 }],
-                source: ResourceSource::SecretRef { secret_id: "secret-defaults".to_string() },
+                source: ResourceSource::SecretRef {
+                    secret_id: "secret-defaults".to_string(),
+                    managed_source_ids: Vec::new(),
+                },
                 enforcement: Enforcement::Prompt,
                 metadata: Default::default(),
                 origin: Default::default(),
@@ -2086,6 +2099,7 @@ mod tests {
                 }],
                 source: ResourceSource::SecretRef {
                     secret_id: "fixture-managed-private-key".to_string(),
+                    managed_source_ids: Vec::new(),
                 },
                 enforcement: Enforcement::Prompt,
                 metadata: Default::default(),

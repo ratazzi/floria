@@ -1964,12 +1964,7 @@ impl ReplicationEngine {
         let secret_ids = projection
             .resources
             .iter()
-            .filter_map(|resource| match &resource.source {
-                floria_catalog::ResourceSource::SecretRef { secret_id } => {
-                    Some(secret_id.clone())
-                }
-                _ => None,
-            })
+            .flat_map(|resource| resource.source.referenced_secret_ids().map(str::to_string))
             .collect::<BTreeSet<_>>();
         for secret_id in secret_ids {
             let parsed: SecretId = secret_id.parse()?;
@@ -3488,7 +3483,10 @@ mod tests {
                     key: Some("FIXTURE_VALUE".to_string()),
                     sensitive: true,
                 }],
-                source: ResourceSource::SecretRef { secret_id: secret_id.to_string() },
+                source: ResourceSource::SecretRef {
+                    secret_id: secret_id.to_string(),
+                    managed_source_ids: Vec::new(),
+                },
                 enforcement: Enforcement::Prompt,
                 metadata: Default::default(),
                 origin: Default::default(),
@@ -3512,6 +3510,36 @@ mod tests {
         let mut projection = projection(secret_id);
         projection.projects = project_projection(name).projects;
         projection
+    }
+
+    fn ssh_projection_with_managed_source(
+        secret_id: &SecretId,
+        managed_source_id: &SecretId,
+    ) -> ReplicatedCatalog {
+        ReplicatedCatalog {
+            resources: vec![Resource {
+                id: "ssh-identity-1".to_string(),
+                name: "Personal SSH".to_string(),
+                kind: ResourceKind::SshIdentity,
+                shape: ValueShape::SshIdentity,
+                codec: ResourceCodec::Opaque,
+                default_env_key: None,
+                entries: vec![EntrySpec {
+                    address: format!("ssh/sha256/{}", "a".repeat(43)),
+                    label: "Personal SSH".to_string(),
+                    key: None,
+                    sensitive: false,
+                }],
+                source: ResourceSource::SecretRef {
+                    secret_id: secret_id.to_string(),
+                    managed_source_ids: vec![managed_source_id.to_string()],
+                },
+                enforcement: Enforcement::Prompt,
+                metadata: Default::default(),
+                origin: Default::default(),
+            }],
+            ..Default::default()
+        }
     }
 
     fn journal(
@@ -4550,6 +4578,39 @@ mod tests {
             store.get(&secret_id).unwrap().as_slice(),
             b"fixture payload, not a credential"
         );
+    }
+
+    #[test]
+    fn snapshot_requires_the_managed_source_owned_by_an_ssh_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = open_store(directory.path(), "local");
+        let secret_id: SecretId = "55555555-5555-4555-8555-555555555555".parse().unwrap();
+        let managed_source_id: SecretId =
+            "77777777-7777-4777-8777-777777777777".parse().unwrap();
+        store
+            .put_identified(
+                secret_id.clone(),
+                NewSecret::managed("Personal SSH"),
+                b"fixture identity payload",
+                "66666666-6666-4666-8666-666666666666",
+            )
+            .unwrap();
+        let package = package_for_store(&store);
+        let intents = journal(directory.path(), "local", package.vault_id(), [79; 32]);
+        let catalog = Arc::new(Catalog::open(directory.path().join("catalog.sqlite")).unwrap());
+        catalog
+            .apply_replicated_catalog(&ssh_projection_with_managed_source(
+                &secret_id,
+                &managed_source_id,
+            ))
+            .unwrap();
+        let engine = ReplicationEngine::from_parts(package, intents, catalog, store);
+
+        let error = engine
+            .stage_current_snapshot("2026-08-16T00:00:00Z")
+            .unwrap_err();
+
+        assert!(error.to_string().contains(managed_source_id.as_str()));
     }
 
     #[test]

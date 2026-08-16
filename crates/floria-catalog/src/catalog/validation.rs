@@ -181,7 +181,28 @@ pub(super) fn validate_resource(resource: &Resource) -> CatalogResult<()> {
     }
 
     match &resource.source {
-        ResourceSource::SecretRef { secret_id } => require_id(secret_id, "secret reference")?,
+        ResourceSource::SecretRef {
+            secret_id,
+            managed_source_ids,
+        } => {
+            require_id(secret_id, "secret reference")?;
+            if !managed_source_ids.is_empty() && resource.kind != ResourceKind::SshIdentity {
+                return Err(CatalogError::Validation(format!(
+                    "resource {:?} cannot own managed source files",
+                    resource.id
+                )));
+            }
+            let mut unique = std::collections::HashSet::new();
+            for managed_source_id in managed_source_ids {
+                require_id(managed_source_id, "managed source id")?;
+                if managed_source_id == secret_id || !unique.insert(managed_source_id) {
+                    return Err(CatalogError::Validation(format!(
+                        "resource {:?} repeats store reference {:?}",
+                        resource.id, managed_source_id
+                    )));
+                }
+            }
+        }
         ResourceSource::Command { argv } if argv.iter().any(|arg| arg.is_empty()) => {
             return Err(CatalogError::Validation(
                 "command argv cannot contain empty arguments".to_string(),

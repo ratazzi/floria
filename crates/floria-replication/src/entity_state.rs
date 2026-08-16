@@ -283,6 +283,7 @@ mod tests {
                 }],
                 source: ResourceSource::SecretRef {
                     secret_id: "55555555-5555-4555-8555-555555555555".to_string(),
+                    managed_source_ids: Vec::new(),
                 },
                 enforcement: Enforcement::Prompt,
                 metadata: ItemMetadata::default(),

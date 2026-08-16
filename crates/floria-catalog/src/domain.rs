@@ -190,10 +190,30 @@ pub enum EntrySelection {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ResourceSource {
-    SecretRef { secret_id: String },
+    SecretRef {
+        secret_id: String,
+        /// Protected source files owned by this resource when import managed the originals.
+        /// These stable store ids are replicated; paths in `ResourceOrigin` are not.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        managed_source_ids: Vec<String>,
+    },
     Literal { value: String },
     Command { argv: Vec<String> },
     Socket,
+}
+
+impl ResourceSource {
+    /// Every encrypted store record required to reconstruct this resource and its managed source.
+    pub fn referenced_secret_ids(&self) -> impl Iterator<Item = &str> {
+        let (primary, managed) = match self {
+            ResourceSource::SecretRef {
+                secret_id,
+                managed_source_ids,
+            } => (Some(secret_id.as_str()), managed_source_ids.as_slice()),
+            _ => (None, &[][..]),
+        };
+        primary.into_iter().chain(managed.iter().map(String::as_str))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -627,7 +647,7 @@ impl CatalogSnapshot {
                     })
             })
             .and_then(|resource| match &resource.source {
-                ResourceSource::SecretRef { secret_id } => Some(secret_id.as_str()),
+                ResourceSource::SecretRef { secret_id, .. } => Some(secret_id.as_str()),
                 _ => None,
             })
             .unwrap_or(&surface.id)
@@ -733,7 +753,10 @@ mod tests {
                 key: Some("FIXTURE".to_string()),
                 sensitive: true,
             }],
-            source: ResourceSource::SecretRef { secret_id: secret_id.to_string() },
+            source: ResourceSource::SecretRef {
+                secret_id: secret_id.to_string(),
+                managed_source_ids: Vec::new(),
+            },
             enforcement: Enforcement::Prompt,
             metadata: ItemMetadata::default(),
             origin: ResourceOrigin {
@@ -794,6 +817,7 @@ mod tests {
             entries: Vec::new(),
             source: ResourceSource::SecretRef {
                 secret_id: "fixture-secret".to_string(),
+                managed_source_ids: Vec::new(),
             },
             enforcement: Enforcement::Prompt,
             metadata: ItemMetadata::default(),

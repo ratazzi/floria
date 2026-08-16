@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use floria_catalog::{ReplicatedCatalog, ResourceSource};
+use floria_catalog::ReplicatedCatalog;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -281,20 +281,19 @@ fn validate_secret_references(
     secrets: &BTreeMap<String, SecretEntityDocument>,
 ) -> ReplicationResult<()> {
     for resource in &catalog.resources {
-        let ResourceSource::SecretRef { secret_id } = &resource.source else {
-            continue;
-        };
-        let secret = secrets.get(secret_id).ok_or_else(|| {
-            ReplicationError::Invalid(format!(
-                "active resource {} references missing secret {secret_id}",
-                resource.id
-            ))
-        })?;
-        if secret.lifecycle() != EntityLifecycle::Active {
-            return Err(ReplicationError::Invalid(format!(
-                "active resource {} references archived secret {secret_id}",
-                resource.id
-            )));
+        for secret_id in resource.source.referenced_secret_ids() {
+            let secret = secrets.get(secret_id).ok_or_else(|| {
+                ReplicationError::Invalid(format!(
+                    "active resource {} references missing secret {secret_id}",
+                    resource.id
+                ))
+            })?;
+            if secret.lifecycle() != EntityLifecycle::Active {
+                return Err(ReplicationError::Invalid(format!(
+                    "active resource {} references archived secret {secret_id}",
+                    resource.id
+                )));
+            }
         }
     }
     Ok(())
@@ -372,7 +371,7 @@ mod tests {
     use age::x25519;
     use floria_catalog::{
         EntrySpec, ItemMetadata, Resource, ResourceCodec, ResourceKind, ResourceOrigin,
-        ValueShape,
+        ResourceSource, ValueShape,
     };
     use floria_core::authz::Enforcement;
     use floria_integrity::StateAuthenticator;
@@ -444,7 +443,10 @@ mod tests {
                 key: Some("FIXTURE_TOKEN".to_string()),
                 sensitive: true,
             }],
-            source: ResourceSource::SecretRef { secret_id },
+            source: ResourceSource::SecretRef {
+                secret_id,
+                managed_source_ids: Vec::new(),
+            },
             enforcement: Enforcement::Prompt,
             metadata: ItemMetadata::default(),
             origin: ResourceOrigin::default(),

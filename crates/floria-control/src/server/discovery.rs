@@ -255,7 +255,7 @@ pub(super) fn apply_discovery(
                         )
                     };
                     match imported {
-                        Ok(_) => {
+                        Ok(ControlResult::SshIdentityCreated { mut resource }) => {
                             if existing_identity.is_some() {
                                 result.reused_resources += 1;
                             } else {
@@ -275,6 +275,21 @@ pub(super) fn apply_discovery(
                                         file.environment.as_deref(),
                                     )?;
                                 }
+                                let ControlResult::FileProtected {
+                                    file: protected_file,
+                                    ..
+                                } = &protected
+                                else {
+                                    return Err(DispatchError::Validation(
+                                        "protecting an SSH identity source returned an unexpected result"
+                                            .to_string(),
+                                    ));
+                                };
+                                attach_managed_source(
+                                    catalog,
+                                    &mut resource,
+                                    &protected_file.id,
+                                )?;
                                 result.protected_files += 1;
                             }
                             result.files.push(DiscoveryAppliedFile {
@@ -289,6 +304,12 @@ pub(super) fn apply_discovery(
                                     "Imported as a managed SSH identity".to_string()
                                 },
                             });
+                        }
+                        Ok(_) => {
+                            return Err(DispatchError::Validation(
+                                "importing an SSH identity returned an unexpected result"
+                                    .to_string(),
+                            ));
                         }
                         // The private-key heuristic can misread other PEM credentials (JWT/TLS
                         // keys) as SSH keys; protect those as opaque files instead of failing
@@ -1355,7 +1376,9 @@ impl Drop for DiscoveryMutationGuard<'_> {
                 .resource(resource_id)
                 .ok()
                 .and_then(|resource| match resource.source {
-                    ResourceSource::SecretRef { secret_id } => secret_id.parse::<SecretId>().ok(),
+                    ResourceSource::SecretRef { secret_id, .. } => {
+                        secret_id.parse::<SecretId>().ok()
+                    }
                     ResourceSource::Literal { .. }
                     | ResourceSource::Command { .. }
                     | ResourceSource::Socket => None,
@@ -1906,7 +1929,7 @@ pub(super) fn existing_discovery_secrets(
         if !candidate_keys.contains(&key) {
             continue;
         }
-        let ResourceSource::SecretRef { secret_id } = resource.source else { continue };
+        let ResourceSource::SecretRef { secret_id, .. } = resource.source else { continue };
         let id = match secret_id.parse::<SecretId>() {
             Ok(id) => id,
             Err(error) => {

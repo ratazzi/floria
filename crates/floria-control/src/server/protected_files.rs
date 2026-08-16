@@ -12,7 +12,7 @@ pub(super) fn protected_files(
         .resources
         .iter()
         .filter_map(|resource| match &resource.source {
-            ResourceSource::SecretRef { secret_id } => Some(secret_id.as_str()),
+            ResourceSource::SecretRef { secret_id, .. } => Some(secret_id.as_str()),
             ResourceSource::Literal { .. }
             | ResourceSource::Command { .. }
             | ResourceSource::Socket => None,
@@ -105,7 +105,10 @@ pub(super) fn configure_managed_file(
     if snapshot.resources.iter().any(|resource| {
         matches!(
             &resource.source,
-            ResourceSource::SecretRef { secret_id: existing } if existing == id
+            ResourceSource::SecretRef {
+                secret_id: existing,
+                ..
+            } if existing == id
         )
     }) {
         return Err(DispatchError::Validation(format!(
@@ -204,7 +207,10 @@ pub(super) fn configure_managed_file(
                 sensitive: true,
             })
             .collect(),
-        source: ResourceSource::SecretRef { secret_id: secret_id.to_string() },
+        source: ResourceSource::SecretRef {
+            secret_id: secret_id.to_string(),
+            managed_source_ids: Vec::new(),
+        },
         enforcement: record.enforcement,
         metadata: record.metadata.clone(),
         origin: ResourceOrigin {
@@ -288,7 +294,7 @@ pub(super) fn restore_managed_file(
             && resource.origin.sources.len() == 1
             && resource.origin.sources[0].path == surface_path
     }) {
-        let ResourceSource::SecretRef { secret_id } = &resource.source else { continue };
+        let ResourceSource::SecretRef { secret_id, .. } = &resource.source else { continue };
         let parsed: SecretId = secret_id.parse()?;
         let Some(record) = store.record(&parsed)? else { continue };
         if matches!(&record.origin, SecretOrigin::File { source_path } if source_path == &surface_path)
@@ -663,7 +669,7 @@ pub(super) fn protect_discovered_file(
     )
 }
 
-fn protect_file_with_initial_enforcement(
+pub(super) fn protect_file_with_initial_enforcement(
     catalog: &Catalog,
     store: &dyn SecretStore,
     mount_path: &Path,
@@ -1103,7 +1109,7 @@ pub(super) fn restore_file(
         .resources
         .iter()
         .filter_map(|resource| match &resource.source {
-            ResourceSource::SecretRef { secret_id } if secret_id == id.as_str() => {
+            ResourceSource::SecretRef { secret_id, .. } if secret_id == id.as_str() => {
                 Some(resource.name.as_str())
             }
             _ => None,

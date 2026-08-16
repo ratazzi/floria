@@ -2980,6 +2980,11 @@
         assert_eq!(snapshot.projects.len(), 1);
         assert_eq!(snapshot.resources.len(), 1);
         assert_eq!(snapshot.resources[0].kind, ResourceKind::SshIdentity);
+        assert!(matches!(
+            &snapshot.resources[0].source,
+            ResourceSource::SecretRef { managed_source_ids, .. }
+                if managed_source_ids == &[FIXTURE_FILE_SECRET_ID.to_string()]
+        ));
         assert_eq!(
             snapshot.resources[0].origin.sources[0].project_id.as_deref(),
             Some(snapshot.projects[0].id.as_str())
@@ -3056,6 +3061,11 @@
         let snapshot = catalog.snapshot().unwrap();
         assert_eq!(snapshot.resources.len(), 1);
         assert_eq!(snapshot.projects.len(), 1);
+        assert!(matches!(
+            &snapshot.resources[0].source,
+            ResourceSource::SecretRef { managed_source_ids, .. }
+                if managed_source_ids == &[FIXTURE_FILE_SECRET_ID.to_string()]
+        ));
         assert_eq!(
             snapshot.resources[0].origin.sources[0].project_id.as_deref(),
             Some(snapshot.projects[0].id.as_str())
@@ -3163,11 +3173,8 @@
         let dir = tempfile::tempdir().unwrap();
         let source_path = dir.path().join("fixture-id_ed25519");
         let private_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
-        std::fs::write(
-            &source_path,
-            private_key.to_openssh(LineEnding::LF).unwrap().as_bytes(),
-        )
-        .unwrap();
+        let source_bytes = private_key.to_openssh(LineEnding::LF).unwrap();
+        std::fs::write(&source_path, source_bytes.as_bytes()).unwrap();
         std::fs::set_permissions(&source_path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
         let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
@@ -3192,8 +3199,9 @@
             .request(ControlCommand::SshIdentityImport {
                 resource_id: "fixture-ssh-identity".to_string(),
                 name: "Fixture SSH Identity".to_string(),
-                path: source_path,
+                path: source_path.clone(),
                 passphrase: None,
+                manage_source: false,
                 enforcement: Enforcement::Prompt,
                 metadata: ItemMetadata::default(),
             })
@@ -3207,7 +3215,10 @@
         assert!(resource.entries[0].address.starts_with("ssh/sha256/"));
         assert_eq!(
             resource.source,
-            ResourceSource::SecretRef { secret_id: FIXTURE_SECRET_ID.to_string() }
+            ResourceSource::SecretRef {
+                secret_id: FIXTURE_SECRET_ID.to_string(),
+                managed_source_ids: Vec::new(),
+            }
         );
         let catalog_json = serde_json::to_string(&catalog.snapshot().unwrap()).unwrap();
         assert!(!catalog_json.contains("OPENSSH PRIVATE KEY"));
@@ -3215,6 +3226,7 @@
         let stored_identity = floria_ssh::identity_from_private_key(&stored).unwrap();
         assert_eq!(stored_identity.address, resource.entries[0].address);
         assert_eq!(observer.notifications.load(Ordering::Relaxed), 1);
+        assert!(std::fs::symlink_metadata(&source_path).unwrap().is_file());
 
         assert_eq!(
             client
@@ -3226,7 +3238,99 @@
         );
         assert!(catalog.snapshot().unwrap().resources.is_empty());
         assert!(store.record(&FIXTURE_SECRET_ID.parse().unwrap()).unwrap().is_none());
+        assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes.as_bytes());
         assert_eq!(observer.notifications.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn managed_ssh_identity_can_manage_a_non_project_source_and_restore_it_on_removal() {
+        use ssh_key::rand_core::OsRng;
+        use ssh_key::{Algorithm, LineEnding, PrivateKey};
+
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("prod.key");
+        let mount_path = dir.path().join("mount");
+        std::fs::create_dir_all(&mount_path).unwrap();
+        let private_key = PrivateKey::random(&mut OsRng, Algorithm::Ed25519).unwrap();
+        let source_bytes = private_key.to_openssh(LineEnding::LF).unwrap();
+        std::fs::write(&source_path, source_bytes.as_bytes()).unwrap();
+        std::fs::set_permissions(&source_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let store = FixtureStore::new();
+        let services = DispatchServices {
+            store: Some(&store),
+            mount_path: Some(&mount_path),
+            ..DispatchServices::default()
+        };
+
+        let created = dispatch(
+            &catalog,
+            services,
+            ControlCommand::SshIdentityImport {
+                resource_id: "fixture-global-identity".to_string(),
+                name: "Fixture SSH Identity".to_string(),
+                path: source_path.clone(),
+                passphrase: None,
+                manage_source: true,
+                enforcement: Enforcement::Prompt,
+                metadata: ItemMetadata::default(),
+            },
+        )
+        .unwrap();
+        let ControlResult::SshIdentityCreated { resource } = created else {
+            panic!("expected managed SSH identity result");
+        };
+        assert_eq!(resource.origin.sources[0].project_id, None);
+        assert!(matches!(
+            &resource.source,
+            ResourceSource::SecretRef { managed_source_ids, .. }
+                if managed_source_ids == &[FIXTURE_FILE_SECRET_ID.to_string()]
+        ));
+        assert_eq!(
+            std::fs::read_link(&source_path).unwrap(),
+            mount_path
+                .join(floria_core::config::ITEMS_DIR)
+                .join(FIXTURE_FILE_SECRET_ID)
+                .join("prod.key")
+        );
+
+        dispatch(
+            &catalog,
+            services,
+            ControlCommand::ResourceMetadataUpdate {
+                resource_id: resource.id.clone(),
+                name: "Personal SSH".to_string(),
+                enforcement: Enforcement::TouchId,
+                metadata: ItemMetadata {
+                    note: Some("Available without a project".to_string()),
+                    links: Vec::new(),
+                },
+            },
+        )
+        .unwrap();
+        let managed_source = store
+            .record(&FIXTURE_FILE_SECRET_ID.parse().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(managed_source.enforcement, Enforcement::TouchId);
+        assert_eq!(
+            managed_source.metadata.note.as_deref(),
+            Some("Available without a project")
+        );
+
+        assert_eq!(
+            dispatch(
+                &catalog,
+                services,
+                ControlCommand::SshIdentityRemove { resource_id: resource.id },
+            )
+            .unwrap(),
+            ControlResult::Empty
+        );
+        assert_eq!(std::fs::read(&source_path).unwrap(), source_bytes.as_bytes());
+        assert!(catalog.snapshot().unwrap().resources.is_empty());
+        assert!(store.record(&FIXTURE_SECRET_ID.parse().unwrap()).unwrap().is_none());
+        assert!(store.record(&FIXTURE_FILE_SECRET_ID.parse().unwrap()).unwrap().is_none());
     }
 
     #[test]
@@ -4051,7 +4155,10 @@
         let resource = catalog.resource("fixture-shared-secret").unwrap();
         assert_eq!(
             resource.source,
-            ResourceSource::SecretRef { secret_id: FIXTURE_SECRET_ID.to_string() }
+            ResourceSource::SecretRef {
+                secret_id: FIXTURE_SECRET_ID.to_string(),
+                managed_source_ids: Vec::new(),
+            }
         );
         assert_eq!(resource.metadata.note.as_deref(), Some("Documentation deployment token"));
         assert_eq!(resource.metadata.links[0].label, "Token dashboard");
@@ -4349,6 +4456,7 @@
                         }],
                         source: ResourceSource::SecretRef {
                             secret_id: schema_secret_id,
+                            managed_source_ids: Vec::new(),
                         },
                         enforcement: Enforcement::Allow,
                         metadata: Default::default(),
@@ -4638,6 +4746,7 @@
                     entries: Vec::new(),
                     source: ResourceSource::SecretRef {
                         secret_id: FIXTURE_SECRET_ID.to_string(),
+                        managed_source_ids: Vec::new(),
                     },
                     enforcement: Enforcement::Prompt,
                     metadata: Default::default(),
@@ -4784,7 +4893,10 @@
         );
         assert_eq!(
             snapshot.resources[0].source,
-            ResourceSource::SecretRef { secret_id: FIXTURE_SECRET_ID.to_string() }
+            ResourceSource::SecretRef {
+                secret_id: FIXTURE_SECRET_ID.to_string(),
+                managed_source_ids: Vec::new(),
+            }
         );
         assert_eq!(snapshot.bindings.len(), 1);
         assert_eq!(snapshot.surfaces, vec![surface.clone()]);
@@ -4891,7 +5003,7 @@
             resource.entries.iter().filter_map(|entry| entry.key.as_deref()).collect::<Vec<_>>(),
             vec!["API_HOST", "LOG_LEVEL"]
         );
-        let ResourceSource::SecretRef { secret_id } = resource.source else {
+        let ResourceSource::SecretRef { secret_id, .. } = resource.source else {
             panic!("expected a store reference");
         };
         let id: SecretId = secret_id.parse().unwrap();

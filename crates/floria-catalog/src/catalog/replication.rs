@@ -437,6 +437,7 @@ mod tests {
             }],
             source: ResourceSource::SecretRef {
                 secret_id: "11111111-1111-4111-8111-111111111111".to_string(),
+                managed_source_ids: Vec::new(),
             },
             enforcement: Enforcement::Prompt,
             metadata: Default::default(),
@@ -525,5 +526,56 @@ mod tests {
         let snapshot = target.snapshot().unwrap();
         assert_eq!(snapshot.resources[0].origin, local_resource.origin);
         assert_eq!(snapshot.projects[0].path, PathBuf::from("/target/example"));
+    }
+
+    #[test]
+    fn projection_preserves_stable_ssh_identity_source_ids_without_local_paths() {
+        let (_source_directory, source) = source_catalog();
+        let identity = Resource {
+            id: "ssh-identity-1".to_string(),
+            name: "Personal SSH".to_string(),
+            kind: ResourceKind::SshIdentity,
+            shape: ValueShape::SshIdentity,
+            codec: ResourceCodec::Opaque,
+            default_env_key: None,
+            entries: vec![EntrySpec {
+                address: format!("ssh/sha256/{}", "a".repeat(43)),
+                label: "Personal SSH".to_string(),
+                key: None,
+                sensitive: false,
+            }],
+            source: ResourceSource::SecretRef {
+                secret_id: "22222222-2222-4222-8222-222222222222".to_string(),
+                managed_source_ids: vec![
+                    "33333333-3333-4333-8333-333333333333".to_string(),
+                ],
+            },
+            enforcement: Enforcement::Prompt,
+            metadata: Default::default(),
+            origin: ResourceOrigin {
+                kind: OriginKind::SshImport,
+                sources: vec![OriginSource {
+                    path: PathBuf::from("/source/.ssh/id_ed25519"),
+                    project_id: None,
+                    environment: None,
+                    imported_at: "2026-08-16T00:00:00Z".to_string(),
+                }],
+            },
+        };
+        source.upsert_resource(&identity).unwrap();
+
+        let projection = source.replicated_catalog().unwrap();
+        let projected = projection
+            .resources
+            .iter()
+            .find(|resource| resource.id == identity.id)
+            .unwrap();
+        assert_eq!(projected.origin, ResourceOrigin::default());
+        assert_eq!(projected.source, identity.source);
+
+        let target_directory = tempfile::tempdir().unwrap();
+        let target = Catalog::open(target_directory.path().join("catalog.sqlite")).unwrap();
+        target.apply_replicated_catalog(&projection).unwrap();
+        assert_eq!(target.resource(&identity.id).unwrap().source, identity.source);
     }
 }

@@ -31,7 +31,10 @@ pub(super) fn create_shared_secret(
             key: default_env_key,
             sensitive: true,
         }],
-        source: ResourceSource::SecretRef { secret_id: "pending-secret-id".to_string() },
+        source: ResourceSource::SecretRef {
+            secret_id: "pending-secret-id".to_string(),
+            managed_source_ids: Vec::new(),
+        },
         enforcement,
         metadata,
         origin,
@@ -52,7 +55,10 @@ pub(super) fn create_shared_secret(
         NewSecret::managed(resource.name.clone()).with_enforcement(enforcement),
         value.as_bytes(),
     )?;
-    resource.source = ResourceSource::SecretRef { secret_id: secret_id.to_string() };
+    resource.source = ResourceSource::SecretRef {
+        secret_id: secret_id.to_string(),
+        managed_source_ids: Vec::new(),
+    };
     if let Err(error) = catalog.create_resource(&resource) {
         if let Err(cleanup_error) = store.delete(&secret_id) {
             tracing::warn!(%secret_id, %cleanup_error, "cleaning up unreferenced shared secret failed");
@@ -115,7 +121,7 @@ pub(super) fn update_shared_secret(
     resource.metadata = metadata;
     catalog.validate_resource(&resource)?;
     validate_resource_value(catalog, Some(store), &resource)?;
-    let ResourceSource::SecretRef { secret_id } = &resource.source else {
+    let ResourceSource::SecretRef { secret_id, .. } = &resource.source else {
         return Err(DispatchError::Validation(format!(
             "resource {resource_id:?} does not reference a stored secret"
         )));
@@ -161,7 +167,7 @@ pub(super) fn remove_shared_secret(
             "resource {resource_id:?} is not a shared secret"
         )));
     }
-    let ResourceSource::SecretRef { secret_id } = &resource.source else {
+    let ResourceSource::SecretRef { secret_id, .. } = &resource.source else {
         return Err(DispatchError::Validation(format!(
             "resource {resource_id:?} does not reference a stored secret"
         )));
@@ -193,7 +199,7 @@ pub(super) fn validate_snapshot_values(
         if resource.kind == ResourceKind::SshIdentity {
             continue;
         }
-        let ResourceSource::SecretRef { secret_id } = &resource.source else { continue };
+        let ResourceSource::SecretRef { secret_id, .. } = &resource.source else { continue };
         if !validated.insert(secret_id) {
             continue;
         }
@@ -222,7 +228,7 @@ pub(super) fn rotate_shared_secret(
             "resource {resource_id:?} is not a shared secret"
         )));
     }
-    let ResourceSource::SecretRef { secret_id } = resource.source else {
+    let ResourceSource::SecretRef { secret_id, .. } = resource.source else {
         return Err(DispatchError::Validation(format!(
             "resource {resource_id:?} does not reference a stored secret"
         )));
@@ -279,7 +285,10 @@ pub(super) fn create_env_file(
                 sensitive: true,
             })
             .collect(),
-        source: ResourceSource::SecretRef { secret_id: "pending-secret-id".to_string() },
+        source: ResourceSource::SecretRef {
+            secret_id: "pending-secret-id".to_string(),
+            managed_source_ids: Vec::new(),
+        },
         enforcement,
         metadata,
         origin,
@@ -300,7 +309,10 @@ pub(super) fn create_env_file(
         NewSecret::managed(resource.name.clone()).with_enforcement(enforcement),
         value.as_bytes(),
     )?;
-    resource.source = ResourceSource::SecretRef { secret_id: secret_id.to_string() };
+    resource.source = ResourceSource::SecretRef {
+        secret_id: secret_id.to_string(),
+        managed_source_ids: Vec::new(),
+    };
     if let Err(error) = catalog.create_resource(&resource) {
         if let Err(cleanup_error) = store.delete(&secret_id) {
             tracing::warn!(%secret_id, %cleanup_error, "cleaning up unreferenced env file failed");
@@ -312,17 +324,38 @@ pub(super) fn create_env_file(
 
 pub(super) fn update_resource_metadata(
     catalog: &Catalog,
+    store: Option<&dyn SecretStore>,
     resource_id: &str,
     name: String,
     enforcement: Enforcement,
     metadata: ItemMetadata,
 ) -> Result<ControlResult, DispatchError> {
-    let mut resource = catalog.resource(resource_id)?;
+    let original = catalog.resource(resource_id)?;
+    let mut resource = original.clone();
     resource.name = name;
     resource.enforcement = enforcement;
     resource.metadata = metadata;
     if resource.kind == ResourceKind::SharedSecret && resource.entries.len() == 1 {
         resource.entries[0].label = resource.name.clone();
+    }
+    let managed_source_ids = match &resource.source {
+        ResourceSource::SecretRef { managed_source_ids, .. } => managed_source_ids.as_slice(),
+        _ => &[],
+    };
+    let managed_store = if managed_source_ids.is_empty() {
+        None
+    } else {
+        Some(store.ok_or(DispatchError::StoreUnavailable)?)
+    };
+    let mut previous = Vec::with_capacity(managed_source_ids.len());
+    if let Some(store) = managed_store {
+        for managed_source_id in managed_source_ids {
+            let id: SecretId = managed_source_id.parse()?;
+            let record = store
+                .record(&id)?
+                .ok_or_else(|| StoreError::NotFound(managed_source_id.clone()))?;
+            previous.push((id, record));
+        }
     }
     if resource.source == ResourceSource::Socket {
         let endpoint = catalog
@@ -338,6 +371,42 @@ pub(super) fn update_resource_metadata(
         catalog.upsert_socket_resource(&resource, &endpoint)?;
     } else {
         catalog.upsert_resource(&resource)?;
+    }
+
+    let Some(store) = managed_store else {
+        return Ok(ControlResult::Empty);
+    };
+    for (index, (id, record)) in previous.iter().enumerate() {
+        if let Err(error) = store.update_settings(
+            id,
+            resource.metadata.clone(),
+            enforcement,
+            record.environment_ids.clone(),
+        ) {
+            for (updated_id, updated) in &previous[..index] {
+                if let Err(restore_error) = store.update_settings(
+                    updated_id,
+                    updated.metadata.clone(),
+                    updated.enforcement,
+                    updated.environment_ids.clone(),
+                ) {
+                    tracing::error!(
+                        resource_id,
+                        managed_source_id = %updated_id,
+                        %restore_error,
+                        "managed SSH source settings rollback failed"
+                    );
+                }
+            }
+            if let Err(restore_error) = catalog.upsert_resource(&original) {
+                tracing::error!(
+                    resource_id,
+                    %restore_error,
+                    "managed SSH source settings failed and resource rollback also failed"
+                );
+            }
+            return Err(DispatchError::Store(error));
+        }
     }
     Ok(ControlResult::Empty)
 }

@@ -14,7 +14,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use floria_catalog::{Catalog, ResourceSource};
+use floria_catalog::Catalog;
 use floria_store::{AgeDirStore, StoreMaintenanceGuard, StoreVerification};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -302,11 +302,12 @@ fn validate_catalog_store_references(
     let missing = snapshot
         .resources
         .iter()
-        .filter_map(|resource| match &resource.source {
-            ResourceSource::SecretRef { secret_id } if !stored.contains(secret_id.as_str()) => {
-                Some(format!("{} -> {}", resource.id, secret_id))
-            }
-            _ => None,
+        .flat_map(|resource| {
+            resource
+                .source
+                .referenced_secret_ids()
+                .filter(|secret_id| !stored.contains(secret_id))
+                .map(|secret_id| format!("{} -> {}", resource.id, secret_id))
         })
         .collect::<Vec<_>>();
     if missing.is_empty() {
@@ -627,7 +628,10 @@ mod tests {
                 key: Some("FIXTURE_KEY".to_string()),
                 sensitive: true,
             }],
-            source: ResourceSource::SecretRef { secret_id },
+            source: ResourceSource::SecretRef {
+                secret_id,
+                managed_source_ids: Vec::new(),
+            },
             enforcement: Enforcement::Prompt,
             metadata: ItemMetadata::default(),
             origin: ResourceOrigin::default(),
