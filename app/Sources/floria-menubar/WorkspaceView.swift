@@ -3876,6 +3876,7 @@ struct AddSshAccessSheet: View {
     private struct IdentityChoice: Identifiable {
         let providerID: WorkspaceResource.ID
         let providerName: String
+        let providerKind: WorkspaceResourceKind
         let address: String
         let label: String
 
@@ -3888,6 +3889,8 @@ struct AddSshAccessSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var name = "SSH Access"
     @State private var selectedIdentityIDs: Set<String> = []
+    @State private var showingIdentityPicker = false
+    @State private var identitySearch = ""
     @State private var selectedProjectIDs: Set<WorkspaceProject.ID>
     @State private var securityLevel = WorkspaceSecurityLevel.confirmation
     @State private var hostPatterns = ""
@@ -3944,6 +3947,7 @@ struct AddSshAccessSheet: View {
             provider.entries.map { entry in
                 IdentityChoice(
                     providerID: provider.id, providerName: provider.name,
+                    providerKind: provider.kind,
                     address: entry.address, label: entry.label)
             }
         }
@@ -3971,26 +3975,44 @@ struct AddSshAccessSheet: View {
                         .textFieldStyle(.roundedBorder)
                 }
 
-                GroupBox("SSH identities") {
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 9) {
-                            ForEach(identityChoices) { identity in
-                                Toggle(isOn: identitySelection(identity.id)) {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(identity.label)
-                                        if identity.providerName != identity.label {
-                                            Text(identity.providerName)
-                                                .font(.caption)
-                                                .foregroundStyle(.secondary)
-                                        }
-                                    }
-                                }
-                                .toggleStyle(.checkbox)
-                            }
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("SSH identities").font(.callout.weight(.medium))
+                    Button {
+                        showingIdentityPicker = true
+                    } label: {
+                        HStack(spacing: 9) {
+                            Image(systemName: "key.horizontal.fill")
+                                .foregroundStyle(Color.indigo)
+                                .frame(width: 22)
+                            Text(identitySelectionSummary)
+                                .foregroundStyle(
+                                    selectedIdentityIDs.isEmpty ? Color.secondary : Color.primary)
+                                .lineLimit(1)
+                            Spacer(minLength: 12)
+                            Text("\(selectedIdentityIDs.count) selected")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                            Image(systemName: "chevron.up.chevron.down")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
                         }
-                        .padding(8)
+                        .padding(.horizontal, 10)
+                        .frame(height: 34)
+                        .contentShape(Rectangle())
+                        .background(
+                            Color(nsColor: .controlBackgroundColor),
+                            in: RoundedRectangle(cornerRadius: 7))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 7)
+                                .stroke(Color.secondary.opacity(0.20), lineWidth: 1)
+                        }
                     }
-                    .frame(minHeight: 44, maxHeight: 180)
+                    .buttonStyle(.plain)
+                    .popover(isPresented: $showingIdentityPicker, arrowEdge: .bottom) {
+                        identityPicker
+                    }
+                    .accessibilityLabel("Select SSH identities")
+                    .accessibilityValue(identitySelectionSummary)
                 }
 
                 GroupBox("Host routing") {
@@ -4018,26 +4040,49 @@ struct AddSshAccessSheet: View {
 
                 SecurityLevelPicker(selection: $securityLevel)
 
-                GroupBox("Related Projects (optional)") {
-                    if store.projects.isEmpty {
-                        Text("No Projects on this Mac. SSH Access will remain in the Library.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(8)
-                    } else {
-                        ScrollView {
-                            VStack(alignment: .leading, spacing: 7) {
-                                ForEach(store.projects) { project in
-                                    Toggle(project.name, isOn: projectSelection(project.id))
-                                        .toggleStyle(.checkbox)
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("Related Projects (optional)")
+                        .font(.callout.weight(.medium))
+                    Menu {
+                        Button("No Projects") {
+                            selectedProjectIDs.removeAll()
+                        }
+                        if !store.projects.isEmpty {
+                            Divider()
+                            ForEach(store.projects) { project in
+                                Button {
+                                    toggleProject(project.id)
+                                } label: {
+                                    if selectedProjectIDs.contains(project.id) {
+                                        Label(project.name, systemImage: "checkmark")
+                                    } else {
+                                        Text(project.name)
+                                    }
                                 }
                             }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(8)
                         }
-                        .frame(minHeight: 96, maxHeight: 120)
+                        if unavailableProjectCount > 0 {
+                            Divider()
+                            Text(
+                                "\(unavailableProjectCount) synced Project\(unavailableProjectCount == 1 ? "" : "s") not on this Mac"
+                            )
+                        }
+                    } label: {
+                        HStack {
+                            Text(relatedProjectTitle)
+                            Spacer()
+                            Image(systemName: "chevron.up.chevron.down")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        .padding(.horizontal, 10)
+                        .frame(width: 240, height: 32)
+                        .background(
+                            Color(nsColor: .controlBackgroundColor),
+                            in: RoundedRectangle(cornerRadius: 7))
                     }
+                    .buttonStyle(.bordered)
+                    .fixedSize()
                 }
                 Text("Projects organize this item and its activity. They do not restrict where OpenSSH can use the route.")
                     .font(.caption)
@@ -4078,6 +4123,83 @@ struct AddSshAccessSheet: View {
         "\(providerID)\u{1f}\(address)"
     }
 
+    private var filteredIdentityChoices: [IdentityChoice] {
+        guard !identitySearch.isEmpty else { return identityChoices }
+        return identityChoices.filter { identity in
+            [identity.label, identity.providerName, identityDetail(identity)]
+                .joined(separator: " ")
+                .localizedCaseInsensitiveContains(identitySearch)
+        }
+    }
+
+    private var identitySelectionSummary: String {
+        let selected = identityChoices.filter { selectedIdentityIDs.contains($0.id) }
+        guard !selected.isEmpty else { return "Select identities" }
+        let visible = selected.prefix(2).map(\.label).joined(separator: ", ")
+        let remaining = selected.count - min(selected.count, 2)
+        return remaining == 0 ? visible : "\(visible) +\(remaining)"
+    }
+
+    private var identityPicker: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("Search identities", text: $identitySearch)
+                    .textFieldStyle(.plain)
+            }
+            .padding(.horizontal, 12)
+            .frame(height: 38)
+
+            Divider()
+
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 4) {
+                    ForEach(filteredIdentityChoices) { identity in
+                        Toggle(isOn: identitySelection(identity.id)) {
+                            HStack(spacing: 9) {
+                                Image(systemName: identity.providerKind.systemImage)
+                                    .foregroundStyle(Color.indigo)
+                                    .frame(width: 22)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text(identity.label)
+                                    Text(identityDetail(identity))
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
+                        .toggleStyle(.checkbox)
+                        .padding(.horizontal, 12)
+                        .frame(minHeight: 42)
+                    }
+                }
+                .padding(.vertical, 6)
+            }
+            .overlay {
+                if filteredIdentityChoices.isEmpty {
+                    ContentUnavailableView.search(text: identitySearch)
+                }
+            }
+
+            Divider()
+
+            HStack {
+                Text("\(selectedIdentityIDs.count) selected")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Clear") { selectedIdentityIDs.removeAll() }
+                    .disabled(selectedIdentityIDs.isEmpty)
+                Button("Done") { showingIdentityPicker = false }
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(10)
+        }
+        .frame(width: 360, height: 300)
+        .onDisappear { identitySearch = "" }
+    }
+
     private func identitySelection(_ id: String) -> Binding<Bool> {
         Binding(
             get: { selectedIdentityIDs.contains(id) },
@@ -4100,13 +4222,35 @@ struct AddSshAccessSheet: View {
         }
     }
 
-    private func projectSelection(_ id: WorkspaceProject.ID) -> Binding<Bool> {
-        Binding(
-            get: { selectedProjectIDs.contains(id) },
-            set: { selected in
-                if selected { selectedProjectIDs.insert(id) }
-                else { selectedProjectIDs.remove(id) }
-            })
+    private func identityDetail(_ identity: IdentityChoice) -> String {
+        let kind = identity.providerKind == .sshAgent ? "External agent" : "Managed key"
+        return identity.providerName == identity.label
+            ? kind
+            : "\(identity.providerName) · \(kind)"
+    }
+
+    private var unavailableProjectCount: Int {
+        let localProjectIDs = Set(store.projects.map(\.id))
+        return selectedProjectIDs.subtracting(localProjectIDs).count
+    }
+
+    private var relatedProjectTitle: String {
+        guard !selectedProjectIDs.isEmpty else { return "No Projects" }
+        if selectedProjectIDs.count == 1,
+            let id = selectedProjectIDs.first,
+            let project = store.projects.first(where: { $0.id == id })
+        {
+            return project.name
+        }
+        return "\(selectedProjectIDs.count) Projects"
+    }
+
+    private func toggleProject(_ id: WorkspaceProject.ID) {
+        if selectedProjectIDs.contains(id) {
+            selectedProjectIDs.remove(id)
+        } else {
+            selectedProjectIDs.insert(id)
+        }
     }
 
     private func create() {
