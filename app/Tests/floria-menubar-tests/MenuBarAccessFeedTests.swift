@@ -87,11 +87,29 @@ final class MenuBarAccessFeedTests: XCTestCase {
         XCTAssertEqual(recent.relativeTime(relativeTo: now), "now")
     }
 
+    func testSshAccessCanBeFoundAndDistinguishedByIdentitySource() {
+        let alpha = makeRecent(
+            secondsBeforeNow: 1, path: "surfaces/shared", operation: "sign",
+            ssh: makeSsh(source: "~/keys/alpha/id_ed25519", fingerprint: "SHA256:alpha"))
+        let beta = makeRecent(
+            secondsBeforeNow: 2, path: "surfaces/shared", operation: "sign",
+            ssh: makeSsh(source: "~/keys/beta/id_ed25519", fingerprint: "SHA256:beta"))
+
+        let feed = MenuBarAccessFeed.make(
+            recents: [alpha, beta], searchText: "beta/id_ed25519", now: now)
+
+        XCTAssertEqual(feed.groups.count, 1)
+        XCTAssertEqual(
+            feed.groups[0].latest.shownPath,
+            "Deploy key · ~/keys/beta/id_ed25519")
+    }
+
     private func makeRecent(
         secondsBeforeNow: TimeInterval,
         path: String,
         display: String? = nil,
-        operation: String = "read"
+        operation: String = "read",
+        ssh: SshSignView? = nil
     ) -> RecentAccess {
         RecentAccess(
             AccessEventMsg(
@@ -102,13 +120,22 @@ final class MenuBarAccessFeedTests: XCTestCase {
                 decision: "allowed",
                 rule_id: "fixture-rule",
                 policy: nil,
-                ssh: nil,
+                ssh: ssh,
                 identity: IdentityView(
                     pid: 42,
                     uid: 501,
                     exe: "/usr/bin/fixture-reader",
                     cwd: "/Users/fixture/project",
                     chain: "zsh -> fixture-reader")))
+    }
+
+    private func makeSsh(source: String, fingerprint: String) -> SshSignView {
+        SshSignView(
+            surface_id: "shared", surface_name: "Shared access",
+            resource_id: fingerprint, key_fingerprint: fingerprint,
+            key_label: "Deploy key", identity_source: source,
+            requested_destination: "fixture.example",
+            verified_host_key_fingerprint: nil, ssh_user: "git", forwarding_hops: 0)
     }
 
     private static let iso: ISO8601DateFormatter = {

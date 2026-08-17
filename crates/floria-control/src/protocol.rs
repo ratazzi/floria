@@ -566,6 +566,7 @@ pub struct AccessHistorySsh {
     pub resource_id: String,
     pub key_fingerprint: String,
     pub key_label: String,
+    pub identity_source: Option<String>,
     pub requested_destination: Option<String>,
     pub verified_host_key_fingerprint: Option<String>,
     pub ssh_user: Option<String>,

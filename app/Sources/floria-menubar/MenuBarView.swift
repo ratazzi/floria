@@ -677,7 +677,7 @@ private struct AccessRow: View {
     private var tooltip: String {
         var lines = [ev.shownPath]
         if let ssh = ev.ssh {
-            lines.append(ssh.key_fingerprint)
+            if ev.sshIdentitySource != nil { lines.append(ssh.key_fingerprint) }
             lines.append("agent: \(ssh.surface_name)")
         }
         if ev.display != nil { lines.append(ev.path) }

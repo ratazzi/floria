@@ -25,8 +25,15 @@ struct RecentAccess: Identifiable {
             && policy?.mode == "audit_only"
     }
 
-    /// What the list shows: the friendly name over the opaque `secrets/<uuid>` path.
-    var shownPath: String { ssh?.key_label ?? display ?? path }
+    var sshIdentitySource: String? {
+        ssh?.identity_source.map { ($0 as NSString).abbreviatingWithTildeInPath }
+    }
+
+    /// What access lists show: a human name plus the source that disambiguates equal SSH labels.
+    var shownPath: String {
+        guard let ssh else { return display ?? path }
+        return "\(ssh.key_label) · \(sshIdentitySource ?? ssh.key_fingerprint)"
+    }
     var ruleLabel: String { ruleId == "grant" ? "Active grant" : (ruleId ?? "-") }
 
     var time: String {

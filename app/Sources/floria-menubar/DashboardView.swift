@@ -164,7 +164,10 @@ struct AccessLogView: View {
 
     private func eventDetail(_ event: RecentAccess) -> String {
         if let ssh = event.ssh {
-            return "\(event.shownPath)\n\(ssh.key_fingerprint)\nAgent: \(ssh.surface_name)"
+            var lines = [event.shownPath]
+            if event.sshIdentitySource != nil { lines.append(ssh.key_fingerprint) }
+            lines.append("Agent: \(ssh.surface_name)")
+            return lines.joined(separator: "\n")
         }
         return event.display != nil ? "\(event.shownPath)\n\(event.path)" : event.path
     }

@@ -86,6 +86,8 @@ pub struct SshSignView<'a> {
     pub key_fingerprint: &'a str,
     pub key_label: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity_source: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub requested_destination: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verified_host_key_fingerprint: Option<&'a str>,
@@ -104,6 +106,7 @@ impl<'a> SshSignView<'a> {
             resource_id: sign.resource_id,
             key_fingerprint: sign.key_fingerprint,
             key_label: sign.key_label,
+            identity_source: sign.identity_source,
             requested_destination: sign.requested_destination,
             verified_host_key_fingerprint: sign.verified_host_key_fingerprint,
             ssh_user: sign.ssh_user,
@@ -280,6 +283,7 @@ mod tests {
             resource_id: "fixture-resource",
             key_fingerprint: "SHA256:fixture-fingerprint",
             key_label: "Fixture identity",
+            identity_source: Some("/Users/fixture/.ssh/fixture-key"),
             requested_destination: Some("git@github.com"),
             verified_host_key_fingerprint: Some("SHA256:fixture-host-key"),
             ssh_user: Some("git"),
@@ -289,6 +293,7 @@ mod tests {
         let value = serde_json::to_value(SshSignView::from_context(Some(context))).unwrap();
 
         assert_eq!(value["requested_destination"], "git@github.com");
+        assert_eq!(value["identity_source"], "/Users/fixture/.ssh/fixture-key");
         assert_eq!(
             value["verified_host_key_fingerprint"],
             "SHA256:fixture-host-key"

@@ -256,6 +256,7 @@ enum ProviderSpec {
     ManagedPrivateKey {
         resource_id: String,
         secret_id: String,
+        identity_source: Option<String>,
     },
     ExternalAgent {
         resource_id: String,
@@ -268,6 +269,15 @@ impl ProviderSpec {
         match self {
             ProviderSpec::ManagedPrivateKey { resource_id, .. }
             | ProviderSpec::ExternalAgent { resource_id, .. } => resource_id,
+        }
+    }
+
+    fn identity_source(&self) -> Option<&str> {
+        match self {
+            ProviderSpec::ManagedPrivateKey {
+                identity_source, ..
+            } => identity_source.as_deref(),
+            ProviderSpec::ExternalAgent { endpoint, .. } => endpoint.to_str(),
         }
     }
 }
@@ -507,6 +517,11 @@ fn ssh_provider(
         ) => Ok(ProviderSpec::ManagedPrivateKey {
             resource_id: resource.id.clone(),
             secret_id: secret_id.clone(),
+            identity_source: resource
+                .origin
+                .sources
+                .first()
+                .map(|source| source.path.display().to_string()),
         }),
         (
             ResourceKind::SshAgent,
@@ -749,6 +764,7 @@ struct AvailableIdentity {
     resource_id: String,
     fingerprint: String,
     label: String,
+    identity_source: Option<String>,
 }
 
 struct ConnectionState {
@@ -859,6 +875,10 @@ fn refresh_identities(
             .spec
             .resource_id()
             .to_string();
+        let identity_source = providers[selected.provider_index]
+            .spec
+            .identity_source()
+            .map(str::to_string);
         answer.push((parsed.key_blob.clone(), selected.label.as_bytes().to_vec()));
         available.insert(
             parsed.key_blob,
@@ -867,6 +887,7 @@ fn refresh_identities(
                 resource_id,
                 fingerprint: parsed.fingerprint,
                 label: selected.label.clone(),
+                identity_source,
             },
         );
     }
@@ -906,6 +927,8 @@ fn handle_sign(
             &spec.id,
             "unselected",
             &fingerprint,
+            "Unselected identity",
+            None,
             "identity_not_selected",
             None,
         );
@@ -934,6 +957,7 @@ fn handle_sign(
         resource_id: &selected.resource_id,
         key_fingerprint: &selected.fingerprint,
         key_label: &selected.label,
+        identity_source: selected.identity_source.as_deref(),
         requested_destination,
         verified_host_key_fingerprint: verified_session
             .as_ref()
@@ -962,6 +986,8 @@ fn handle_sign(
             &spec.id,
             &selected.resource_id,
             &selected.fingerprint,
+            &selected.label,
+            selected.identity_source.as_deref(),
             "authorization_denied",
             Some(ssh_session_audit),
         );
@@ -989,6 +1015,8 @@ fn handle_sign(
         &spec.id,
         &selected.resource_id,
         &selected.fingerprint,
+        &selected.label,
+        selected.identity_source.as_deref(),
         result,
         Some(ssh_session_audit),
     ) {

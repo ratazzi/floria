@@ -53,6 +53,8 @@ struct SshSignView: Codable, Sendable {
     let resource_id: String
     let key_fingerprint: String
     let key_label: String
+    /// Original managed-key path or external-agent endpoint, when known on this Device.
+    let identity_source: String?
     /// Display-only token from the local ssh command. It is not a verified destination identity.
     let requested_destination: String?
     /// Host-key fingerprint proven by OpenSSH's session-bind extension; identifies a key, not a name.
@@ -61,6 +63,24 @@ struct SshSignView: Codable, Sendable {
     let ssh_user: String?
     /// Verified forwarding bindings before the final authentication session.
     let forwarding_hops: Int?
+
+    init(
+        surface_id: String, surface_name: String, resource_id: String,
+        key_fingerprint: String, key_label: String, identity_source: String? = nil,
+        requested_destination: String?, verified_host_key_fingerprint: String?,
+        ssh_user: String?, forwarding_hops: Int?
+    ) {
+        self.surface_id = surface_id
+        self.surface_name = surface_name
+        self.resource_id = resource_id
+        self.key_fingerprint = key_fingerprint
+        self.key_label = key_label
+        self.identity_source = identity_source
+        self.requested_destination = requested_destination
+        self.verified_host_key_fingerprint = verified_host_key_fingerprint
+        self.ssh_user = ssh_user
+        self.forwarding_hops = forwarding_hops
+    }
 }
 
 // Incoming (daemon -> app)

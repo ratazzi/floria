@@ -42,6 +42,9 @@ pub struct SshSignContext<'a> {
     pub resource_id: &'a str,
     pub key_fingerprint: &'a str,
     pub key_label: &'a str,
+    /// Original managed-key path or external-agent endpoint, when this Device knows it.
+    /// Display and audit only; authorization continues to key on the stable resource id.
+    pub identity_source: Option<&'a str>,
     /// Destination token claimed by the local ssh process. Display-only: the SSH agent protocol
     /// does not authenticate hostnames, so policy must not treat this as a destination constraint.
     pub requested_destination: Option<&'a str>,

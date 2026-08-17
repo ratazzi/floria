@@ -111,6 +111,8 @@ pub struct AuditAccessRecord {
     pub surface_id: Option<String>,
     pub resource_id: Option<String>,
     pub key_fingerprint: Option<String>,
+    pub key_label: Option<String>,
+    pub identity_source: Option<String>,
     pub ssh_session: Option<OwnedSshSessionAudit>,
 }
 
@@ -437,6 +439,8 @@ impl AuditLog {
         surface_id: &str,
         resource_id: &str,
         key_fingerprint: &str,
+        key_label: &str,
+        identity_source: Option<&str>,
         result: &str,
         ssh_session: Option<SshSessionAudit<'_>>,
     ) -> std::io::Result<()> {
@@ -458,6 +462,8 @@ impl AuditLog {
             surface_id,
             resource_id,
             key_fingerprint,
+            key_label,
+            identity_source,
             result,
             ssh_session,
         })
@@ -793,6 +799,9 @@ struct SshSignEvent<'a> {
     surface_id: &'a str,
     resource_id: &'a str,
     key_fingerprint: &'a str,
+    key_label: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identity_source: Option<&'a str>,
     result: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     ssh_session: Option<SshSessionAudit<'a>>,
@@ -962,6 +971,8 @@ mod tests {
             "fixture-agent",
             "fixture-provider",
             "SHA256:fixtureFingerprint",
+            "Fixture identity",
+            Some("/Users/fixture/.ssh/fixture-key"),
             "signed",
             Some(SshSessionAudit {
                 requested_destination: Some("fixture.example"),
@@ -975,6 +986,7 @@ mod tests {
         let line = std::fs::read_to_string(path).unwrap();
         assert!(line.contains("\"event\":\"ssh_sign\""));
         assert!(line.contains("SHA256:fixtureFingerprint"));
+        assert!(line.contains("/Users/fixture/.ssh/fixture-key"));
         assert!(line.contains("\"result\":\"signed\""));
         assert!(line.contains("SHA256:fixtureHostKey"));
         assert!(line.contains("\"forwarding_hops\":1"));

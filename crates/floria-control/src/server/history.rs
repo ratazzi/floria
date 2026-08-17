@@ -86,18 +86,48 @@ pub(super) fn history_ssh(record: &AuditAccessRecord, snapshot: &CatalogSnapshot
             .unwrap_or_else(|| surface_id.clone()),
         resource_id: resource_id.clone(),
         key_fingerprint: key_fingerprint.clone(),
-        key_label: snapshot
-            .resources
-            .iter()
-            .find(|resource| resource.id == *resource_id)
-            .map(|resource| resource.name.clone())
+        key_label: record
+            .key_label
+            .clone()
+            .or_else(|| {
+                snapshot
+                    .resources
+                    .iter()
+                    .find(|resource| resource.id == *resource_id)
+                    .map(|resource| resource.name.clone())
+            })
             .unwrap_or_else(|| resource_id.clone()),
+        identity_source: record
+            .identity_source
+            .clone()
+            .or_else(|| history_ssh_identity_source(resource_id, snapshot)),
         requested_destination: session.and_then(|value| value.requested_destination.clone()),
         verified_host_key_fingerprint: session
             .and_then(|value| value.verified_host_key_fingerprint.clone()),
         ssh_user: session.and_then(|value| value.ssh_user.clone()),
         forwarding_hops: session.map_or(0, |value| value.forwarding_hops),
     })
+}
+
+fn history_ssh_identity_source(
+    resource_id: &str,
+    snapshot: &CatalogSnapshot,
+) -> Option<String> {
+    let resource = snapshot
+        .resources
+        .iter()
+        .find(|resource| resource.id == resource_id)?;
+    if resource.kind == ResourceKind::SshAgent {
+        return snapshot
+            .endpoints
+            .get(resource_id)
+            .map(|path| path.display().to_string());
+    }
+    resource
+        .origin
+        .sources
+        .first()
+        .map(|source| source.path.display().to_string())
 }
 
 pub(super) fn history_identity(identity: &floria_core::identity::ProcessIdentity) -> AccessHistoryIdentity {
