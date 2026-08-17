@@ -52,16 +52,18 @@ enum WorkspaceResourceKind: String, CaseIterable, Sendable {
     case command
     case sshIdentity
     case sshAgent
+    case sshAccess
 
     var title: String {
         switch self {
-        case .sharedSecret: "Shared Secret"
+        case .sharedSecret: "Secret"
         case .secret: "Secret"
         case .envFile: "Env File"
         case .literal: "Literal"
         case .command: "Command"
         case .sshIdentity: "SSH Identity"
         case .sshAgent: "External Agent"
+        case .sshAccess: "SSH Access"
         }
     }
 
@@ -73,6 +75,7 @@ enum WorkspaceResourceKind: String, CaseIterable, Sendable {
         case .command: "terminal.fill"
         case .sshIdentity: "key.horizontal.fill"
         case .sshAgent: "network"
+        case .sshAccess: "point.3.connected.trianglepath.dotted"
         }
     }
 }
@@ -83,6 +86,7 @@ enum WorkspaceValueShape: String, Sendable {
     case bytes
     case sshIdentity
     case socket
+    case sshAccess
 }
 
 enum WorkspaceResourceCodec: String, Sendable {
@@ -190,6 +194,7 @@ struct WorkspaceResource: Identifiable, Hashable, Sendable {
     let metadata: ItemMetadata
     let origin: CatalogResourceOrigin?
     let managedSourceIDs: [WorkspaceProtectedFile.ID]
+    let sshAccess: WorkspaceSshAccess?
     let usageCount: Int
 
     init(
@@ -201,6 +206,7 @@ struct WorkspaceResource: Identifiable, Hashable, Sendable {
         metadata: ItemMetadata = .empty,
         origin: CatalogResourceOrigin? = nil,
         managedSourceIDs: [WorkspaceProtectedFile.ID] = [],
+        sshAccess: WorkspaceSshAccess? = nil,
         usageCount: Int
     ) {
         self.id = id
@@ -221,6 +227,7 @@ struct WorkspaceResource: Identifiable, Hashable, Sendable {
         self.metadata = metadata
         self.origin = origin
         self.managedSourceIDs = managedSourceIDs
+        self.sshAccess = sshAccess
         self.usageCount = usageCount
     }
 
@@ -249,10 +256,24 @@ struct WorkspaceResource: Identifiable, Hashable, Sendable {
         if kind == .sshIdentity || kind == .sshAgent {
             return "\(entries.count) identit\(entries.count == 1 ? "y" : "ies")"
         }
+        if let sshAccess {
+            return sshAccess.route.hostPatterns.joined(separator: " ")
+        }
         if exports.isEmpty, entries.count == 1 { return "Keyless value" }
         if exports.count == 1, let key = exports.first?.key { return key }
         return "\(entries.count) entries"
     }
+}
+
+struct WorkspaceSshIdentitySelection: Hashable, Sendable {
+    let resourceID: WorkspaceResource.ID
+    let selection: WorkspaceEntrySelection
+}
+
+struct WorkspaceSshAccess: Hashable, Sendable {
+    let identities: [WorkspaceSshIdentitySelection]
+    let route: WorkspaceSshRoute
+    let projectIDs: [WorkspaceProject.ID]
 }
 
 enum WorkspaceEntrySelection: Hashable, Sendable {
@@ -1367,7 +1388,7 @@ final class WorkspaceStore {
     ) async throws {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
         guard resources.contains(where: { $0.id == id && $0.kind == .sharedSecret }) else {
-            throw WorkspaceStoreError.invalid("Choose a Shared Secret first")
+            throw WorkspaceStoreError.invalid("Choose a Secret first")
         }
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         let enteredKey = defaultEnvKey.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1391,7 +1412,7 @@ final class WorkspaceStore {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
         guard let resource = resources.first(where: { $0.id == id && $0.kind == .sharedSecret })
         else {
-            throw WorkspaceStoreError.invalid("Choose a Shared Secret first")
+            throw WorkspaceStoreError.invalid("Choose a Secret first")
         }
         guard resource.usageCount == 0 else {
             let projectWord = resource.usageCount == 1 ? "project" : "projects"
@@ -1540,8 +1561,9 @@ final class WorkspaceStore {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
         guard let resource = resources.first(where: { $0.id == id }),
             resource.kind == .sshIdentity || resource.kind == .sshAgent
+                || resource.kind == .sshAccess
         else {
-            throw WorkspaceStoreError.invalid("Choose an SSH identity provider first")
+            throw WorkspaceStoreError.invalid("Choose an SSH Library item first")
         }
         if resource.kind == .sshIdentity {
             try await controlClient.removeSshIdentity(resourceID: id)
@@ -1772,6 +1794,44 @@ final class WorkspaceStore {
         selectedSurfaceID = surfaceID
         lastError = nil
         return surfaceID
+    }
+
+    @discardableResult
+    func createSshAccess(
+        accessID: WorkspaceResource.ID? = nil,
+        name: String, resourceID: WorkspaceResource.ID, selectedEntries: Set<String>,
+        projectIDs: [WorkspaceProject.ID], securityLevel: WorkspaceSecurityLevel,
+        route: WorkspaceSshRoute, metadata: ItemMetadata = .empty
+    ) async throws -> WorkspaceResource.ID {
+        guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { throw WorkspaceStoreError.invalid("SSH Access name is required") }
+        guard let resource = sshIdentityProviders.first(where: { $0.id == resourceID }) else {
+            throw WorkspaceStoreError.invalid("Choose an SSH identity provider")
+        }
+        let addresses = resource.entries.map(\.address).filter(selectedEntries.contains)
+        guard !addresses.isEmpty else {
+            throw WorkspaceStoreError.invalid("Select at least one SSH identity")
+        }
+        let accessID = accessID ?? Self.newID("ssh-access")
+        let selection: CatalogEntrySelection = addresses.count == resource.entries.count
+            ? .all : .entries(addresses)
+        try await controlClient.upsertResource(
+            CatalogResource(
+                id: accessID, name: name, kind: "ssh_access", shape: "ssh_access",
+                codec: "opaque", defaultEnvKey: nil, entries: [],
+                source: .sshAccess(
+                    identities: [
+                        CatalogSshIdentitySelection(
+                            resourceID: resource.id, selection: selection)
+                    ],
+                    route: route.catalogValue, projectIDs: projectIDs),
+                enforcement: securityLevel.rawValue,
+                metadata: try Self.validatedMetadata(metadata),
+                origin: CatalogResourceOrigin(kind: "manual", sources: [])))
+        apply(try await controlClient.snapshot())
+        lastError = nil
+        return accessID
     }
 
     @discardableResult
@@ -2155,6 +2215,12 @@ final class WorkspaceStore {
         let previousSurfaceID = selectedSurfaceID
         let projectUsage = Dictionary(grouping: snapshot.bindings, by: \.resourceID)
             .mapValues { Set($0.map(\.projectID)).count }
+        var sshAccessUsage: [WorkspaceResource.ID: Int] = [:]
+        for access in snapshot.resources where access.source.type == "ssh_access" {
+            for identity in access.source.identities ?? [] {
+                sshAccessUsage[identity.resourceID, default: 0] += 1
+            }
+        }
         managedLinkStatuses = Dictionary(
             uniqueKeysWithValues: snapshot.managedLinks.map { ($0.path, $0.status) })
 
@@ -2177,6 +2243,21 @@ final class WorkspaceStore {
                     previewValue: preview,
                     sensitive: $0.sensitive)
             }
+            let sshAccess = resource.source.type == "ssh_access"
+                ? resource.source.route.map { route in
+                    WorkspaceSshAccess(
+                        identities: (resource.source.identities ?? []).map {
+                            WorkspaceSshIdentitySelection(
+                                resourceID: $0.resourceID,
+                                selection: WorkspaceEntrySelection($0.selection))
+                        },
+                        route: WorkspaceSshRoute(route),
+                        projectIDs: resource.source.projectIDs ?? [])
+                }
+                : nil
+            let usageCount = resource.kind == "ssh_access"
+                ? (resource.source.projectIDs ?? []).count
+                : (projectUsage[resource.id] ?? 0) + (sshAccessUsage[resource.id] ?? 0)
             return WorkspaceResource(
                 id: resource.id, name: resource.name, kind: kind, shape: shape, codec: codec,
                 defaultEnvKey: resource.defaultEnvKey,
@@ -2186,7 +2267,8 @@ final class WorkspaceStore {
                 metadata: resource.metadata,
                 origin: resource.origin,
                 managedSourceIDs: resource.source.managedSourceIDs ?? [],
-                usageCount: projectUsage[resource.id] ?? 0)
+                sshAccess: sshAccess,
+                usageCount: usageCount)
         }
 
         let bindings = Dictionary(grouping: snapshot.bindings, by: \.projectID)
@@ -2390,6 +2472,7 @@ private extension WorkspaceResourceKind {
         case "command": self = .command
         case "ssh_identity": self = .sshIdentity
         case "ssh_agent": self = .sshAgent
+        case "ssh_access": self = .sshAccess
         default: return nil
         }
     }
@@ -2403,6 +2486,7 @@ private extension WorkspaceValueShape {
         case "bytes": self = .bytes
         case "ssh_identity": self = .sshIdentity
         case "socket": self = .socket
+        case "ssh_access": self = .sshAccess
         default: return nil
         }
     }

@@ -33,11 +33,16 @@ struct ProjectEventMatcher {
     private let namePattern: String
     private let surfaceIDs: Set<WorkspaceSurface.ID>
 
-    init(_ project: WorkspaceProject) {
+    init(_ project: WorkspaceProject, resources: [WorkspaceResource] = []) {
         path = (project.path as NSString).expandingTildeInPath.lowercased()
         pathPrefix = path + "/"
         namePattern = project.name.lowercased() + "/"
-        surfaceIDs = Set(project.environments.flatMap(\.surfaces).map(\.id))
+        surfaceIDs = Set(project.environments.flatMap(\.surfaces).map(\.id)).union(
+            resources.compactMap { resource in
+                (resource.kind == .sshAccess
+                    && resource.sshAccess?.projectIDs.contains(project.id) == true)
+                    ? resource.id : nil
+            })
     }
 
     static func loweredCandidates(for event: RecentAccess) -> [String] {
@@ -93,6 +98,10 @@ struct DashboardView: View {
     @State private var backupOperationInProgress = false
     @State private var showingRecoveryKeyExport = false
     @State private var showingSync = false
+    @State private var showingProtectFile = false
+    @State private var showingNewSecret = false
+    @State private var showingImportSshIdentity = false
+    @State private var showingNewSshAccess = false
     @FocusState private var searchIsFocused: Bool
     @Environment(\.openWindow) private var openWindow
 
@@ -196,6 +205,20 @@ struct DashboardView: View {
                 service: state.cloudSyncService,
                 restartDaemon: { await state.restartDaemonForCloudSync() })
         }
+        .sheet(isPresented: $showingProtectFile) {
+            ProtectExistingFileSheet(store: state.workspace)
+        }
+        .sheet(isPresented: $showingNewSecret) {
+            NewSharedSecretSheet(store: state.workspace)
+        }
+        .sheet(isPresented: $showingImportSshIdentity) {
+            ImportSshIdentitySheet(store: state.workspace)
+        }
+        .sheet(isPresented: $showingNewSshAccess) {
+            AddSshAccessSheet(
+                store: state.workspace,
+                preselectedProjectIDs: Set(selectedProject.map { [$0.id] } ?? []))
+        }
         .onAppear {
             presentRequestedSystemHealth()
         }
@@ -279,6 +302,28 @@ struct DashboardView: View {
                 RoundedRectangle(cornerRadius: 8)
                     .stroke(Color.secondary.opacity(0.18), lineWidth: 1)
             }
+
+            Menu {
+                Button("Protect File", systemImage: "lock.fill") {
+                    showingProtectFile = true
+                }
+                Button("New Secret", systemImage: "key.fill") {
+                    showingNewSecret = true
+                }
+                Button("Import SSH Identity", systemImage: "key.horizontal.fill") {
+                    showingImportSshIdentity = true
+                }
+                Button("New SSH Access", systemImage: "point.3.connected.trianglepath.dotted") {
+                    showingNewSshAccess = true
+                }
+            } label: {
+                Image(systemName: "plus")
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .accessibilityLabel("Add Library item")
 
             Divider().frame(height: 28)
 
@@ -686,7 +731,9 @@ struct DashboardView: View {
     private var projectActivity: [WorkspaceProject.ID: (index: Int, event: RecentAccess)] {
         let projects = state.workspace.projects
         guard !projects.isEmpty else { return [:] }
-        let matchers = projects.map { ($0.id, ProjectEventMatcher($0)) }
+        let matchers = projects.map {
+            ($0.id, ProjectEventMatcher($0, resources: state.workspace.resources))
+        }
         var result: [WorkspaceProject.ID: (index: Int, event: RecentAccess)] = [:]
         for (index, event) in state.recents.enumerated() {
             let candidates = ProjectEventMatcher.loweredCandidates(for: event)
@@ -718,7 +765,9 @@ struct DashboardView: View {
     }
 
     private var visibleAccess: [RecentAccessGroup] {
-        let matcher = selectedProject.map(ProjectEventMatcher.init)
+        let matcher = selectedProject.map {
+            ProjectEventMatcher($0, resources: state.workspace.resources)
+        }
         let recents = state.recents.filter { event in
             (matcher?.matches(event) ?? true)
                 && (search.isEmpty || accessMatchesSearch(event))
@@ -820,7 +869,10 @@ struct DashboardView: View {
             file.path.hasPrefix(prefix)
                 && !surfacePaths.contains((file.path as NSString).standardizingPath)
         }
-        return surfaces.count + protectedCount
+        let sshAccessCount = state.workspace.resources.count {
+            $0.kind == .sshAccess && $0.sshAccess?.projectIDs.contains(project.id) == true
+        }
+        return surfaces.count + protectedCount + sshAccessCount
     }
 
     private func projectIsHealthy(_ project: WorkspaceProject) -> Bool {
@@ -1392,6 +1444,9 @@ private struct CompactProjectDetailView: View {
         })
         let items =
             surfaces.map(CompactManagedItem.surface)
+            + state.workspace.resources
+                .filter { $0.kind == .sshAccess && $0.sshAccess?.projectIDs.contains(project.id) == true }
+                .map(CompactManagedItem.resource)
             + projectProtectedFiles
                 .filter {
                     !surfacePaths.contains(($0.path as NSString).standardizingPath)
@@ -1409,6 +1464,9 @@ private struct CompactProjectDetailView: View {
         })
         return (
             allSurfaces.map(CompactManagedItem.surface)
+                + state.workspace.resources
+                    .filter { $0.kind == .sshAccess && $0.sshAccess?.projectIDs.contains(project.id) == true }
+                    .map(CompactManagedItem.resource)
                 + projectProtectedFiles
                     .filter {
                         !surfacePaths.contains(($0.path as NSString).standardizingPath)
@@ -1472,11 +1530,13 @@ private struct CompactProjectDetailView: View {
 private enum CompactManagedItem: Identifiable {
     case surface(WorkspaceSurface)
     case file(WorkspaceProtectedFile)
+    case resource(WorkspaceResource)
 
     var id: String {
         switch self {
         case .surface(let surface): "surface:\(surface.id)"
         case .file(let file): "file:\(file.id)"
+        case .resource(let resource): "resource:\(resource.id)"
         }
     }
 
@@ -1484,6 +1544,7 @@ private enum CompactManagedItem: Identifiable {
         switch self {
         case .surface(let surface): surface.path
         case .file(let file): file.path
+        case .resource: nil
         }
     }
 
@@ -1491,6 +1552,7 @@ private enum CompactManagedItem: Identifiable {
         switch self {
         case .surface(let surface): surface.managedLink
         case .file(let file): file.managedLink
+        case .resource: nil
         }
     }
 
@@ -1500,6 +1562,7 @@ private enum CompactManagedItem: Identifiable {
             surface.path.map { URL(fileURLWithPath: $0).lastPathComponent }
                 ?? surface.displayName
         case .file(let file): URL(fileURLWithPath: file.path).lastPathComponent
+        case .resource(let resource): resource.name
         }
     }
 
@@ -1514,6 +1577,7 @@ private enum CompactManagedItem: Identifiable {
         switch self {
         case .surface(let surface): CompactManagedKindPresentation(surface: surface).title
         case .file(let file): file.kind.title
+        case .resource(let resource): resource.kind.title
         }
     }
 
@@ -1521,6 +1585,7 @@ private enum CompactManagedItem: Identifiable {
         switch self {
         case .surface(let surface): CompactManagedKindPresentation(surface: surface).systemImage
         case .file(let file): file.kind.systemImage
+        case .resource(let resource): resource.kind.systemImage
         }
     }
 
@@ -1528,6 +1593,7 @@ private enum CompactManagedItem: Identifiable {
         switch self {
         case .surface(let surface): surface.securityLevel
         case .file(let file): file.securityLevel
+        case .resource(let resource): resource.securityLevel
         }
     }
 
@@ -1535,7 +1601,13 @@ private enum CompactManagedItem: Identifiable {
         switch self {
         case .surface(let surface): .surface(surface)
         case .file(let file): .file(file)
+        case .resource(let resource): .resource(resource)
         }
+    }
+
+    var detail: String? {
+        guard case .resource(let resource) = self else { return nil }
+        return resource.sshAccess?.route.hostPatterns.joined(separator: " · ")
     }
 
     @MainActor
@@ -1558,6 +1630,9 @@ private enum CompactManagedItem: Identifiable {
             ).joined(separator: " ")
         case .file(let file):
             return [file.path, file.kind.title, file.securityLevel.title]
+                .joined(separator: " ")
+        case .resource(let resource):
+            return [resource.name, resource.kind.title, resource.exportSummary]
                 .joined(separator: " ")
         }
     }
@@ -2138,7 +2213,7 @@ private struct CompactManagedItemRow: View {
                             kind: item.kindTitle,
                             path: item.path.map {
                                 compactManagedPath($0, projectPath: projectPath)
-                            },
+                            } ?? item.detail,
                             needsAttention: needsAttention)
                     }
 
@@ -2206,6 +2281,10 @@ private struct CompactManagedItemRow: View {
         case .file(let file):
             try await state.workspace.updateProtectedFileMetadata(
                 file.id, securityLevel: level, metadata: file.metadata)
+        case .resource(let resource):
+            try await state.workspace.updateResourceMetadata(
+                resource.id, name: resource.name,
+                securityLevel: level, metadata: resource.metadata)
         }
     }
 

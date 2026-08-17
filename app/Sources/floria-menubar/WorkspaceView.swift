@@ -326,6 +326,7 @@ struct AdvancedWorkspaceView: View {
     @State private var showingNewEnvFile = false
     @State private var showingImportSshIdentity = false
     @State private var showingConnectExternalAgent = false
+    @State private var showingNewSshAccess = false
     @State private var showingSystemHealth = false
     @State private var pendingAuditWindow: AuditOnlyWindow?
     @State private var showingAuditConfirmation = false
@@ -384,6 +385,11 @@ struct AdvancedWorkspaceView: View {
         }
         .sheet(isPresented: $showingConnectExternalAgent) {
             NewSshAgentSheet(store: state.workspace)
+        }
+        .sheet(isPresented: $showingNewSshAccess) {
+            AddSshAccessSheet(
+                store: state.workspace,
+                preselectedProjectIDs: Set(state.workspace.selectedProject.map { [$0.id] } ?? []))
         }
         .sheet(isPresented: $showingSystemHealth) {
             SystemHealthView(state: state)
@@ -447,7 +453,7 @@ struct AdvancedWorkspaceView: View {
                 Button("Protect Existing File", systemImage: "lock.fill") {
                     showingProtectFile = true
                 }
-                Button("New Shared Secret", systemImage: "key.fill") {
+                Button("New Secret", systemImage: "key.fill") {
                     showingNewSharedSecret = true
                 }
                 Button("New Env File", systemImage: "doc.badge.plus") {
@@ -458,6 +464,9 @@ struct AdvancedWorkspaceView: View {
                 }
                 Button("Connect External Agent", systemImage: "network") {
                     showingConnectExternalAgent = true
+                }
+                Button("New SSH Access", systemImage: "point.3.connected.trianglepath.dotted") {
+                    showingNewSshAccess = true
                 }
             } label: {
                 Image(systemName: "plus")
@@ -649,7 +658,7 @@ struct AdvancedWorkspaceView: View {
                 protectFile: { showingProtectFile = true })
         case .sharedSecrets:
             ResourceCatalogView(
-                store: state.workspace, title: "Shared Secrets",
+                store: state.workspace, title: "Secrets",
                 subtitle: "Reusable scalar values with a default environment key",
                 kinds: [.sharedSecret, .secret], search: search,
                 addResourceTitle: "Add Secret", addResource: { showingNewSharedSecret = true })
@@ -749,7 +758,9 @@ private struct ProjectWorkspaceView: View {
             AddLinesSurfaceSheet(store: store)
         }
         .sheet(isPresented: $showingAddSshAgent) {
-            AddSshAgentSurfaceSheet(store: store)
+            AddSshAccessSheet(
+                store: store,
+                preselectedProjectIDs: Set(store.selectedProject.map { [$0.id] } ?? []))
         }
         .sheet(isPresented: $showingNewEnvironment) {
             NewEnvironmentSheet(store: store)
@@ -1379,7 +1390,7 @@ private struct LinesSurfacePreview: View {
                             "No keyless values",
                             systemImage: "text.line.first.and.arrowtriangle.forward",
                             description: Text(
-                                "Bind a Shared Secret without a default environment key first."))
+                                "Bind a Secret without a default environment key first."))
                             .padding(24)
                     }
                 }
@@ -1973,6 +1984,7 @@ private enum LibraryCatalogFilter: String, CaseIterable, Identifiable {
             resource.kind == .sharedSecret || resource.kind == .secret
         case (.ssh, .resource(let resource)):
             resource.kind == .sshIdentity || resource.kind == .sshAgent
+                || resource.kind == .sshAccess
         case (.ssh, .surface(let surface)):
             surface.kind == .unixSocket
         default:
@@ -2011,11 +2023,23 @@ enum LibraryCatalogItem: Identifiable {
         case .file(let file):
             return (file.path as NSString).abbreviatingWithTildeInPath
         case .resource(let resource):
+            if let access = resource.sshAccess {
+                let route = access.route.hostPatterns.joined(separator: " · ")
+                let projects = access.projectIDs.count
+                return projects == 0
+                    ? "\(route) · No project"
+                    : "\(route) · \(projects) project\(projects == 1 ? "" : "s")"
+            }
             if let note = resource.metadata.note { return note }
             if let origin = resource.originSummary { return origin }
             if let key = resource.defaultEnvKey { return key }
+            if resource.kind == .sshIdentity || resource.kind == .sshAgent {
+                return resource.usageCount == 0
+                    ? "Not used by SSH Access"
+                    : "Used by \(resource.usageCount) SSH access item\(resource.usageCount == 1 ? "" : "s")"
+            }
             return resource.usageCount == 0
-                ? "Not used by a project"
+                ? "Not used"
                 : "Used by \(resource.usageCount) project\(resource.usageCount == 1 ? "" : "s")"
         case .surface(let surface):
             if let path = surface.path {
@@ -2041,6 +2065,7 @@ enum LibraryCatalogItem: Identifiable {
                 } ?? "Env file"
             case .sshIdentity: "SSH identity"
             case .sshAgent: "SSH agent"
+            case .sshAccess: "SSH access"
             case .literal: "Value"
             case .command: "Command"
             }
@@ -2356,6 +2381,7 @@ struct LibraryItemDetailSheet: View {
     @State private var editingFile: WorkspaceProtectedFile?
     @State private var editingSharedSecret: WorkspaceResource?
     @State private var editingResource: WorkspaceResource?
+    @State private var editingSshAccess: WorkspaceResource?
     @State private var editingSurface: WorkspaceSurface?
     @State private var historyFile: WorkspaceProtectedFile?
     @State private var confirmingConfiguration = false
@@ -2462,11 +2488,41 @@ struct LibraryItemDetailSheet: View {
                                 value: ByteCountFormatter.string(
                                     fromByteCount: Int64(file.size), countStyle: .file))
                         case .resource(let resource):
-                            LabeledContent(
-                                "Projects",
-                                value: resource.usageCount == 0
-                                    ? "Not in use"
-                                    : "\(resource.usageCount)")
+                            if let access = resource.sshAccess {
+                                let projectNames = access.projectIDs.compactMap { id in
+                                    store.projects.first { $0.id == id }?.name
+                                }
+                                let unavailableProjects = access.projectIDs.count - projectNames.count
+                                let projectSummary = (
+                                    projectNames
+                                        + (unavailableProjects == 0
+                                            ? []
+                                            : ["\(unavailableProjects) synced project\(unavailableProjects == 1 ? "" : "s")"])
+                                ).joined(separator: ", ")
+                                LabeledContent(
+                                    "Host patterns",
+                                    value: access.route.hostPatterns.joined(separator: " "))
+                                if let user = access.route.user {
+                                    LabeledContent("User", value: user)
+                                }
+                                LabeledContent(
+                                    "SSH identities",
+                                    value: access.identities.compactMap { selection in
+                                        store.resource(selection.resourceID)?.name
+                                    }.joined(separator: ", "))
+                                LabeledContent(
+                                    "Related projects",
+                                    value: access.projectIDs.isEmpty
+                                        ? "None"
+                                        : projectSummary)
+                            } else {
+                                LabeledContent(
+                                    resource.kind == .sshIdentity || resource.kind == .sshAgent
+                                        ? "SSH Access" : "Projects",
+                                    value: resource.usageCount == 0
+                                        ? "Not in use"
+                                        : "\(resource.usageCount)")
+                            }
                             if let key = resource.defaultEnvKey {
                                 LabeledContent("Default key", value: key)
                             }
@@ -2578,6 +2634,11 @@ struct LibraryItemDetailSheet: View {
                                 Button("Edit Info…", systemImage: "pencil") {
                                     editCurrentItem()
                                 }
+                                if resource.kind == .sshAccess {
+                                    Button("Configure…", systemImage: "slider.horizontal.3") {
+                                        editingSshAccess = resource
+                                    }
+                                }
                                 if managedSourceFiles.count == 1,
                                     let source = managedSourceFiles.first
                                 {
@@ -2675,6 +2736,9 @@ struct LibraryItemDetailSheet: View {
         .sheet(item: $editingResource) { resource in
             EditResourceMetadataSheet(store: store, resource: resource)
         }
+        .sheet(item: $editingSshAccess) { resource in
+            AddSshAccessSheet(store: store, existing: resource)
+        }
         .sheet(item: $editingSurface) { surface in
             ManageSurfaceSheet(store: store, surface: surface)
         }
@@ -2747,8 +2811,14 @@ struct LibraryItemDetailSheet: View {
         case .resource(let resource) where resource.kind == .sharedSecret:
             "Delete this secret"
         case .resource(let resource)
-        where resource.kind == .sshIdentity || resource.kind == .sshAgent:
-            resource.kind == .sshIdentity ? "Delete this SSH identity" : "Disconnect this SSH agent"
+        where resource.kind == .sshIdentity || resource.kind == .sshAgent
+            || resource.kind == .sshAccess:
+            switch resource.kind {
+            case .sshIdentity: "Delete this SSH identity"
+            case .sshAgent: "Disconnect this SSH agent"
+            case .sshAccess: "Delete this SSH access"
+            default: nil
+            }
         case .resource:
             nil
         case .surface(let surface):
@@ -2762,10 +2832,13 @@ struct LibraryItemDetailSheet: View {
         switch currentItem {
         case .file:
             "Restore the current plaintext at its original path and delete its encrypted history."
-        case .resource(let resource) where resource.usageCount > 0:
+        case .resource(let resource)
+        where resource.usageCount > 0 && resource.kind != .sshAccess:
             "Remove it from \(resource.usageCount) project\(resource.usageCount == 1 ? "" : "s") first."
         case .resource(let resource) where resource.kind == .sshAgent:
             "The external agent is not changed."
+        case .resource(let resource) where resource.kind == .sshAccess:
+            "Remove this OpenSSH route. Its SSH identities remain in the Library."
         case .resource(let resource) where resource.kind == .sshIdentity
             && !managedSourceFiles.isEmpty:
             managedSourceFiles.count == 1
@@ -2794,7 +2867,7 @@ struct LibraryItemDetailSheet: View {
         switch currentItem {
         case .file(let file): file.managedLink.needsAttention
         case .resource(let resource):
-            resource.usageCount > 0
+            (resource.kind != .sshAccess && resource.usageCount > 0)
                 || (resource.kind == .sshIdentity
                     && managedSourceFiles.contains(where: \.managedLink.needsAttention))
         case .surface: false
@@ -2806,6 +2879,8 @@ struct LibraryItemDetailSheet: View {
         case .file: "Restore plaintext and stop protecting?"
         case .resource(let resource) where resource.kind == .sshAgent:
             "Disconnect SSH agent?"
+        case .resource(let resource) where resource.kind == .sshAccess:
+            "Delete SSH access?"
         case .resource(let resource) where resource.kind == .sshIdentity:
             "Delete SSH identity?"
         case .resource:
@@ -2831,6 +2906,8 @@ struct LibraryItemDetailSheet: View {
             }
         case .resource(let resource) where resource.kind == .sshAgent:
             "Floria removes only its saved identity metadata. The external agent is not changed."
+        case .resource(let resource) where resource.kind == .sshAccess:
+            "Floria removes this OpenSSH route. Selected SSH identities and their encrypted keys remain in the Library."
         case .resource:
             "This permanently removes the encrypted value and version history."
         case .surface(let surface) where surface.kind == .unixSocket:
@@ -2964,7 +3041,8 @@ struct LibraryItemDetailSheet: View {
                 case .resource(let resource) where resource.kind == .sharedSecret:
                     try await store.deleteSharedSecret(resource.id)
                 case .resource(let resource)
-                where resource.kind == .sshIdentity || resource.kind == .sshAgent:
+                where resource.kind == .sshIdentity || resource.kind == .sshAgent
+                    || resource.kind == .sshAccess:
                     try await store.removeSshAgentResource(resource.id)
                 case .resource:
                     return
@@ -3530,7 +3608,7 @@ private struct ProtectedFileHistorySheet: View {
     }
 }
 
-private struct ImportSshIdentitySheet: View {
+struct ImportSshIdentitySheet: View {
     @Bindable var store: WorkspaceStore
 
     @Environment(\.dismiss) private var dismiss
@@ -3794,20 +3872,58 @@ private struct NewSshAgentSheet: View {
     }
 }
 
-private struct AddSshAgentSurfaceSheet: View {
+struct AddSshAccessSheet: View {
     @Bindable var store: WorkspaceStore
+    let existingID: WorkspaceResource.ID?
 
     @Environment(\.dismiss) private var dismiss
+    @State private var name = "SSH Access"
     @State private var resourceID = ""
     @State private var selectedEntries: Set<String> = []
+    @State private var selectedProjectIDs: Set<WorkspaceProject.ID>
     @State private var securityLevel = WorkspaceSecurityLevel.confirmation
     @State private var hostPatterns = ""
     @State private var hostname = ""
     @State private var user = ""
     @State private var port = ""
     @State private var forwardAgent = false
+    @State private var note = ""
+    @State private var links: [EditableItemLink] = []
     @State private var isSaving = false
     @State private var errorMessage: String?
+
+    init(
+        store: WorkspaceStore,
+        existing: WorkspaceResource? = nil,
+        preselectedProjectIDs: Set<WorkspaceProject.ID> = []
+    ) {
+        self.store = store
+        existingID = existing?.id
+        let access = existing?.sshAccess
+        let identity = access?.identities.first
+        let provider = identity.flatMap { selected in
+            store.sshIdentityProviders.first { $0.id == selected.resourceID }
+        }
+        let addresses: Set<String>
+        switch identity?.selection {
+        case .all: addresses = Set(provider?.entries.map(\.address) ?? [])
+        case .entries(let selected): addresses = Set(selected)
+        case nil: addresses = []
+        }
+        _name = State(initialValue: existing?.name ?? "SSH Access")
+        _resourceID = State(initialValue: identity?.resourceID ?? "")
+        _selectedEntries = State(initialValue: addresses)
+        _selectedProjectIDs = State(
+            initialValue: Set(access?.projectIDs ?? Array(preselectedProjectIDs)))
+        _securityLevel = State(initialValue: existing?.securityLevel ?? .confirmation)
+        _hostPatterns = State(initialValue: access?.route.hostPatterns.joined(separator: " ") ?? "")
+        _hostname = State(initialValue: access?.route.hostname ?? "")
+        _user = State(initialValue: access?.route.user ?? "")
+        _port = State(initialValue: access?.route.port.map(String.init) ?? "")
+        _forwardAgent = State(initialValue: access?.route.forwardAgent ?? false)
+        _note = State(initialValue: existing?.metadata.note ?? "")
+        _links = State(initialValue: existing.map { editableLinks($0.metadata) } ?? [])
+    }
 
     private var resource: WorkspaceResource? {
         store.sshIdentityProviders.first { $0.id == resourceID }
@@ -3816,8 +3932,9 @@ private struct AddSshAgentSurfaceSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Add SSH Access").font(.title2.bold())
-                Text("Choose which identities this project can use and the hosts they apply to.")
+                Text(existingID == nil ? "Add SSH Access" : "Edit SSH Access")
+                    .font(.title2.bold())
+                Text("Route matching hosts through selected Library identities. A Project is optional.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -3828,6 +3945,12 @@ private struct AddSshAgentSurfaceSheet: View {
                     description: Text("Import a private key or connect an external agent in the Library first."))
                     .frame(maxWidth: .infinity, minHeight: 180)
             } else {
+                VStack(alignment: .leading, spacing: 7) {
+                    Text("Name").font(.callout.weight(.medium))
+                    TextField("AWS Frankfurt", text: $name)
+                        .textFieldStyle(.roundedBorder)
+                }
+
                 VStack(alignment: .leading, spacing: 7) {
                     Text("Identity source").font(.callout.weight(.medium))
                     Picker("Identity source", selection: $resourceID) {
@@ -3853,7 +3976,7 @@ private struct AddSshAgentSurfaceSheet: View {
                             }
                             .padding(8)
                         }
-                        .frame(maxHeight: 160)
+                        .frame(minHeight: 36, maxHeight: 160)
                     }
                 }
 
@@ -3881,6 +4004,33 @@ private struct AddSshAgentSurfaceSheet: View {
                 }
 
                 SecurityLevelPicker(selection: $securityLevel)
+
+                GroupBox("Related Projects (optional)") {
+                    if store.projects.isEmpty {
+                        Text("No Projects on this Mac. SSH Access will remain in the Library.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(8)
+                    } else {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 7) {
+                                ForEach(store.projects) { project in
+                                    Toggle(project.name, isOn: projectSelection(project.id))
+                                        .toggleStyle(.checkbox)
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(8)
+                        }
+                        .frame(minHeight: 96, maxHeight: 120)
+                    }
+                }
+                Text("Projects organize this item and its activity. They do not restrict where OpenSSH can use the route.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                ItemMetadataEditor(note: $note, links: $links)
             }
 
             Divider()
@@ -3888,11 +4038,12 @@ private struct AddSshAgentSurfaceSheet: View {
                 Spacer()
                 Button("Cancel") { dismiss() }
                     .keyboardShortcut(.cancelAction)
-                Button("Add SSH Access", action: create)
+                Button(existingID == nil ? "Add SSH Access" : "Save Changes", action: create)
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
                     .disabled(
-                        isSaving || resourceID.isEmpty || selectedEntries.isEmpty
+                        isSaving || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            || resourceID.isEmpty || selectedEntries.isEmpty
                             || hostPatterns.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
@@ -3903,7 +4054,7 @@ private struct AddSshAgentSurfaceSheet: View {
         }
         .onChange(of: resourceID) { _, value in selectResource(value) }
         .alert(
-            "Could not add SSH access",
+            existingID == nil ? "Could not add SSH access" : "Could not update SSH access",
             isPresented: Binding(
                 get: { errorMessage != nil },
                 set: { if !$0 { errorMessage = nil } })
@@ -3929,6 +4080,15 @@ private struct AddSshAgentSurfaceSheet: View {
             })
     }
 
+    private func projectSelection(_ id: WorkspaceProject.ID) -> Binding<Bool> {
+        Binding(
+            get: { selectedProjectIDs.contains(id) },
+            set: { selected in
+                if selected { selectedProjectIDs.insert(id) }
+                else { selectedProjectIDs.remove(id) }
+            })
+    }
+
     private func create() {
         Task {
             isSaving = true
@@ -3951,9 +4111,12 @@ private struct AddSshAgentSurfaceSheet: View {
                     hostname: hostname.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
                     user: user.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty,
                     port: portValue, forwardAgent: forwardAgent)
-                try await store.createSshAgentSurface(
+                try await store.createSshAccess(
+                    accessID: existingID, name: name,
                     resourceID: resourceID, selectedEntries: selectedEntries,
-                    securityLevel: securityLevel, route: route)
+                    projectIDs: selectedProjectIDs.sorted(),
+                    securityLevel: securityLevel, route: route,
+                    metadata: itemMetadata(note: note, links: links))
                 dismiss()
             } catch {
                 errorMessage = error.localizedDescription
@@ -4304,7 +4467,7 @@ private struct ResourceCatalogView: View {
         }
         .alert(
             deletingSharedSecret?.usageCount == 0
-                ? "Delete Shared Secret?" : "Shared Secret Is In Use",
+                ? "Delete Secret?" : "Secret Is In Use",
             isPresented: Binding(
                 get: { deletingSharedSecret != nil },
                 set: { if !$0 { deletingSharedSecret = nil } })
@@ -4523,7 +4686,7 @@ private struct EditSharedSecretSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("Edit Shared Secret").font(.title2.bold())
+                Text("Edit Secret").font(.title2.bold())
                 Text("Change its metadata or rotate the encrypted value.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -4948,7 +5111,7 @@ private struct AddBindingSheet: View {
     }
 }
 
-private struct ProtectExistingFileSheet: View {
+struct ProtectExistingFileSheet: View {
     @Bindable var store: WorkspaceStore
 
     @Environment(\.dismiss) private var dismiss
@@ -5201,7 +5364,7 @@ private struct NewProjectSheet: View {
     }
 }
 
-private struct NewSharedSecretSheet: View {
+struct NewSharedSecretSheet: View {
     @Bindable var store: WorkspaceStore
 
     @Environment(\.dismiss) private var dismiss
@@ -5217,8 +5380,8 @@ private struct NewSharedSecretSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("New Shared Secret").font(.title2.bold())
-                Text("Create it once, then bind it into any project environment.")
+                Text("New Secret").font(.title2.bold())
+                Text("Keep it in the Library, or use it in any project environment.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -6214,6 +6377,7 @@ private extension WorkspaceResourceKind {
         case .command: .teal
         case .sshIdentity: .indigo
         case .sshAgent: .blue
+        case .sshAccess: .indigo
         }
     }
 }

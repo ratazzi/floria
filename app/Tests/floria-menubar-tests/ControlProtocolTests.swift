@@ -767,6 +767,38 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(event.identity.parent_chain?.first?.name, "cat")
     }
 
+    func testLibrarySshAccessEncodesWithoutAProjectOwner() throws {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let resource = CatalogResource(
+            id: "fixture-access", name: "AWS Frankfurt", kind: "ssh_access",
+            shape: "ssh_access", codec: "opaque", defaultEnvKey: nil, entries: [],
+            source: .sshAccess(
+                identities: [
+                    CatalogSshIdentitySelection(
+                        resourceID: "fixture-identity", selection: .all)
+                ],
+                route: CatalogSshRoute(
+                    hostPatterns: ["ec2*.example.com"], hostname: nil, user: "admin",
+                    port: nil, forwardAgent: false),
+                projectIDs: []),
+            enforcement: "prompt", metadata: .empty,
+            origin: CatalogResourceOrigin(kind: "manual", sources: []))
+
+        let data = try ControlCommand.resourceUpsert(resource, endpoint: nil)
+            .requestData(requestID: 173, encoder: encoder)
+        let request = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let params = try XCTUnwrap(request["params"] as? [String: Any])
+        let encoded = try XCTUnwrap(params["resource"] as? [String: Any])
+        let source = try XCTUnwrap(encoded["source"] as? [String: Any])
+
+        XCTAssertEqual(request["method"] as? String, "resource_upsert")
+        XCTAssertEqual(source["type"] as? String, "ssh_access")
+        XCTAssertEqual(source["project_ids"] as? [String], [])
+        XCTAssertEqual((source["route"] as? [String: Any])?["user"] as? String, "admin")
+    }
+
     func testBackupRequestsAndReportMatchRustWireShape() throws {
         let encoder = JSONEncoder()
         encoder.keyEncodingStrategy = .convertToSnakeCase

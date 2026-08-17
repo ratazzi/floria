@@ -203,16 +203,30 @@ struct CatalogResourceSource: Codable, Sendable {
     let managedSourceIDs: [String]?
     let value: String?
     let argv: [String]?
+    let identities: [CatalogSshIdentitySelection]?
+    let route: CatalogSshRoute?
+    let projectIDs: [String]?
 
     enum CodingKeys: String, CodingKey {
-        case type, value, argv
+        case type, value, argv, identities, route
         case secretID = "secret_id"
         case managedSourceIDs = "managed_source_ids"
+        case projectIDs = "project_ids"
     }
 
     static var socket: CatalogResourceSource {
         CatalogResourceSource(
-            type: "socket", secretID: nil, managedSourceIDs: nil, value: nil, argv: nil)
+            type: "socket", secretID: nil, managedSourceIDs: nil, value: nil, argv: nil,
+            identities: nil, route: nil, projectIDs: nil)
+    }
+
+    static func sshAccess(
+        identities: [CatalogSshIdentitySelection], route: CatalogSshRoute,
+        projectIDs: [String]
+    ) -> CatalogResourceSource {
+        CatalogResourceSource(
+            type: "ssh_access", secretID: nil, managedSourceIDs: nil, value: nil, argv: nil,
+            identities: identities, route: route, projectIDs: projectIDs)
     }
 }
 
@@ -315,6 +329,16 @@ struct CatalogEntrySelection: Codable, Sendable {
 
     static func entries(_ addresses: [String]) -> CatalogEntrySelection {
         CatalogEntrySelection(type: "entries", addresses: addresses)
+    }
+}
+
+struct CatalogSshIdentitySelection: Codable, Sendable {
+    let resourceID: String
+    let selection: CatalogEntrySelection
+
+    enum CodingKeys: String, CodingKey {
+        case selection
+        case resourceID = "resource_id"
     }
 }
 

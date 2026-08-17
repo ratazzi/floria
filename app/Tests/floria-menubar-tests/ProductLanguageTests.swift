@@ -118,7 +118,6 @@ final class ProductLanguageTests: XCTestCase {
 
         for phrase in [
             "Env value",
-            "New Secret",
             "New secret",
             "New shared secret",
             "Share in import",
@@ -208,9 +207,11 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertTrue(model.contains(#"case .unixSocket: "SSH access""#))
         XCTAssertTrue(model.contains(#"kind == .unixSocket ? "SSH Access" : name"#))
         XCTAssertTrue(workspace.contains(#"case (.ssh, .surface(let surface))"#))
+        XCTAssertTrue(workspace.contains(#"resource.kind == .sshAccess"#))
         XCTAssertTrue(workspace.contains(#"surface.kind == .unixSocket"#))
-        XCTAssertTrue(workspace.contains(#"Text("Add SSH Access")"#))
-        XCTAssertTrue(workspace.contains(#"Button("Add SSH Access", action: create)"#))
+        XCTAssertTrue(workspace.contains("Add SSH Access"))
+        XCTAssertTrue(workspace.contains("A Project is optional"))
+        XCTAssertTrue(workspace.contains("store.createSshAccess("))
         XCTAssertTrue(workspace.contains(#"? "Remove from Project…" : "Stop Protecting…""#))
         XCTAssertTrue(workspace.contains(#"Button(isSocketSurface ? "Save SSH Access" : "Save Changes""#))
         XCTAssertTrue(workspace.contains(#"throw WorkspaceStoreError.invalid("Add at least one SSH Host pattern")"#))
