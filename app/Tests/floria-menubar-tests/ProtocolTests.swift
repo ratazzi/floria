@@ -181,7 +181,7 @@ final class ProtocolTests: XCTestCase {
         let ssh = SshSignView(
             surface_id: "surface-1", surface_name: "GitHub identities",
             resource_id: "resource-1", key_fingerprint: "SHA256:abc123",
-            key_label: "Personal GitHub",
+            key_label: "Personal GitHub", identity_source: "~/keys/personal-github",
             requested_destination: "github.com",
             verified_host_key_fingerprint: "SHA256:host123",
             ssh_user: "git", forwarding_hops: 1)
@@ -203,6 +203,8 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(presentation.sshUser, "git")
         XCTAssertEqual(presentation.sshForwardingHops, 1)
         XCTAssertEqual(presentation.ssh?.surface_name, "GitHub identities")
+        XCTAssertEqual(presentation.sshIdentitySource, "~/keys/personal-github")
+        XCTAssertEqual(presentation.sshAccessName, "GitHub identities")
     }
 
     func testSshSignDecodesIdentitySourceForAuditPresentation() throws {

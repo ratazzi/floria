@@ -134,6 +134,8 @@ struct PromptPresentation {
     let sshHostKeyFingerprint: String?
     let sshUser: String?
     let sshForwardingHops: Int
+    let sshIdentitySource: String?
+    let sshAccessName: String?
 
     init(_ prompt: PromptMsg) {
         ssh = prompt.ssh
@@ -141,6 +143,12 @@ struct PromptPresentation {
         sshHostKeyFingerprint = prompt.ssh?.verified_host_key_fingerprint
         sshUser = prompt.ssh?.ssh_user
         sshForwardingHops = prompt.ssh?.forwarding_hops ?? 0
+        sshIdentitySource = prompt.ssh.map {
+            (($0.identity_source ?? $0.key_fingerprint) as NSString).abbreviatingWithTildeInPath
+        }
+        sshAccessName = prompt.ssh.flatMap {
+            $0.surface_name == $0.key_label ? nil : $0.surface_name
+        }
         if let ssh = prompt.ssh {
             targetName = ssh.key_label
             targetPath = ssh.key_fingerprint
@@ -441,9 +449,11 @@ struct AuthorizationPromptView: View {
             if let mountPath = model.mountPath {
                 detailRow("Internal mount path", value: mountPath)
             }
-            if let ssh = model.ssh {
-                detailRow("Agent surface", value: ssh.surface_name)
-                detailRow("Signer source", value: ssh.resource_id)
+            if let identitySource = model.sshIdentitySource {
+                detailRow("Identity source", value: identitySource)
+            }
+            if let accessName = model.sshAccessName {
+                detailRow("SSH access", value: accessName)
             }
         }
         .padding(.top, 8)

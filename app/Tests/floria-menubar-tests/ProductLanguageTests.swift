@@ -471,6 +471,15 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertFalse(detail.contains(#""SSH agent""#))
     }
 
+    func testSshPromptHidesImplementationIdentifiers() throws {
+        let prompt = try source("AuthorizationPromptView.swift")
+
+        XCTAssertTrue(prompt.contains(#"detailRow("Identity source", value: identitySource)"#))
+        XCTAssertTrue(prompt.contains(#"detailRow("SSH access", value: accessName)"#))
+        XCTAssertFalse(prompt.contains(#"detailRow("Agent surface""#))
+        XCTAssertFalse(prompt.contains(#"detailRow("Signer source""#))
+    }
+
     private func source(_ name: String) throws -> String {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
