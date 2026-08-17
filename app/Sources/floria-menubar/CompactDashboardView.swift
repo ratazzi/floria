@@ -27,15 +27,17 @@ private struct BackupNotice: Identifiable {
 /// Matches access events to a project with pre-lowercased, pre-expanded
 /// strings so hot loops stay on plain Swift string operations (macOS paths
 /// are case-insensitive, so lowercased comparison is safe).
-private struct ProjectEventMatcher {
+struct ProjectEventMatcher {
     private let path: String
     private let pathPrefix: String
     private let namePattern: String
+    private let surfaceIDs: Set<WorkspaceSurface.ID>
 
     init(_ project: WorkspaceProject) {
         path = (project.path as NSString).expandingTildeInPath.lowercased()
         pathPrefix = path + "/"
         namePattern = project.name.lowercased() + "/"
+        surfaceIDs = Set(project.environments.flatMap(\.surfaces).map(\.id))
     }
 
     static func loweredCandidates(for event: RecentAccess) -> [String] {
@@ -45,15 +47,17 @@ private struct ProjectEventMatcher {
         }
     }
 
-    func matchesLowered(_ candidates: [String]) -> Bool {
-        candidates.contains { candidate in
+    func matchesLowered(_ candidates: [String], surfaceID: WorkspaceSurface.ID? = nil) -> Bool {
+        if let surfaceID, surfaceIDs.contains(surfaceID) { return true }
+        return candidates.contains { candidate in
             candidate == path || candidate.hasPrefix(pathPrefix)
                 || candidate.contains(namePattern)
         }
     }
 
     func matches(_ event: RecentAccess) -> Bool {
-        matchesLowered(Self.loweredCandidates(for: event))
+        matchesLowered(
+            Self.loweredCandidates(for: event), surfaceID: event.ssh?.surface_id)
     }
 }
 
@@ -687,7 +691,7 @@ struct DashboardView: View {
         for (index, event) in state.recents.enumerated() {
             let candidates = ProjectEventMatcher.loweredCandidates(for: event)
             for (id, matcher) in matchers where result[id] == nil {
-                if matcher.matchesLowered(candidates) {
+                if matcher.matchesLowered(candidates, surfaceID: event.ssh?.surface_id) {
                     result[id] = (index, event)
                 }
             }
