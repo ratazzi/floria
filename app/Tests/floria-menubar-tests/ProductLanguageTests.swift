@@ -255,6 +255,15 @@ final class ProductLanguageTests: XCTestCase {
                 #".frame(width: AccessSummaryRowLayout.timeWidth, alignment: .trailing)"#))
     }
 
+    func testRecentAccessUsesTheSameOperationTermsEverywhere() throws {
+        let compact = try source("CompactDashboardView.swift")
+        let menuBar = try source("MenuBarView.swift")
+
+        XCTAssertFalse(compact.contains(#"event.operation == "sign" ? "used""#))
+        XCTAssertTrue(compact.contains(#"Text(event.operation)"#))
+        XCTAssertTrue(menuBar.contains(#"Text(ev.operation)"#))
+    }
+
     func testClosingSyncRefreshesTheVisibleLibrary() throws {
         let dashboard = try source("CompactDashboardView.swift")
 

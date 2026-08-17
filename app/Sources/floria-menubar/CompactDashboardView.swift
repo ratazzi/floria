@@ -1081,7 +1081,7 @@ private struct AccessSummaryRow: View {
 
             Text(event.exe)
                 .font(.callout.weight(.medium))
-            Text(event.operation == "sign" ? "used" : event.operation)
+            Text(event.operation)
                 .font(.callout)
                 .foregroundStyle(.secondary)
             Text(event.shownPath)
