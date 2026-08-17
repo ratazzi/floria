@@ -2491,6 +2491,14 @@ fn managed_policy_items(
                 object: ManagedObject::SshResource { resource_id: resource.id.clone() },
                 enforcement: resource.enforcement,
             });
+        } else if resource.kind == ResourceKind::SshAccess {
+            items.push(ManagedPolicyItem {
+                object: ManagedObject::Surface {
+                    surface_id: resource.id.clone(),
+                    item_id: resource.id.clone(),
+                },
+                enforcement: resource.enforcement,
+            });
         }
         let ResourceSource::SecretRef { secret_id, .. } = &resource.source else { continue };
         items.push(ManagedPolicyItem {

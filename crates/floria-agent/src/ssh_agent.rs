@@ -17,8 +17,9 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use floria_catalog::{
-    catalog_surface_semantic_revision, Binding, CatalogSnapshot, EntrySelection, Resource,
-    ResourceKind, ResourceSource, SshRouteSpec, SurfaceInput, SurfaceKind, ValueShape,
+    catalog_ssh_access_semantic_revision, catalog_surface_semantic_revision, CatalogSnapshot,
+    EntrySelection, Resource, ResourceKind, ResourceSource, SshRouteSpec,
+    SurfaceInput, SurfaceKind, ValueShape,
 };
 use floria_core::audit::{AuditLog, SshSessionAudit};
 use floria_core::authz::{
@@ -310,11 +311,7 @@ fn compile_surface_specs(
             }
         };
         let socket_path = floria_ssh::agent_runtime_socket_path(runtime_dir, &surface.id);
-        let mut providers = Vec::<ProviderSpec>::new();
-        let mut provider_indexes = HashMap::<&str, usize>::new();
-        let mut identities = Vec::new();
-        let mut addresses = HashSet::new();
-
+        let mut selected_resources = Vec::new();
         for binding_id in binding_ids {
             let binding = bindings
                 .get(binding_id.as_str())
@@ -325,39 +322,14 @@ fn compile_surface_specs(
             let resource = resources
                 .get(binding.resource_id.as_str())
                 .ok_or_else(|| invalid(format!("missing resource {:?}", binding.resource_id)))?;
-            let provider = ssh_provider(resource, &snapshot.endpoints)?;
-            if let ProviderSpec::ExternalAgent { endpoint, .. } = &provider {
-                if endpoint == &socket_path {
-                    return Err(invalid(format!(
-                        "SSH agent resource {:?} points back to surface {:?}",
-                        resource.id, surface.id
-                    )));
-                }
-            }
-            let provider_index = match provider_indexes.get(resource.id.as_str()).copied() {
-                Some(index) => index,
-                None => {
-                    let index = providers.len();
-                    providers.push(provider);
-                    provider_indexes.insert(resource.id.as_str(), index);
-                    index
-                }
-            };
-
-            for entry in selected_entries(binding, resource) {
-                if !addresses.insert(entry.address.as_str()) {
-                    return Err(invalid(format!(
-                        "SSH agent surface {:?} selects duplicate identity {:?}",
-                        surface.id, entry.address
-                    )));
-                }
-                identities.push(SelectedIdentity {
-                    provider_index,
-                    address: entry.address.clone(),
-                    label: entry.label.clone(),
-                });
-            }
+            selected_resources.push((*resource, &binding.selection));
         }
+        let (providers, identities) = compile_identity_set(
+            &surface.id,
+            &socket_path,
+            &snapshot.endpoints,
+            selected_resources,
+        )?;
 
         specs.push(SurfaceSpec {
             id: surface.id.clone(),
@@ -370,7 +342,99 @@ fn compile_surface_specs(
             route,
         });
     }
+
+    for access in snapshot
+        .resources
+        .iter()
+        .filter(|resource| resource.kind == ResourceKind::SshAccess)
+    {
+        let ResourceSource::SshAccess(spec) = &access.source else {
+            return Err(invalid(format!(
+                "SSH access resource {:?} has an incompatible source",
+                access.id
+            )));
+        };
+        let socket_path = floria_ssh::agent_runtime_socket_path(runtime_dir, &access.id);
+        let selected_resources = spec
+            .identities
+            .iter()
+            .map(|selection| {
+                resources
+                    .get(selection.resource_id.as_str())
+                    .copied()
+                    .map(|resource| (resource, &selection.selection))
+                    .ok_or_else(|| invalid(format!("missing resource {:?}", selection.resource_id)))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let (providers, identities) = compile_identity_set(
+            &access.id,
+            &socket_path,
+            &snapshot.endpoints,
+            selected_resources,
+        )?;
+
+        specs.push(SurfaceSpec {
+            id: access.id.clone(),
+            name: access.name.clone(),
+            semantic_revision: catalog_ssh_access_semantic_revision(snapshot, &access.id)
+                .map_err(|error| invalid(error.to_string()))?,
+            socket_path,
+            providers,
+            identities,
+            route: Some(spec.route.clone()),
+        });
+    }
     Ok(specs)
+}
+
+fn compile_identity_set<'a>(
+    owner_id: &str,
+    socket_path: &Path,
+    endpoints: &HashMap<String, PathBuf>,
+    selections: impl IntoIterator<Item = (&'a Resource, &'a EntrySelection)>,
+) -> io::Result<(Vec<ProviderSpec>, Vec<SelectedIdentity>)> {
+    let mut providers = Vec::<ProviderSpec>::new();
+    let mut provider_indexes = HashMap::<&str, usize>::new();
+    let mut identities = Vec::new();
+    let mut addresses = HashSet::new();
+
+    for (resource, selection) in selections {
+        let provider = ssh_provider(resource, endpoints)?;
+        if let ProviderSpec::ExternalAgent { endpoint, .. } = &provider {
+            if endpoint == socket_path {
+                return Err(invalid(format!(
+                    "SSH agent resource {:?} points back to access {:?}",
+                    resource.id, owner_id
+                )));
+            }
+        }
+        let provider_index = match provider_indexes.get(resource.id.as_str()).copied() {
+            Some(index) => index,
+            None => {
+                let index = providers.len();
+                providers.push(provider);
+                provider_indexes.insert(resource.id.as_str(), index);
+                index
+            }
+        };
+        for entry in resource.entries.iter().filter(|entry| match selection {
+            EntrySelection::All => true,
+            EntrySelection::Entries { addresses } => addresses.contains(&entry.address),
+        }) {
+            if !addresses.insert(entry.address.as_str()) {
+                return Err(invalid(format!(
+                    "SSH access {:?} selects duplicate identity {:?}",
+                    owner_id, entry.address
+                )));
+            }
+            identities.push(SelectedIdentity {
+                provider_index,
+                address: entry.address.clone(),
+                label: entry.label.clone(),
+            });
+        }
+    }
+    Ok((providers, identities))
 }
 
 fn write_generated_config(path: &Path, specs: &[SurfaceSpec]) -> io::Result<()> {
@@ -462,16 +526,6 @@ fn ssh_provider(
             resource.id
         ))),
     }
-}
-
-fn selected_entries<'a>(
-    binding: &'a Binding,
-    resource: &'a Resource,
-) -> impl Iterator<Item = &'a floria_catalog::EntrySpec> {
-    resource.entries.iter().filter(|entry| match &binding.selection {
-        EntrySelection::All => true,
-        EntrySelection::Entries { addresses } => addresses.contains(&entry.address),
-    })
 }
 
 fn invalid(message: impl Into<String>) -> io::Error {
@@ -1371,7 +1425,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use floria_catalog::{
-        BindingScope, EntrySpec, Environment, Project, ResourceCodec, SshRouteSpec, Surface,
+        Binding, BindingScope, EntrySpec, Environment, Project, ResourceCodec,
+        SshIdentitySelection, SshRouteSpec, Surface,
     };
     use floria_core::authz::{Decision, Enforcement};
 
@@ -1676,6 +1731,55 @@ mod tests {
                 position: 0,
             }],
         }
+    }
+
+    #[test]
+    fn library_ssh_access_compiles_without_a_project_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let upstream = dir.path().join("upstream.sock");
+        let mut catalog = snapshot(dir.path(), &upstream);
+        let provider = catalog.resources[0].clone();
+        let selected_address = provider.entries[0].address.clone();
+        catalog.resources = vec![
+            provider,
+            Resource {
+                id: "fixture-library-access".to_string(),
+                name: "AWS Frankfurt".to_string(),
+                kind: ResourceKind::SshAccess,
+                shape: ValueShape::SshAccess,
+                codec: ResourceCodec::Opaque,
+                default_env_key: None,
+                entries: Vec::new(),
+                source: ResourceSource::SshAccess(Box::new(floria_catalog::SshAccessSpec {
+                    identities: vec![SshIdentitySelection {
+                        resource_id: "fixture-upstream".to_string(),
+                        selection: EntrySelection::Entries {
+                            addresses: vec![selected_address],
+                        },
+                    }],
+                    route: SshRouteSpec {
+                        host_patterns: vec!["ec2*.example.com".to_string()],
+                        hostname: None,
+                        user: Some("admin".to_string()),
+                        port: None,
+                        forward_agent: false,
+                    },
+                    project_ids: Vec::new(),
+                })),
+                enforcement: Enforcement::Prompt,
+                metadata: Default::default(),
+                origin: Default::default(),
+            },
+        ];
+        catalog.bindings.clear();
+        catalog.surfaces.clear();
+
+        let specs = compile_surface_specs(&catalog, dir.path()).unwrap();
+
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].id, "fixture-library-access");
+        assert_eq!(specs[0].identities.len(), 1);
+        assert_eq!(specs[0].route.as_ref().unwrap().user.as_deref(), Some("admin"));
     }
 
     fn managed_snapshot(

@@ -880,7 +880,10 @@ pub(crate) fn read_msg<R: Read, T: DeserializeOwned>(reader: &mut R) -> io::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
-    use floria_catalog::{EntrySpec, ResourceKind, ResourceSource, ValueShape};
+    use floria_catalog::{
+        EntrySelection, EntrySpec, ResourceKind, ResourceSource, SshAccessSpec,
+        SshIdentitySelection, SshRouteSpec, ValueShape,
+    };
 
     #[test]
     fn ping_reports_protocol_daemon_and_catalog_versions() {
@@ -1542,6 +1545,45 @@ mod tests {
             value["params"]["resource"]["source"],
             serde_json::json!({ "type": "socket" })
         );
+    }
+
+    #[test]
+    fn library_ssh_access_wire_shape_keeps_project_relationship_optional() {
+        let source = ResourceSource::SshAccess(Box::new(SshAccessSpec {
+            identities: vec![SshIdentitySelection {
+                resource_id: "fixture-identity".to_string(),
+                selection: EntrySelection::All,
+            }],
+            route: SshRouteSpec {
+                host_patterns: vec!["github.com".to_string()],
+                hostname: None,
+                user: Some("git".to_string()),
+                port: None,
+                forward_agent: false,
+            },
+            project_ids: Vec::new(),
+        }));
+
+        let value = serde_json::to_value(&source).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "ssh_access",
+                "identities": [{
+                    "resource_id": "fixture-identity",
+                    "selection": { "type": "all" }
+                }],
+                "route": {
+                    "host_patterns": ["github.com"],
+                    "hostname": null,
+                    "user": "git",
+                    "port": null,
+                    "forward_agent": false
+                }
+            })
+        );
+        assert_eq!(serde_json::from_value::<ResourceSource>(value).unwrap(), source);
     }
 
     #[test]

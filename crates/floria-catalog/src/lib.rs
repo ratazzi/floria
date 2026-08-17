@@ -9,8 +9,8 @@ mod domain;
 mod error;
 
 pub use catalog::{
-    catalog_surface_semantic_revision, resolve_catalog_snapshot, resolve_catalog_surface,
-    validate_replicated_catalog, Catalog,
+    catalog_ssh_access_semantic_revision, catalog_surface_semantic_revision,
+    resolve_catalog_snapshot, resolve_catalog_surface, validate_replicated_catalog, Catalog,
 };
 pub use domain::{
     Binding, BindingScope, CatalogSnapshot, EntrySelection, EntrySpec, Environment, FileBacking,
@@ -19,6 +19,7 @@ pub use domain::{
     ReplicatedProject, ReplicatedSurface, ResolvedEnvironment, ReplicationOutboxEntry,
     ReplicationStoreVersionRef, ResolvedExport, Resource,
     ResourceBindingUsage, ResourceCodec, ResourceKind, ResourceOrigin, ResourceSource,
-    ResourceUsage, SshRouteSpec, Surface, SurfaceFormat, SurfaceInput, SurfaceKind, ValueShape,
+    ResourceUsage, SshAccessSpec, SshIdentitySelection, SshRouteSpec, Surface, SurfaceFormat,
+    SurfaceInput, SurfaceKind, ValueShape,
 };
 pub use error::{CatalogError, CatalogResult};

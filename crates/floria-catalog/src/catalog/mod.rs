@@ -711,14 +711,15 @@ use replication::replicated_catalog_from;
 use schema::{migrate, migrate_authenticated_v13_to_v14};
 use snapshot::{snapshot_from, validate_snapshot_conflicts};
 pub use snapshot::{
-    catalog_surface_semantic_revision, resolve_catalog_snapshot, resolve_catalog_surface,
+    catalog_ssh_access_semantic_revision, catalog_surface_semantic_revision,
+    resolve_catalog_snapshot, resolve_catalog_surface,
 };
 use validation::*;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{EntrySpec, SshRouteSpec};
+    use crate::domain::{EntrySpec, SshIdentitySelection, SshRouteSpec};
 
     fn project() -> Project {
         Project {
@@ -815,6 +816,35 @@ mod tests {
         }
     }
 
+    fn ssh_access_resource(id: &str, provider_id: &str, project_ids: Vec<String>) -> Resource {
+        Resource {
+            id: id.to_string(),
+            name: "AWS Frankfurt".to_string(),
+            kind: ResourceKind::SshAccess,
+            shape: ValueShape::SshAccess,
+            codec: ResourceCodec::Opaque,
+            default_env_key: None,
+            entries: Vec::new(),
+            source: ResourceSource::SshAccess(Box::new(crate::domain::SshAccessSpec {
+                identities: vec![SshIdentitySelection {
+                    resource_id: provider_id.to_string(),
+                    selection: EntrySelection::All,
+                }],
+                route: SshRouteSpec {
+                    host_patterns: vec!["ec2*.eu-central-1.compute.amazonaws.com".to_string()],
+                    hostname: None,
+                    user: Some("admin".to_string()),
+                    port: None,
+                    forward_agent: false,
+                },
+                project_ids,
+            })),
+            enforcement: Enforcement::Prompt,
+            metadata: Default::default(),
+            origin: Default::default(),
+        }
+    }
+
     fn binding(id: &str, resource_id: &str, scope: BindingScope) -> Binding {
         Binding {
             id: id.to_string(),
@@ -835,6 +865,56 @@ mod tests {
         catalog.upsert_project(&project()).unwrap();
         catalog.upsert_environment(&environment()).unwrap();
         (dir, catalog)
+    }
+
+    #[test]
+    fn ssh_access_is_a_library_resource_with_optional_project_uses() {
+        let (dir, catalog) = catalog();
+        let endpoint = dir.path().join("upstream.sock");
+        let provider = socket_resource("fixture-provider");
+        catalog.upsert_socket_resource(&provider, &endpoint).unwrap();
+
+        let access = ssh_access_resource("fixture-access", &provider.id, Vec::new());
+        catalog.upsert_resource(&access).unwrap();
+        let initial_revision = catalog_ssh_access_semantic_revision(
+            &catalog.snapshot().unwrap(),
+            &access.id,
+        )
+        .unwrap();
+        assert_eq!(catalog.resource(&access.id).unwrap(), access);
+        assert!(catalog
+            .replicated_catalog()
+            .unwrap()
+            .resources
+            .iter()
+            .any(|resource| resource.id == access.id));
+
+        let error = catalog.remove_resource(&provider.id).unwrap_err();
+        assert!(matches!(error, CatalogError::ResourceInUse { surface_ids, .. } if surface_ids == vec![access.id.clone()]));
+
+        let associated = ssh_access_resource(
+            "fixture-access",
+            &provider.id,
+            vec!["floria".to_string()],
+        );
+        catalog.upsert_resource(&associated).unwrap();
+        assert_eq!(catalog.resource(&associated.id).unwrap(), associated);
+        assert_eq!(
+            catalog_ssh_access_semantic_revision(
+                &catalog.snapshot().unwrap(),
+                &access.id,
+            )
+            .unwrap(),
+            initial_revision,
+            "Project relationships are presentation-only"
+        );
+
+        catalog.remove_project("floria").unwrap();
+        let detached = catalog.resource("fixture-access").unwrap();
+        assert!(matches!(
+            detached.source,
+            ResourceSource::SshAccess(spec) if spec.project_ids.is_empty()
+        ));
     }
 
     fn replication_outbox_entry() -> ReplicationOutboxEntry {

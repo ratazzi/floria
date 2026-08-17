@@ -246,6 +246,48 @@ pub fn catalog_surface_semantic_revision(
     Ok(format!("{:x}", Sha256::digest(canonical)))
 }
 
+/// Stable digest of one Library SSH Access and every selected identity provider.
+pub fn catalog_ssh_access_semantic_revision(
+    snapshot: &CatalogSnapshot,
+    access_id: &str,
+) -> CatalogResult<String> {
+    let access = snapshot
+        .resources
+        .iter()
+        .find(|resource| resource.id == access_id && resource.kind == ResourceKind::SshAccess)
+        .ok_or_else(|| CatalogError::NotFound(format!("SSH access {access_id}")))?;
+    let ResourceSource::SshAccess(spec) = &access.source else {
+        return Err(CatalogError::Validation(format!(
+            "SSH access {access_id:?} has an incompatible source"
+        )));
+    };
+    let mut providers = Vec::with_capacity(spec.identities.len());
+    let mut endpoints = Vec::new();
+    for identity in &spec.identities {
+        let provider = snapshot
+            .resources
+            .iter()
+            .find(|resource| resource.id == identity.resource_id)
+            .ok_or_else(|| CatalogError::NotFound(format!("resource {}", identity.resource_id)))?;
+        providers.push(provider);
+        if let Some(endpoint) = snapshot.endpoints.get(&identity.resource_id) {
+            endpoints.push((identity.resource_id.as_str(), endpoint));
+        }
+    }
+    // Project relationships and item metadata are presentation-only. Changing either must not
+    // rotate the filtered socket identity or invalidate an otherwise identical signing grant.
+    let canonical = serde_json::to_vec(&(
+        access.id.as_str(),
+        access.name.as_str(),
+        access.enforcement,
+        &spec.identities,
+        &spec.route,
+        providers,
+        endpoints,
+    ))?;
+    Ok(format!("{:x}", Sha256::digest(canonical)))
+}
+
 pub fn resolve_catalog_snapshot(
     snapshot: &CatalogSnapshot,
     project_id: &str,
@@ -399,6 +441,7 @@ pub(super) fn resolve_exports(
 
 pub(super) fn validate_snapshot_conflicts(snapshot: &CatalogSnapshot) -> CatalogResult<()> {
     validate_binding_selections(snapshot)?;
+    validate_ssh_access_inputs(snapshot)?;
     validate_surface_inputs(snapshot)?;
     validate_ssh_route_conflicts(snapshot)?;
     for surface in &snapshot.surfaces {
@@ -414,6 +457,74 @@ pub(super) fn validate_snapshot_conflicts(snapshot: &CatalogSnapshot) -> Catalog
             SurfaceKind::File(FileBacking::Composed(SurfaceFormat::Lines))
             | SurfaceKind::File(FileBacking::EnvFileDirect) => {}
             SurfaceKind::UnixSocket => validate_ssh_agent_surface_conflicts(snapshot, surface)?,
+        }
+    }
+    Ok(())
+}
+
+fn validate_ssh_access_inputs(snapshot: &CatalogSnapshot) -> CatalogResult<()> {
+    let resources = snapshot
+        .resources
+        .iter()
+        .map(|resource| (resource.id.as_str(), resource))
+        .collect::<HashMap<_, _>>();
+
+    for access in snapshot
+        .resources
+        .iter()
+        .filter(|resource| resource.kind == ResourceKind::SshAccess)
+    {
+        let ResourceSource::SshAccess(spec) = &access.source
+        else {
+            return Err(CatalogError::Validation(format!(
+                "SSH access resource {:?} has an incompatible source",
+                access.id
+            )));
+        };
+        let mut selected_addresses = HashMap::<&str, &str>::new();
+        for identity in &spec.identities {
+            let provider = resources.get(identity.resource_id.as_str()).ok_or_else(|| {
+                CatalogError::NotFound(format!("resource {}", identity.resource_id))
+            })?;
+            if provider.id == access.id
+                || !matches!(provider.kind, ResourceKind::SshIdentity | ResourceKind::SshAgent)
+            {
+                return Err(CatalogError::Validation(format!(
+                    "SSH access {:?} references non-identity resource {:?}",
+                    access.id, provider.id
+                )));
+            }
+            let entries = provider.entries.iter().filter(|entry| match &identity.selection {
+                EntrySelection::All => true,
+                EntrySelection::Entries { addresses } => addresses.contains(&entry.address),
+            });
+            let selected = entries.collect::<Vec<_>>();
+            if selected.is_empty() {
+                return Err(CatalogError::Validation(format!(
+                    "SSH access {:?} selects no identities from resource {:?}",
+                    access.id, provider.id
+                )));
+            }
+            if let EntrySelection::Entries { addresses } = &identity.selection {
+                if addresses.iter().any(|address| {
+                    !provider.entries.iter().any(|entry| entry.address == *address)
+                }) {
+                    return Err(CatalogError::Validation(format!(
+                        "SSH access {:?} selects identities not exposed by resource {:?}",
+                        access.id, provider.id
+                    )));
+                }
+            }
+            for entry in selected {
+                if let Some(existing) =
+                    selected_addresses.insert(entry.address.as_str(), provider.id.as_str())
+                {
+                    return Err(CatalogError::Conflict {
+                        key: entry.address.clone(),
+                        binding_ids: vec![existing.to_string(), provider.id.clone()],
+                    });
+                }
+            }
         }
     }
     Ok(())

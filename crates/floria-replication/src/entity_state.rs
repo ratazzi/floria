@@ -243,8 +243,8 @@ mod tests {
 
     use floria_catalog::{
         BindingScope, EntrySelection, EntrySpec, FileBacking, ItemMetadata, ResourceCodec,
-        ResourceKind, ResourceOrigin, ResourceSource, SurfaceFormat, SurfaceInput, SurfaceKind,
-        ValueShape,
+        ResourceKind, ResourceOrigin, ResourceSource, SshAccessSpec, SshIdentitySelection,
+        SshRouteSpec, SurfaceFormat, SurfaceInput, SurfaceKind, ValueShape,
     };
     use floria_core::authz::Enforcement;
 
@@ -326,6 +326,74 @@ mod tests {
         let decoded = CatalogEntityDocument::decode(&first.encode().unwrap()).unwrap();
         assert_eq!(&decoded, first);
         assert_eq!(decoded.entity_id(), decoded.state().entity_id());
+    }
+
+    #[test]
+    fn library_ssh_access_round_trips_as_a_resource_entity_without_a_project() {
+        let mut source = source_catalog();
+        let identity_id = "resource-77777777-7777-4777-8777-777777777777".to_string();
+        let address = "ssh/sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string();
+        source.resources.push(Resource {
+            id: identity_id.clone(),
+            name: "Fixture identity".to_string(),
+            kind: ResourceKind::SshIdentity,
+            shape: ValueShape::SshIdentity,
+            codec: ResourceCodec::Opaque,
+            default_env_key: None,
+            entries: vec![EntrySpec {
+                address: address.clone(), label: "Fixture identity".to_string(),
+                key: None, sensitive: false,
+            }],
+            source: ResourceSource::SecretRef {
+                secret_id: "88888888-8888-4888-8888-888888888888".to_string(),
+                managed_source_ids: Vec::new(),
+            },
+            enforcement: Enforcement::Prompt,
+            metadata: ItemMetadata::default(),
+            origin: ResourceOrigin::default(),
+        });
+        source.resources.push(Resource {
+            id: "resource-99999999-9999-4999-8999-999999999999".to_string(),
+            name: "Global SSH".to_string(),
+            kind: ResourceKind::SshAccess,
+            shape: ValueShape::SshAccess,
+            codec: ResourceCodec::Opaque,
+            default_env_key: None,
+            entries: Vec::new(),
+            source: ResourceSource::SshAccess(Box::new(SshAccessSpec {
+                identities: vec![SshIdentitySelection {
+                    resource_id: identity_id,
+                    selection: EntrySelection::Entries { addresses: vec![address] },
+                }],
+                route: SshRouteSpec {
+                    host_patterns: vec!["github.com".to_string()], hostname: None,
+                    user: Some("git".to_string()), port: None, forward_agent: false,
+                },
+                project_ids: Vec::new(),
+            })),
+            enforcement: Enforcement::TouchId,
+            metadata: ItemMetadata::default(),
+            origin: ResourceOrigin::default(),
+        });
+
+        let entities = CatalogEntitySet::from_catalog(&source).unwrap();
+        let projected = entities.active_catalog().unwrap();
+
+        assert_eq!(projected.projects, source.projects);
+        assert_eq!(projected.environments, source.environments);
+        assert_eq!(projected.bindings, source.bindings);
+        assert_eq!(projected.surfaces, source.surfaces);
+        assert_eq!(projected.resources.len(), source.resources.len());
+        assert!(projected.resources.iter().any(|resource| {
+            resource.kind == ResourceKind::SshAccess
+                && resource.name == "Global SSH"
+        }));
+        assert!(entities.documents().any(|document| {
+            matches!(
+                document.state(),
+                CatalogEntityState::Resource(resource) if resource.kind == ResourceKind::SshAccess
+            )
+        }));
     }
 
     #[test]

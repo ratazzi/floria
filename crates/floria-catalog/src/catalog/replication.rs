@@ -279,6 +279,18 @@ pub fn validate_replicated_catalog(projection: &ReplicatedCatalog) -> CatalogRes
     let mut resource_ids = HashSet::new();
     for resource in &projection.resources {
         validate_resource(resource)?;
+        if let ResourceSource::SshAccess(spec) = &resource.source {
+            if spec
+                .project_ids
+                .iter()
+                .any(|project_id| !project_ids.contains(project_id.as_str()))
+            {
+                return Err(CatalogError::Validation(format!(
+                    "replicated SSH access {:?} references a missing project",
+                    resource.id
+                )));
+            }
+        }
         if resource.origin != ResourceOrigin::default()
             || !resource_ids.insert(resource.id.as_str())
         {

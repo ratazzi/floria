@@ -66,7 +66,27 @@ impl Catalog {
 
     pub fn remove_project(&self, id: &str) -> CatalogResult<()> {
         require_id(id, "project id")?;
-        self.with_authenticated_mutation(|tx| remove_one(tx, "projects", id, "project"))
+        self.with_authenticated_mutation(|tx| {
+            let snapshot = snapshot_from(tx)?;
+            for resource in snapshot.resources {
+                let ResourceSource::SshAccess(mut spec) = resource.source
+                else {
+                    continue;
+                };
+                let previous_len = spec.project_ids.len();
+                spec.project_ids.retain(|project_id| project_id != id);
+                if spec.project_ids.len() == previous_len {
+                    continue;
+                }
+                let source = ResourceSource::SshAccess(spec);
+                tx.execute(
+                    "UPDATE resources SET source_json = ?2, updated_at = CURRENT_TIMESTAMP
+                     WHERE id = ?1",
+                    params![resource.id, serde_json::to_string(&source)?],
+                )?;
+            }
+            remove_one(tx, "projects", id, "project")
+        })
     }
 
     pub fn upsert_checkout(&self, checkout: &ProjectCheckout) -> CatalogResult<()> {

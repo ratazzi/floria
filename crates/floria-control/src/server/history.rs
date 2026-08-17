@@ -74,6 +74,15 @@ pub(super) fn history_ssh(record: &AuditAccessRecord, snapshot: &CatalogSnapshot
             .iter()
             .find(|surface| surface.id == *surface_id)
             .map(|surface| surface.name.clone())
+            .or_else(|| {
+                snapshot
+                    .resources
+                    .iter()
+                    .find(|resource| {
+                        resource.id == *surface_id && resource.kind == ResourceKind::SshAccess
+                    })
+                    .map(|resource| resource.name.clone())
+            })
             .unwrap_or_else(|| surface_id.clone()),
         resource_id: resource_id.clone(),
         key_fingerprint: key_fingerprint.clone(),

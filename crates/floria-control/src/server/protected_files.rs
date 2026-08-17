@@ -15,7 +15,8 @@ pub(super) fn protected_files(
             ResourceSource::SecretRef { secret_id, .. } => Some(secret_id.as_str()),
             ResourceSource::Literal { .. }
             | ResourceSource::Command { .. }
-            | ResourceSource::Socket => None,
+            | ResourceSource::Socket
+            | ResourceSource::SshAccess(_) => None,
         })
         .collect::<HashSet<_>>();
     let mut files = store

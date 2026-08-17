@@ -78,6 +78,7 @@ pub enum ResourceKind {
     Command,
     SshIdentity,
     SshAgent,
+    SshAccess,
 }
 
 impl ResourceKind {
@@ -90,6 +91,7 @@ impl ResourceKind {
             ResourceKind::Command => "command",
             ResourceKind::SshIdentity => "ssh_identity",
             ResourceKind::SshAgent => "ssh_agent",
+            ResourceKind::SshAccess => "ssh_access",
         }
     }
 
@@ -102,6 +104,7 @@ impl ResourceKind {
             "command" => Some(ResourceKind::Command),
             "ssh_identity" => Some(ResourceKind::SshIdentity),
             "ssh_agent" => Some(ResourceKind::SshAgent),
+            "ssh_access" => Some(ResourceKind::SshAccess),
             _ => None,
         }
     }
@@ -115,6 +118,7 @@ pub enum ValueShape {
     Bytes,
     SshIdentity,
     Socket,
+    SshAccess,
 }
 
 impl ValueShape {
@@ -125,6 +129,7 @@ impl ValueShape {
             ValueShape::Bytes => "bytes",
             ValueShape::SshIdentity => "ssh_identity",
             ValueShape::Socket => "socket",
+            ValueShape::SshAccess => "ssh_access",
         }
     }
 
@@ -135,6 +140,7 @@ impl ValueShape {
             "bytes" => Some(ValueShape::Bytes),
             "ssh_identity" => Some(ValueShape::SshIdentity),
             "socket" => Some(ValueShape::Socket),
+            "ssh_access" => Some(ValueShape::SshAccess),
             _ => None,
         }
     }
@@ -186,6 +192,21 @@ pub enum EntrySelection {
     Entries { addresses: Vec<String> },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshIdentitySelection {
+    pub resource_id: String,
+    #[serde(default)]
+    pub selection: EntrySelection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshAccessSpec {
+    pub identities: Vec<SshIdentitySelection>,
+    pub route: SshRouteSpec,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub project_ids: Vec<String>,
+}
+
 /// How a resource obtains its value. Secret values are referenced by id and never stored here.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -200,6 +221,7 @@ pub enum ResourceSource {
     Literal { value: String },
     Command { argv: Vec<String> },
     Socket,
+    SshAccess(Box<SshAccessSpec>),
 }
 
 impl ResourceSource {

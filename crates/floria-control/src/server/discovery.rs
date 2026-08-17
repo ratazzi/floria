@@ -1381,7 +1381,8 @@ impl Drop for DiscoveryMutationGuard<'_> {
                     }
                     ResourceSource::Literal { .. }
                     | ResourceSource::Command { .. }
-                    | ResourceSource::Socket => None,
+                    | ResourceSource::Socket
+                    | ResourceSource::SshAccess(_) => None,
                 });
             if let Err(error) = self.catalog.remove_resource(resource_id) {
                 tracing::warn!(%resource_id, %error, "discovery rollback could not remove resource");

@@ -94,6 +94,7 @@ impl Catalog {
             ));
         }
         self.with_authenticated_mutation(|tx| {
+            validate_ssh_access_projects(tx, resource)?;
             let exists = tx
                 .query_row("SELECT 1 FROM resources WHERE id = ?1", [&resource.id], |_| Ok(()))
                 .optional()?
@@ -202,7 +203,7 @@ fn resource_usage_from_snapshot(
                 surface_ids,
             });
         }
-        let direct_surface_ids = snapshot
+        let mut direct_surface_ids = snapshot
             .surfaces
             .iter()
             .filter(|surface| {
@@ -212,7 +213,18 @@ fn resource_usage_from_snapshot(
                 )
             })
             .map(|surface| surface.id.clone())
-            .collect();
+            .collect::<Vec<_>>();
+        direct_surface_ids.extend(snapshot.resources.iter().filter_map(|resource| {
+            let ResourceSource::SshAccess(spec) = &resource.source else {
+                return None;
+            };
+            spec.identities
+                .iter()
+                .any(|identity| identity.resource_id == id)
+                .then(|| resource.id.clone())
+        }));
+        direct_surface_ids.sort();
+        direct_surface_ids.dedup();
         Ok(ResourceUsage { resource_id: id.to_string(), bindings, direct_surface_ids })
 }
 
@@ -220,6 +232,7 @@ fn upsert_resource_row(
     tx: &rusqlite::Transaction<'_>,
     resource: &Resource,
 ) -> CatalogResult<()> {
+    validate_ssh_access_projects(tx, resource)?;
     tx.execute(
         "INSERT INTO resources
             (id, name, kind, shape, codec, default_env_key, entries_json, source_json, enforcement, metadata_json, origin_json)
@@ -246,5 +259,18 @@ fn upsert_resource_row(
             serde_json::to_string(&resource.origin)?,
         ],
     )?;
+    Ok(())
+}
+
+fn validate_ssh_access_projects(
+    tx: &rusqlite::Transaction<'_>,
+    resource: &Resource,
+) -> CatalogResult<()> {
+    let ResourceSource::SshAccess(spec) = &resource.source else {
+        return Ok(());
+    };
+    for project_id in &spec.project_ids {
+        require_exists(tx, "projects", project_id, "project")?;
+    }
     Ok(())
 }

@@ -83,9 +83,9 @@ pub(super) fn validate_resource(resource: &Resource) -> CatalogResult<()> {
                 "key_value_set resources require at least one keyed entry".to_string(),
             ))
         }
-        ValueShape::Bytes if !resource.entries.is_empty() => {
+        ValueShape::Bytes | ValueShape::SshAccess if !resource.entries.is_empty() => {
             return Err(CatalogError::Validation(
-                "bytes resources cannot declare entries".to_string(),
+                "bytes and SSH access resources cannot declare entries".to_string(),
             ))
         }
         ValueShape::Socket if resource.entries.iter().any(|entry| entry.key.is_some()) => {
@@ -101,7 +101,8 @@ pub(super) fn validate_resource(resource: &Resource) -> CatalogResult<()> {
             ValueShape::Scalar
                 | ValueShape::Bytes
                 | ValueShape::SshIdentity
-                | ValueShape::Socket,
+                | ValueShape::Socket
+                | ValueShape::SshAccess,
             ResourceCodec::Opaque,
         )
         | (
@@ -172,6 +173,18 @@ pub(super) fn validate_resource(resource: &Resource) -> CatalogResult<()> {
                 )));
             }
         }
+        (
+            ResourceKind::SshAccess,
+            ValueShape::SshAccess,
+            ResourceSource::SshAccess(_),
+        ) => {
+            if resource.default_env_key.is_some() || !resource.entries.is_empty() {
+                return Err(CatalogError::Validation(format!(
+                    "SSH access resource {:?} cannot expose environment entries",
+                    resource.id
+                )));
+            }
+        }
         _ => {
             return Err(CatalogError::Validation(format!(
                 "resource kind {:?}, shape {:?}, and source {:?} are incompatible",
@@ -207,6 +220,49 @@ pub(super) fn validate_resource(resource: &Resource) -> CatalogResult<()> {
             return Err(CatalogError::Validation(
                 "command argv cannot contain empty arguments".to_string(),
             ))
+        }
+        ResourceSource::SshAccess(spec) => {
+            if spec.identities.is_empty() {
+                return Err(CatalogError::Validation(
+                    "SSH access requires at least one identity".to_string(),
+                ));
+            }
+            validate_ssh_route(&spec.route)?;
+            let mut projects = HashSet::new();
+            for project_id in &spec.project_ids {
+                require_id(project_id, "SSH access project id")?;
+                if !projects.insert(project_id) {
+                    return Err(CatalogError::Validation(format!(
+                        "SSH access repeats project {project_id:?}"
+                    )));
+                }
+            }
+            let mut resources = HashSet::new();
+            for identity in &spec.identities {
+                require_id(&identity.resource_id, "SSH identity resource id")?;
+                if !resources.insert(&identity.resource_id) {
+                    return Err(CatalogError::Validation(format!(
+                        "SSH access repeats identity provider {:?}",
+                        identity.resource_id
+                    )));
+                }
+                if let EntrySelection::Entries { addresses } = &identity.selection {
+                    if addresses.is_empty() {
+                        return Err(CatalogError::Validation(
+                            "SSH identity selection cannot be empty".to_string(),
+                        ));
+                    }
+                    let mut selected = HashSet::new();
+                    for address in addresses {
+                        require_entry_address(address)?;
+                        if !selected.insert(address) {
+                            return Err(CatalogError::Validation(format!(
+                                "SSH access repeats identity address {address:?}"
+                            )));
+                        }
+                    }
+                }
+            }
         }
         _ => {}
     }
@@ -372,16 +428,36 @@ pub(super) fn validate_ssh_route(route: &crate::domain::SshRouteSpec) -> Catalog
 }
 
 pub(super) fn validate_ssh_route_conflicts(snapshot: &CatalogSnapshot) -> CatalogResult<()> {
-    let mut owners = HashMap::<&str, &str>::new();
+    let mut owners = HashMap::<String, String>::new();
     for surface in &snapshot.surfaces {
         let SurfaceInput::SshAgent { route: Some(route), .. } = &surface.input else {
             continue;
         };
         for pattern in route.host_patterns.iter().filter(|pattern| !pattern.starts_with('!')) {
-            if let Some(existing) = owners.insert(pattern, &surface.id) {
+            if let Some(existing) = owners.insert(pattern.clone(), surface.id.clone()) {
                 return Err(CatalogError::Validation(format!(
                     "SSH host pattern {pattern:?} is routed by both {existing:?} and {:?}",
                     surface.id
+                )));
+            }
+        }
+    }
+    for access in snapshot
+        .resources
+        .iter()
+        .filter(|resource| resource.kind == ResourceKind::SshAccess)
+    {
+        let ResourceSource::SshAccess(spec) = &access.source else { continue };
+        for pattern in spec
+            .route
+            .host_patterns
+            .iter()
+            .filter(|pattern| !pattern.starts_with('!'))
+        {
+            if let Some(existing) = owners.insert(pattern.clone(), access.id.clone()) {
+                return Err(CatalogError::Validation(format!(
+                    "SSH host pattern {pattern:?} is routed by both {existing:?} and {:?}",
+                    access.id
                 )));
             }
         }

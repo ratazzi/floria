@@ -30,6 +30,12 @@ pub fn compile_source(
                 reason: "socket source is not byte content".to_string(),
             });
         }
+        ResourceSource::SshAccess(_) => {
+            return Err(SurfaceError::IncompatibleResource {
+                resource_id: "<resource-source>".to_string(),
+                reason: "SSH access source is not byte content".to_string(),
+            });
+        }
     };
     Ok(source)
 }
