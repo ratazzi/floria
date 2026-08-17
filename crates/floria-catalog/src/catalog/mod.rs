@@ -12,11 +12,12 @@ use serde::{Deserialize, Serialize};
 
 use crate::domain::{
     Binding, BindingScope, CatalogSnapshot, EntrySelection, Environment, FileBacking,
-    FormatInputModel, ManagedFileConfigurationRemoval, OriginKind, OriginSource, Project,
+    FormatInputModel, ItemMetadata, ManagedFileConfigurationRemoval, OriginKind, OriginSource, Project,
     ProjectCheckout, ProjectCheckoutKind, ResolvedEnvironment, ResolvedExport, Resource,
     ReplicatedCatalog, ReplicatedProject, ReplicatedSurface, ReplicationOutboxEntry,
     ResourceBindingUsage, ResourceCodec, ResourceKind, ResourceOrigin, ResourceSource,
-    ResourceUsage, Surface, SurfaceFormat, SurfaceInput, SurfaceKind, ValueShape,
+    ResourceUsage, SshAccessSpec, SshIdentitySelection, Surface, SurfaceFormat, SurfaceInput,
+    SurfaceKind, ValueShape,
 };
 use crate::error::{CatalogError, CatalogResult};
 
@@ -914,6 +915,63 @@ mod tests {
         assert!(matches!(
             detached.source,
             ResourceSource::SshAccess(spec) if spec.project_ids.is_empty()
+        ));
+    }
+
+    #[test]
+    fn legacy_project_ssh_surface_is_promoted_atomically_with_the_same_id() {
+        let (dir, catalog) = catalog();
+        let provider = socket_resource("fixture-provider");
+        catalog
+            .upsert_socket_resource(&provider, &dir.path().join("upstream.sock"))
+            .unwrap();
+        let identity_binding = binding(
+            "fixture-identity-binding",
+            &provider.id,
+            BindingScope::Environment { environment_id: "development".to_string() },
+        );
+        catalog.upsert_binding(&identity_binding).unwrap();
+        let surface = Surface {
+            id: "fixture-legacy-access".to_string(),
+            environment_id: "development".to_string(),
+            name: "AWS Frankfurt".to_string(),
+            kind: SurfaceKind::UnixSocket,
+            path: None,
+            input: SurfaceInput::SshAgent {
+                binding_ids: vec![identity_binding.id.clone()],
+                route: Some(SshRouteSpec {
+                    host_patterns: vec!["ec2*.example.com".to_string()],
+                    hostname: None,
+                    user: Some("admin".to_string()),
+                    port: None,
+                    forward_agent: true,
+                }),
+            },
+            enforcement: Enforcement::TouchId,
+            position: 0,
+        };
+        catalog.upsert_surface(&surface).unwrap();
+
+        assert_eq!(catalog.promote_legacy_ssh_accesses().unwrap(), 1);
+        assert_eq!(catalog.promote_legacy_ssh_accesses().unwrap(), 0);
+
+        let snapshot = catalog.snapshot().unwrap();
+        assert!(snapshot.surfaces.is_empty());
+        assert!(snapshot.bindings.is_empty());
+        let access = snapshot
+            .resources
+            .iter()
+            .find(|resource| resource.id == surface.id)
+            .unwrap();
+        assert_eq!(access.kind, ResourceKind::SshAccess);
+        assert_eq!(access.enforcement, Enforcement::TouchId);
+        assert!(matches!(
+            &access.source,
+            ResourceSource::SshAccess(spec)
+                if spec.project_ids.len() == 1
+                    && spec.project_ids[0] == "floria"
+                    && spec.identities[0].resource_id == provider.id
+                    && spec.route.user.as_deref() == Some("admin")
         ));
     }
 

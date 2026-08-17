@@ -1,6 +1,113 @@
 use super::*;
 
 impl Catalog {
+    /// Promote routed legacy SSH socket surfaces into project-optional Library capabilities.
+    ///
+    /// The resource reuses the surface id, so runtime socket paths and OpenSSH routes stay stable.
+    /// Unrouted capability surfaces remain untouched.
+    pub fn promote_legacy_ssh_accesses(&self) -> CatalogResult<usize> {
+        self.with_authenticated_mutation(|tx| {
+            let snapshot = snapshot_from(tx)?;
+            let bindings = snapshot
+                .bindings
+                .iter()
+                .map(|binding| (binding.id.as_str(), binding))
+                .collect::<std::collections::HashMap<_, _>>();
+            let environments = snapshot
+                .environments
+                .iter()
+                .map(|environment| (environment.id.as_str(), environment))
+                .collect::<std::collections::HashMap<_, _>>();
+            let resource_ids = snapshot
+                .resources
+                .iter()
+                .map(|resource| resource.id.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            let mut migrated_surface_ids = std::collections::HashSet::new();
+            let mut candidate_binding_ids = std::collections::HashSet::new();
+            let mut migrated = 0;
+
+            for surface in snapshot
+                .surfaces
+                .iter()
+                .filter(|surface| surface.kind == SurfaceKind::UnixSocket)
+            {
+                let SurfaceInput::SshAgent {
+                    binding_ids,
+                    route: Some(route),
+                } = &surface.input
+                else {
+                    continue;
+                };
+                if resource_ids.contains(surface.id.as_str()) {
+                    return Err(CatalogError::AlreadyExists {
+                        kind: "resource",
+                        id: surface.id.clone(),
+                    });
+                }
+                let environment = environments
+                    .get(surface.environment_id.as_str())
+                    .ok_or_else(|| {
+                        CatalogError::NotFound(format!(
+                            "environment {}",
+                            surface.environment_id
+                        ))
+                    })?;
+                let identities = binding_ids
+                    .iter()
+                    .filter_map(|binding_id| bindings.get(binding_id.as_str()).copied())
+                    .filter(|binding| binding.enabled)
+                    .map(|binding| SshIdentitySelection {
+                        resource_id: binding.resource_id.clone(),
+                        selection: binding.selection.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                if identities.is_empty() {
+                    continue;
+                }
+                let access = Resource {
+                    id: surface.id.clone(),
+                    name: surface.name.clone(),
+                    kind: ResourceKind::SshAccess,
+                    shape: ValueShape::SshAccess,
+                    codec: ResourceCodec::Opaque,
+                    default_env_key: None,
+                    entries: Vec::new(),
+                    source: ResourceSource::SshAccess(Box::new(SshAccessSpec {
+                        identities,
+                        route: route.clone(),
+                        project_ids: vec![environment.project_id.clone()],
+                    })),
+                    enforcement: surface.enforcement,
+                    metadata: ItemMetadata::default(),
+                    origin: ResourceOrigin::default(),
+                };
+                validate_resource(&access)?;
+                upsert_resource_row(tx, &access)?;
+                tx.execute("DELETE FROM surfaces WHERE id = ?1", [&surface.id])?;
+                migrated_surface_ids.insert(surface.id.as_str());
+                candidate_binding_ids.extend(binding_ids.iter().map(String::as_str));
+                migrated += 1;
+            }
+
+            let retained_binding_ids = snapshot
+                .surfaces
+                .iter()
+                .filter(|surface| !migrated_surface_ids.contains(surface.id.as_str()))
+                .filter_map(|surface| surface.input.binding_ids())
+                .flatten()
+                .map(String::as_str)
+                .collect::<std::collections::HashSet<_>>();
+            for binding_id in candidate_binding_ids
+                .into_iter()
+                .filter(|binding_id| !retained_binding_ids.contains(binding_id))
+            {
+                tx.execute("DELETE FROM bindings WHERE id = ?1", [binding_id])?;
+            }
+            Ok(migrated)
+        })
+    }
+
     pub fn upsert_resource(&self, resource: &Resource) -> CatalogResult<()> {
         validate_resource(resource)?;
         if resource.source == ResourceSource::Socket {
@@ -228,7 +335,7 @@ fn resource_usage_from_snapshot(
         Ok(ResourceUsage { resource_id: id.to_string(), bindings, direct_surface_ids })
 }
 
-fn upsert_resource_row(
+pub(super) fn upsert_resource_row(
     tx: &rusqlite::Transaction<'_>,
     resource: &Resource,
 ) -> CatalogResult<()> {

@@ -8,7 +8,7 @@ use std::process::Command;
 use std::sync::{mpsc, Arc, Mutex};
 
 use floria_catalog::{
-    Catalog, CatalogSnapshot, ResourceKind, ResourceSource, Surface,
+    Catalog, CatalogSnapshot, ResourceKind, ResourceSource, Surface, SurfaceInput, SurfaceKind,
 };
 use floria_agent::{ManagedObject, ManagedPolicyItem};
 use floria_control::{
@@ -1055,6 +1055,28 @@ fn cmd_mount(config: &Path) -> Result<()> {
             ),
             Err(error) => tracing::warn!(%error, "initial replication sync failed"),
         }
+    }
+    let has_legacy_ssh_access = catalog
+        .snapshot()
+        .context("checking for legacy project SSH access")?
+        .surfaces
+        .iter()
+        .any(|surface| {
+            surface.kind == SurfaceKind::UnixSocket
+                && matches!(surface.input, SurfaceInput::SshAgent { route: Some(_), .. })
+        });
+    let promoted_ssh_accesses = if has_legacy_ssh_access {
+        mutations
+            .run_committed(|| catalog.promote_legacy_ssh_accesses())
+            .context("promoting legacy project SSH access into the Library")?
+    } else {
+        0
+    };
+    if promoted_ssh_accesses > 0 {
+        tracing::info!(
+            count = promoted_ssh_accesses,
+            "promoted legacy project SSH access into Library capabilities"
+        );
     }
     let snapshot = catalog.snapshot().context("loading initial surface registry")?;
     let checkout_monitor = Arc::new(
