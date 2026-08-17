@@ -3873,13 +3873,21 @@ private struct NewSshAgentSheet: View {
 }
 
 struct AddSshAccessSheet: View {
+    private struct IdentityChoice: Identifiable {
+        let providerID: WorkspaceResource.ID
+        let providerName: String
+        let address: String
+        let label: String
+
+        var id: String { AddSshAccessSheet.identityID(providerID, address) }
+    }
+
     @Bindable var store: WorkspaceStore
     let existingID: WorkspaceResource.ID?
 
     @Environment(\.dismiss) private var dismiss
     @State private var name = "SSH Access"
-    @State private var resourceID = ""
-    @State private var selectedEntries: Set<String> = []
+    @State private var selectedIdentityIDs: Set<String> = []
     @State private var selectedProjectIDs: Set<WorkspaceProject.ID>
     @State private var securityLevel = WorkspaceSecurityLevel.confirmation
     @State private var hostPatterns = ""
@@ -3900,19 +3908,25 @@ struct AddSshAccessSheet: View {
         self.store = store
         existingID = existing?.id
         let access = existing?.sshAccess
-        let identity = access?.identities.first
-        let provider = identity.flatMap { selected in
-            store.sshIdentityProviders.first { $0.id == selected.resourceID }
+        var selectedIDs = Set<String>()
+        for identity in access?.identities ?? [] {
+            guard let provider = store.sshIdentityProviders.first(where: {
+                $0.id == identity.resourceID
+            }) else { continue }
+            for address in identity.selection.addresses(in: provider) {
+                selectedIDs.insert(Self.identityID(provider.id, address))
+            }
         }
-        let addresses: Set<String>
-        switch identity?.selection {
-        case .all: addresses = Set(provider?.entries.map(\.address) ?? [])
-        case .entries(let selected): addresses = Set(selected)
-        case nil: addresses = []
+        if existing == nil {
+            let choices = store.sshIdentityProviders.flatMap { provider in
+                provider.entries.map { Self.identityID(provider.id, $0.address) }
+            }
+            if choices.count == 1, let choice = choices.first {
+                selectedIDs.insert(choice)
+            }
         }
         _name = State(initialValue: existing?.name ?? "SSH Access")
-        _resourceID = State(initialValue: identity?.resourceID ?? "")
-        _selectedEntries = State(initialValue: addresses)
+        _selectedIdentityIDs = State(initialValue: selectedIDs)
         _selectedProjectIDs = State(
             initialValue: Set(access?.projectIDs ?? Array(preselectedProjectIDs)))
         _securityLevel = State(initialValue: existing?.securityLevel ?? .confirmation)
@@ -3925,8 +3939,14 @@ struct AddSshAccessSheet: View {
         _links = State(initialValue: existing.map { editableLinks($0.metadata) } ?? [])
     }
 
-    private var resource: WorkspaceResource? {
-        store.sshIdentityProviders.first { $0.id == resourceID }
+    private var identityChoices: [IdentityChoice] {
+        store.sshIdentityProviders.flatMap { provider in
+            provider.entries.map { entry in
+                IdentityChoice(
+                    providerID: provider.id, providerName: provider.name,
+                    address: entry.address, label: entry.label)
+            }
+        }
     }
 
     var body: some View {
@@ -3951,33 +3971,26 @@ struct AddSshAccessSheet: View {
                         .textFieldStyle(.roundedBorder)
                 }
 
-                VStack(alignment: .leading, spacing: 7) {
-                    Text("Identity source").font(.callout.weight(.medium))
-                    Picker("Identity source", selection: $resourceID) {
-                        ForEach(store.sshIdentityProviders) { resource in
-                            Text(
-                                "\(resource.name) · \(resource.entries.count) identit\(resource.entries.count == 1 ? "y" : "ies")"
-                            )
-                                .tag(resource.id)
-                        }
-                    }
-                    .labelsHidden()
-                    .frame(maxWidth: .infinity)
-                }
-
-                if let resource {
-                    GroupBox("Allowed identities") {
-                        ScrollView {
-                            VStack(alignment: .leading, spacing: 7) {
-                                ForEach(resource.entries) { entry in
-                                    Toggle(entry.label, isOn: entrySelection(entry.address))
-                                        .toggleStyle(.checkbox)
+                GroupBox("SSH identities") {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 9) {
+                            ForEach(identityChoices) { identity in
+                                Toggle(isOn: identitySelection(identity.id)) {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(identity.label)
+                                        if identity.providerName != identity.label {
+                                            Text(identity.providerName)
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
                                 }
+                                .toggleStyle(.checkbox)
                             }
-                            .padding(8)
                         }
-                        .frame(minHeight: 36, maxHeight: 160)
+                        .padding(8)
                     }
+                    .frame(minHeight: 44, maxHeight: 180)
                 }
 
                 GroupBox("Host routing") {
@@ -4043,16 +4056,12 @@ struct AddSshAccessSheet: View {
                     .keyboardShortcut(.defaultAction)
                     .disabled(
                         isSaving || name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                            || resourceID.isEmpty || selectedEntries.isEmpty
+                            || selectedIdentityIDs.isEmpty
                             || hostPatterns.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
         .padding(24)
         .frame(width: 580)
-        .onAppear {
-            if resourceID.isEmpty { selectResource(store.sshIdentityProviders.first?.id ?? "") }
-        }
-        .onChange(of: resourceID) { _, value in selectResource(value) }
         .alert(
             existingID == nil ? "Could not add SSH access" : "Could not update SSH access",
             isPresented: Binding(
@@ -4065,19 +4074,30 @@ struct AddSshAccessSheet: View {
         }
     }
 
-    private func selectResource(_ id: String) {
-        resourceID = id
-        selectedEntries = Set(
-            store.sshIdentityProviders.first(where: { $0.id == id })?.entries.map(\.address) ?? [])
+    private static func identityID(_ providerID: String, _ address: String) -> String {
+        "\(providerID)\u{1f}\(address)"
     }
 
-    private func entrySelection(_ address: String) -> Binding<Bool> {
+    private func identitySelection(_ id: String) -> Binding<Bool> {
         Binding(
-            get: { selectedEntries.contains(address) },
+            get: { selectedIdentityIDs.contains(id) },
             set: { selected in
-                if selected { selectedEntries.insert(address) }
-                else { selectedEntries.remove(address) }
+                if selected { selectedIdentityIDs.insert(id) }
+                else { selectedIdentityIDs.remove(id) }
             })
+    }
+
+    private var selectedIdentities: [WorkspaceSshIdentitySelection] {
+        store.sshIdentityProviders.compactMap { provider in
+            let addresses = provider.entries.map(\.address).filter { address in
+                selectedIdentityIDs.contains(Self.identityID(provider.id, address))
+            }
+            guard !addresses.isEmpty else { return nil }
+            return WorkspaceSshIdentitySelection(
+                resourceID: provider.id,
+                selection: addresses.count == provider.entries.count
+                    ? .all : .entries(addresses))
+        }
     }
 
     private func projectSelection(_ id: WorkspaceProject.ID) -> Binding<Bool> {
@@ -4113,7 +4133,7 @@ struct AddSshAccessSheet: View {
                     port: portValue, forwardAgent: forwardAgent)
                 try await store.createSshAccess(
                     accessID: existingID, name: name,
-                    resourceID: resourceID, selectedEntries: selectedEntries,
+                    identities: selectedIdentities,
                     projectIDs: selectedProjectIDs.sorted(),
                     securityLevel: securityLevel, route: route,
                     metadata: itemMetadata(note: note, links: links))

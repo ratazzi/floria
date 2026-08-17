@@ -1799,32 +1799,38 @@ final class WorkspaceStore {
     @discardableResult
     func createSshAccess(
         accessID: WorkspaceResource.ID? = nil,
-        name: String, resourceID: WorkspaceResource.ID, selectedEntries: Set<String>,
+        name: String, identities: [WorkspaceSshIdentitySelection],
         projectIDs: [WorkspaceProject.ID], securityLevel: WorkspaceSecurityLevel,
         route: WorkspaceSshRoute, metadata: ItemMetadata = .empty
     ) async throws -> WorkspaceResource.ID {
         guard let controlClient else { throw WorkspaceStoreError.controlUnavailable }
         let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { throw WorkspaceStoreError.invalid("SSH Access name is required") }
-        guard let resource = sshIdentityProviders.first(where: { $0.id == resourceID }) else {
-            throw WorkspaceStoreError.invalid("Choose an SSH identity provider")
+        let catalogIdentities = try identities.map { identity in
+            guard let resource = sshIdentityProviders.first(where: {
+                $0.id == identity.resourceID
+            }) else {
+                throw WorkspaceStoreError.invalid("Choose an existing SSH identity")
+            }
+            let addresses = identity.selection.addresses(in: resource)
+            guard !addresses.isEmpty else {
+                throw WorkspaceStoreError.invalid("Select at least one SSH identity")
+            }
+            let selection: CatalogEntrySelection = addresses.count == resource.entries.count
+                ? .all : .entries(addresses)
+            return CatalogSshIdentitySelection(
+                resourceID: resource.id, selection: selection)
         }
-        let addresses = resource.entries.map(\.address).filter(selectedEntries.contains)
-        guard !addresses.isEmpty else {
+        guard !catalogIdentities.isEmpty else {
             throw WorkspaceStoreError.invalid("Select at least one SSH identity")
         }
         let accessID = accessID ?? Self.newID("ssh-access")
-        let selection: CatalogEntrySelection = addresses.count == resource.entries.count
-            ? .all : .entries(addresses)
         try await controlClient.upsertResource(
             CatalogResource(
                 id: accessID, name: name, kind: "ssh_access", shape: "ssh_access",
                 codec: "opaque", defaultEnvKey: nil, entries: [],
                 source: .sshAccess(
-                    identities: [
-                        CatalogSshIdentitySelection(
-                            resourceID: resource.id, selection: selection)
-                    ],
+                    identities: catalogIdentities,
                     route: route.catalogValue, projectIDs: projectIDs),
                 enforcement: securityLevel.rawValue,
                 metadata: try Self.validatedMetadata(metadata),

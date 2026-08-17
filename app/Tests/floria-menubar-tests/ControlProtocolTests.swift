@@ -776,7 +776,9 @@ final class ControlProtocolTests: XCTestCase {
             source: .sshAccess(
                 identities: [
                     CatalogSshIdentitySelection(
-                        resourceID: "fixture-identity", selection: .all)
+                        resourceID: "fixture-identity", selection: .all),
+                    CatalogSshIdentitySelection(
+                        resourceID: "fixture-agent", selection: .entries(["ssh/sha256/fixture"]))
                 ],
                 route: CatalogSshRoute(
                     hostPatterns: ["ec2*.example.com"], hostname: nil, user: "admin",
@@ -795,6 +797,7 @@ final class ControlProtocolTests: XCTestCase {
 
         XCTAssertEqual(request["method"] as? String, "resource_upsert")
         XCTAssertEqual(source["type"] as? String, "ssh_access")
+        XCTAssertEqual((source["identities"] as? [[String: Any]])?.count, 2)
         XCTAssertEqual(source["project_ids"] as? [String], [])
         XCTAssertEqual((source["route"] as? [String: Any])?["user"] as? String, "admin")
     }
