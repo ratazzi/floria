@@ -3879,6 +3879,7 @@ struct AddSshAccessSheet: View {
         let providerKind: WorkspaceResourceKind
         let address: String
         let label: String
+        let sourceSummary: String
 
         var id: String { AddSshAccessSheet.identityID(providerID, address) }
     }
@@ -3944,11 +3945,13 @@ struct AddSshAccessSheet: View {
 
     private var identityChoices: [IdentityChoice] {
         store.sshIdentityProviders.flatMap { provider in
-            provider.entries.map { entry in
+            let sourceSummary = identitySourceSummary(for: provider)
+            return provider.entries.map { entry in
                 IdentityChoice(
                     providerID: provider.id, providerName: provider.name,
                     providerKind: provider.kind,
-                    address: entry.address, label: entry.label)
+                    address: entry.address, label: entry.label,
+                    sourceSummary: sourceSummary)
             }
         }
     }
@@ -4126,7 +4129,7 @@ struct AddSshAccessSheet: View {
     private var filteredIdentityChoices: [IdentityChoice] {
         guard !identitySearch.isEmpty else { return identityChoices }
         return identityChoices.filter { identity in
-            [identity.label, identity.providerName, identityDetail(identity)]
+            [identity.label, identity.providerName, identity.sourceSummary]
                 .joined(separator: " ")
                 .localizedCaseInsensitiveContains(identitySearch)
         }
@@ -4135,7 +4138,7 @@ struct AddSshAccessSheet: View {
     private var identitySelectionSummary: String {
         let selected = identityChoices.filter { selectedIdentityIDs.contains($0.id) }
         guard !selected.isEmpty else { return "Select identities" }
-        let visible = selected.prefix(2).map(\.label).joined(separator: ", ")
+        let visible = selected.prefix(2).map(identitySelectionLabel).joined(separator: ", ")
         let remaining = selected.count - min(selected.count, 2)
         return remaining == 0 ? visible : "\(visible) +\(remaining)"
     }
@@ -4163,9 +4166,11 @@ struct AddSshAccessSheet: View {
                                     .frame(width: 22)
                                 VStack(alignment: .leading, spacing: 2) {
                                     Text(identity.label)
-                                    Text(identityDetail(identity))
+                                    Text(identity.sourceSummary)
                                         .font(.caption)
                                         .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                        .truncationMode(.middle)
                                 }
                             }
                         }
@@ -4222,11 +4227,44 @@ struct AddSshAccessSheet: View {
         }
     }
 
-    private func identityDetail(_ identity: IdentityChoice) -> String {
-        let kind = identity.providerKind == .sshAgent ? "External agent" : "Managed key"
-        return identity.providerName == identity.label
-            ? kind
-            : "\(identity.providerName) · \(kind)"
+    private func identitySourceSummary(for provider: WorkspaceResource) -> String {
+        let managedPaths = store.protectedSourceFiles(for: provider)
+            .map { ($0.path as NSString).abbreviatingWithTildeInPath }
+            .sorted()
+        if let first = managedPaths.first {
+            return managedPaths.count == 1 ? first : "\(first) +\(managedPaths.count - 1)"
+        }
+        if provider.kind == .sshAgent,
+            let endpoint = provider.entries.first?.previewValue,
+            !endpoint.isEmpty
+        {
+            return (endpoint as NSString).abbreviatingWithTildeInPath
+        }
+        if let origin = provider.originSummary { return origin }
+        if let address = provider.entries.first?.address,
+            let fingerprint = sshFingerprint(from: address)
+        {
+            return fingerprint
+        }
+        return provider.kind == .sshAgent ? "External agent" : "Source unavailable"
+    }
+
+    private func sshFingerprint(from address: String) -> String? {
+        let prefix = "ssh/sha256/"
+        guard address.hasPrefix(prefix) else { return nil }
+        var encoded = String(address.dropFirst(prefix.count))
+            .replacingOccurrences(of: "-", with: "+")
+            .replacingOccurrences(of: "_", with: "/")
+        encoded.append(String(repeating: "=", count: (4 - encoded.count % 4) % 4))
+        guard let digest = Data(base64Encoded: encoded) else { return nil }
+        return "SHA256:\(digest.base64EncodedString().trimmingCharacters(in: CharacterSet(charactersIn: "=")))"
+    }
+
+    private func identitySelectionLabel(_ identity: IdentityChoice) -> String {
+        let duplicate = identityChoices.contains {
+            $0.id != identity.id && $0.label == identity.label
+        }
+        return duplicate ? "\(identity.label) · \(identity.sourceSummary)" : identity.label
     }
 
     private var unavailableProjectCount: Int {
