@@ -311,7 +311,12 @@ fn grant_metadata(req: &AuthRequest<'_>) -> GrantMetadata {
         .unwrap_or_else(|| format!("pid {}", req.identity.pid));
     let target = match req.context {
         Some(floria_core::authz::AccessContext::SshSign(context)) => {
-            context.key_label.to_string()
+            let destination = context.requested_destination.unwrap_or(context.surface_name);
+            if destination == context.key_label {
+                context.key_label.to_string()
+            } else {
+                format!("{destination} · {}", context.key_label)
+            }
         }
         None => req.display.unwrap_or(req.path).to_string(),
     };
@@ -534,6 +539,37 @@ mod tests {
 
         let bare = ProcessIdentity::bare(1004, 501, 20);
         assert_eq!(grant_key(&bare, None), "pid:1004");
+    }
+
+    #[test]
+    fn ssh_grant_metadata_distinguishes_destination_from_identity() {
+        let mut identity = ProcessIdentity::bare(1005, 501, 20);
+        identity.exe_path = Some("/usr/bin/ssh".into());
+        let context = SshSignContext {
+            surface_id: "fixture-access",
+            surface_name: "Production hosts",
+            resource_id: "fixture-identity",
+            key_fingerprint: "SHA256:fixture",
+            key_label: "Gutline",
+            identity_source: Some("~/.ssh/gutline"),
+            requested_destination: Some("admin@ec2.example.com"),
+            verified_host_key_fingerprint: None,
+            ssh_user: Some("admin"),
+            forwarding_hops: 0,
+        };
+        let request = AuthRequest {
+            path: "surfaces/fixture-access",
+            display: Some("Production hosts"),
+            object_revision: None,
+            operation: Operation::Sign,
+            context: Some(AccessContext::SshSign(context)),
+            identity: &identity,
+        };
+
+        assert_eq!(
+            grant_metadata(&request).target,
+            "admin@ec2.example.com · Gutline"
+        );
     }
 
     fn connect_test_app(agent: &SocketAgent, socket_path: &std::path::Path) -> UnixStream {
