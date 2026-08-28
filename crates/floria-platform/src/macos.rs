@@ -7,6 +7,28 @@ use libproc::proc_pid::{self, pidinfo};
 /// Maximum depth when walking up the parent chain; guards against cycles and anomalies.
 const MAX_CHAIN_DEPTH: usize = 32;
 
+// `libproc` exposes PROC_PIDTBSDINFO but not the less privileged short BSD flavor. Keep this
+// definition in sync with <sys/proc_info.h>; the layout is stable across supported macOS releases.
+const PROC_PIDT_SHORTBSDINFO: libc::c_int = 13;
+const MAXCOMLEN: usize = 16;
+
+#[repr(C)]
+struct ProcBsdShortInfo {
+    pid: u32,
+    ppid: u32,
+    pgid: u32,
+    status: u32,
+    comm: [libc::c_char; MAXCOMLEN],
+    flags: u32,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    ruid: libc::uid_t,
+    rgid: libc::gid_t,
+    svuid: libc::uid_t,
+    svgid: libc::gid_t,
+    reserved: u32,
+}
+
 pub fn enrich(pid: i32, uid: u32, gid: u32) -> ProcessIdentity {
     let started_at_micros = process_start_micros(pid);
     let exe_path = proc_pid::pidpath(pid).ok().map(PathBuf::from);
@@ -52,14 +74,11 @@ fn parent_chain(start: i32) -> Vec<ProcSummary> {
     let mut chain = Vec::new();
     let mut pid = start;
     for _ in 0..MAX_CHAIN_DEPTH {
-        let Some(info) = bsd_info(pid) else { break };
-        let ppid = info.pbi_ppid as i32;
-        chain.push(ProcSummary {
-            pid,
-            ppid,
-            name: proc_name(&info).unwrap_or_else(|| format!("pid:{pid}")),
-            exe_path: proc_pid::pidpath(pid).ok().map(PathBuf::from),
-        });
+        let Some(process) = process_summary(pid) else {
+            break;
+        };
+        let ppid = process.ppid;
+        chain.push(process);
         if ppid == 0 || pid == 1 {
             break;
         }
@@ -68,8 +87,54 @@ fn parent_chain(start: i32) -> Vec<ProcSummary> {
     chain
 }
 
+fn process_summary(pid: i32) -> Option<ProcSummary> {
+    let exe_path = proc_pid::pidpath(pid).ok().map(PathBuf::from);
+    let (ppid, name) = match bsd_info(pid) {
+        Some(info) => (info.pbi_ppid as i32, proc_name(&info)),
+        // A terminal's root-owned `login` process rejects PROC_PIDTBSDINFO with EPERM. The
+        // deliberately smaller PROC_PIDT_SHORTBSDINFO flavor remains readable and carries the
+        // parent relationship needed to reach the user-owned terminal application above it.
+        None => short_bsd_info(pid)?,
+    };
+    let name = name
+        .or_else(|| {
+            exe_path
+                .as_deref()
+                .and_then(|path| path.file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| format!("pid:{pid}"));
+    Some(ProcSummary {
+        pid,
+        ppid,
+        name,
+        exe_path,
+    })
+}
+
 fn bsd_info(pid: i32) -> Option<BSDInfo> {
     pidinfo::<BSDInfo>(pid, 0).ok()
+}
+
+/// Read display-only ancestry through libproc's short BSD flavor when richer metadata is denied.
+fn short_bsd_info(pid: i32) -> Option<(i32, Option<String>)> {
+    // SAFETY: ProcBsdShortInfo mirrors the public proc_bsdshortinfo layout, and the result is
+    // accepted only when proc_pidinfo fills the complete structure.
+    unsafe {
+        let mut info: ProcBsdShortInfo = std::mem::zeroed();
+        let size = std::mem::size_of::<ProcBsdShortInfo>() as libc::c_int;
+        let written = libc::proc_pidinfo(
+            pid,
+            PROC_PIDT_SHORTBSDINFO,
+            0,
+            &mut info as *mut _ as *mut libc::c_void,
+            size,
+        );
+        if written < size {
+            return None;
+        }
+        Some((info.ppid as i32, cstr_from_array(&info.comm)))
+    }
 }
 
 /// Prefer the longer `pbi_name`; fall back to `pbi_comm` when it is empty.
@@ -215,6 +280,19 @@ mod tests {
         for pair in id.parent_chain.windows(2) {
             assert_eq!(pair[0].ppid, pair[1].pid, "chain links must connect");
         }
+        assert_eq!(
+            id.parent_chain.last().map(|process| process.pid),
+            Some(1),
+            "the fallback should carry ancestry through protected processes to launchd"
+        );
+    }
+
+    #[test]
+    fn short_bsd_info_reports_protected_launchd() {
+        assert_eq!(short_bsd_info(1).map(|info| info.0), Some(0));
+        let launchd = process_summary(1).expect("launchd should remain displayable");
+        assert_eq!(launchd.ppid, 0);
+        assert_eq!(launchd.name, "launchd");
     }
 
     #[test]
