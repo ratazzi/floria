@@ -12,7 +12,9 @@ CONTROL_SOCKET="${RUNTIME_DIRECTORY}/control.sock"
 SERVICE_LABEL="floria.hola.ac.daemon"
 SERVICE_TARGET="gui/$(id -u)/${SERVICE_LABEL}"
 LAUNCH_AGENT_PLIST="${HOME}/Library/LaunchAgents/${SERVICE_LABEL}.plist"
-WAIT_SECONDS="${FLORIA_SMOKE_WAIT_SECONDS:-20}"
+# Runtime recovery can legitimately span both the old mount process's exit timeout and
+# launchd's throttled KeepAlive restart. Keep the default above those two serialized windows.
+WAIT_SECONDS="${FLORIA_SMOKE_WAIT_SECONDS:-40}"
 READ_FAILURE_SECONDS="${FLORIA_SMOKE_READ_FAILURE_SECONDS:-3}"
 CRASH_FIXTURE_DIRECTORY=""
 CRASH_FIXTURE_PATH=""
