@@ -320,6 +320,7 @@
         mutation_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         before_append_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
         get_calls: AtomicUsize,
+        list_calls: AtomicUsize,
     }
 
     impl FixtureStore {
@@ -331,6 +332,7 @@
                 mutation_hook: Mutex::new(None),
                 before_append_hook: Mutex::new(None),
                 get_calls: AtomicUsize::new(0),
+                list_calls: AtomicUsize::new(0),
             }
         }
 
@@ -687,6 +689,7 @@
         }
 
         fn list(&self) -> StoreResult<Vec<SecretRecord>> {
+            self.list_calls.fetch_add(1, Ordering::Relaxed);
             let entries = self.entries.lock().unwrap();
             let metadata = self.metadata.lock().unwrap();
             let heads = self.heads.lock().unwrap();
@@ -900,6 +903,7 @@
         };
         assert_eq!(inventory.revision, 0);
         assert_eq!(inventory.projects, vec![discovery.clone()]);
+        assert!(!inventory.unchanged);
 
         let checkout = floria_catalog::ProjectCheckout {
             id: "fixture-worktree".to_string(),
@@ -927,6 +931,34 @@
         )
         .unwrap();
         assert!(!catalog.snapshot().unwrap().checkouts.contains(&checkout));
+    }
+
+    #[test]
+    fn unchanged_checkout_inventory_skips_catalog_store_composition() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let store = FixtureStore::new();
+        let monitor = GitCheckoutMonitor::start(Vec::new()).unwrap();
+        let revision = monitor.inventory().revision;
+
+        let result = dispatch(
+            &catalog,
+            DispatchServices {
+                store: Some(&store),
+                checkout_monitor: Some(&monitor),
+                ..DispatchServices::default()
+            },
+            ControlCommand::ProjectCheckoutInventoryIfChanged { revision },
+        )
+        .unwrap();
+        let ControlResult::ProjectCheckoutInventory(inventory) = result else {
+            panic!("unexpected checkout inventory result")
+        };
+
+        assert_eq!(inventory.revision, revision);
+        assert!(inventory.unchanged);
+        assert!(inventory.projects.is_empty());
+        assert_eq!(store.list_calls.load(Ordering::Relaxed), 0);
     }
 
     #[test]

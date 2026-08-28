@@ -1,6 +1,6 @@
 import Foundation
 
-let supportedControlProtocolVersion: UInt32 = 21
+let supportedControlProtocolVersion: UInt32 = 22
 
 struct ControlServerInfo: Decodable, Equatable, Sendable {
     let protocolVersion: UInt32?
@@ -50,6 +50,7 @@ struct SystemHealthReport: Codable, Equatable, Sendable {
     var hasIssues: Bool {
         !issues.isEmpty
     }
+
 }
 
 enum RuntimePolicyMode: String, Codable, Sendable {
@@ -477,6 +478,7 @@ struct ProjectCheckoutDiscovery: Codable, Hashable, Sendable {
 struct ProjectCheckoutInventory: Codable, Hashable, Sendable {
     let revision: UInt64
     let projects: [ProjectCheckoutDiscovery]
+    let unchanged: Bool
 }
 
 struct ProjectCheckoutCandidate: Codable, Hashable, Identifiable, Sendable {
@@ -1533,6 +1535,7 @@ enum ControlCommand: Sendable {
     case discoverReferenceResolve(
         surfaceID: String, key: String, source: DiscoveryReferenceSource)
     case projectCheckoutInventory
+    case projectCheckoutInventoryIfChanged(revision: UInt64)
     case projectCheckoutDiscover(projectID: String)
     case projectCheckoutUpsert(CatalogProjectCheckout)
     case projectCheckoutRemove(id: String)
@@ -1630,6 +1633,7 @@ enum ControlCommand: Sendable {
         case .discoverApply: "discover_apply"
         case .discoverReferenceResolve: "discover_reference_resolve"
         case .projectCheckoutInventory: "project_checkout_inventory"
+        case .projectCheckoutInventoryIfChanged: "project_checkout_inventory_if_changed"
         case .projectCheckoutDiscover: "project_checkout_discover"
         case .projectCheckoutUpsert: "project_checkout_upsert"
         case .projectCheckoutRemove: "project_checkout_remove"
@@ -1841,6 +1845,11 @@ enum ControlCommand: Sendable {
                     requestID: requestID, method: method,
                     params: DiscoverReferenceResolveParams(
                         surfaceID: surfaceID, key: key, source: source)))
+        case .projectCheckoutInventoryIfChanged(let revision):
+            return try encoder.encode(
+                ControlRequest(
+                    requestID: requestID, method: method,
+                    params: ProjectCheckoutInventoryIfChangedParams(revision: revision)))
         case .projectCheckoutDiscover(let projectID):
             return try encoder.encode(
                 ControlRequest(
@@ -2100,6 +2109,7 @@ private struct DiscoverReferenceResolveParams: Encodable {
     let source: DiscoveryReferenceSource
 }
 private struct ProjectCheckoutDiscoverParams: Encodable { let projectID: String }
+private struct ProjectCheckoutInventoryIfChangedParams: Encodable { let revision: UInt64 }
 private struct ProjectCheckoutUpsertParams: Encodable { let checkout: CatalogProjectCheckout }
 private struct ManagedLinkRepairParams: Encodable { let path: String }
 private struct SshAgentDiscoverParams: Encodable { let endpoint: String }

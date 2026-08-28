@@ -510,9 +510,13 @@ final class ControlClient: @unchecked Sendable {
         return result
     }
 
-    func projectCheckoutInventory() async throws -> ProjectCheckoutInventory {
+    func projectCheckoutInventory(
+        ifChangedSince revision: UInt64? = nil
+    ) async throws -> ProjectCheckoutInventory {
+        let command = revision.map(ControlCommand.projectCheckoutInventoryIfChanged)
+            ?? .projectCheckoutInventory
         guard let result: ProjectCheckoutInventory = try await request(
-            .projectCheckoutInventory,
+            command,
             expecting: "project_checkout_inventory",
             as: ProjectCheckoutInventory.self)
         else {

@@ -28,7 +28,7 @@ use zeroize::{Zeroize, Zeroizing};
 
 const MAX_MSG: usize = 8 << 20;
 pub(crate) const MAX_RECORD_SYNC_BATCH_BYTES: usize = 6 << 20;
-pub const CONTROL_PROTOCOL_VERSION: u32 = 21;
+pub const CONTROL_PROTOCOL_VERSION: u32 = 22;
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ControlRequest {
@@ -162,6 +162,7 @@ pub enum ControlCommand {
         source: DiscoveryReferenceSource,
     },
     ProjectCheckoutInventory,
+    ProjectCheckoutInventoryIfChanged { revision: u64 },
     ProjectCheckoutDiscover { project_id: String },
     ProjectCheckoutUpsert { checkout: ProjectCheckout },
     ProjectCheckoutRemove { id: String },
@@ -490,6 +491,8 @@ pub enum ManagedLinkStatus {
 pub struct ProjectCheckoutInventory {
     pub revision: u64,
     pub projects: Vec<ProjectCheckoutDiscovery>,
+    #[serde(default)]
+    pub unchanged: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1269,6 +1272,17 @@ mod tests {
         assert_eq!(inventory["method"], "project_checkout_inventory");
         assert!(inventory.get("params").is_none());
 
+        let unchanged = serde_json::to_value(ControlRequest {
+            request_id: 35,
+            command: ControlCommand::ProjectCheckoutInventoryIfChanged { revision: 4 },
+        })
+        .unwrap();
+        assert_eq!(
+            unchanged["method"],
+            "project_checkout_inventory_if_changed"
+        );
+        assert_eq!(unchanged["params"]["revision"], 4);
+
         let discover = serde_json::to_value(ControlRequest {
             request_id: 31,
             command: ControlCommand::ProjectCheckoutDiscover {
@@ -1362,11 +1376,13 @@ mod tests {
             ProjectCheckoutInventory {
                 revision: 4,
                 projects: vec![],
+                unchanged: false,
             },
         ))
         .unwrap();
         assert_eq!(inventory["type"], "project_checkout_inventory");
         assert_eq!(inventory["value"]["revision"], 4);
+        assert_eq!(inventory["value"]["unchanged"], false);
     }
 
     #[test]

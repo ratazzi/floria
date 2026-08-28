@@ -98,6 +98,15 @@ impl GitCheckoutMonitor {
             .clone()
     }
 
+    /// Read only the change token so high-frequency consumers do not clone the inventory.
+    pub fn revision(&self) -> u64 {
+        self.inner
+            .inventory
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .revision
+    }
+
     pub fn discovery(&self, project_id: &str) -> Option<Result<GitCheckoutDiscovery, String>> {
         self.inner
             .inventory

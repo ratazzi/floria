@@ -614,6 +614,7 @@ final class WorkspaceStore {
     @ObservationIgnored private let controlClient: ControlClient?
     @ObservationIgnored private var autoProvisionAttempted: Set<String> = []
     @ObservationIgnored private var managedLinkStatuses: [String: ManagedLinkStatus] = [:]
+    @ObservationIgnored private var checkoutInventoryRevision: UInt64?
 
     init(
         projects: [WorkspaceProject], resources: [WorkspaceResource],
@@ -1103,9 +1104,15 @@ final class WorkspaceStore {
         return result
     }
 
-    func refreshProjectCheckoutDiscoveries() async {
+    func refreshProjectCheckoutDiscoveries(force: Bool = true) async {
         guard let controlClient else { return }
-        guard let inventory = try? await controlClient.projectCheckoutInventory() else { return }
+        let knownRevision = force ? nil : checkoutInventoryRevision
+        guard
+            let inventory = try? await controlClient.projectCheckoutInventory(
+                ifChangedSince: knownRevision)
+        else { return }
+        checkoutInventoryRevision = inventory.revision
+        guard !inventory.unchanged else { return }
         let projectIDs = Set(projects.map(\.id))
         let next = Dictionary(
             uniqueKeysWithValues: inventory.projects.compactMap { discovery in

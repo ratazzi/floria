@@ -15,7 +15,7 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertNil(request["params"])
 
         let response = Data(
-            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":21,"daemon_version":"0.1.0","schema_version":14,"minimum_schema_version":14,"store_format_version":5,"minimum_store_format_version":5}}}"#.utf8)
+            #"{"request_id":6,"status":"ok","result":{"type":"pong","value":{"protocol_version":22,"daemon_version":"0.1.0","schema_version":14,"minimum_schema_version":14,"store_format_version":5,"minimum_store_format_version":5}}}"#.utf8)
         let decoded = try JSONDecoder().decode(
             ControlResponseEnvelope<ControlServerInfo>.self, from: response)
         let info = try XCTUnwrap(decoded.result?.value)
@@ -1194,6 +1194,17 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(inventoryValue["method"] as? String, "project_checkout_inventory")
         XCTAssertNil(inventoryValue["params"])
 
+        let unchangedInventory = try ControlCommand.projectCheckoutInventoryIfChanged(revision: 4)
+            .requestData(requestID: 35, encoder: encoder)
+        let unchangedInventoryValue = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: unchangedInventory) as? [String: Any])
+        XCTAssertEqual(
+            unchangedInventoryValue["method"] as? String,
+            "project_checkout_inventory_if_changed")
+        XCTAssertEqual(
+            (unchangedInventoryValue["params"] as? [String: Any])?["revision"] as? UInt64,
+            4)
+
         let discover = try ControlCommand.projectCheckoutDiscover(projectID: "fixture-project")
             .requestData(requestID: 31, encoder: encoder)
         let discoverValue = try XCTUnwrap(
@@ -1244,12 +1255,13 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertTrue(result.checkouts.last?.needsAttention == true)
 
         let inventoryResponse = Data(
-            #"{"request_id":30,"status":"ok","result":{"type":"project_checkout_inventory","value":{"revision":4,"projects":[{"project_id":"fixture-project","common_dir":"/tmp/fixture/.git","checkouts":[]}]}}}"#.utf8)
+            #"{"request_id":30,"status":"ok","result":{"type":"project_checkout_inventory","value":{"revision":4,"projects":[{"project_id":"fixture-project","common_dir":"/tmp/fixture/.git","checkouts":[]}],"unchanged":false}}}"#.utf8)
         let decodedInventory = try JSONDecoder().decode(
             ControlResponseEnvelope<ProjectCheckoutInventory>.self, from: inventoryResponse)
         let inventoryResult = try XCTUnwrap(decodedInventory.result?.value)
         XCTAssertEqual(inventoryResult.revision, 4)
         XCTAssertEqual(inventoryResult.projects.first?.projectID, "fixture-project")
+        XCTAssertFalse(inventoryResult.unchanged)
 
         let remove = try ControlCommand.projectCheckoutRemove(id: "fixture-worktree")
             .requestData(requestID: 34, encoder: encoder)

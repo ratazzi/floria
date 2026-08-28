@@ -30,11 +30,25 @@ pub(super) fn project_checkout_inventory(
     monitor: Option<&GitCheckoutMonitor>,
     store: Option<&dyn SecretStore>,
     mount_path: Option<&Path>,
+    known_revision: Option<u64>,
 ) -> Result<ControlResult, DispatchError> {
+    if let (Some(known_revision), Some(monitor)) = (known_revision, monitor) {
+        let revision = monitor.revision();
+        if known_revision == revision {
+            return Ok(ControlResult::ProjectCheckoutInventory(
+                ProjectCheckoutInventory {
+                    revision,
+                    projects: Vec::new(),
+                    unchanged: true,
+                },
+            ));
+        }
+    }
+
+    let monitored = monitor.map(GitCheckoutMonitor::inventory);
     let snapshot = catalog.snapshot()?;
     let records = store.map(SecretStore::list).transpose()?;
-    let (revision, projects) = if let Some(monitor) = monitor {
-        let inventory = monitor.inventory();
+    let (revision, projects) = if let Some(inventory) = monitored {
         let mut projects = Vec::new();
         for project in &snapshot.projects {
             if let Some(MonitoredGitCheckout::Ready(discovered)) =
@@ -66,7 +80,7 @@ pub(super) fn project_checkout_inventory(
         (0, projects)
     };
     Ok(ControlResult::ProjectCheckoutInventory(
-        ProjectCheckoutInventory { revision, projects },
+        ProjectCheckoutInventory { revision, projects, unchanged: false },
     ))
 }
 

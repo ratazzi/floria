@@ -523,6 +523,7 @@ fn command_allowed_for_peer(access: PeerAccess, command: &ControlCommand) -> boo
                 | ControlCommand::ReplicationEnrollment
                 | ControlCommand::Snapshot
                 | ControlCommand::ProjectCheckoutInventory
+                | ControlCommand::ProjectCheckoutInventoryIfChanged { .. }
                 | ControlCommand::ProjectCheckoutDiscover { .. }
                 | ControlCommand::SshConfigStatus
                 | ControlCommand::ProtectedFiles
@@ -564,6 +565,7 @@ fn is_read_only(command: &ControlCommand) -> bool {
             | ControlCommand::DiscoverStatus { .. }
             | ControlCommand::DiscoverCancel { .. }
             | ControlCommand::ProjectCheckoutInventory
+            | ControlCommand::ProjectCheckoutInventoryIfChanged { .. }
             | ControlCommand::ProjectCheckoutDiscover { .. }
             | ControlCommand::SshAgentDiscover { .. }
             | ControlCommand::SshConfigStatus

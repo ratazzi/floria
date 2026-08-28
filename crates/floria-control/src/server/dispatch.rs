@@ -531,7 +531,16 @@ fn dispatch_uncoordinated(
             )
         }
         ControlCommand::ProjectCheckoutInventory => {
-            project_checkout_inventory(catalog, checkout_monitor, store, mount_path)
+            project_checkout_inventory(catalog, checkout_monitor, store, mount_path, None)
+        }
+        ControlCommand::ProjectCheckoutInventoryIfChanged { revision } => {
+            project_checkout_inventory(
+                catalog,
+                checkout_monitor,
+                store,
+                mount_path,
+                Some(revision),
+            )
         }
         ControlCommand::ProjectCheckoutDiscover { project_id } => {
             discover_project_checkouts(catalog, &project_id, store, mount_path)
