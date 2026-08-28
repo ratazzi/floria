@@ -558,11 +558,9 @@ private struct ActiveGrantRow: View {
                     .truncationMode(.middle)
             }
             Spacer(minLength: 4)
-            TimelineView(.periodic(from: .now, by: 1)) { context in
-                Text(remaining(at: context.date))
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
+            Text(remaining(at: Date()))
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(.secondary)
             Button(action: revoke) {
                 Image(systemName: "xmark.circle.fill")
                     .foregroundStyle(hovered ? Color.orange : Color.secondary)

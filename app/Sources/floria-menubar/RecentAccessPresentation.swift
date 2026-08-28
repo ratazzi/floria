@@ -50,9 +50,7 @@ struct RecentAccessTimeText: View {
     let event: RecentAccess
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 1)) { context in
-            Text(event.relativeTime(relativeTo: context.date))
-        }
+        Text(event.relativeTime(relativeTo: Date()))
     }
 }
 

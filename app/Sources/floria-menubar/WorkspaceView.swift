@@ -330,6 +330,7 @@ struct AdvancedWorkspaceView: View {
     @State private var showingSystemHealth = false
     @State private var pendingAuditWindow: AuditOnlyWindow?
     @State private var showingAuditConfirmation = false
+    @State private var checkoutPresentationID = UUID()
     @FocusState private var searchIsFocused: Bool
 
     init(
@@ -358,9 +359,14 @@ struct AdvancedWorkspaceView: View {
             searchIsFocused = true
         }
         .onAppear {
-            guard case .project(let projectID) = initialSelection else { return }
-            state.workspace.selectProject(projectID)
-            selection = initialSelection
+            state.setWorkspacePresentation(checkoutPresentationID, visible: true)
+            if case .project(let projectID) = initialSelection {
+                state.workspace.selectProject(projectID)
+                selection = initialSelection
+            }
+        }
+        .onDisappear {
+            state.setWorkspacePresentation(checkoutPresentationID, visible: false)
         }
         .onChange(of: selection) {
             guard case .project(let id) = selection else { return }

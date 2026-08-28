@@ -102,6 +102,7 @@ struct DashboardView: View {
     @State private var showingNewSecret = false
     @State private var showingImportSshIdentity = false
     @State private var showingNewSshAccess = false
+    @State private var checkoutPresentationID = UUID()
     @FocusState private var searchIsFocused: Bool
     @Environment(\.openWindow) private var openWindow
 
@@ -220,7 +221,11 @@ struct DashboardView: View {
                 preselectedProjectIDs: Set(selectedProject.map { [$0.id] } ?? []))
         }
         .onAppear {
+            state.setWorkspacePresentation(checkoutPresentationID, visible: true)
             presentRequestedSystemHealth()
+        }
+        .onDisappear {
+            state.setWorkspacePresentation(checkoutPresentationID, visible: false)
         }
         .onChange(of: state.systemHealthPresentationRequested) {
             presentRequestedSystemHealth()

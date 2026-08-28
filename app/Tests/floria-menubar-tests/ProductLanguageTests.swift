@@ -272,6 +272,15 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertTrue(menuBar.contains(#"Text(ev.operation)"#))
     }
 
+    func testClosedMenuBarHasNoAlwaysRunningTimeline() throws {
+        let sources = try [
+            source("MenuBarView.swift"),
+            source("RecentAccessPresentation.swift"),
+        ].joined(separator: "\n")
+
+        XCTAssertFalse(sources.contains("TimelineView"))
+    }
+
     func testClosingSyncRefreshesTheVisibleLibrary() throws {
         let dashboard = try source("CompactDashboardView.swift")
 

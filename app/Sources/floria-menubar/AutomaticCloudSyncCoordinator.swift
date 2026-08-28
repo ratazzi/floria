@@ -57,7 +57,7 @@ final class AutomaticCloudSyncCoordinator {
     init(
         service: any AutomaticCloudSyncServicing,
         localCheckNanoseconds: UInt64 = 3_000_000_000,
-        remotePollInterval: TimeInterval = 30,
+        remotePollInterval: TimeInterval = 5 * 60,
         now: @escaping @Sendable () -> Date = { Date() },
         restartDaemon: @escaping DaemonRestarter = {}
     ) {

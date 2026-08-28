@@ -105,6 +105,7 @@ final class AppState {
     @ObservationIgnored private var policyRefreshTask: Task<Void, Never>?
     @ObservationIgnored private var healthRefreshTask: Task<Void, Never>?
     @ObservationIgnored private var checkoutRefreshTask: Task<Void, Never>?
+    @ObservationIgnored private var workspacePresentations = Set<UUID>()
     @ObservationIgnored private let prompter = PromptPresenter()
     @ObservationIgnored private let enrollmentPresenter = DeviceEnrollmentPresenter()
     @ObservationIgnored private let daemonManager = DaemonManager()
@@ -205,21 +206,6 @@ final class AppState {
                 await self.reloadActiveGrants()
             }
         }
-        healthRefreshTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 60_000_000_000)
-                guard let self, !Task.isCancelled else { return }
-                await self.reloadSystemHealth()
-            }
-        }
-        checkoutRefreshTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 3_000_000_000)
-                guard let self, !Task.isCancelled else { return }
-                await self.workspace.refreshProjectCheckoutDiscoveries()
-            }
-        }
-
         if DaemonManager.isProductionApp {
             // A packaged app always reconciles the LaunchAgent definition. DaemonManager leaves
             // a running job from the same bundle revision alone, starts it when inactive, and
@@ -355,6 +341,59 @@ final class AppState {
         await reloadPolicyMode()
         await reloadActiveGrants()
         await loadAccessHistoryIfNeeded()
+    }
+
+    func setWorkspacePresentation(_ id: UUID, visible: Bool) {
+        if visible {
+            workspacePresentations.insert(id)
+        } else {
+            workspacePresentations.remove(id)
+        }
+        guard !workspacePresentations.isEmpty else {
+            checkoutRefreshTask?.cancel()
+            checkoutRefreshTask = nil
+            healthRefreshTask?.cancel()
+            healthRefreshTask = nil
+            return
+        }
+        if checkoutRefreshTask == nil {
+            checkoutRefreshTask = Task { [weak self] in
+                guard let self else { return }
+                await self.workspace.refreshProjectCheckoutDiscoveries()
+                // Git changes advance the daemon's in-memory revision. A full pass once per minute
+                // also repairs visible UI state after link changes that Git cannot observe.
+                var pollsUntilFullRefresh = 20
+                while !Task.isCancelled {
+                    do {
+                        try await Task.sleep(nanoseconds: 3_000_000_000)
+                    } catch {
+                        return
+                    }
+                    guard !Task.isCancelled else { return }
+                    pollsUntilFullRefresh -= 1
+                    let force = pollsUntilFullRefresh == 0
+                    await self.workspace.refreshProjectCheckoutDiscoveries(force: force)
+                    if force {
+                        pollsUntilFullRefresh = 20
+                    }
+                }
+            }
+        }
+        if healthRefreshTask == nil {
+            healthRefreshTask = Task { [weak self] in
+                guard let self else { return }
+                await self.reloadSystemHealth()
+                while !Task.isCancelled {
+                    do {
+                        try await Task.sleep(nanoseconds: 60_000_000_000)
+                    } catch {
+                        return
+                    }
+                    guard !Task.isCancelled else { return }
+                    await self.reloadSystemHealth()
+                }
+            }
+        }
     }
 
     /// Finish a durable cross-Vault activation scheduled by Rust. The service blocks further
