@@ -8,6 +8,8 @@ final class DockVisibilityController {
     private let setActivationPolicy: @MainActor (NSApplication.ActivationPolicy) -> Void
     private weak var dashboardWindow: NSWindow?
     private var closeObserver: NSObjectProtocol?
+    private var keyObserver: NSObjectProtocol?
+    private var clearedInitialDashboardFocus = false
     private var authorizationPromptVisible = false
     private var backgroundAttentionWindowCount = 0
 
@@ -28,6 +30,7 @@ final class DockVisibilityController {
 
         stopObservingDashboardWindow()
         dashboardWindow = window
+        clearedInitialDashboardFocus = false
         setActivationPolicy(.regular)
         closeObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.willCloseNotification,
@@ -38,6 +41,20 @@ final class DockVisibilityController {
             MainActor.assumeIsolated {
                 self.dashboardWindowWillClose(window)
             }
+        }
+        keyObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didBecomeKeyNotification,
+            object: window,
+            queue: .main
+        ) { [weak self, weak window] _ in
+            guard let self, let window else { return }
+            MainActor.assumeIsolated {
+                self.clearInitialFocus(in: window)
+            }
+        }
+        DispatchQueue.main.async { [weak self, weak window] in
+            guard let self, let window, window.isKeyWindow else { return }
+            self.clearInitialFocus(in: window)
         }
     }
 
@@ -72,10 +89,21 @@ final class DockVisibilityController {
         dashboardDidClose()
     }
 
+    private func clearInitialFocus(in window: NSWindow) {
+        guard dashboardWindow === window, !clearedInitialDashboardFocus else { return }
+        clearedInitialDashboardFocus = true
+        window.makeFirstResponder(nil)
+    }
+
     private func stopObservingDashboardWindow() {
-        guard let closeObserver else { return }
-        NotificationCenter.default.removeObserver(closeObserver)
-        self.closeObserver = nil
+        if let closeObserver {
+            NotificationCenter.default.removeObserver(closeObserver)
+            self.closeObserver = nil
+        }
+        if let keyObserver {
+            NotificationCenter.default.removeObserver(keyObserver)
+            self.keyObserver = nil
+        }
     }
 
     private func updateActivationPolicy() {
