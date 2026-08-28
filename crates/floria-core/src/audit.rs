@@ -3,7 +3,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -15,12 +17,18 @@ use crate::identity::ProcessIdentity;
 /// Append-only JSONL audit log. Flushed line by line so no already-written event is lost even if the process is killed.
 pub struct AuditLog {
     writer: Mutex<AuditWriter>,
-    authority: Option<std::sync::Arc<dyn AuditAuthority>>,
+    authority: Option<Arc<dyn AuditAuthority>>,
+    checkpoint_worker: Option<CheckpointWorker>,
+    health: Arc<Mutex<Option<String>>>,
     path: PathBuf,
 }
 
 const AUDIT_FORMAT: u32 = 1;
 const GENESIS_HASH: &str = "genesis";
+#[cfg(not(test))]
+const AUDIT_CHECKPOINT_MAX_DELAY: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const AUDIT_CHECKPOINT_MAX_DELAY: Duration = Duration::from_secs(60);
 
 /// Authenticated tail of one append-only audit chain.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,7 +55,179 @@ struct AuditWriter {
     head: String,
     file_size: u64,
     stamp: FileStamp,
-    degraded: Option<String>,
+}
+
+enum CheckpointCommand {
+    Update(AuditCheckpoint),
+    Flush(AuditCheckpoint, mpsc::SyncSender<std::io::Result<()>>),
+    Shutdown(mpsc::SyncSender<std::io::Result<()>>),
+}
+
+struct CheckpointWorker {
+    sender: mpsc::Sender<CheckpointCommand>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl CheckpointWorker {
+    fn start(
+        authority: Arc<dyn AuditAuthority>,
+        durable: AuditCheckpoint,
+        health: Arc<Mutex<Option<String>>>,
+    ) -> std::io::Result<Self> {
+        let (sender, receiver) = mpsc::channel();
+        let join = std::thread::Builder::new()
+            .name("floria-audit-checkpoint".to_string())
+            .spawn(move || checkpoint_worker_loop(receiver, authority, durable, health))?;
+        Ok(Self {
+            sender,
+            join: Some(join),
+        })
+    }
+
+    fn update(&self, checkpoint: AuditCheckpoint) -> std::io::Result<()> {
+        self.sender
+            .send(CheckpointCommand::Update(checkpoint))
+            .map_err(|_| std::io::Error::other("audit checkpoint worker stopped"))
+    }
+
+    fn flush(&self, checkpoint: AuditCheckpoint) -> std::io::Result<()> {
+        let (reply, response) = mpsc::sync_channel(1);
+        self.sender
+            .send(CheckpointCommand::Flush(checkpoint, reply))
+            .map_err(|_| std::io::Error::other("audit checkpoint worker stopped"))?;
+        response
+            .recv()
+            .map_err(|_| std::io::Error::other("audit checkpoint worker stopped"))?
+    }
+
+    fn shutdown(&mut self) -> std::io::Result<()> {
+        let (reply, response) = mpsc::sync_channel(1);
+        let result = match self.sender.send(CheckpointCommand::Shutdown(reply)) {
+            Ok(()) => response
+                .recv()
+                .map_err(|_| std::io::Error::other("audit checkpoint worker stopped"))?,
+            Err(_) => Err(std::io::Error::other("audit checkpoint worker stopped")),
+        };
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+        result
+    }
+}
+
+fn checkpoint_worker_loop(
+    receiver: mpsc::Receiver<CheckpointCommand>,
+    authority: Arc<dyn AuditAuthority>,
+    mut durable: AuditCheckpoint,
+    health: Arc<Mutex<Option<String>>>,
+) {
+    let mut pending: Option<AuditCheckpoint> = None;
+    let mut deadline: Option<Instant> = None;
+
+    loop {
+        let command = match deadline {
+            Some(at) => match receiver.recv_timeout(at.saturating_duration_since(Instant::now())) {
+                Ok(command) => Some(command),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    if let Some(checkpoint) = pending.take() {
+                        if let Err(error) =
+                            persist_newer_checkpoint(authority.as_ref(), &mut durable, checkpoint)
+                        {
+                            mark_degraded(&health, &error);
+                        }
+                    }
+                    break;
+                }
+            },
+            None => match receiver.recv() {
+                Ok(command) => Some(command),
+                Err(_) => break,
+            },
+        };
+
+        match command {
+            Some(CheckpointCommand::Update(checkpoint)) => {
+                pending = Some(checkpoint);
+                if deadline.is_none() {
+                    deadline = Some(Instant::now() + AUDIT_CHECKPOINT_MAX_DELAY);
+                }
+            }
+            Some(CheckpointCommand::Flush(checkpoint, reply)) => {
+                let result = persist_newer_checkpoint(authority.as_ref(), &mut durable, checkpoint);
+                if let Err(error) = &result {
+                    mark_degraded(&health, error);
+                }
+                pending = pending.filter(|candidate| candidate.sequence > durable.sequence);
+                deadline = pending
+                    .as_ref()
+                    .map(|_| Instant::now() + AUDIT_CHECKPOINT_MAX_DELAY);
+                let failed = result.is_err();
+                let _ = reply.send(result);
+                if failed {
+                    break;
+                }
+            }
+            Some(CheckpointCommand::Shutdown(reply)) => {
+                let result = match pending.take() {
+                    Some(checkpoint) => {
+                        persist_newer_checkpoint(authority.as_ref(), &mut durable, checkpoint)
+                    }
+                    None => Ok(()),
+                };
+                if let Err(error) = &result {
+                    mark_degraded(&health, error);
+                }
+                let _ = reply.send(result);
+                break;
+            }
+            None => {
+                if let Some(checkpoint) = pending.take() {
+                    if let Err(error) =
+                        persist_newer_checkpoint(authority.as_ref(), &mut durable, checkpoint)
+                    {
+                        mark_degraded(&health, &error);
+                        break;
+                    }
+                }
+                deadline = None;
+            }
+        }
+    }
+}
+
+fn persist_newer_checkpoint(
+    authority: &dyn AuditAuthority,
+    durable: &mut AuditCheckpoint,
+    checkpoint: AuditCheckpoint,
+) -> std::io::Result<()> {
+    if checkpoint.sequence < durable.sequence {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "audit checkpoint worker refused to move backwards",
+        ));
+    }
+    if checkpoint == *durable {
+        return Ok(());
+    }
+    if checkpoint.sequence == durable.sequence {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "audit checkpoint sequence has conflicting authenticated tails",
+        ));
+    }
+    authority.persist_checkpoint(&checkpoint)?;
+    *durable = checkpoint;
+    Ok(())
+}
+
+fn mark_degraded(health: &Mutex<Option<String>>, error: &std::io::Error) {
+    if let Ok(mut degraded) = health.lock() {
+        if degraded.is_none() {
+            *degraded = Some(error.to_string());
+        }
+    }
+    tracing::error!(%error, "audit checkpoint failed; future allowed access will fail closed");
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -130,16 +310,13 @@ impl AuditLog {
         Self::open_with_authority(path, None)
     }
 
-    pub fn open_authenticated(
-        path: &Path,
-        authority: std::sync::Arc<dyn AuditAuthority>,
-    ) -> Result<Self> {
+    pub fn open_authenticated(path: &Path, authority: Arc<dyn AuditAuthority>) -> Result<Self> {
         Self::open_with_authority(path, Some(authority))
     }
 
     fn open_with_authority(
         path: &Path,
-        authority: Option<std::sync::Arc<dyn AuditAuthority>>,
+        authority: Option<Arc<dyn AuditAuthority>>,
     ) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -164,7 +341,7 @@ impl AuditLog {
         }
 
         let tail = if path.exists() {
-            verify_audit_chain(path, authority.as_deref())?
+            verify_audit_chain(path, authority.as_deref(), checkpoint.as_ref())?
         } else {
             AuditCheckpoint {
                 sequence: 0,
@@ -172,23 +349,23 @@ impl AuditLog {
                 file_size: 0,
             }
         };
-        if let Some(expected) = &checkpoint {
-            if expected != &tail {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "audit log tail does not match its authenticated checkpoint: expected sequence {}, found {}",
-                        expected.sequence, tail.sequence
-                    ),
-                )
-                .into());
+        if let Some(authority) = &authority {
+            if checkpoint.as_ref() != Some(&tail) {
+                authority.persist_checkpoint(&tail)?;
             }
-        } else if let Some(authority) = &authority {
-            authority.persist_checkpoint(&tail)?;
         }
 
         let file = open_private_append(path)?;
         let stamp = file_stamp(&file.metadata()?);
+        let health = Arc::new(Mutex::new(None));
+        let checkpoint_worker = match &authority {
+            Some(authority) => Some(CheckpointWorker::start(
+                authority.clone(),
+                tail.clone(),
+                health.clone(),
+            )?),
+            None => None,
+        };
         Ok(AuditLog {
             writer: Mutex::new(AuditWriter {
                 output: BufWriter::new(file),
@@ -196,9 +373,10 @@ impl AuditLog {
                 head: tail.head,
                 file_size: tail.file_size,
                 stamp,
-                degraded: None,
             }),
             authority,
+            checkpoint_worker,
+            health,
             path: path.to_path_buf(),
         })
     }
@@ -208,35 +386,24 @@ impl AuditLog {
     }
 
     pub fn ensure_healthy(&self) -> std::io::Result<()> {
+        self.check_health()?;
         let writer = self
             .writer
             .lock()
             .map_err(|_| std::io::Error::other("audit writer lock poisoned"))?;
         validate_writer_file(&self.path, &writer)?;
-        match &writer.degraded {
-            Some(reason) => Err(std::io::Error::other(format!(
-                "audit log is degraded: {reason}"
-            ))),
-            None => Ok(()),
-        }
+        self.check_health()
     }
 
     /// Read access history only after verifying the exact bytes against the live chain and
     /// authenticated tail. Keeping this on `AuditLog` prevents control-plane readers from
     /// accidentally treating the JSONL encoding as trusted state by itself.
-    pub fn read_recent_verified(
-        &self,
-        limit: usize,
-    ) -> std::io::Result<Vec<AuditAccessRecord>> {
+    pub fn read_recent_verified(&self, limit: usize) -> std::io::Result<Vec<AuditAccessRecord>> {
+        self.check_health()?;
         let mut writer = self
             .writer
             .lock()
             .map_err(|_| std::io::Error::other("audit writer lock poisoned"))?;
-        if let Some(reason) = &writer.degraded {
-            return Err(std::io::Error::other(format!(
-                "audit log is degraded: {reason}"
-            )));
-        }
 
         let verified = (|| {
             writer.output.flush()?;
@@ -247,6 +414,10 @@ impl AuditLog {
                 file_size: writer.file_size,
             };
             if let Some(authority) = &self.authority {
+                self.checkpoint_worker
+                    .as_ref()
+                    .ok_or_else(|| std::io::Error::other("audit checkpoint worker is missing"))?
+                    .flush(expected.clone())?;
                 if authority.load_checkpoint()?.as_ref() != Some(&expected) {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -257,11 +428,8 @@ impl AuditLog {
 
             let mut input = writer.output.get_ref().try_clone()?;
             input.seek(SeekFrom::Start(0))?;
-            let (tail, records) = read_verified_access_chain(
-                &mut input,
-                self.authority.as_deref(),
-                limit,
-            )?;
+            let (tail, records) =
+                read_verified_access_chain(&mut input, self.authority.as_deref(), None, limit)?;
             if tail != expected {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -273,24 +441,21 @@ impl AuditLog {
         })();
 
         if let Err(error) = &verified {
-            writer.degraded = Some(error.to_string());
+            mark_degraded(&self.health, error);
         }
         verified
     }
 
     fn write(&self, value: &impl Serialize) -> std::io::Result<()> {
+        self.check_health()?;
         let event = serde_json::to_value(value).map_err(std::io::Error::other)?;
         let mut writer = self
             .writer
             .lock()
             .map_err(|_| std::io::Error::other("audit writer lock poisoned"))?;
-        if let Some(reason) = &writer.degraded {
-            return Err(std::io::Error::other(format!(
-                "audit log is degraded: {reason}"
-            )));
-        }
+        self.check_health()?;
         if let Err(error) = validate_writer_file(&self.path, &writer) {
-            writer.degraded = Some(error.to_string());
+            mark_degraded(&self.health, &error);
             return Err(error);
         }
 
@@ -312,7 +477,7 @@ impl AuditLog {
         let mut line = serde_json::to_vec(&envelope).map_err(std::io::Error::other)?;
         line.push(b'\n');
 
-        let attempted = (|| -> std::io::Result<AuditCheckpoint> {
+        let attempted = (|| -> std::io::Result<()> {
             writer.output.write_all(&line)?;
             writer.output.flush()?;
             let checkpoint = AuditCheckpoint {
@@ -320,24 +485,35 @@ impl AuditLog {
                 head: tag,
                 file_size: writer.file_size.saturating_add(line.len() as u64),
             };
-            if let Some(authority) = &self.authority {
-                authority.persist_checkpoint(&checkpoint)?;
+            writer.sequence = checkpoint.sequence;
+            writer.head = checkpoint.head.clone();
+            writer.file_size = checkpoint.file_size;
+            writer.stamp = file_stamp(&writer.output.get_ref().metadata()?);
+            if let Some(worker) = &self.checkpoint_worker {
+                worker.update(checkpoint)?;
             }
-            Ok(checkpoint)
+            Ok(())
         })();
         match attempted {
-            Ok(checkpoint) => {
-                writer.sequence = checkpoint.sequence;
-                writer.head = checkpoint.head;
-                writer.file_size = checkpoint.file_size;
-                writer.stamp = file_stamp(&writer.output.get_ref().metadata()?);
-                Ok(())
-            }
+            Ok(()) => Ok(()),
             Err(error) => {
-                writer.degraded = Some(error.to_string());
+                mark_degraded(&self.health, &error);
                 tracing::error!(%error, "audit write failed; future allowed access will fail closed");
                 Err(error)
             }
+        }
+    }
+
+    fn check_health(&self) -> std::io::Result<()> {
+        let degraded = self
+            .health
+            .lock()
+            .map_err(|_| std::io::Error::other("audit health lock poisoned"))?;
+        match &*degraded {
+            Some(reason) => Err(std::io::Error::other(format!(
+                "audit log is degraded: {reason}"
+            ))),
+            None => Ok(()),
         }
     }
 
@@ -489,6 +665,16 @@ impl AuditLog {
     }
 }
 
+impl Drop for AuditLog {
+    fn drop(&mut self) {
+        if let Some(worker) = &mut self.checkpoint_worker {
+            if let Err(error) = worker.shutdown() {
+                mark_degraded(&self.health, &error);
+            }
+        }
+    }
+}
+
 fn open_private_append(path: &Path) -> std::io::Result<File> {
     if path.exists() {
         let metadata = std::fs::symlink_metadata(path)?;
@@ -547,6 +733,7 @@ fn validate_writer_file(path: &Path, writer: &AuditWriter) -> std::io::Result<()
 fn verify_audit_chain(
     path: &Path,
     authority: Option<&dyn AuditAuthority>,
+    required_checkpoint: Option<&AuditCheckpoint>,
 ) -> std::io::Result<AuditCheckpoint> {
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
@@ -566,12 +753,14 @@ fn verify_audit_chain(
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
-    read_verified_access_chain(&mut file, authority, 0).map(|(checkpoint, _)| checkpoint)
+    read_verified_access_chain(&mut file, authority, required_checkpoint, 0)
+        .map(|(checkpoint, _)| checkpoint)
 }
 
 fn read_verified_access_chain(
     file: &mut File,
     authority: Option<&dyn AuditAuthority>,
+    required_checkpoint: Option<&AuditCheckpoint>,
     limit: usize,
 ) -> std::io::Result<(AuditCheckpoint, Vec<AuditAccessRecord>)> {
     let expected_size = file.metadata()?.len();
@@ -580,6 +769,11 @@ fn read_verified_access_chain(
     let mut file_size = 0_u64;
     let mut records = VecDeque::with_capacity(limit.min(500));
     let reader = BufReader::new(file);
+    let mut checkpoint_matched = required_checkpoint
+        .map(|checkpoint| {
+            checkpoint.sequence == 0 && checkpoint.head == GENESIS_HASH && checkpoint.file_size == 0
+        })
+        .unwrap_or(true);
 
     for line in reader.split(b'\n') {
         let line = line?;
@@ -615,6 +809,17 @@ fn read_verified_access_chain(
         }
         sequence = envelope.sequence;
         head = envelope.tag;
+        if let Some(checkpoint) = required_checkpoint {
+            if sequence == checkpoint.sequence {
+                if head != checkpoint.head || file_size != checkpoint.file_size {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "audit chain conflicts with its authenticated checkpoint",
+                    ));
+                }
+                checkpoint_matched = true;
+            }
+        }
 
         if limit != 0 {
             if let Ok(record) = serde_json::from_value::<AuditAccessRecord>(envelope.event) {
@@ -631,6 +836,12 @@ fn read_verified_access_chain(
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "audit log ends with a partial row",
+        ));
+    }
+    if !checkpoint_matched {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "audit log was truncated before its authenticated checkpoint",
         ));
     }
 
@@ -822,12 +1033,13 @@ struct CloseEvent<'a> {
 mod tests {
     use super::*;
     use crate::authz::{Enforcement, PolicyMode};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[derive(Default)]
     struct TestAuditAuthority {
         checkpoint: Mutex<Option<AuditCheckpoint>>,
         fail_persist: AtomicBool,
+        persist_count: AtomicUsize,
     }
 
     impl AuditAuthority for TestAuditAuthority {
@@ -856,6 +1068,7 @@ mod tests {
             if self.fail_persist.load(Ordering::SeqCst) {
                 return Err(std::io::Error::other("fixture checkpoint failure"));
             }
+            self.persist_count.fetch_add(1, Ordering::SeqCst);
             *self.checkpoint.lock().unwrap() = Some(checkpoint.clone());
             Ok(())
         }
@@ -904,7 +1117,7 @@ mod tests {
         let audit = AuditLog::open_authenticated(&path, authority.clone()).unwrap();
         authority.fail_persist.store(true, Ordering::SeqCst);
 
-        assert!(audit
+        audit
             .log_denied(
                 "surfaces/fixture",
                 "read",
@@ -913,8 +1126,73 @@ mod tests {
                 "fixture reason",
                 None,
             )
-            .is_err());
+            .unwrap();
+        assert!(audit.read_recent_verified(10).is_err());
         assert!(audit.ensure_healthy().is_err());
+    }
+
+    #[test]
+    fn authenticated_checkpoint_updates_are_coalesced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let authority = Arc::new(TestAuditAuthority::default());
+        let audit = AuditLog::open_authenticated(&path, authority.clone()).unwrap();
+        assert_eq!(authority.persist_count.load(Ordering::SeqCst), 1);
+
+        for pid in 1..=10 {
+            audit
+                .log_denied(
+                    "surfaces/fixture",
+                    "read",
+                    &ProcessIdentity::bare(pid, 501, 20),
+                    Some("fixture-deny"),
+                    "fixture reason",
+                    None,
+                )
+                .unwrap();
+        }
+
+        assert_eq!(authority.persist_count.load(Ordering::SeqCst), 1);
+        assert_eq!(audit.read_recent_verified(20).unwrap().len(), 10);
+        assert_eq!(authority.persist_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn authenticated_open_recovers_a_valid_tail_ahead_of_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let authority = Arc::new(TestAuditAuthority::default());
+        drop(AuditLog::open_authenticated(&path, authority.clone()).unwrap());
+
+        let event = serde_json::json!({"event": "fixture"});
+        let payload = chain_payload(1, GENESIS_HASH, &event).unwrap();
+        let tag = authority.authenticate(&payload).unwrap();
+        let mut line = serde_json::to_vec(&AuditEnvelope {
+            format: AUDIT_FORMAT,
+            sequence: 1,
+            previous: GENESIS_HASH.to_string(),
+            event,
+            tag: tag.clone(),
+        })
+        .unwrap();
+        line.push(b'\n');
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&line)
+            .unwrap();
+
+        let recovered = AuditLog::open_authenticated(&path, authority.clone()).unwrap();
+        assert_eq!(
+            authority.load_checkpoint().unwrap(),
+            Some(AuditCheckpoint {
+                sequence: 1,
+                head: tag,
+                file_size: line.len() as u64,
+            })
+        );
+        recovered.ensure_healthy().unwrap();
     }
 
     #[test]

@@ -12,7 +12,8 @@
 //!
 //! Plaintext exists only as [`Zeroizing`] in memory and never touches disk here.
 
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::collections::BTreeMap;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -393,11 +394,74 @@ struct StoreIntegrity {
     authenticator: Arc<StateAuthenticator>,
     sidecar: PathBuf,
     generation: Arc<Mutex<u64>>,
+    verified: Arc<RwLock<VerifiedStoreState>>,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoreSecuritySnapshot {
     entries: Vec<HeadsDocument>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct StoreFileStamp {
+    device: u64,
+    inode: u64,
+    size: u64,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+struct VerifiedHead {
+    document: HeadsDocument,
+    stamp: StoreFileStamp,
+}
+
+struct VerifiedStoreState {
+    sidecar_stamp: StoreFileStamp,
+    heads_directory_stamp: StoreFileStamp,
+    heads: BTreeMap<String, VerifiedHead>,
+}
+
+fn store_file_stamp(path: &Path, directory: bool) -> StoreResult<StoreFileStamp> {
+    let metadata = std::fs::symlink_metadata(path).map_err(|source| StoreError::io(path, source))?;
+    let expected_type = if directory {
+        metadata.file_type().is_dir()
+    } else {
+        metadata.file_type().is_file()
+    };
+    if !expected_type || metadata.file_type().is_symlink() {
+        return Err(StoreError::Corrupt {
+            id: "store".to_string(),
+            reason: format!(
+                "authenticated store path was replaced with the wrong file type: {}",
+                path.display()
+            ),
+        });
+    }
+    Ok(StoreFileStamp {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        size: metadata.len(),
+        ctime: metadata.ctime(),
+        ctime_nsec: metadata.ctime_nsec(),
+    })
+}
+
+fn validate_store_stamp(
+    path: &Path,
+    directory: bool,
+    expected: StoreFileStamp,
+) -> StoreResult<()> {
+    if store_file_stamp(path, directory)? != expected {
+        return Err(StoreError::Corrupt {
+            id: "store".to_string(),
+            reason: format!(
+                "authenticated store path changed outside the daemon transaction boundary: {}",
+                path.display()
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// The mutable shared-half binding: swapped atomically when sync is enabled (relocate) or an
@@ -591,10 +655,12 @@ impl AgeDirStore {
                 })
             }
         };
+        let verified = self.capture_verified_state(&current, &sidecar)?;
         self.integrity = Some(StoreIntegrity {
             authenticator,
             sidecar,
             generation: Arc::new(Mutex::new(generation)),
+            verified: Arc::new(RwLock::new(verified)),
         });
         Ok(self)
     }
@@ -618,6 +684,11 @@ impl AgeDirStore {
                 .generation
                 .lock()
                 .expect("store integrity generation poisoned") = next;
+            *integrity
+                .verified
+                .write()
+                .expect("store verified snapshot poisoned") =
+                self.capture_verified_state(&snapshot, &integrity.sidecar)?;
         }
         Ok(())
     }
@@ -1628,7 +1699,16 @@ impl AgeDirStore {
 
     fn decrypt_version(&self, id: &SecretId, ordinal: u32) -> StoreResult<Zeroizing<Vec<u8>>> {
         let heads = self.read_heads(id)?;
-        let version = self.find_version(&heads, ordinal)?;
+        self.decrypt_version_from_heads(id, &heads, ordinal)
+    }
+
+    fn decrypt_version_from_heads(
+        &self,
+        id: &SecretId,
+        heads: &HeadsDocument,
+        ordinal: u32,
+    ) -> StoreResult<Zeroizing<Vec<u8>>> {
+        let version = self.find_version(heads, ordinal)?;
         let ciphertext = self.read_object_verified(&version.digest, id)?;
         let identity = {
             let state = self.state.read().expect("shared state poisoned");
@@ -1641,6 +1721,33 @@ impl AgeDirStore {
         };
         let decrypted = vault::decrypt_with_identity(&identity, &ciphertext)?;
         decode_bound_payload(id, &version.version_uuid, decrypted)
+    }
+
+    fn record_from_heads(
+        &self,
+        id: &SecretId,
+        heads: HeadsDocument,
+    ) -> StoreResult<SecretRecord> {
+        let head = self.find_version(&heads, heads.current_version)?;
+        let origin = match (heads.source_path, heads.managed_label) {
+            (Some(source_path), None) => SecretOrigin::File {
+                source_path: PathBuf::from(source_path),
+            },
+            (None, Some(label)) => SecretOrigin::Managed { label },
+            _ => unreachable!("validated head document has exactly one origin"),
+        };
+        Ok(SecretRecord {
+            id: id.clone(),
+            origin,
+            mode: heads.mode,
+            size: head.size,
+            created: heads.created,
+            current_version: heads.current_version,
+            enforcement: heads.enforcement,
+            environment_ids: heads.environment_ids,
+            placements: heads.placements,
+            metadata: heads.metadata,
+        })
     }
 
     /// Write one immutable version object and return its table row. The object is published
@@ -1888,6 +1995,80 @@ impl AgeDirStore {
         Ok(StoreSecuritySnapshot { entries })
     }
 
+    fn capture_verified_state(
+        &self,
+        snapshot: &StoreSecuritySnapshot,
+        sidecar: &Path,
+    ) -> StoreResult<VerifiedStoreState> {
+        let sidecar_stamp = store_file_stamp(sidecar, false)?;
+        let heads_directory = self.root.join("local/heads");
+        let heads_directory_stamp = store_file_stamp(&heads_directory, true)?;
+        let mut heads = BTreeMap::new();
+        for document in &snapshot.entries {
+            let id = document.id.parse::<SecretId>()?;
+            let path = self.heads_path(&id);
+            heads.insert(
+                document.id.clone(),
+                VerifiedHead {
+                    document: document.clone(),
+                    stamp: store_file_stamp(&path, false)?,
+                },
+            );
+        }
+        Ok(VerifiedStoreState {
+            sidecar_stamp,
+            heads_directory_stamp,
+            heads,
+        })
+    }
+
+    fn read_verified_heads(&self, id: &SecretId) -> StoreResult<HeadsDocument> {
+        let Some(integrity) = &self.integrity else {
+            return self.read_heads(id);
+        };
+        let verified = integrity
+            .verified
+            .read()
+            .expect("store verified snapshot poisoned");
+        validate_store_stamp(&integrity.sidecar, false, verified.sidecar_stamp)?;
+        validate_store_stamp(
+            &self.root.join("local/heads"),
+            true,
+            verified.heads_directory_stamp,
+        )?;
+        let head = verified
+            .heads
+            .get(id.as_str())
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
+        validate_store_stamp(&self.heads_path(id), false, head.stamp)?;
+        Ok(head.document.clone())
+    }
+
+    fn read_all_verified_heads(&self) -> StoreResult<Vec<HeadsDocument>> {
+        let Some(integrity) = &self.integrity else {
+            return self.security_snapshot().map(|snapshot| snapshot.entries);
+        };
+        let verified = integrity
+            .verified
+            .read()
+            .expect("store verified snapshot poisoned");
+        validate_store_stamp(&integrity.sidecar, false, verified.sidecar_stamp)?;
+        validate_store_stamp(
+            &self.root.join("local/heads"),
+            true,
+            verified.heads_directory_stamp,
+        )?;
+        for (id, head) in &verified.heads {
+            let id = id.parse::<SecretId>()?;
+            validate_store_stamp(&self.heads_path(&id), false, head.stamp)?;
+        }
+        Ok(verified
+            .heads
+            .values()
+            .map(|head| head.document.clone())
+            .collect())
+    }
+
     fn verify_security_state(&self) -> StoreResult<()> {
         let Some(integrity) = &self.integrity else { return Ok(()) };
         let loaded = integrity
@@ -1909,6 +2090,11 @@ impl AgeDirStore {
             .generation
             .lock()
             .expect("store integrity generation poisoned") = loaded.generation;
+        *integrity
+            .verified
+            .write()
+            .expect("store verified snapshot poisoned") =
+            self.capture_verified_state(&authenticated, &integrity.sidecar)?;
         Ok(())
     }
 
@@ -1925,6 +2111,11 @@ impl AgeDirStore {
             *generation,
             &snapshot,
         )?;
+        *integrity
+            .verified
+            .write()
+            .expect("store verified snapshot poisoned") =
+            self.capture_verified_state(&snapshot, &integrity.sidecar)?;
         Ok(())
     }
 }
@@ -2206,24 +2397,22 @@ impl SecretStore for AgeDirStore {
     }
 
     fn get(&self, id: &SecretId) -> StoreResult<Zeroizing<Vec<u8>>> {
-        self.verify_security_state()?;
-        let head = self.read_heads(id)?.current_version;
-        self.decrypt_version(id, head)
+        let heads = self.read_verified_heads(id)?;
+        self.decrypt_version_from_heads(id, &heads, heads.current_version)
     }
 
     fn get_many(&self, ids: &[SecretId]) -> StoreResult<Vec<Zeroizing<Vec<u8>>>> {
-        self.verify_security_state()?;
         ids.iter()
             .map(|id| {
-                let head = self.read_heads(id)?.current_version;
-                self.decrypt_version(id, head)
+                let heads = self.read_verified_heads(id)?;
+                self.decrypt_version_from_heads(id, &heads, heads.current_version)
             })
             .collect()
     }
 
     fn get_version(&self, id: &SecretId, version: u32) -> StoreResult<Zeroizing<Vec<u8>>> {
-        self.verify_security_state()?;
-        self.decrypt_version(id, version)
+        let heads = self.read_verified_heads(id)?;
+        self.decrypt_version_from_heads(id, &heads, version)
     }
 
     fn append_version(&self, id: &SecretId, plaintext: &[u8]) -> StoreResult<u32> {
@@ -2231,8 +2420,7 @@ impl SecretStore for AgeDirStore {
     }
 
     fn history(&self, id: &SecretId) -> StoreResult<Vec<VersionRecord>> {
-        self.verify_security_state()?;
-        let mut heads = self.read_heads(id)?;
+        let mut heads = self.read_verified_heads(id)?;
         heads.versions.sort_by_key(|version| version.version);
         Ok(heads
             .versions
@@ -2258,48 +2446,25 @@ impl SecretStore for AgeDirStore {
     }
 
     fn record(&self, id: &SecretId) -> StoreResult<Option<SecretRecord>> {
-        self.verify_security_state()?;
-        let heads = match self.read_heads(id) {
+        let heads = match self.read_verified_heads(id) {
             Ok(heads) => heads,
             Err(StoreError::NotFound(_)) => return Ok(None),
             Err(e) => return Err(e),
         };
-        let head = self.find_version(&heads, heads.current_version)?;
-        let origin = match (heads.source_path, heads.managed_label) {
-            (Some(source_path), None) => {
-                SecretOrigin::File { source_path: PathBuf::from(source_path) }
-            }
-            (None, Some(label)) => SecretOrigin::Managed { label },
-            _ => unreachable!("read_heads validates exactly one origin"),
-        };
-        Ok(Some(SecretRecord {
-            id: id.clone(),
-            origin,
-            mode: heads.mode,
-            size: head.size,
-            created: heads.created,
-            current_version: heads.current_version,
-            enforcement: heads.enforcement,
-            environment_ids: heads.environment_ids,
-            placements: heads.placements,
-            metadata: heads.metadata,
-        }))
+        self.record_from_heads(id, heads).map(Some)
     }
 
     fn list(&self) -> StoreResult<Vec<SecretRecord>> {
-        self.verify_security_state()?;
         let mut out = Vec::new();
-        for id in self.heads_ids()? {
-            if let Some(record) = self.record(&id)? {
-                out.push(record);
-            }
+        for heads in self.read_all_verified_heads()? {
+            let id = heads.id.parse::<SecretId>()?;
+            out.push(self.record_from_heads(&id, heads)?);
         }
         out.sort_by_key(SecretRecord::display_name);
         Ok(out)
     }
 
     fn get_by_path(&self, source_path: &Path) -> StoreResult<Option<SecretRecord>> {
-        self.verify_security_state()?;
         let target = source_path.to_string_lossy();
         Ok(self.list()?.into_iter().find(|record| {
             record
