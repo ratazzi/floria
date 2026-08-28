@@ -681,22 +681,15 @@ impl<'a> RecordSyncControl<'a> {
     pub fn status(&self) -> ReplicationResult<SyncDomainStatus> {
         let vault_id = self.store.vault_document().vault_id;
         let key_generation = self.store.current_generation()?;
-        let outbound_transactions = self.journal.outbound()?.len();
-        let inbound = self.journal.inbound()?;
-        let pending_transactions = self.journal.pending_transactions()?;
-        let conflicting_entities = match self.journal.projection_records() {
-            Ok(_) => 0,
-            Err(ReplicationError::ProjectionConflict { entity_ids }) => entity_ids.len(),
-            Err(error) => return Err(error),
-        };
+        let journal = self.journal.status()?;
         Ok(SyncDomainStatus {
             vault_id,
             key_generation,
-            outbound_transactions,
-            inbound_transactions: inbound.len(),
-            pending_transactions,
-            conflicting_entities,
-            projection_pending: self.journal.pending_projection()?.is_some(),
+            outbound_transactions: journal.outbound_transactions,
+            inbound_transactions: journal.inbound_transactions,
+            pending_transactions: journal.pending_transactions,
+            conflicting_entities: journal.conflicting_entities,
+            projection_pending: journal.projection_pending,
         })
     }
 
@@ -1252,6 +1245,21 @@ mod tests {
         assert_eq!(status.pending_transactions(), 0);
         assert_eq!(status.conflicting_entities(), 0);
         assert!(!status.projection_pending());
+
+        let outbound = fixture.control().next_outbound(1).unwrap();
+        let commit_id = outbound.commits()[0].commit_id().to_string();
+        fixture
+            .control()
+            .settle_outbound(&[SyncDeliveryOutcome::new(
+                commit_id,
+                SyncDeliveryDisposition::Accepted,
+            )])
+            .unwrap();
+        assert_eq!(
+            fixture.control().status().unwrap().outbound_transactions(),
+            0,
+            "journal mutations must invalidate the verified status cache"
+        );
     }
 
     #[test]

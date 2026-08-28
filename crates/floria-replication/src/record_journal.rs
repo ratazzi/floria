@@ -123,6 +123,19 @@ pub struct ProjectionCheckpoint {
     applied_at: String,
 }
 
+/// One authenticated view of the journal state needed by periodic sync scheduling.
+///
+/// Keeping this projection inside the journal ensures callers cannot accidentally pay for one
+/// complete integrity verification per field.
+#[derive(Clone)]
+pub(crate) struct JournalStatus {
+    pub(crate) outbound_transactions: usize,
+    pub(crate) inbound_transactions: usize,
+    pub(crate) pending_transactions: usize,
+    pub(crate) conflicting_entities: usize,
+    pub(crate) projection_pending: bool,
+}
+
 impl ProjectionCheckpoint {
     pub fn plan_id(&self) -> &str {
         &self.plan_id
@@ -203,6 +216,7 @@ pub struct RecordJournal {
     path: PathBuf,
     integrity: JournalIntegrity,
     mutation: Mutex<()>,
+    status_cache: Mutex<Option<JournalStatus>>,
 }
 
 impl RecordJournal {
@@ -294,6 +308,7 @@ impl RecordJournal {
                 domain,
             },
             mutation: Mutex::new(()),
+            status_cache: Mutex::new(None),
         })
     }
 
@@ -487,26 +502,36 @@ impl RecordJournal {
     /// Number of distinct transaction barriers that cannot yet participate in projection.
     /// This includes revisions that arrived before their owning manifest.
     pub fn pending_transactions(&self) -> ReplicationResult<usize> {
+        self.with_read(|_, snapshot| Ok(pending_transaction_count_from(snapshot)))
+    }
+
+    pub(crate) fn status(&self) -> ReplicationResult<JournalStatus> {
+        if let Some(status) = self
+            .status_cache
+            .lock()
+            .expect("record journal status cache poisoned")
+            .clone()
+        {
+            return Ok(status);
+        }
         self.with_read(|_, snapshot| {
-            let known_commits = snapshot
-                .commits
-                .iter()
-                .map(|commit| commit.commit_id())
-                .collect::<BTreeSet<_>>();
-            let mut pending = snapshot
-                .revisions
-                .iter()
-                .filter(|revision| !known_commits.contains(revision.commit_id()))
-                .map(|revision| revision.commit_id().to_string())
-                .collect::<BTreeSet<_>>();
-            pending.extend(
-                snapshot
-                    .inbound
-                    .iter()
-                    .filter(|item| !item.readiness().is_ready())
-                    .map(|item| item.commit().commit_id().to_string()),
-            );
-            Ok(pending.len())
+            let conflicting_entities = match projection_records_from(snapshot) {
+                Ok(_) => 0,
+                Err(ReplicationError::ProjectionConflict { entity_ids }) => entity_ids.len(),
+                Err(error) => return Err(error),
+            };
+            let status = JournalStatus {
+                outbound_transactions: snapshot.outbound.len(),
+                inbound_transactions: snapshot.inbound.len(),
+                pending_transactions: pending_transaction_count_from(snapshot),
+                conflicting_entities,
+                projection_pending: snapshot.pending_projection.is_some(),
+            };
+            *self
+                .status_cache
+                .lock()
+                .expect("record journal status cache poisoned") = Some(status.clone());
+            Ok(status)
         })
     }
 
@@ -672,6 +697,10 @@ impl RecordJournal {
             &next,
         )?;
         tx.commit()?;
+        *self
+            .status_cache
+            .lock()
+            .expect("record journal status cache poisoned") = None;
         Ok(result)
     }
 
@@ -999,6 +1028,28 @@ fn projection_records_from(
         revisions,
         head_revision_ids,
     })
+}
+
+fn pending_transaction_count_from(snapshot: &JournalSecuritySnapshot) -> usize {
+    let known_commits = snapshot
+        .commits
+        .iter()
+        .map(|commit| commit.commit_id())
+        .collect::<BTreeSet<_>>();
+    let mut pending = snapshot
+        .revisions
+        .iter()
+        .filter(|revision| !known_commits.contains(revision.commit_id()))
+        .map(|revision| revision.commit_id().to_string())
+        .collect::<BTreeSet<_>>();
+    pending.extend(
+        snapshot
+            .inbound
+            .iter()
+            .filter(|item| !item.readiness().is_ready())
+            .map(|item| item.commit().commit_id().to_string()),
+    );
+    pending.len()
 }
 
 fn eligible_records_from(

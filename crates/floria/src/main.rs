@@ -5,6 +5,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
 use floria_catalog::{
@@ -1236,6 +1237,7 @@ struct DaemonRecordSyncService {
     store: Arc<AgeDirStore>,
     mutations: Arc<floria_surface::ManagedMutationCoordinator>,
     journal: Mutex<Option<RecordJournal>>,
+    initial_capture_completed: AtomicBool,
 }
 
 impl DaemonRecordSyncService {
@@ -1257,6 +1259,7 @@ impl DaemonRecordSyncService {
             store,
             mutations,
             journal: Mutex::new(None),
+            initial_capture_completed: AtomicBool::new(false),
         }
     }
 
@@ -1294,7 +1297,32 @@ impl DaemonRecordSyncService {
                     catalog,
                     replication_timestamp(),
                 )?;
+                self.initial_capture_completed.store(true, Ordering::Release);
                 operation(journal)
+            })
+        })
+    }
+
+    /// Establish the journal's initial local baseline exactly once.
+    ///
+    /// Committed mutations publish incrementally after activation, while `next_outbound` keeps a
+    /// final capture as a repair boundary. Re-capturing the whole Catalog and Store for every
+    /// status poll only repeats integrity and Keychain work without improving correctness.
+    fn ensure_initial_capture(&self) -> Result<(), String> {
+        if self.initial_capture_completed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.mutations.run(|| {
+            if self.initial_capture_completed.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            self.with_journal(|journal| {
+                RecordPublisher::new(journal, Arc::clone(&self.store)).capture(
+                    &self.catalog,
+                    replication_timestamp(),
+                )?;
+                self.initial_capture_completed.store(true, Ordering::Release);
+                Ok(())
             })
         })
     }
@@ -1380,7 +1408,8 @@ impl DaemonRecordSyncService {
 
 impl RuntimeRecordSyncService for DaemonRecordSyncService {
     fn status(&self) -> Result<SyncDomainStatus, String> {
-        self.with_captured_state(&self.catalog, |journal| {
+        self.ensure_initial_capture()?;
+        self.with_journal(|journal| {
             RecordSyncControl::new(journal, Arc::clone(&self.store)).status()
         })
     }
@@ -1581,9 +1610,12 @@ impl ManagedMutationObserver for DaemonRecordSyncService {
         let Some(journal) = journal.as_ref() else {
             return;
         };
-        match RecordPublisher::new(journal, Arc::clone(&self.store))
-            .capture(&self.catalog, replication_timestamp())
-        {
+        let capture = RecordPublisher::new(journal, Arc::clone(&self.store))
+            .capture(&self.catalog, replication_timestamp());
+        if capture.is_ok() {
+            self.initial_capture_completed.store(true, Ordering::Release);
+        }
+        match capture {
             Ok(report) if report.queued_transaction() => tracing::debug!(
                 changed_entities = report.changed_entities(),
                 "queued committed local state for coordinated sync"
@@ -3560,11 +3592,18 @@ mod tests {
         assert_eq!(service.status().unwrap().outbound_transactions(), 1);
         assert!(records_path.exists());
 
+        // Status polling is journal-only after the initial baseline. A write that bypasses the
+        // managed mutation boundary is intentionally discovered by the outbound repair capture,
+        // not by every three-second status request.
+        store.append_version(&secret_id, b"second payload").unwrap();
+        assert_eq!(service.status().unwrap().outbound_transactions(), 1);
+        assert_eq!(service.next_outbound(10).unwrap().commits().len(), 2);
+
         mutations
-            .run_committed(|| store.append_version(&secret_id, b"second payload"))
+            .run_committed(|| store.append_version(&secret_id, b"third payload"))
             .unwrap();
         let journal = service.journal.lock().unwrap();
-        assert_eq!(journal.as_ref().unwrap().outbound().unwrap().len(), 2);
+        assert_eq!(journal.as_ref().unwrap().outbound().unwrap().len(), 3);
     }
 
     #[test]
