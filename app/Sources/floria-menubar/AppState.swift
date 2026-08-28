@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Observation
 import os
@@ -111,6 +112,7 @@ final class AppState {
     @ObservationIgnored private let daemonManager = DaemonManager()
     @ObservationIgnored private var accessHistoryLoaded = false
     @ObservationIgnored private var macFuseProbeTask: Task<Void, Never>?
+    @ObservationIgnored private var sessionObserver: NSObjectProtocol?
     @ObservationIgnored private let macFusePreview =
         ProcessInfo.processInfo.environment["FLORIA_MACFUSE_SETUP_PREVIEW"] != nil
 
@@ -172,6 +174,18 @@ final class AppState {
         }
 
         client.start()
+        sessionObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.sessionDidResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                _ = self.client.send(SessionInactiveMsg())
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                await self.reloadActiveGrants()
+            }
+        }
         let coordinator = AutomaticCloudSyncCoordinator(
             service: cloudSyncService,
             restartDaemon: { [weak self] in

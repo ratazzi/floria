@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 /// Reject frames larger than this to bound memory on a hostile/broken peer.
 const MAX_MSG: usize = 1 << 20;
-pub const AGENT_PROTOCOL_VERSION: u32 = 1;
+pub const AGENT_PROTOCOL_VERSION: u32 = 2;
 
 /// Messages the app (client) sends to the daemon.
 #[derive(Debug, Deserialize)]
@@ -20,12 +20,14 @@ pub const AGENT_PROTOCOL_VERSION: u32 = 1;
 pub enum ClientMsg {
     /// Handshake sent by the app right after connecting.
     Hello { version: u32 },
+    /// The active macOS login session is resigning (lock or fast-user switch).
+    SessionInactive,
     /// The user's answer to a prompt.
     Decision {
         req_id: u64,
         /// "allow" | "deny"
         outcome: String,
-        /// "once" | "ttl" | "app_file" | "app_project"
+        /// "once" | "today" | "until_lock" | "ttl" | "app_file" | "app_project"
         #[serde(default)]
         scope: Option<String>,
         #[serde(default)]

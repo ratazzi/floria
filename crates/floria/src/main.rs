@@ -2418,6 +2418,7 @@ impl RuntimePolicyController for AgentPolicyController {
                     object: grant.object,
                     operation: grant.operation.as_str().to_string(),
                     enforcement: grant.enforcement,
+                    scope: grant.scope.as_str().to_string(),
                     expires_at: grant.expires_at,
                     client: grant.metadata.client,
                     executable: grant.metadata.executable,

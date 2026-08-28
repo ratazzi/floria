@@ -14,7 +14,7 @@ mod ssh_agent;
 pub mod socket;
 
 pub use agent::SocketAgent;
-pub use grant_cache::{ActiveGrant, GrantMetadata};
+pub use grant_cache::{ActiveGrant, GrantMetadata, GrantScope};
 pub use managed_rules::{ManagedObject, ManagedPolicyItem};
 pub use ssh_agent::{
     discover_identities, DiscoveredSshIdentity, ManagedKeyReader, SshAgentRuntime,

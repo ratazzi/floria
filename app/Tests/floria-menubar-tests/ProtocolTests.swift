@@ -111,10 +111,17 @@ final class ProtocolTests: XCTestCase {
         XCTAssertEqual(v["version"] as? UInt32, supportedAgentProtocolVersion)
     }
 
+    func testSessionInactiveMatchesRustSchema() throws {
+        let data = try JSONEncoder().encode(SessionInactiveMsg())
+        let value = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any])
+        XCTAssertEqual(value["type"] as? String, "session_inactive")
+    }
+
     func testDecodeDaemonHelloAndRejectMismatchedAgentProtocol() throws {
         let hello = try JSONDecoder().decode(
             AgentHelloMsg.self,
-            from: Data(#"{"type":"hello","version":1,"daemon_version":"0.1.0"}"#.utf8))
+            from: Data(#"{"type":"hello","version":2,"daemon_version":"0.1.0"}"#.utf8))
         XCTAssertEqual(hello.version, supportedAgentProtocolVersion)
         XCTAssertEqual(hello.daemon_version, "0.1.0")
         XCTAssertNoThrow(try validateAgentProtocolVersion(hello.version))

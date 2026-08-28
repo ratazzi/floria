@@ -47,6 +47,7 @@ pub struct SocketServer {
     pending: DashMap<u64, mpsc::Sender<ClientDecision>>,
     next_req: AtomicU64,
     conn_gen: AtomicU64,
+    session_invalidator: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 struct Conn {
@@ -75,6 +76,7 @@ impl SocketServer {
             pending: DashMap::new(),
             next_req: AtomicU64::new(1),
             conn_gen: AtomicU64::new(1),
+            session_invalidator: Mutex::new(None),
         });
 
         let srv = Arc::clone(&server);
@@ -143,9 +145,17 @@ impl SocketServer {
                     srv.read_loop(stream);
                     // Clear the writer only if it is still ours — a newer connection may
                     // have replaced it while we were serving.
-                    let mut guard = srv.conn.lock().expect("conn poisoned");
-                    if guard.as_ref().is_some_and(|c| c.gen == gen) {
-                        *guard = None;
+                    let disconnected_current = {
+                        let mut guard = srv.conn.lock().expect("conn poisoned");
+                        if guard.as_ref().is_some_and(|c| c.gen == gen) {
+                            *guard = None;
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if disconnected_current {
+                        srv.invalidate_session();
                     }
                     tracing::info!(gen, "menubar app disconnected");
                 });
@@ -159,7 +169,7 @@ impl SocketServer {
         reader.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
         let received_version = match read_msg::<_, ClientMsg>(reader)? {
             ClientMsg::Hello { version } => Some(version),
-            ClientMsg::Decision { .. } => None,
+            ClientMsg::Decision { .. } | ClientMsg::SessionInactive => None,
         };
         if received_version != Some(AGENT_PROTOCOL_VERSION) {
             write_msg(
@@ -190,6 +200,7 @@ impl SocketServer {
                 Ok(ClientMsg::Hello { version }) => {
                     tracing::warn!(version, "ignoring duplicate agent hello");
                 }
+                Ok(ClientMsg::SessionInactive) => self.invalidate_session(),
                 Ok(ClientMsg::Decision {
                     req_id,
                     outcome,
@@ -206,6 +217,24 @@ impl SocketServer {
                 }
                 Err(_) => break, // EOF or protocol error -> disconnect
             }
+        }
+    }
+
+    pub fn set_session_invalidator(&self, invalidator: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .session_invalidator
+            .lock()
+            .expect("session invalidator poisoned") = Some(invalidator);
+    }
+
+    fn invalidate_session(&self) {
+        if let Some(invalidator) = self
+            .session_invalidator
+            .lock()
+            .expect("session invalidator poisoned")
+            .clone()
+        {
+            invalidator();
         }
     }
 
@@ -267,6 +296,7 @@ mod tests {
     };
     use serde_json::{json, Value};
     use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Instant;
 
     fn sock_path(tag: &str) -> PathBuf {
@@ -430,6 +460,31 @@ mod tests {
             _ => panic!("expected a decision"),
         }
         assert!(srv.pending.is_empty(), "pending must be drained after reply");
+    }
+
+    #[test]
+    fn inactive_session_and_current_app_disconnect_invalidate_lock_bound_state() {
+        let path = sock_path("inactive-session");
+        let srv = start(&path);
+        let invalidations = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&invalidations);
+        srv.set_session_invalidator(Arc::new(move || {
+            observed.fetch_add(1, Ordering::SeqCst);
+        }));
+        let mut client = connect(&path);
+        wait_until(|| current_gen(&srv).is_some(), "app connected");
+
+        write_msg(&mut client, &json!({"type": "session_inactive"})).unwrap();
+        wait_until(
+            || invalidations.load(Ordering::SeqCst) == 1,
+            "session invalidation",
+        );
+
+        drop(client);
+        wait_until(
+            || invalidations.load(Ordering::SeqCst) == 2,
+            "disconnect invalidation",
+        );
     }
 
     #[test]

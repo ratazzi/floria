@@ -520,7 +520,8 @@ pub struct ActiveGrant {
     pub object: String,
     pub operation: String,
     pub enforcement: Enforcement,
-    pub expires_at: i64,
+    pub scope: String,
+    pub expires_at: Option<i64>,
     pub client: String,
     pub executable: Option<String>,
     pub bundle_id: Option<String>,
@@ -1200,7 +1201,8 @@ mod tests {
             object: "secrets/fixture".to_string(),
             operation: "read".to_string(),
             enforcement: Enforcement::Prompt,
-            expires_at: 1_800_000_600,
+            scope: "today".to_string(),
+            expires_at: Some(1_800_000_600),
             client: "cat".to_string(),
             executable: Some("/usr/bin/cat".to_string()),
             bundle_id: None,
@@ -1210,6 +1212,7 @@ mod tests {
         assert_eq!(result["type"], "active_grants");
         assert_eq!(result["value"][0]["client"], "cat");
         assert_eq!(result["value"][0]["enforcement"], "prompt");
+        assert_eq!(result["value"][0]["scope"], "today");
     }
 
     #[test]

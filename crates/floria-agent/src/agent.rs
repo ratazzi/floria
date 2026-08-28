@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::Duration;
 
+use chrono::{Days, Local, LocalResult, TimeZone};
 use floria_core::authz::{
     AuthRequest, Authorizer, Decision, Enforcement, PolicyMode, PolicyModeStatus,
 };
@@ -19,7 +20,9 @@ use floria_core::rules::{repo_root, RuleObject, RuleRequest, RuleSet};
 use floria_integrity::StateAuthenticator;
 use floria_platform::SocketPeerVerifier;
 
-use crate::grant_cache::{ActiveGrant, GrantCache, GrantKey, GrantMetadata};
+use crate::grant_cache::{
+    ActiveGrant, GrantCache, GrantKey, GrantLifetime, GrantMetadata, GrantScope,
+};
 use crate::managed_rules::{
     managed_rules, normalize_managed_policy, ManagedPolicyItem,
 };
@@ -110,7 +113,7 @@ impl SocketAgent {
             "agent socket listening"
         );
         let base_rules = cfg.rules.clone();
-        Ok(Arc::new(SocketAgent {
+        let agent = Arc::new(SocketAgent {
             server,
             rules: RwLock::new(base_rules.clone()),
             base_rules,
@@ -125,7 +128,14 @@ impl SocketAgent {
             ),
             prompt_flights: Mutex::new(HashMap::new()),
             grant_generation: AtomicU64::new(0),
-        }))
+        });
+        let weak = Arc::downgrade(&agent);
+        agent.server.set_session_invalidator(Arc::new(move || {
+            if let Some(agent) = weak.upgrade() {
+                agent.revoke_lock_bound_grants();
+            }
+        }));
+        Ok(agent)
     }
 
     pub fn policy_mode(&self) -> PolicyModeStatus {
@@ -158,6 +168,17 @@ impl SocketAgent {
     pub fn clear_grants(&self) -> std::io::Result<()> {
         self.grant_generation.fetch_add(1, Ordering::AcqRel);
         self.grants.clear()
+    }
+
+    fn revoke_lock_bound_grants(&self) {
+        match self.grants.clear_until_lock() {
+            Ok(true) => {
+                self.grant_generation.fetch_add(1, Ordering::AcqRel);
+                tracing::info!("revoked grants bounded by the active macOS login session");
+            }
+            Ok(false) => {}
+            Err(error) => tracing::warn!(%error, "revoking lock-bound grants failed"),
+        }
     }
 
     /// Replace catalog/store policy as ordinary rules. Normalization makes refresh order
@@ -261,9 +282,9 @@ impl SocketAgent {
         match result {
             PromptResult::Decision(d) if d.allow => {
                 if self.grant_generation.load(Ordering::Acquire) == generation {
-                    if let Some(ttl) = grant_ttl(&d) {
+                    if let Some(lifetime) = grant_lifetime(&d) {
                         if let Err(error) =
-                            self.grants.insert(key.clone(), ttl, grant_metadata(req))
+                            self.grants.insert(key.clone(), lifetime, grant_metadata(req))
                         {
                             tracing::warn!(%error, "persisting authorization grant failed");
                         }
@@ -425,13 +446,43 @@ fn grant_key(id: &ProcessIdentity, repo: Option<&str>) -> String {
     format!("pid:{}", id.pid)
 }
 
-/// Map a decision's scope to a grant TTL. `once` caches nothing.
-fn grant_ttl(d: &crate::protocol::ClientDecision) -> Option<Duration> {
+/// Map a decision's scope to one explicit grant lifetime. `once` caches nothing.
+fn grant_lifetime(d: &crate::protocol::ClientDecision) -> Option<GrantLifetime> {
     match d.scope.as_deref() {
-        Some("ttl") => Some(d.ttl_secs.map(Duration::from_secs).unwrap_or(DEFAULT_TTL)),
-        Some("app_file") | Some("app_project") => Some(PERSISTENT_TTL),
+        Some("today") => Some(GrantLifetime::Timed {
+            ttl: today_ttl(),
+            scope: GrantScope::Today,
+        }),
+        Some("until_lock") => Some(GrantLifetime::UntilLock),
+        Some("ttl") => Some(GrantLifetime::Timed {
+            ttl: d.ttl_secs.map(Duration::from_secs).unwrap_or(DEFAULT_TTL),
+            scope: GrantScope::Timed,
+        }),
+        Some("app_file") | Some("app_project") => Some(GrantLifetime::Timed {
+            ttl: PERSISTENT_TTL,
+            scope: GrantScope::Timed,
+        }),
         _ => None, // "once" or unspecified
     }
+}
+
+fn today_ttl() -> Duration {
+    let now = Local::now();
+    let Some(tomorrow) = now.date_naive().checked_add_days(Days::new(1)) else {
+        return Duration::from_secs(24 * 60 * 60);
+    };
+    let Some(midnight) = tomorrow.and_hms_opt(0, 0, 0) else {
+        return Duration::from_secs(24 * 60 * 60);
+    };
+    let boundary = match Local.from_local_datetime(&midnight) {
+        LocalResult::Single(value) => value,
+        LocalResult::Ambiguous(first, second) => first.min(second),
+        LocalResult::None => return Duration::from_secs(24 * 60 * 60),
+    };
+    boundary
+        .signed_duration_since(now)
+        .to_std()
+        .unwrap_or_else(|_| Duration::from_secs(1))
 }
 
 #[cfg(test)]
@@ -455,6 +506,13 @@ mod tests {
             executable: Some("/usr/bin/fixture-client".to_string()),
             bundle_id: None,
             target: "~/.fixture".to_string(),
+        }
+    }
+
+    fn timed_grant() -> GrantLifetime {
+        GrantLifetime::Timed {
+            ttl: Duration::from_secs(600),
+            scope: GrantScope::Timed,
         }
     }
 
@@ -539,6 +597,21 @@ mod tests {
 
         let bare = ProcessIdentity::bare(1004, 501, 20);
         assert_eq!(grant_key(&bare, None), "pid:1004");
+    }
+
+    #[test]
+    fn today_lifetime_is_daemon_owned_and_bounded_by_the_next_local_day() {
+        let decision = crate::protocol::ClientDecision {
+            allow: true,
+            scope: Some("today".to_string()),
+            ttl_secs: Some(1),
+        };
+        let Some(GrantLifetime::Timed { ttl, scope }) = grant_lifetime(&decision) else {
+            panic!("today must create a timed grant");
+        };
+        assert_eq!(scope, GrantScope::Today);
+        assert!(ttl > Duration::ZERO);
+        assert!(ttl <= Duration::from_secs(26 * 60 * 60));
     }
 
     #[test]
@@ -792,7 +865,7 @@ mod tests {
                     Operation::Read,
                     Enforcement::Prompt,
                 ),
-                Duration::from_secs(600),
+                timed_grant(),
                 fixture_grant_metadata(),
             )
             .unwrap();
@@ -822,7 +895,7 @@ mod tests {
                     Operation::Read,
                     Enforcement::Prompt,
                 ),
-                Duration::from_secs(600),
+                timed_grant(),
                 fixture_grant_metadata(),
             )
             .unwrap();
@@ -899,7 +972,7 @@ mod tests {
                     Operation::Sign,
                     Enforcement::Prompt,
                 ),
-                Duration::from_secs(600),
+                timed_grant(),
                 fixture_grant_metadata(),
             )
             .unwrap();
@@ -981,7 +1054,7 @@ mod tests {
                     Operation::Read,
                     Enforcement::Prompt,
                 ),
-                Duration::from_secs(600),
+                timed_grant(),
                 fixture_grant_metadata(),
             )
             .unwrap();
@@ -1141,7 +1214,7 @@ mod tests {
                     Operation::Write,
                     Enforcement::Prompt,
                 ),
-                Duration::from_secs(600),
+                timed_grant(),
                 fixture_grant_metadata(),
             )
             .unwrap();
@@ -1184,7 +1257,7 @@ mod tests {
                     Operation::Read,
                     Enforcement::Prompt,
                 ),
-                Duration::from_secs(600),
+                timed_grant(),
                 fixture_grant_metadata(),
             )
             .unwrap();
@@ -1207,7 +1280,7 @@ mod tests {
         );
         agent
             .grants
-            .insert(key.clone(), Duration::from_secs(600), fixture_grant_metadata())
+            .insert(key.clone(), timed_grant(), fixture_grant_metadata())
             .unwrap();
 
         let surface = ManagedPolicyItem {

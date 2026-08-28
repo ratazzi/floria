@@ -27,14 +27,20 @@ final class AuthorizationPromptViewTests: XCTestCase {
 
     func testPresetAndCustomDurationsResolveToArbitraryTTL() {
         XCTAssertEqual(
-            PromptGrantPreset.fiveMinutes.scope(customDuration: 1, unit: .minutes),
-            .timed(seconds: 300))
-        XCTAssertEqual(
             PromptGrantPreset.oneHour.scope(customDuration: 1, unit: .minutes),
             .timed(seconds: 3_600))
         XCTAssertEqual(
             PromptGrantPreset.custom.scope(customDuration: 3, unit: .hours),
             .timed(seconds: 10_800))
+    }
+
+    func testTodayAndLockScopesLeaveLifetimePolicyToTheDaemon() {
+        XCTAssertEqual(
+            PromptGrantPreset.today.scope(customDuration: 1, unit: .minutes),
+            .today)
+        XCTAssertEqual(
+            PromptGrantPreset.untilMacLocks.scope(customDuration: 1, unit: .minutes),
+            .untilLock)
     }
 
     func testGrantScopeMapsToExistingWireProtocol() {
@@ -44,5 +50,11 @@ final class AuthorizationPromptViewTests: XCTestCase {
         let timed = PromptGrantScope.timed(seconds: 1_800)
         XCTAssertEqual(timed.wireScope, "ttl")
         XCTAssertEqual(timed.ttlSeconds, 1_800)
+
+        let today = PromptGrantScope.today
+        XCTAssertEqual(today.wireScope, "today")
+        XCTAssertNil(today.ttlSeconds)
+        XCTAssertEqual(PromptGrantScope.untilLock.wireScope, "until_lock")
+        XCTAssertNil(PromptGrantScope.untilLock.ttlSeconds)
     }
 }

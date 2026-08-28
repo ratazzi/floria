@@ -10,11 +10,15 @@ private enum AuthorizationPromptLayout {
 
 enum PromptGrantScope: Equatable, Sendable {
     case once
+    case today
+    case untilLock
     case timed(seconds: UInt64)
 
     var title: String {
         switch self {
         case .once: "Once"
+        case .today: "Today"
+        case .untilLock: "Until Mac Locks"
         case .timed(let seconds): Self.durationTitle(seconds)
         }
     }
@@ -22,6 +26,8 @@ enum PromptGrantScope: Equatable, Sendable {
     var wireScope: String {
         switch self {
         case .once: "once"
+        case .today: "today"
+        case .untilLock: "until_lock"
         case .timed: "ttl"
         }
     }
@@ -29,6 +35,8 @@ enum PromptGrantScope: Equatable, Sendable {
     var ttlSeconds: UInt64? {
         switch self {
         case .once: nil
+        case .today: nil
+        case .untilLock: nil
         case .timed(let seconds): seconds
         }
     }
@@ -44,19 +52,17 @@ enum PromptGrantScope: Equatable, Sendable {
 }
 
 enum PromptGrantPreset: String, CaseIterable {
+    case today
+    case untilMacLocks
     case once
-    case fiveMinutes
-    case tenMinutes
-    case thirtyMinutes
     case oneHour
     case custom
 
     var title: String {
         switch self {
+        case .today: "Today"
+        case .untilMacLocks: "Until Mac Locks"
         case .once: "Once"
-        case .fiveMinutes: "5 minutes"
-        case .tenMinutes: "10 minutes"
-        case .thirtyMinutes: "30 minutes"
         case .oneHour: "1 hour"
         case .custom: "Custom…"
         }
@@ -64,14 +70,12 @@ enum PromptGrantPreset: String, CaseIterable {
 
     func scope(customDuration: Int, unit: PromptGrantCustomUnit) -> PromptGrantScope {
         switch self {
+        case .today:
+            return .today
+        case .untilMacLocks:
+            return .untilLock
         case .once:
             return .once
-        case .fiveMinutes:
-            return .timed(seconds: 5 * 60)
-        case .tenMinutes:
-            return .timed(seconds: 10 * 60)
-        case .thirtyMinutes:
-            return .timed(seconds: 30 * 60)
         case .oneHour:
             return .timed(seconds: 60 * 60)
         case .custom:
@@ -220,7 +224,7 @@ struct AuthorizationPromptView: View {
     let deny: () -> Void
     let allow: (PromptGrantScope) -> Void
 
-    @State private var grantPreset = PromptGrantPreset.once
+    @State private var grantPreset = PromptGrantPreset.today
     @State private var customDuration = 15
     @State private var customUnit = PromptGrantCustomUnit.minutes
     @State private var showsFullPath = false
@@ -491,8 +495,10 @@ struct AuthorizationPromptView: View {
     }
 
     private var primaryButtonTitle: String {
-        if model.requiresTouchID { return "Use Touch ID" }
-        return scope == .once ? "Allow Once" : "Allow for \(scope.title.capitalized)"
+        if model.requiresTouchID {
+            return scope == .once ? "Use Touch ID" : "Use Touch ID for \(scope.title)"
+        }
+        return scope == .once ? "Allow Once" : "Allow \(scope.title)"
     }
 
     private func icon(for process: PromptProcessNode) -> NSImage {
@@ -531,7 +537,7 @@ struct AuthorizationScopePicker: View {
                 }
                 .labelsHidden()
                 .pickerStyle(.menu)
-                .frame(width: 118, alignment: .trailing)
+                .frame(width: 164, alignment: .trailing)
             }
             if preset == .custom {
                 Divider()
@@ -563,11 +569,7 @@ struct AuthorizationScopePicker: View {
                         unit.range.upperBound)
                 }
             }
-            Text(scope == .once
-                ? "Allow only this request."
-                : operation == "sign"
-                    ? "Reuse this approval for the same application or project and SSH identity for \(scope.title)."
-                    : "Reuse this approval for the same application or project and file for \(scope.title).")
+            Text(scopeDescription)
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -578,6 +580,25 @@ struct AuthorizationScopePicker: View {
         .overlay {
             RoundedRectangle(cornerRadius: 12)
                 .stroke(Color.primary.opacity(0.08))
+        }
+    }
+
+    private var scopeDescription: String {
+        switch scope {
+        case .once:
+            return "Allow only this request."
+        case .today:
+            return operation == "sign"
+                ? "Reuse this approval for the same client and SSH identity until the end of today."
+                : "Reuse this approval for the same client and file until the end of today."
+        case .untilLock:
+            return operation == "sign"
+                ? "Reuse this approval until this Mac locks or Floria disconnects."
+                : "Reuse this approval until this Mac locks or Floria disconnects."
+        case .timed:
+            return operation == "sign"
+                ? "Reuse this approval for the same client and SSH identity for \(scope.title)."
+                : "Reuse this approval for the same client and file for \(scope.title)."
         }
     }
 }

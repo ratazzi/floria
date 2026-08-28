@@ -84,7 +84,8 @@ struct MenuBarView: View {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         let now = Date()
         return state.activeGrants.filter {
-            $0.expirationDate > now
+            ($0.expirationDate.map { expiration in expiration > now }
+                ?? ($0.scope == "until_lock"))
                 && (query.isEmpty || $0.matchesMenuBarSearch(query))
         }
     }
@@ -577,7 +578,10 @@ private struct ActiveGrantRow: View {
     }
 
     private func remaining(at date: Date) -> String {
-        let seconds = max(0, Int(grant.expirationDate.timeIntervalSince(date)))
+        if grant.scope == "until_lock" { return "Until lock" }
+        if grant.scope == "today" { return "Today" }
+        guard let expirationDate = grant.expirationDate else { return "Active" }
+        let seconds = max(0, Int(expirationDate.timeIntervalSince(date)))
         if seconds >= 3600 {
             return "\(seconds / 3600)h \((seconds % 3600) / 60)m"
         }
@@ -588,7 +592,9 @@ private struct ActiveGrantRow: View {
         var lines = [
             grant.shownTarget,
             "client: \(grant.client)",
-            "expires: \(grant.expirationDate.formatted(date: .omitted, time: .standard))",
+            grant.expirationDate.map {
+                "expires: \($0.formatted(date: .omitted, time: .standard))"
+            } ?? "expires when this Mac locks",
         ]
         if let executable = grant.executable {
             lines.append("executable: \(executable)")

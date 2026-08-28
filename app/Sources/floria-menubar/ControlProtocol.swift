@@ -85,20 +85,21 @@ struct ActiveGrant: Codable, Equatable, Identifiable, Sendable {
     let object: String
     let operation: String
     let enforcement: String
-    let expiresAt: Int64
+    let scope: String
+    let expiresAt: Int64?
     let client: String
     let executable: String?
     let bundleID: String?
     let target: String
 
     enum CodingKeys: String, CodingKey {
-        case id, subject, object, operation, enforcement, client, executable, target
+        case id, subject, object, operation, enforcement, scope, client, executable, target
         case expiresAt = "expires_at"
         case bundleID = "bundle_id"
     }
 
-    var expirationDate: Date {
-        Date(timeIntervalSince1970: TimeInterval(expiresAt))
+    var expirationDate: Date? {
+        expiresAt.map { Date(timeIntervalSince1970: TimeInterval($0)) }
     }
 }
 

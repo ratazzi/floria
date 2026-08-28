@@ -12,9 +12,33 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: u32 = 2;
+const SCHEMA_VERSION: u32 = 3;
 const INTEGRITY_DOMAIN: &str = "authorization-grants";
-const MAXIMUM_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const MAXIMUM_TTL: Duration = Duration::from_secs(26 * 60 * 60);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GrantLifetime {
+    Timed { ttl: Duration, scope: GrantScope },
+    UntilLock,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrantScope {
+    Timed,
+    Today,
+    UntilLock,
+}
+
+impl GrantScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Timed => "timed",
+            Self::Today => "today",
+            Self::UntilLock => "until_lock",
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct GrantKey {
@@ -50,14 +74,19 @@ pub struct ActiveGrant {
     pub object: String,
     pub operation: Operation,
     pub enforcement: Enforcement,
-    pub expires_at: i64,
+    pub scope: GrantScope,
+    pub expires_at: Option<i64>,
     pub metadata: GrantMetadata,
 }
 
 struct GrantRecord {
-    monotonic: Instant,
-    unix: i64,
+    lifetime: GrantRecordLifetime,
     metadata: GrantMetadata,
+}
+
+enum GrantRecordLifetime {
+    Timed { monotonic: Instant, unix: i64, scope: GrantScope },
+    UntilLock,
 }
 
 pub(crate) struct GrantCache {
@@ -224,7 +253,11 @@ impl GrantCache {
     pub(crate) fn is_valid(&self, key: &GrantKey) -> bool {
         let mut entries = self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         match entries.get(key) {
-            Some(expiry) if expiry.monotonic > Instant::now() => true,
+            Some(GrantRecord { lifetime: GrantRecordLifetime::UntilLock, .. }) => true,
+            Some(GrantRecord {
+                lifetime: GrantRecordLifetime::Timed { monotonic, .. },
+                ..
+            }) if *monotonic > Instant::now() => true,
             Some(_) => {
                 entries.remove(key);
                 self.persist_best_effort(&entries, "remove expired grant");
@@ -237,29 +270,35 @@ impl GrantCache {
     pub(crate) fn insert(
         &self,
         key: GrantKey,
-        ttl: Duration,
+        lifetime: GrantLifetime,
         metadata: GrantMetadata,
     ) -> io::Result<()> {
-        if ttl > MAXIMUM_TTL {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "grant TTL exceeds the 24-hour daemon limit",
-            ));
-        }
-        let expires_at = now_unix()
-            .checked_add(
-                ttl.as_secs()
-                    .try_into()
-                    .map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidInput, "grant TTL is too large")
-                    })?,
-            )
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "grant expiry overflow"))?;
-        let monotonic = Instant::now()
-            .checked_add(ttl)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "grant TTL is too large"))?;
+        let lifetime = match lifetime {
+            GrantLifetime::UntilLock => GrantRecordLifetime::UntilLock,
+            GrantLifetime::Timed { ttl, scope } => {
+                if ttl > MAXIMUM_TTL {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "grant TTL exceeds the 26-hour daemon limit",
+                    ));
+                }
+                let expires_at = now_unix()
+                    .checked_add(
+                        ttl.as_secs().try_into().map_err(|_| {
+                            io::Error::new(io::ErrorKind::InvalidInput, "grant TTL is too large")
+                        })?,
+                    )
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "grant expiry overflow")
+                    })?;
+                let monotonic = Instant::now().checked_add(ttl).ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "grant TTL is too large")
+                })?;
+                GrantRecordLifetime::Timed { monotonic, unix: expires_at, scope }
+            }
+        };
         let mut entries = self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        entries.insert(key, GrantRecord { monotonic, unix: expires_at, metadata });
+        entries.insert(key, GrantRecord { lifetime, metadata });
         self.persist_best_effort(&entries, "insert grant");
         Ok(())
     }
@@ -268,7 +307,10 @@ impl GrantCache {
         let mut entries = self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = Instant::now();
         let before = entries.len();
-        entries.retain(|_, grant| grant.monotonic > now);
+        entries.retain(|_, grant| match &grant.lifetime {
+            GrantRecordLifetime::Timed { monotonic, .. } => *monotonic > now,
+            GrantRecordLifetime::UntilLock => true,
+        });
         if entries.len() != before {
             self.persist_best_effort(&entries, "remove expired grants");
         }
@@ -281,6 +323,19 @@ impl GrantCache {
                 .cmp(&(right.expires_at, &right.metadata.client, &right.metadata.target))
         });
         Ok(active)
+    }
+
+    pub(crate) fn clear_until_lock(&self) -> io::Result<bool> {
+        let mut entries = self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let before = entries.len();
+        entries.retain(|_, grant| {
+            !matches!(grant.lifetime, GrantRecordLifetime::UntilLock)
+        });
+        let removed = entries.len() != before;
+        if removed {
+            self.persist_best_effort(&entries, "clear lock-bound grants");
+        }
+        Ok(removed)
     }
 
     pub(crate) fn revoke(&self, id: &str) -> io::Result<bool> {
@@ -326,8 +381,11 @@ impl GrantCache {
             .insert(
                 key,
                 GrantRecord {
-                    monotonic: Instant::now() - Duration::from_secs(1),
-                    unix: 1,
+                    lifetime: GrantRecordLifetime::Timed {
+                        monotonic: Instant::now() - Duration::from_secs(1),
+                        unix: 1,
+                        scope: GrantScope::Timed,
+                    },
                     metadata: GrantMetadata {
                         client: "expired-client".to_string(),
                         executable: None,
@@ -351,6 +409,7 @@ struct PersistedGrant {
     object: String,
     operation: String,
     enforcement: Enforcement,
+    scope: GrantScope,
     expires_at: i64,
     client: String,
     executable: Option<String>,
@@ -394,8 +453,11 @@ fn load_document(document: GrantDocument) -> io::Result<HashMap<GrantKey, GrantR
                 persisted.enforcement,
             ),
             GrantRecord {
-                monotonic,
-                unix: persisted.expires_at,
+                lifetime: GrantRecordLifetime::Timed {
+                    monotonic,
+                    unix: persisted.expires_at,
+                    scope: persisted.scope,
+                },
                 metadata: GrantMetadata {
                     client: persisted.client,
                     executable: persisted.executable,
@@ -411,16 +473,22 @@ fn load_document(document: GrantDocument) -> io::Result<HashMap<GrantKey, GrantR
 fn persisted_document(entries: &HashMap<GrantKey, GrantRecord>) -> GrantDocument {
     let mut grants = entries
         .iter()
-        .map(|(key, expiry)| PersistedGrant {
-            subject: key.subject.clone(),
-            object: key.object.clone(),
-            operation: key.operation.as_str().to_string(),
-            enforcement: key.enforcement,
-            expires_at: expiry.unix,
-            client: expiry.metadata.client.clone(),
-            executable: expiry.metadata.executable.clone(),
-            bundle_id: expiry.metadata.bundle_id.clone(),
-            target: expiry.metadata.target.clone(),
+        .filter_map(|(key, record)| {
+            let GrantRecordLifetime::Timed { unix, scope, .. } = record.lifetime else {
+                return None;
+            };
+            Some(PersistedGrant {
+                subject: key.subject.clone(),
+                object: key.object.clone(),
+                operation: key.operation.as_str().to_string(),
+                enforcement: key.enforcement,
+                scope,
+                expires_at: unix,
+                client: record.metadata.client.clone(),
+                executable: record.metadata.executable.clone(),
+                bundle_id: record.metadata.bundle_id.clone(),
+                target: record.metadata.target.clone(),
+            })
         })
         .collect::<Vec<_>>();
     grants.sort_by(|left, right| {
@@ -445,13 +513,18 @@ fn integrity_io(error: floria_integrity::IntegrityError) -> io::Error {
 }
 
 fn active_grant(key: &GrantKey, record: &GrantRecord) -> ActiveGrant {
+    let (scope, expires_at) = match record.lifetime {
+        GrantRecordLifetime::Timed { unix, scope, .. } => (scope, Some(unix)),
+        GrantRecordLifetime::UntilLock => (GrantScope::UntilLock, None),
+    };
     ActiveGrant {
         id: grant_id(key),
         subject: key.subject.clone(),
         object: key.object.clone(),
         operation: key.operation,
         enforcement: key.enforcement,
-        expires_at: record.unix,
+        scope,
+        expires_at,
         metadata: record.metadata.clone(),
     }
 }
@@ -541,6 +614,10 @@ mod tests {
         )
     }
 
+    fn timed(ttl: Duration) -> GrantLifetime {
+        GrantLifetime::Timed { ttl, scope: GrantScope::Timed }
+    }
+
     #[test]
     fn grant_survives_reopen_and_file_is_private() {
         let dir = tempfile::tempdir().unwrap();
@@ -548,7 +625,7 @@ mod tests {
         let auth = authenticator();
         let cache = GrantCache::open(&path, Arc::clone(&auth));
         cache
-            .insert(key(Operation::Read), Duration::from_secs(600), metadata())
+            .insert(key(Operation::Read), timed(Duration::from_secs(600)), metadata())
             .unwrap();
 
         assert!(GrantCache::open(&path, Arc::clone(&auth)).is_valid(&key(Operation::Read)));
@@ -556,6 +633,64 @@ mod tests {
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].metadata, metadata());
         assert_eq!(fs::metadata(path).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn today_grant_persists_but_lock_bound_grant_is_memory_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grants.json");
+        let auth = authenticator();
+        let cache = GrantCache::open(&path, Arc::clone(&auth));
+        cache
+            .insert(
+                key(Operation::Read),
+                GrantLifetime::Timed {
+                    ttl: Duration::from_secs(3_600),
+                    scope: GrantScope::Today,
+                },
+                metadata(),
+            )
+            .unwrap();
+        cache
+            .insert(key(Operation::Sign), GrantLifetime::UntilLock, metadata())
+            .unwrap();
+
+        let active = cache.active().unwrap();
+        assert_eq!(active.len(), 2);
+        assert!(active.iter().any(|grant| {
+            grant.scope == GrantScope::Today && grant.expires_at.is_some()
+        }));
+        assert!(active.iter().any(|grant| {
+            grant.scope == GrantScope::UntilLock && grant.expires_at.is_none()
+        }));
+
+        let reopened = GrantCache::open(&path, auth);
+        assert!(reopened.is_valid(&key(Operation::Read)));
+        assert!(!reopened.is_valid(&key(Operation::Sign)));
+    }
+
+    #[test]
+    fn screen_lock_revokes_only_lock_bound_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = GrantCache::open(dir.path().join("grants.json"), authenticator());
+        cache
+            .insert(
+                key(Operation::Read),
+                GrantLifetime::Timed {
+                    ttl: Duration::from_secs(3_600),
+                    scope: GrantScope::Today,
+                },
+                metadata(),
+            )
+            .unwrap();
+        cache
+            .insert(key(Operation::Sign), GrantLifetime::UntilLock, metadata())
+            .unwrap();
+
+        assert!(cache.clear_until_lock().unwrap());
+        assert!(cache.is_valid(&key(Operation::Read)));
+        assert!(!cache.is_valid(&key(Operation::Sign)));
+        assert!(!cache.clear_until_lock().unwrap());
     }
 
     #[test]
@@ -569,6 +704,7 @@ mod tests {
                 object: "secrets/fixture".to_string(),
                 operation: "read".to_string(),
                 enforcement: Enforcement::Prompt,
+                scope: GrantScope::Timed,
                 expires_at: 1,
                 client: "fixture-client".to_string(),
                 executable: None,
@@ -630,7 +766,7 @@ mod tests {
         let auth = authenticator();
         let cache = GrantCache::open(&path, Arc::clone(&auth));
         cache
-            .insert(key(Operation::Read), Duration::from_secs(600), metadata())
+            .insert(key(Operation::Read), timed(Duration::from_secs(600)), metadata())
             .unwrap();
         fs::remove_file(&path).unwrap();
 
@@ -655,7 +791,7 @@ mod tests {
         let cache = GrantCache::open(&path, Arc::clone(&auth));
 
         cache
-            .insert(key(Operation::Read), Duration::from_secs(600), metadata())
+            .insert(key(Operation::Read), timed(Duration::from_secs(600)), metadata())
             .unwrap();
         assert!(cache.is_valid(&key(Operation::Read)));
         assert!(cache.is_memory_only());
@@ -663,7 +799,7 @@ mod tests {
         fs::remove_file(&blocked_parent).unwrap();
         fs::create_dir(&blocked_parent).unwrap();
         cache
-            .insert(key(Operation::Sign), Duration::from_secs(600), metadata())
+            .insert(key(Operation::Sign), timed(Duration::from_secs(600)), metadata())
             .unwrap();
         assert!(!cache.is_memory_only());
 
@@ -679,7 +815,7 @@ mod tests {
         let auth = authenticator();
         let cache = GrantCache::open(&path, Arc::clone(&auth));
         cache
-            .insert(key(Operation::Sign), Duration::from_secs(600), metadata())
+            .insert(key(Operation::Sign), timed(Duration::from_secs(600)), metadata())
             .unwrap();
         cache.clear().unwrap();
 
@@ -691,7 +827,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cache = GrantCache::open(dir.path().join("grants.json"), authenticator());
 
-        assert!(cache.insert(key(Operation::Read), Duration::MAX, metadata()).is_err());
+        assert!(cache.insert(key(Operation::Read), timed(Duration::MAX), metadata()).is_err());
         assert!(cache.is_empty());
     }
 
@@ -702,7 +838,7 @@ mod tests {
         let auth = authenticator();
         let cache = GrantCache::open(&path, Arc::clone(&auth));
         cache
-            .insert(key(Operation::Read), Duration::from_secs(600), metadata())
+            .insert(key(Operation::Read), timed(Duration::from_secs(600)), metadata())
             .unwrap();
 
         let active = cache.active().unwrap();

@@ -732,15 +732,16 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertNil(clearValue["params"])
 
         let response = Data(
-            #"{"request_id":170,"status":"ok","result":{"type":"active_grants","value":[{"id":"fixture-grant","subject":"exe:/usr/bin/cat","object":"secrets/fixture","operation":"read","enforcement":"prompt","expires_at":1800000600,"client":"cat","executable":"/usr/bin/cat","bundle_id":null,"target":"~/.pgpass"}]}}"#.utf8)
+            #"{"request_id":170,"status":"ok","result":{"type":"active_grants","value":[{"id":"fixture-grant","subject":"exe:/usr/bin/cat","object":"secrets/fixture","operation":"read","enforcement":"prompt","scope":"today","expires_at":1800000600,"client":"cat","executable":"/usr/bin/cat","bundle_id":null,"target":"~/.pgpass"}]}}"#.utf8)
         let decoded = try JSONDecoder().decode(
             ControlResponseEnvelope<[ActiveGrant]>.self, from: response)
         let grant = try XCTUnwrap(decoded.result?.value?.first)
 
         XCTAssertEqual(decoded.result?.type, "active_grants")
         XCTAssertEqual(grant.client, "cat")
+        XCTAssertEqual(grant.scope, "today")
         XCTAssertEqual(grant.target, "~/.pgpass")
-        XCTAssertEqual(grant.expirationDate.timeIntervalSince1970, 1_800_000_600)
+        XCTAssertEqual(grant.expirationDate?.timeIntervalSince1970, 1_800_000_600)
     }
 
     func testAccessHistoryRequestAndResultMatchRustWireShape() throws {
