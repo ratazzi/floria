@@ -45,7 +45,9 @@ else
 fi
 echo "==> Building Rust daemon"
 if [[ "${SIGN_IDENTITY}" == "-" ]]; then
-    FLORIA_INSECURE_DEVELOPMENT_BUILD=1 cargo build --release -p floria
+    env -u FLORIA_SIGNING_TEAM_ID \
+        FLORIA_INSECURE_DEVELOPMENT_BUILD=1 \
+        cargo build --release -p floria
 elif [[ "${FLORIA_SIGNING_TEAM_ID}" =~ ^[A-Z0-9]{10}$ ]]; then
     FLORIA_SIGNING_TEAM_ID="${FLORIA_SIGNING_TEAM_ID}" cargo build --release -p floria
 else
