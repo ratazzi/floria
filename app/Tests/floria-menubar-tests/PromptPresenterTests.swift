@@ -50,7 +50,9 @@ final class PromptPresenterTests: XCTestCase {
 
     @MainActor
     func testExpiredPromptDeniesAndDismissesItself() async {
-        let presenter = makePresenter(lifetimeNanoseconds: 10_000_000)
+        let presenter = PromptPresenter(
+            dockVisibilityController: DockVisibilityController { _ in },
+            sleep: { _ in })
         let expired = expectation(description: "expired prompt denied")
         var observed: DecisionMsg?
 

@@ -45,6 +45,7 @@ final class PromptPresenter {
 
     private let lifetimeNanoseconds: UInt64
     private let dockVisibilityController: DockVisibilityController
+    private let sleep: @Sendable (UInt64) async throws -> Void
     private var queue = [PendingPrompt]()
     private var active: ActivePrompt?
     private var previousApplication: NSRunningApplication?
@@ -53,10 +54,14 @@ final class PromptPresenter {
 
     init(
         lifetimeNanoseconds: UInt64 = 28_000_000_000,
-        dockVisibilityController: DockVisibilityController? = nil
+        dockVisibilityController: DockVisibilityController? = nil,
+        sleep: @escaping @Sendable (UInt64) async throws -> Void = {
+            try await Task.sleep(nanoseconds: $0)
+        }
     ) {
         self.lifetimeNanoseconds = lifetimeNanoseconds
         self.dockVisibilityController = dockVisibilityController ?? .shared
+        self.sleep = sleep
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(applicationDidBecomeActive),
@@ -110,9 +115,10 @@ final class PromptPresenter {
             active = session
 
             let remaining = pending.deadline - now
+            let sleep = self.sleep
             session.timeoutTask = Task { @MainActor [weak self, weak session] in
                 do {
-                    try await Task.sleep(nanoseconds: remaining)
+                    try await sleep(remaining)
                 } catch {
                     return
                 }
