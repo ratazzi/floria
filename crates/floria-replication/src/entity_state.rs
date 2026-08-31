@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use floria_catalog::{
     validate_replicated_catalog, Binding, Environment, ReplicatedCatalog, ReplicatedProject,
-    ReplicatedSurface, Resource,
+    ReplicatedSurface, Resource, ResourceKind, SurfaceInput, SurfaceKind,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -219,8 +219,37 @@ impl CatalogEntitySet {
 
     fn project(&self, active_only: bool) -> ReplicationResult<ReplicatedCatalog> {
         let mut catalog = ReplicatedCatalog::default();
+        let promoted_ssh_access_ids = self
+            .documents
+            .values()
+            .filter(|document| document.lifecycle == EntityLifecycle::Active)
+            .filter_map(|document| match &document.state {
+                CatalogEntityState::Resource(resource)
+                    if resource.kind == ResourceKind::SshAccess =>
+                {
+                    Some(resource.id.as_str())
+                }
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
         for document in self.documents.values() {
             if active_only && document.lifecycle == EntityLifecycle::Archived {
+                continue;
+            }
+            if !active_only
+                && document.lifecycle == EntityLifecycle::Archived
+                && matches!(
+                    &document.state,
+                    CatalogEntityState::Surface(surface)
+                        if promoted_ssh_access_ids.contains(surface.id.as_str())
+                            && surface.kind == SurfaceKind::UnixSocket
+                            && matches!(surface.input, SurfaceInput::SshAgent { route: Some(_), .. })
+                )
+            {
+                // Promotion intentionally reuses the legacy surface id so the runtime socket and
+                // OpenSSH route remain stable. Retained history may therefore contain both the
+                // archived surface representation and its active Library resource replacement;
+                // they are successive forms of one route, not simultaneous conflict owners.
                 continue;
             }
             match &document.state {
@@ -394,6 +423,107 @@ mod tests {
                 CatalogEntityState::Resource(resource) if resource.kind == ResourceKind::SshAccess
             )
         }));
+    }
+
+    #[test]
+    fn promoted_ssh_access_can_retain_its_archived_legacy_surface() {
+        let mut source = source_catalog();
+        let project_id = source.projects[0].id.clone();
+        let environment_id = source.environments[0].id.clone();
+        let identity_id = "resource-77777777-7777-4777-8777-777777777777".to_string();
+        let access_id = "ssh-agent-99999999-9999-4999-8999-999999999999".to_string();
+        let binding_id = "binding-88888888-8888-4888-8888-888888888888".to_string();
+        let address = "ssh/sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string();
+        let route = SshRouteSpec {
+            host_patterns: vec!["ec2-*.example.internal".to_string()],
+            hostname: None,
+            user: Some("admin".to_string()),
+            port: None,
+            forward_agent: false,
+        };
+        source.resources.push(Resource {
+            id: identity_id.clone(),
+            name: "Fixture identity".to_string(),
+            kind: ResourceKind::SshIdentity,
+            shape: ValueShape::SshIdentity,
+            codec: ResourceCodec::Opaque,
+            default_env_key: None,
+            entries: vec![EntrySpec {
+                address: address.clone(),
+                label: "Fixture identity".to_string(),
+                key: None,
+                sensitive: false,
+            }],
+            source: ResourceSource::SecretRef {
+                secret_id: "88888888-8888-4888-8888-888888888888".to_string(),
+                managed_source_ids: Vec::new(),
+            },
+            enforcement: Enforcement::Prompt,
+            metadata: ItemMetadata::default(),
+            origin: ResourceOrigin::default(),
+        });
+        source.bindings.push(Binding {
+            id: binding_id.clone(),
+            project_id: project_id.clone(),
+            scope: BindingScope::Environment { environment_id: environment_id.clone() },
+            resource_id: identity_id.clone(),
+            selection: EntrySelection::All,
+            key_override: None,
+            enabled: true,
+            allow_override: false,
+            position: 0,
+        });
+        source.surfaces.push(ReplicatedSurface {
+            id: access_id.clone(),
+            environment_id,
+            name: "Fixture SSH access".to_string(),
+            kind: SurfaceKind::UnixSocket,
+            relative_path: None,
+            input: SurfaceInput::SshAgent {
+                binding_ids: vec![binding_id],
+                route: Some(route.clone()),
+            },
+            enforcement: Enforcement::Prompt,
+            position: 0,
+        });
+
+        let mut documents = CatalogEntitySet::from_catalog(&source)
+            .unwrap()
+            .documents()
+            .cloned()
+            .map(|document| {
+                if matches!(document.state(), CatalogEntityState::Surface(surface) if surface.id == access_id) {
+                    document.archived()
+                } else {
+                    document
+                }
+            })
+            .collect::<Vec<_>>();
+        documents.push(CatalogEntityDocument::active(CatalogEntityState::Resource(Resource {
+            id: access_id.clone(),
+            name: "Fixture SSH access".to_string(),
+            kind: ResourceKind::SshAccess,
+            shape: ValueShape::SshAccess,
+            codec: ResourceCodec::Opaque,
+            default_env_key: None,
+            entries: Vec::new(),
+            source: ResourceSource::SshAccess(Box::new(SshAccessSpec {
+                identities: vec![SshIdentitySelection {
+                    resource_id: identity_id,
+                    selection: EntrySelection::Entries { addresses: vec![address] },
+                }],
+                route,
+                project_ids: vec![project_id],
+            })),
+            enforcement: Enforcement::Prompt,
+            metadata: ItemMetadata::default(),
+            origin: ResourceOrigin::default(),
+        })));
+
+        let entities = CatalogEntitySet::from_documents(documents).unwrap();
+        let active = entities.active_catalog().unwrap();
+        assert!(active.surfaces.iter().all(|surface| surface.id != access_id));
+        assert!(active.resources.iter().any(|resource| resource.id == access_id));
     }
 
     #[test]
