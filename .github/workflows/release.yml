@@ -1,0 +1,77 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build macOS release
+    runs-on: macos-26
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install toolchain
+        uses: jdx/mise-action@v4
+        with:
+          cache: true
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install macFUSE build dependency
+        run: brew install --cask macfuse
+
+      - name: Import signing certificate
+        uses: apple-actions/import-codesign-certs@v7
+        with:
+          p12-file-base64: ${{ secrets.DEVELOPER_ID_CERTIFICATE_P12 }}
+          p12-password: ${{ secrets.DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+
+      - name: Build macOS release
+        env:
+          DEVELOPER_ID_IDENTITY: ${{ secrets.DEVELOPER_ID_IDENTITY }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          FLORIA_APP_PROVISIONING_PROFILE_BASE64: ${{ secrets.FLORIA_APP_PROVISIONING_PROFILE_BASE64 }}
+          NOTARIZE_APPLE_ID: ${{ secrets.NOTARIZE_APPLE_ID }}
+          NOTARIZE_PASSWORD: ${{ secrets.NOTARIZE_PASSWORD }}
+        run: mise run release
+
+      - name: Upload notarized DMG
+        uses: actions/upload-artifact@v7
+        with:
+          name: Floria-macos-arm64
+          path: build/Floria-*.dmg
+          if-no-files-found: error
+
+  release:
+    name: Create draft GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download notarized DMG
+        uses: actions/download-artifact@v8
+        with:
+          name: Floria-macos-arm64
+          path: artifacts
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v3
+        with:
+          draft: true
+          generate_release_notes: true
+          files: artifacts/Floria-*.dmg

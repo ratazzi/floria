@@ -604,8 +604,10 @@ mod tests {
         output
     }
 
+    type FixtureEntries = HashMap<String, (u32, Vec<Vec<u8>>)>;
+
     struct FixtureStore {
-        entries: Mutex<HashMap<String, (u32, Vec<Vec<u8>>)>>,
+        entries: Mutex<FixtureEntries>,
         requested_versions: Mutex<Vec<(String, u32)>>,
     }
 

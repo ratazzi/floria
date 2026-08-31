@@ -2942,7 +2942,7 @@ fn local_peer_verifiers(
         anyhow::bail!(
             "this build has no embedded Floria signing Team ID; refusing to derive socket trust \
              from mutable executable paths. Build a signed release with FLORIA_SIGNING_TEAM_ID, \
-             or use scripts/build-app for an explicitly insecure local development build"
+             or use 'mise run build-app' for an explicitly insecure local development build"
         );
     }
 
@@ -3754,10 +3754,23 @@ mod tests {
         std::fs::create_dir(&nested).unwrap();
         let mut watcher = ReplicationDirectoryWatcher::new().unwrap();
         watcher.replace_directory(Some(directory.path()));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_stop = std::sync::Arc::clone(&stop);
+        let writer = std::thread::spawn(move || {
+            for index in 0..20 {
+                if writer_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                std::fs::write(nested.join(format!("arrived-{index}.age")), b"fixture")
+                    .unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
 
-        std::fs::write(nested.join("arrived.age"), b"fixture").unwrap();
-
-        assert!(watcher.wait_for(std::time::Duration::from_secs(5)));
+        let woke = watcher.wait_for(std::time::Duration::from_secs(5));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        assert!(woke);
     }
 
     #[test]

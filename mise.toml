@@ -1,5 +1,24 @@
 [tools]
 rust = "1.97.1"
+ruby = "3.4.7"
+"gem:rake" = "13.3.1"
+ripgrep = "15.2.0"
+
+[tasks.ci]
+description = "Run the Rust, Swift, fixture, and packaging checks used by GitHub CI"
+run = "rake ci"
+
+[tasks.release]
+description = "Build, sign, notarize, and verify the macOS release artifact"
+depends = ["check-rust-fixtures"]
+run = "rake release"
+
+[tasks.release.env]
+DEVELOPER_ID_IDENTITY = { required = true, redact = true }
+APPLE_TEAM_ID = { required = true, redact = true }
+FLORIA_APP_PROVISIONING_PROFILE_BASE64 = { required = true, redact = true }
+NOTARIZE_APPLE_ID = { required = true, redact = true }
+NOTARIZE_PASSWORD = { required = true, redact = true }
 
 [tasks.generate-icons]
 description = "Generate the macOS app and menu-bar icons from the checked-in source image"
@@ -12,7 +31,7 @@ run = "uv run --with pillow python scripts/generate-dmg-background.py app/Assets
 [tasks.build-app]
 description = "Build and sign Floria.app without installing or launching it"
 depends = ["check-rust-fixtures"]
-run = "scripts/build-app"
+run = "rake build_app"
 
 [tasks.install-app]
 description = "Build a CloudKit-enabled Floria.app and install it in /Applications"
@@ -27,11 +46,12 @@ run = "FLORIA_INSTALL_VARIANT=development FLORIA_ALLOW_CLOUDKIT_DOWNGRADE=1 scri
 [tasks.package-dmg]
 description = "Build, sign, package, and verify a Floria DMG without overwriting an existing image"
 depends = ["check-rust-fixtures"]
-run = "scripts/package-dmg"
+run = "rake package_dmg"
 
 [tasks.notarize-dmg]
-description = "Submit a Developer ID-signed DMG using a notarytool Keychain profile"
-run = "scripts/notarize-dmg"
+description = "Submit and staple a Developer ID-signed DMG"
+usage = 'arg "<dmg>" env="DMG_PATH" help="DMG to submit and staple"'
+run = "rake notarize_dmg"
 raw = true
 
 [tasks.smoke-app]
@@ -44,6 +64,11 @@ run = '''
 set -euo pipefail
 
 PATTERN='(gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|A(KIA|SIA)[0-9A-Z]{16}|glpat-[A-Za-z0-9_-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|sk-[A-Za-z0-9_-]{16,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|-----BEGIN ([A-Z ]+)?PRIVATE KEY-----|postgres(ql)?://[A-Za-z0-9._~-]+:[^@[:space:]]+@|"[^"[:space:]:]+:[0-9*]+:[^"[:space:]:]+:[^"[:space:]:]+:[^"[:space:]:]+(\\n)?")'
+
+command -v rg >/dev/null || {
+    echo "ripgrep is required for credential fixture checks" >&2
+    exit 1
+}
 
 if rg --files-with-matches --glob '*.{rs,swift}' "$PATTERN" crates app; then
     echo "Credential-shaped value found in source; assemble structured fixture values at runtime instead."

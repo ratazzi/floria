@@ -1829,7 +1829,7 @@ mod tests {
         let source = RecordJournal::open_vault_scoped(
             directory.path(),
             &source_vault_id,
-            &[source_vault_id.clone()],
+            std::slice::from_ref(&source_vault_id),
             authenticator,
         )
         .unwrap();

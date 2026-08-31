@@ -211,7 +211,7 @@ BUILD_NUMBER="${BUILD_NUMBER}" \
     SIGN_IDENTITY="${SIGN_IDENTITY}" \
     FLORIA_SIGNING_TEAM_ID="${FLORIA_SIGNING_TEAM_ID}" \
     FLORIA_APP_PROVISIONING_PROFILE="${FLORIA_APP_PROVISIONING_PROFILE}" \
-    scripts/build-app
+    mise run build-app
 refuse_built_cloudkit_downgrade
 
 if pgrep -x "${APP_NAME}" >/dev/null; then
