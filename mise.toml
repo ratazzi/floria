@@ -1,5 +1,5 @@
 [tools]
-rust = "1.97.1"
+rust = { version = "1.97.1", components = ["clippy"] }
 ruby = "3.4.7"
 "gem:rake" = "13.3.1"
 ripgrep = "15.2.0"
