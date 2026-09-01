@@ -414,6 +414,27 @@ fi
 assert_daemon_owns_socket "${new_daemon_pid}" "${AGENT_SOCKET}"
 assert_daemon_owns_socket "${new_daemon_pid}" "${CONTROL_SOCKET}"
 
+echo "==> Verifying recovery after the protected filesystem is externally unmounted"
+unmount_runs_before="$(job_runs)"
+unmounted_daemon_pid="$(job_pid)"
+if [[ "${unmounted_daemon_pid}" == "0" ]]; then
+    echo "Could not capture the daemon generation before external unmount" >&2
+    exit 1
+fi
+"${DAEMON_PATH}" unmount --config "${CONFIG_PATH}"
+wait_for_job_restart \
+    "${unmount_runs_before}" \
+    "launchd to replace the daemon whose filesystem was externally unmounted"
+remounted_daemon_pid="$(job_pid)"
+if [[ "${remounted_daemon_pid}" == "0" ||
+    "${remounted_daemon_pid}" == "${unmounted_daemon_pid}" ]]; then
+    echo "External-unmount recovery did not replace daemon pid ${unmounted_daemon_pid}" >&2
+    exit 1
+fi
+wait_for_process_exit "${unmounted_daemon_pid}" "the externally unmounted Floria daemon"
+wait_for_doctor "the installation to remount after external unmount"
+echo "External unmount recovered daemon ${unmounted_daemon_pid} as ${remounted_daemon_pid}"
+
 run_crash_read=1
 if [[ -n "${FLORIA_SMOKE_MANAGED_READ_PATH:-}" ]]; then
     CRASH_FIXTURE_PATH="${FLORIA_SMOKE_MANAGED_READ_PATH}"

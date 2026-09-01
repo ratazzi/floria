@@ -11,6 +11,7 @@ module Floria
 
     ROOT = File.expand_path("..", __dir__)
     APP_NAME = "Floria"
+    DMG_VOLUME_NAME = "Floria Installer"
     PRODUCT_NAME = "floria-menubar"
     BUNDLE_ID = "floria.hola.ac"
     CONTAINER_ID = "iCloud.floria.hola.ac"
@@ -123,7 +124,7 @@ module Floria
         FileUtils.ln_s("/Applications", File.join(staging, "Applications"))
         FileUtils.mkdir_p(File.join(staging, ".background"))
         FileUtils.cp(background, File.join(staging, ".background/DmgBackground.tiff"))
-        run!("hdiutil", "create", "-volname", APP_NAME, "-srcfolder", staging, "-format", "UDRW", "-fs", "HFS+", writable, out: File::NULL)
+        run!("hdiutil", "create", "-volname", DMG_VOLUME_NAME, "-srcfolder", staging, "-format", "UDRW", "-fs", "HFS+", writable, out: File::NULL)
         run!("hdiutil", "attach", "-readwrite", "-noverify", "-noautoopen", "-mountpoint", mount, writable, out: File::NULL)
         mounted = true
         run!("chflags", "hidden", File.join(mount, ".background"))

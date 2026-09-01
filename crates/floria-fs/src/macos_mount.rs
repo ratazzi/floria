@@ -41,6 +41,20 @@ pub(crate) struct MacOsBackgroundSession {
 }
 
 impl MacOsBackgroundSession {
+    pub(crate) fn is_finished(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_none_or(|session| session.guard.is_finished())
+    }
+
+    /// Join a session that has already stopped because the mount disappeared externally.
+    pub(crate) fn join(mut self) -> io::Result<()> {
+        match self.session.take() {
+            Some(session) => session.join(),
+            None => Ok(()),
+        }
+    }
+
     /// Synchronously unmount, then join fuser after its duplicated device fd receives ENODEV.
     pub(crate) fn unmount_and_join(mut self) -> io::Result<()> {
         if let Some(mut mount) = self.mount.take() {

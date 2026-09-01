@@ -22,7 +22,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use floria_catalog::Catalog;
 use floria_core::audit::{AuditDependency, AuditLog};
@@ -52,6 +52,35 @@ use tree::{NodeKind, Tree};
 /// (bounded by the 30s prompt timeout); everything else keeps flowing because the fuser
 /// event loop and the fast callbacks never wait on them.
 const AUTH_POOL_THREADS: usize = 32;
+
+/// Keep the foreground daemon responsive to a mount session that disappears outside of its
+/// normal shutdown path (for example when Finder ejects the volume). The process must exit so
+/// launchd can restart it instead of leaving a live daemon lock with no mounted filesystem.
+const MOUNT_SESSION_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Eq, PartialEq)]
+enum MountStopReason {
+    ShutdownRequested,
+    SessionEnded,
+}
+
+fn wait_for_mount_stop(
+    shutdown: &std::sync::mpsc::Receiver<()>,
+    session_finished: impl Fn() -> bool,
+    poll_interval: Duration,
+) -> MountStopReason {
+    loop {
+        if session_finished() {
+            return MountStopReason::SessionEnded;
+        }
+        match shutdown.recv_timeout(poll_interval) {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return MountStopReason::ShutdownRequested;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+}
 
 /// Lazily allocated, mount-stable inode registry for one dynamic namespace.
 struct InoMap {
@@ -2032,14 +2061,37 @@ pub fn mount_with_audit(
     let session = fuser::spawn_mount2(fs, &mount_point, &config)?;
 
     tracing::info!("mounted; press Ctrl-C to unmount");
-    let _ = rx.recv();
-
-    tracing::info!(mount = %mount_point.display(), "unmounting");
     #[cfg(all(target_os = "macos", not(feature = "macos-no-mount")))]
-    session.unmount_and_join()?;
+    let stop_reason = wait_for_mount_stop(
+        &rx,
+        || session.is_finished(),
+        MOUNT_SESSION_POLL_INTERVAL,
+    );
     #[cfg(not(all(target_os = "macos", not(feature = "macos-no-mount"))))]
-    drop(session); // fuser's mounted BackgroundSession unmounts on drop.
-    Ok(())
+    let stop_reason = wait_for_mount_stop(
+        &rx,
+        || session.guard.is_finished(),
+        MOUNT_SESSION_POLL_INTERVAL,
+    );
+
+    match stop_reason {
+        MountStopReason::ShutdownRequested => {
+            tracing::info!(mount = %mount_point.display(), "unmounting");
+            #[cfg(all(target_os = "macos", not(feature = "macos-no-mount")))]
+            session.unmount_and_join()?;
+            #[cfg(not(all(target_os = "macos", not(feature = "macos-no-mount"))))]
+            drop(session); // fuser's mounted BackgroundSession unmounts on drop.
+            Ok(())
+        }
+        MountStopReason::SessionEnded => {
+            tracing::error!(mount = %mount_point.display(), "filesystem session ended unexpectedly; exiting so launchd can restart it");
+            #[cfg(all(target_os = "macos", not(feature = "macos-no-mount")))]
+            session.join()?;
+            #[cfg(not(all(target_os = "macos", not(feature = "macos-no-mount"))))]
+            session.join()?;
+            anyhow::bail!("filesystem session ended unexpectedly")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2069,6 +2121,100 @@ mod tests {
     const MANAGED_SECRET_ID: &str = "00000000-0000-0000-0000-000000000402";
     const INI_SECRET_ID: &str = "00000000-0000-0000-0000-000000000403";
     const DIRECT_SECRET_ID: &str = "00000000-0000-0000-0000-000000000404";
+
+    #[test]
+    fn mount_wait_detects_an_ended_session() {
+        let (_shutdown_tx, shutdown_rx) = mpsc::channel();
+
+        assert_eq!(
+            wait_for_mount_stop(&shutdown_rx, || true, Duration::from_millis(1)),
+            MountStopReason::SessionEnded
+        );
+    }
+
+    #[test]
+    fn mount_wait_honors_a_shutdown_request() {
+        let (shutdown_tx, shutdown_rx) = mpsc::channel();
+        shutdown_tx.send(()).unwrap();
+
+        assert_eq!(
+            wait_for_mount_stop(&shutdown_rx, || false, Duration::from_millis(1)),
+            MountStopReason::ShutdownRequested
+        );
+    }
+
+    #[cfg(all(target_os = "macos", not(feature = "macos-no-mount")))]
+    #[test]
+    #[ignore = "requires the live macFUSE kernel backend"]
+    fn externally_unmounted_session_returns_instead_of_leaving_a_zombie_daemon() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "floria-external-unmount-test-{}",
+            std::process::id()
+        ));
+        let mount_path = root.join("mount");
+        let config_path = root.join("floria.toml");
+        let audit_path = root.join("audit.jsonl");
+        std::fs::create_dir_all(&mount_path).unwrap();
+        std::fs::write(
+            &config_path,
+            format!(
+                r#"[mount]
+path = "{}"
+volname = "Floria Lifecycle Test"
+audit_log = "{}"
+
+[agent]
+socket = "{}"
+
+[store]
+root = "{}"
+ssh_key = "{}"
+key_source = "ssh"
+"#,
+                mount_path.display(),
+                audit_path.display(),
+                root.join("agent.sock").display(),
+                root.join("store").display(),
+                root.join("unused-key").display(),
+            ),
+        )
+        .unwrap();
+        let cfg = floria_core::config::Config::load(&config_path).unwrap();
+        let audit = Arc::new(AuditLog::open(&audit_path).unwrap());
+        let unmount_path = CString::new(mount_path.as_os_str().as_bytes()).unwrap();
+        let unmount_worker = std::thread::spawn(move || {
+            for _ in 0..250 {
+                // SAFETY: `unmount_path` is a live, NUL-terminated path for the duration of each
+                // call. Before the mount is ready, unmount returns an error and the loop retries.
+                if unsafe { libc::unmount(unmount_path.as_ptr(), 0) } == 0 {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            panic!("timed out waiting to externally unmount the test filesystem");
+        });
+
+        let result = mount_with_audit(
+            cfg,
+            Arc::new(AllowAll),
+            None,
+            None,
+            None,
+            audit,
+            Arc::new(ManagedMutationCoordinator::new()),
+        );
+        unmount_worker.join().unwrap();
+
+        let error = result.expect_err("an externally removed mount must stop the daemon");
+        assert!(
+            error.to_string().contains("filesystem session ended unexpectedly"),
+            "unexpected mount error: {error:#}"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[derive(Clone)]
     struct StoredFixture {
