@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import subprocess
+import tempfile
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
@@ -11,13 +13,13 @@ from PIL import Image, ImageDraw, ImageFont
 
 WIDTH = 660
 HEIGHT = 420
-SCALE = 2
+SUPERSAMPLE = 2
 BLUE = (20, 126, 245, 255)
 
 
-def font(size: int, *, rounded: bool = False) -> ImageFont.FreeTypeFont:
+def font(size: int, scale: int, *, rounded: bool = False) -> ImageFont.FreeTypeFont:
     family = "SFNSRounded.ttf" if rounded else "SFNS.ttf"
-    return ImageFont.truetype(f"/System/Library/Fonts/{family}", size * SCALE)
+    return ImageFont.truetype(f"/System/Library/Fonts/{family}", size * scale)
 
 
 def centered_text(
@@ -26,14 +28,16 @@ def centered_text(
     text: str,
     text_font: ImageFont.FreeTypeFont,
     fill: tuple[int, int, int, int],
+    scale: int,
 ) -> None:
     bounds = draw.textbbox((0, 0), text, font=text_font)
     width = bounds[2] - bounds[0]
-    draw.text(((WIDTH * SCALE - width) / 2, y * SCALE), text, font=text_font, fill=fill)
+    draw.text(((WIDTH * scale - width) / 2, y * scale), text, font=text_font, fill=fill)
 
 
-def render() -> Image.Image:
-    size = (WIDTH * SCALE, HEIGHT * SCALE)
+def render(representation_scale: int) -> Image.Image:
+    scale = representation_scale * SUPERSAMPLE
+    size = (WIDTH * scale, HEIGHT * scale)
     image = Image.new("RGBA", size, (255, 255, 255, 255))
     pixels = image.load()
 
@@ -53,42 +57,74 @@ def render() -> Image.Image:
             )
 
     draw = ImageDraw.Draw(image, "RGBA")
-    centered_text(draw, 43, "Install Floria", font(28, rounded=True), (26, 34, 45, 255))
+    centered_text(
+        draw,
+        43,
+        "Install Floria",
+        font(28, scale, rounded=True),
+        (26, 34, 45, 255),
+        scale,
+    )
     centered_text(
         draw,
         82,
         "Drag Floria to Applications",
-        font(15),
+        font(15, scale),
         (86, 96, 111, 230),
+        scale,
     )
 
-    arrow_y = 226 * SCALE
-    arrow_start = 278 * SCALE
-    arrow_end = 382 * SCALE
+    arrow_y = 226 * scale
+    arrow_start = 278 * scale
+    arrow_end = 382 * scale
     draw.line(
         (arrow_start, arrow_y, arrow_end, arrow_y),
         fill=(*BLUE[:3], 150),
-        width=3 * SCALE,
+        width=3 * scale,
     )
     draw.line(
-        (arrow_end - 15 * SCALE, arrow_y - 12 * SCALE, arrow_end, arrow_y),
+        (arrow_end - 15 * scale, arrow_y - 12 * scale, arrow_end, arrow_y),
         fill=(*BLUE[:3], 150),
-        width=3 * SCALE,
+        width=3 * scale,
     )
     draw.line(
-        (arrow_end - 15 * SCALE, arrow_y + 12 * SCALE, arrow_end, arrow_y),
+        (arrow_end - 15 * scale, arrow_y + 12 * scale, arrow_end, arrow_y),
         fill=(*BLUE[:3], 150),
-        width=3 * SCALE,
+        width=3 * scale,
     )
 
     centered_text(
         draw,
         378,
         "Your encrypted Library stays on this Mac.",
-        font(12),
+        font(12, scale),
         (109, 118, 131, 185),
+        scale,
     )
-    return image.resize((WIDTH, HEIGHT), Image.Resampling.LANCZOS).convert("RGB")
+    return image.resize(
+        (WIDTH * representation_scale, HEIGHT * representation_scale),
+        Image.Resampling.LANCZOS,
+    ).convert("RGB")
+
+
+def save_retina_tiff(destination: Path) -> None:
+    with tempfile.TemporaryDirectory(prefix="floria-dmg-background.") as directory:
+        directory_path = Path(directory)
+        standard = directory_path / "DmgBackground.tiff"
+        retina = directory_path / "DmgBackground@2x.tiff"
+        render(1).save(standard, compression="tiff_lzw", dpi=(72, 72))
+        render(2).save(retina, compression="tiff_lzw", dpi=(144, 144))
+        subprocess.run(
+            [
+                "/usr/bin/tiffutil",
+                "-cathidpicheck",
+                str(standard),
+                str(retina),
+                "-out",
+                str(destination),
+            ],
+            check=True,
+        )
 
 
 def main() -> None:
@@ -96,7 +132,7 @@ def main() -> None:
     parser.add_argument("destination", type=Path)
     args = parser.parse_args()
     args.destination.parent.mkdir(parents=True, exist_ok=True)
-    render().save(args.destination, optimize=True)
+    save_retina_tiff(args.destination)
 
 
 if __name__ == "__main__":

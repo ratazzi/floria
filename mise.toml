@@ -26,7 +26,7 @@ run = "uv run --with pillow python scripts/generate-app-icons.py app/Assets/Flor
 
 [tasks.generate-dmg-background]
 description = "Generate the checked-in installer background"
-run = "uv run --with pillow python scripts/generate-dmg-background.py app/Assets/DmgBackground.png"
+run = "uv run --with pillow python scripts/generate-dmg-background.py app/Assets/DmgBackground.tiff"
 
 [tasks.build-app]
 description = "Build and sign Floria.app without installing or launching it"

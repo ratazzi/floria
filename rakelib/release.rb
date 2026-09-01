@@ -107,7 +107,7 @@ module Floria
       version = File.read(File.join(ROOT, "Cargo.toml"))[/^version = "([^"]+)"$/, 1]
       identity = ENV.fetch("SIGN_IDENTITY", "-")
       output = File.expand_path(ENV.fetch("OUTPUT_DMG", "build/#{APP_NAME}-#{version}.dmg"), ROOT)
-      background = File.join(ROOT, "app/Assets/DmgBackground.png")
+      background = File.join(ROOT, "app/Assets/DmgBackground.tiff")
       raise "Refusing to overwrite existing DMG: #{output}" if File.exist?(output)
       raise "DMG background is missing; run mise run generate-dmg-background" unless File.file?(background)
 
@@ -122,7 +122,7 @@ module Floria
         run!("ditto", APP_BUNDLE, File.join(staging, "#{APP_NAME}.app"))
         FileUtils.ln_s("/Applications", File.join(staging, "Applications"))
         FileUtils.mkdir_p(File.join(staging, ".background"))
-        FileUtils.cp(background, File.join(staging, ".background/DmgBackground.png"))
+        FileUtils.cp(background, File.join(staging, ".background/DmgBackground.tiff"))
         run!("hdiutil", "create", "-volname", APP_NAME, "-srcfolder", staging, "-format", "UDRW", "-fs", "HFS+", writable, out: File::NULL)
         run!("hdiutil", "attach", "-readwrite", "-noverify", "-noautoopen", "-mountpoint", mount, writable, out: File::NULL)
         mounted = true
@@ -142,7 +142,7 @@ module Floria
         mounted = true
         mounted_app = File.join(mount, "#{APP_NAME}.app")
         raise "DMG Applications link does not point to /Applications" unless File.readlink(File.join(mount, "Applications")) == "/Applications"
-        raise "DMG visual layout metadata is incomplete" unless File.file?(File.join(mount, ".background/DmgBackground.png")) && File.file?(File.join(mount, ".DS_Store"))
+        raise "DMG visual layout metadata is incomplete" unless File.file?(File.join(mount, ".background/DmgBackground.tiff")) && File.file?(File.join(mount, ".DS_Store"))
         bundle = capture!("/usr/libexec/PlistBuddy", "-c", "Print :CFBundleIdentifier", File.join(mounted_app, "Contents/Info.plist")).strip
         raise "DMG app has the wrong bundle identifier" unless bundle == BUNDLE_ID
 
@@ -225,12 +225,14 @@ module Floria
             set toolbar visible of container window to false
             set statusbar visible of container window to false
             set pathbar visible of container window to false
-            set the bounds of container window to {120, 120, 780, 540}
+            -- Finder bounds include the 32 pt title bar. A 452 pt outer height
+            -- leaves the icon view at the background's full 420 pt height.
+            set the bounds of container window to {120, 120, 780, 572}
             set viewOptions to the icon view options of container window
             set arrangement of viewOptions to not arranged
             set icon size of viewOptions to 96
             set text size of viewOptions to 13
-            set background picture of viewOptions to file ".background:DmgBackground.png"
+            set background picture of viewOptions to file ".background:DmgBackground.tiff"
             set position of item "#{APP_NAME}.app" of container window to {180, 235}
             set position of item "Applications" of container window to {480, 235}
             update without registering applications
