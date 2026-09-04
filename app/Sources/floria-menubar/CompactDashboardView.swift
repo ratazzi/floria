@@ -108,6 +108,9 @@ struct DashboardView: View {
 
     var body: some View {
         ZStack {
+            Color(nsColor: .controlBackgroundColor)
+                .ignoresSafeArea()
+
             VStack(spacing: 0) {
                 header
                 Divider()
@@ -150,7 +153,7 @@ struct DashboardView: View {
                     .allowsHitTesting(false)
             }
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .ignoresSafeArea(.container, edges: .top)
         .sheet(item: $state.macFuseSetupStage) { stage in
             MacFuseSetupView(state: state, stage: stage)
@@ -307,6 +310,7 @@ struct DashboardView: View {
                 RoundedRectangle(cornerRadius: 8)
                     .stroke(Color.secondary.opacity(0.18), lineWidth: 1)
             }
+            .layoutPriority(1)
 
             Menu {
                 Button("Protect File", systemImage: "lock.fill") {
@@ -329,6 +333,7 @@ struct DashboardView: View {
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
             .accessibilityLabel("Add Library item")
+            .fixedSize()
 
             Divider().frame(height: 28)
 
@@ -348,6 +353,7 @@ struct DashboardView: View {
             .buttonStyle(.plain)
             .foregroundStyle(isDiscovering ? Color.secondary : Color.primary)
             .disabled(isDiscovering)
+            .fixedSize()
 
             policyMenu
 
@@ -395,9 +401,11 @@ struct DashboardView: View {
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
             .accessibilityLabel("More actions")
+            .fixedSize()
         }
         .padding(.leading, 82)
         .padding(.trailing, 16)
+        .frame(maxWidth: .infinity)
         .frame(height: 52)
         .gesture(WindowDragGesture())
     }

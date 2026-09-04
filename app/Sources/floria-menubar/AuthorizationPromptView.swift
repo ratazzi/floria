@@ -264,6 +264,7 @@ struct AuthorizationPromptView: View {
             .padding(.vertical, 16)
         }
         .frame(width: 520, height: frameHeight)
+        .background(Color(nsColor: .controlBackgroundColor).ignoresSafeArea())
     }
 
     private var requestHeader: some View {

@@ -64,6 +64,7 @@ struct FloriaMenuBarApp: App {
                     .renderingMode(.template)
                     .foregroundStyle(
                         state.policyMode.isAuditOnly() ? Color.orange : Color.primary)
+                    .accessibilityLabel("Floria")
             } else {
                 Image(
                     systemName: state.policyMode.isAuditOnly()
@@ -71,6 +72,7 @@ struct FloriaMenuBarApp: App {
                     .symbolRenderingMode(.hierarchical)
                     .foregroundStyle(
                         state.policyMode.isAuditOnly() ? Color.orange : Color.primary)
+                    .accessibilityLabel("Floria")
             }
         }
         // `.window` turns the dropdown into a real anchored window that hosts arbitrary

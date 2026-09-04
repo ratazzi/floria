@@ -18,13 +18,43 @@ final class MenuBarPresentationTests: XCTestCase {
         XCTAssertTrue(source.contains(#"title: "Quit Floria", icon: "xmark.square""#))
     }
 
+    func testMenuBarContentOwnsItsVerticalSizeAndBackground() throws {
+        let source = try menuBarSource()
+
+        XCTAssertTrue(
+            source.contains(
+                ".frame(width: 360)\n"
+                    + "        .fixedSize(horizontal: false, vertical: true)\n"
+                    + "        .background(Color(nsColor: .controlBackgroundColor))"),
+            "The MenuBarExtra host must not stretch transparent content above the menu body."
+        )
+    }
+
+    func testStatusItemHasAnAccessibleProductName() throws {
+        let source = try appSource()
+
+        XCTAssertEqual(
+            source.components(separatedBy: #".accessibilityLabel("Floria")"#).count - 1,
+            2
+        )
+    }
+
     private func menuBarSource() throws -> String {
+        try source("MenuBarView.swift")
+    }
+
+    private func appSource() throws -> String {
+        try source("App.swift")
+    }
+
+    private func source(_ name: String) throws -> String {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
         let sourceURL = packageRoot
-            .appendingPathComponent("Sources/floria-menubar/MenuBarView.swift")
+            .appendingPathComponent("Sources/floria-menubar")
+            .appendingPathComponent(name)
         return try String(contentsOf: sourceURL, encoding: .utf8)
     }
 }
