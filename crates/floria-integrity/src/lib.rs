@@ -4,7 +4,7 @@
 //! the invariant that a persisted security decision is accepted only when its HMAC and monotonic
 //! Keychain checkpoint both verify.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -18,15 +18,17 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 type HmacSha256 = Hmac<Sha256>;
 
 const ENVELOPE_FORMAT: u32 = 1;
+const AUTHORITY_FORMAT: u32 = 1;
 const KEY_BYTES: usize = 32;
 const KEYCHAIN_SERVICE: &str = "floria.hola.ac.integrity";
-const KEYCHAIN_KEY_ACCOUNT: &str = "state-authentication-key";
+const KEYCHAIN_AUTHORITY_ACCOUNT: &str = "state-authentication-key";
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+static KEYCHAIN_AUTHORITY_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Error)]
 pub enum IntegrityError {
@@ -59,6 +61,54 @@ trait CheckpointStore: Send + Sync {
     fn store(&self, domain: &str, checkpoint: &Checkpoint) -> IntegrityResult<()>;
 }
 
+trait CredentialStore: Send + Sync {
+    fn load(&self, account: &str) -> IntegrityResult<Option<Vec<u8>>>;
+    fn store(&self, account: &str, value: &[u8]) -> IntegrityResult<()>;
+    fn delete(&self, account: &str) -> IntegrityResult<()>;
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthorityRecord {
+    format: u32,
+    key: String,
+    checkpoints: BTreeMap<String, Checkpoint>,
+}
+
+impl AuthorityRecord {
+    fn new(key: &[u8]) -> Self {
+        Self {
+            format: AUTHORITY_FORMAT,
+            key: base64::engine::general_purpose::STANDARD.encode(key),
+            checkpoints: BTreeMap::new(),
+        }
+    }
+
+    fn key_bytes(&self) -> IntegrityResult<Vec<u8>> {
+        if self.format != AUTHORITY_FORMAT {
+            return Err(IntegrityError::Keychain(format!(
+                "{KEYCHAIN_SERVICE}/{KEYCHAIN_AUTHORITY_ACCOUNT} has unsupported format {}",
+                self.format
+            )));
+        }
+        let key = base64::engine::general_purpose::STANDARD
+            .decode(&self.key)
+            .map_err(|error| {
+                IntegrityError::Keychain(format!(
+                    "{KEYCHAIN_SERVICE}/{KEYCHAIN_AUTHORITY_ACCOUNT} has an invalid key: {error}"
+                ))
+            })?;
+        validate_key_length(&key)?;
+        Ok(key)
+    }
+}
+
+impl Drop for AuthorityRecord {
+    fn drop(&mut self) {
+        self.key.zeroize();
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Envelope {
     format: u32,
@@ -82,40 +132,21 @@ pub struct StateAuthenticator {
 
 impl StateAuthenticator {
     /// Open the production authority. The HMAC key and anti-rollback checkpoints live in the
-    /// login Keychain and are never persisted beside the files they authenticate.
+    /// login Keychain as one versioned record and are never persisted beside the files they
+    /// authenticate.
     #[cfg(target_os = "macos")]
     pub fn keychain() -> IntegrityResult<Self> {
-        let key = match security_framework::passwords::get_generic_password(
-            KEYCHAIN_SERVICE,
-            KEYCHAIN_KEY_ACCOUNT,
-        ) {
-            Ok(key) => key,
-            Err(error)
-                if error.code() == security_framework_sys::base::errSecItemNotFound =>
-            {
-                let mut key = vec![0_u8; KEY_BYTES];
-                security_framework::random::SecRandom::default()
-                    .copy_bytes(&mut key)
-                    .map_err(|error| IntegrityError::Keychain(error.to_string()))?;
-                security_framework::passwords::set_generic_password(
-                    KEYCHAIN_SERVICE,
-                    KEYCHAIN_KEY_ACCOUNT,
-                    &key,
-                )
+        let credentials: Arc<dyn CredentialStore> = Arc::new(KeychainCredentials);
+        let (key, checkpoints) = open_credential_authority(credentials, || {
+            let mut key = vec![0_u8; KEY_BYTES];
+            security_framework::random::SecRandom::default()
+                .copy_bytes(&mut key)
                 .map_err(|error| IntegrityError::Keychain(error.to_string()))?;
-                key
-            }
-            Err(error) => return Err(IntegrityError::Keychain(error.to_string())),
-        };
-        if key.len() != KEY_BYTES {
-            return Err(IntegrityError::Keychain(format!(
-                "{KEYCHAIN_SERVICE}/{KEYCHAIN_KEY_ACCOUNT} has invalid length {}",
-                key.len()
-            )));
-        }
+            Ok(key)
+        })?;
         Ok(Self {
             key: Arc::new(Zeroizing::new(key)),
-            checkpoints: Arc::new(KeychainCheckpoints),
+            checkpoints,
         })
     }
 
@@ -288,31 +319,174 @@ impl StateAuthenticator {
     }
 }
 
-#[cfg(target_os = "macos")]
-struct KeychainCheckpoints;
+/// Checkpoints share one credential record. Product mutations have one daemon writer; the static
+/// lock additionally prevents read-modify-write loss between its worker threads and authenticator
+/// instances in the same process.
+struct CredentialCheckpoints {
+    credentials: Arc<dyn CredentialStore>,
+}
+
+impl CheckpointStore for CredentialCheckpoints {
+    fn load(&self, domain: &str) -> IntegrityResult<Option<Checkpoint>> {
+        let account = legacy_checkpoint_account(domain);
+        let record = load_authority_record(self.credentials.as_ref())?;
+        if let Some(checkpoint) = record.checkpoints.get(&account) {
+            return Ok(Some(checkpoint.clone()));
+        }
+
+        let Some(bytes) = self.credentials.load(&account)? else {
+            return Ok(None);
+        };
+        let checkpoint = serde_json::from_slice::<Checkpoint>(&bytes)?;
+        self.merge_legacy_checkpoint(&account, &checkpoint)?;
+        Ok(Some(checkpoint))
+    }
+
+    fn store(&self, domain: &str, checkpoint: &Checkpoint) -> IntegrityResult<()> {
+        let account = legacy_checkpoint_account(domain);
+        let _guard = KEYCHAIN_AUTHORITY_WRITE_LOCK
+            .lock()
+            .map_err(|_| keychain_error("authority write lock is poisoned"))?;
+        let mut record = load_authority_record(self.credentials.as_ref())?;
+        record.checkpoints.insert(account, checkpoint.clone());
+        store_and_verify_authority_record(self.credentials.as_ref(), &record)
+    }
+}
+
+impl CredentialCheckpoints {
+    fn merge_legacy_checkpoint(
+        &self,
+        legacy_account: &str,
+        checkpoint: &Checkpoint,
+    ) -> IntegrityResult<()> {
+        let _guard = KEYCHAIN_AUTHORITY_WRITE_LOCK
+            .lock()
+            .map_err(|_| keychain_error("authority write lock is poisoned"))?;
+        let mut record = load_authority_record(self.credentials.as_ref())?;
+        match record.checkpoints.get(legacy_account) {
+            Some(existing) if existing != checkpoint => {
+                return Err(keychain_error(format!(
+                    "legacy checkpoint {legacy_account} conflicts with the migrated authority record"
+                )));
+            }
+            Some(_) => {}
+            None => {
+                record
+                    .checkpoints
+                    .insert(legacy_account.to_string(), checkpoint.clone());
+                store_and_verify_authority_record(self.credentials.as_ref(), &record)?;
+            }
+        }
+
+        // The aggregate record is authoritative after the verified write. Failure to remove the
+        // legacy item must not make the authenticated state unavailable; it will remain inert.
+        let _ = self.credentials.delete(legacy_account);
+        Ok(())
+    }
+}
+
+fn open_credential_authority(
+    credentials: Arc<dyn CredentialStore>,
+    create_key: impl FnOnce() -> IntegrityResult<Vec<u8>>,
+) -> IntegrityResult<(Vec<u8>, Arc<dyn CheckpointStore>)> {
+    let key = match credentials.load(KEYCHAIN_AUTHORITY_ACCOUNT)? {
+        Some(bytes) if bytes.len() == KEY_BYTES => {
+            validate_key_length(&bytes)?;
+            let record = AuthorityRecord::new(&bytes);
+            store_and_verify_authority_record(credentials.as_ref(), &record)?;
+            bytes
+        }
+        Some(bytes) => decode_authority_record(&bytes)?.key_bytes()?,
+        None => {
+            let key = create_key()?;
+            validate_key_length(&key)?;
+            let record = AuthorityRecord::new(&key);
+            store_and_verify_authority_record(credentials.as_ref(), &record)?;
+            key
+        }
+    };
+    let checkpoints: Arc<dyn CheckpointStore> = Arc::new(CredentialCheckpoints { credentials });
+    Ok((key, checkpoints))
+}
+
+fn load_authority_record(credentials: &dyn CredentialStore) -> IntegrityResult<AuthorityRecord> {
+    let bytes = credentials.load(KEYCHAIN_AUTHORITY_ACCOUNT)?.ok_or_else(|| {
+        keychain_error(format!(
+            "{KEYCHAIN_SERVICE}/{KEYCHAIN_AUTHORITY_ACCOUNT} disappeared while Floria was running"
+        ))
+    })?;
+    decode_authority_record(&bytes)
+}
+
+fn decode_authority_record(bytes: &[u8]) -> IntegrityResult<AuthorityRecord> {
+    let record = serde_json::from_slice::<AuthorityRecord>(bytes).map_err(|error| {
+        keychain_error(format!(
+            "{KEYCHAIN_SERVICE}/{KEYCHAIN_AUTHORITY_ACCOUNT} is not a valid authority record: {error}"
+        ))
+    })?;
+    record.key_bytes()?;
+    Ok(record)
+}
+
+fn store_and_verify_authority_record(
+    credentials: &dyn CredentialStore,
+    record: &AuthorityRecord,
+) -> IntegrityResult<()> {
+    credentials.store(KEYCHAIN_AUTHORITY_ACCOUNT, &serde_json::to_vec(record)?)?;
+    let verified = load_authority_record(credentials)?;
+    if verified.key != record.key || verified.checkpoints != record.checkpoints {
+        return Err(keychain_error("authority record did not round-trip exactly"));
+    }
+    Ok(())
+}
+
+fn validate_key_length(key: &[u8]) -> IntegrityResult<()> {
+    if key.len() == KEY_BYTES {
+        Ok(())
+    } else {
+        Err(keychain_error(format!(
+            "{KEYCHAIN_SERVICE}/{KEYCHAIN_AUTHORITY_ACCOUNT} has invalid key length {}",
+            key.len()
+        )))
+    }
+}
+
+fn keychain_error(reason: impl Into<String>) -> IntegrityError {
+    IntegrityError::Keychain(reason.into())
+}
 
 #[cfg(target_os = "macos")]
-impl CheckpointStore for KeychainCheckpoints {
-    fn load(&self, domain: &str) -> IntegrityResult<Option<Checkpoint>> {
-        let account = checkpoint_account(domain);
-        match security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, &account) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(IntegrityError::from),
+struct KeychainCredentials;
+
+#[cfg(target_os = "macos")]
+impl CredentialStore for KeychainCredentials {
+    fn load(&self, account: &str) -> IntegrityResult<Option<Vec<u8>>> {
+        match security_framework::passwords::get_generic_password(KEYCHAIN_SERVICE, account) {
+            Ok(bytes) => Ok(Some(bytes)),
             Err(error)
                 if error.code() == security_framework_sys::base::errSecItemNotFound =>
             {
                 Ok(None)
             }
-            Err(error) => Err(IntegrityError::Keychain(error.to_string())),
+            Err(error) => Err(keychain_error(error.to_string())),
         }
     }
 
-    fn store(&self, domain: &str, checkpoint: &Checkpoint) -> IntegrityResult<()> {
-        security_framework::passwords::set_generic_password(
-            KEYCHAIN_SERVICE,
-            &checkpoint_account(domain),
-            &serde_json::to_vec(checkpoint)?,
-        )
-        .map_err(|error| IntegrityError::Keychain(error.to_string()))
+    fn store(&self, account: &str, value: &[u8]) -> IntegrityResult<()> {
+        security_framework::passwords::set_generic_password(KEYCHAIN_SERVICE, account, value)
+            .map_err(|error| keychain_error(error.to_string()))
+    }
+
+    fn delete(&self, account: &str) -> IntegrityResult<()> {
+        match security_framework::passwords::delete_generic_password(KEYCHAIN_SERVICE, account) {
+            Ok(()) => Ok(()),
+            Err(error)
+                if error.code() == security_framework_sys::base::errSecItemNotFound =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(keychain_error(error.to_string())),
+        }
     }
 }
 
@@ -333,7 +507,7 @@ impl CheckpointStore for MemoryCheckpoints {
     }
 }
 
-fn checkpoint_account(domain: &str) -> String {
+fn legacy_checkpoint_account(domain: &str) -> String {
     let digest = Sha256::digest(domain.as_bytes());
     format!(
         "checkpoint-{}",
@@ -391,6 +565,110 @@ mod tests {
     #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
     struct Fixture {
         value: String,
+    }
+
+    #[derive(Default)]
+    struct MemoryCredentials(Mutex<HashMap<String, Vec<u8>>>);
+
+    impl MemoryCredentials {
+        fn insert(&self, account: impl Into<String>, value: Vec<u8>) {
+            self.0.lock().unwrap().insert(account.into(), value);
+        }
+
+        fn accounts(&self) -> Vec<String> {
+            let mut accounts = self.0.lock().unwrap().keys().cloned().collect::<Vec<_>>();
+            accounts.sort();
+            accounts
+        }
+    }
+
+    impl CredentialStore for MemoryCredentials {
+        fn load(&self, account: &str) -> IntegrityResult<Option<Vec<u8>>> {
+            Ok(self.0.lock().unwrap().get(account).cloned())
+        }
+
+        fn store(&self, account: &str, value: &[u8]) -> IntegrityResult<()> {
+            self.0.lock().unwrap().insert(account.to_string(), value.to_vec());
+            Ok(())
+        }
+
+        fn delete(&self, account: &str) -> IntegrityResult<()> {
+            self.0.lock().unwrap().remove(account);
+            Ok(())
+        }
+    }
+
+    fn credential_authenticator(
+        credentials: Arc<MemoryCredentials>,
+        key: [u8; KEY_BYTES],
+    ) -> StateAuthenticator {
+        let store: Arc<dyn CredentialStore> = credentials;
+        let (key, checkpoints) =
+            open_credential_authority(store, || Ok(key.to_vec())).unwrap();
+        StateAuthenticator { key: Arc::new(Zeroizing::new(key)), checkpoints }
+    }
+
+    #[test]
+    fn integrity_authority_uses_one_keychain_item_across_domains() {
+        let dir = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(MemoryCredentials::default());
+        let auth = credential_authenticator(Arc::clone(&credentials), [5; KEY_BYTES]);
+        let domains = [
+            "encrypted-store-security-state",
+            "catalog-security-state",
+            "authorization-grants",
+            "global-policy-mode",
+            "audit-log-checkpoint",
+            "replication-runtime-settings",
+        ];
+        for domain in domains {
+            auth.persist(
+                &dir.path().join(format!("{domain}.json")),
+                domain,
+                0,
+                &Fixture { value: domain.into() },
+            )
+            .unwrap();
+        }
+
+        assert_eq!(credentials.accounts(), [KEYCHAIN_AUTHORITY_ACCOUNT]);
+
+        let reopened = credential_authenticator(Arc::clone(&credentials), [99; KEY_BYTES]);
+        for domain in domains {
+            let loaded = reopened
+                .load::<Fixture>(&dir.path().join(format!("{domain}.json")), domain)
+                .unwrap();
+            assert_eq!(loaded.value.unwrap().value, domain);
+        }
+    }
+
+    #[test]
+    fn migrates_legacy_key_and_checkpoint_into_the_authority_item() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let domain = "catalog-security-state";
+        let key = [13; KEY_BYTES];
+        let legacy = StateAuthenticator::for_tests(key);
+        legacy
+            .persist(&path, domain, 0, &Fixture { value: "legacy".into() })
+            .unwrap();
+        let checkpoint = legacy.checkpoints.load(domain).unwrap().unwrap();
+
+        let credentials = Arc::new(MemoryCredentials::default());
+        credentials.insert(KEYCHAIN_AUTHORITY_ACCOUNT, key.to_vec());
+        credentials.insert(
+            legacy_checkpoint_account(domain),
+            serde_json::to_vec(&checkpoint).unwrap(),
+        );
+        let auth = credential_authenticator(Arc::clone(&credentials), [99; KEY_BYTES]);
+
+        let loaded = auth.load::<Fixture>(&path, domain).unwrap();
+        assert_eq!(loaded.value.unwrap().value, "legacy");
+        assert_eq!(credentials.accounts(), [KEYCHAIN_AUTHORITY_ACCOUNT]);
+
+        let record = load_authority_record(credentials.as_ref()).unwrap();
+        assert_eq!(record.key_bytes().unwrap(), key);
+        assert_eq!(record.checkpoints.get(&legacy_checkpoint_account(domain)), Some(&checkpoint));
     }
 
     #[test]
