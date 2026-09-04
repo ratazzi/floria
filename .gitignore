@@ -16,3 +16,5 @@ id_*
 
 # Local Claude Code settings (machine-specific, not for commit)
 .claude/settings.local.json
+*.dmg
+.DS_Store

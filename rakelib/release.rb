@@ -15,6 +15,7 @@ module Floria
     PRODUCT_NAME = "floria-menubar"
     BUNDLE_ID = "floria.hola.ac"
     CONTAINER_ID = "iCloud.floria.hola.ac"
+    MACFUSE_TEAM_ID = "3T5GSNBU6W"
     APP_BUNDLE = File.join(ROOT, "app/.build/Floria.app")
 
     def run!(*command, env: {}, stdin_data: nil, **options)
@@ -29,6 +30,13 @@ module Floria
     def capture!(*command, env: {}, stdin_data: nil)
       output, error, status = Open3.capture3(env, *command, stdin_data:, chdir: ROOT)
       raise "#{command.first} failed: #{error}" unless status.success?
+
+      output
+    end
+
+    def capture_combined!(*command, env: {})
+      output, status = Open3.capture2e(env, *command, chdir: ROOT)
+      raise "#{command.first} failed: #{output}" unless status.success?
 
       output
     end
@@ -92,7 +100,10 @@ module Floria
 
       daemon = File.join(APP_BUNDLE, "Contents/Resources/floria")
       executable = File.join(APP_BUNDLE, "Contents/MacOS/#{APP_NAME}")
-      run!(*codesign, "--identifier", "#{BUNDLE_ID}.daemon", "--entitlements", "app/FloriaDaemon.entitlements", "--library-constraint", "app/FloriaDaemonLibraryConstraint.plist", "--enforce-constraint-validity", daemon)
+      library_constraint = "app/FloriaDaemonLibraryConstraint.plist"
+      verify_library_constraint_source!(library_constraint)
+      run!(*codesign, "--identifier", "#{BUNDLE_ID}.daemon", "--entitlements", "app/FloriaDaemon.entitlements", "--library-constraint", library_constraint, daemon)
+      verify_embedded_library_constraint!(daemon)
       run!(*codesign, "--identifier", BUNDLE_ID, executable)
       app_sign = [*codesign, "--identifier", BUNDLE_ID]
       app_sign += ["--entitlements", signed_entitlements] unless profile.empty?
@@ -200,6 +211,20 @@ module Floria
       ).each { |key, value| raise "signed app does not claim #{value}" unless values.fetch(key, []).include?(value) }
     ensure
       FileUtils.rm_f(path) if path
+    end
+
+    def verify_library_constraint_source!(path)
+      constraint = JSON.parse(capture!("plutil", "-convert", "json", "-o", "-", path))
+      expected = { "team-identifier" => MACFUSE_TEAM_ID }
+      raise "macFUSE library constraint must be exactly #{expected}" unless constraint == expected
+    end
+
+    def verify_embedded_library_constraint!(executable)
+      dump = capture_combined!("codesign", "--display", "--verbose=6", executable)
+      embedded_team = /\[Key\] team-identifier\s+\[Value\]\s+\[String\] #{MACFUSE_TEAM_ID}/m
+      unless dump.include?("Has Library Load Constraints") && dump.match?(embedded_team)
+        raise "signed daemon does not embed the exact macFUSE Team ID library constraint"
+      end
     end
 
     private
