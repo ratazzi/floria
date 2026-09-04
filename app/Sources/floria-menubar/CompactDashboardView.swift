@@ -961,21 +961,20 @@ struct DashboardView: View {
 
 struct FloriaMark: View {
     var body: some View {
-        ZStack {
-            ForEach(0..<8, id: \.self) { index in
-                Capsule()
-                    .fill(
+        Group {
+            if let image = FloriaImages.menuBarTemplate {
+                Image(nsImage: image)
+                    .resizable()
+                    .renderingMode(.template)
+                    .foregroundStyle(
                         LinearGradient(
                             colors: [.blue, Color(red: 0.13, green: 0.69, blue: 1)],
                             startPoint: .bottom,
                             endPoint: .top))
-                    .frame(width: 6.5, height: 12)
-                    .offset(y: -6)
-                    .rotationEffect(.degrees(Double(index) * 45))
+                    .scaledToFit()
+            } else {
+                Color.clear
             }
-            Circle()
-                .fill(Color(nsColor: .windowBackgroundColor))
-                .frame(width: 4, height: 4)
         }
         .accessibilityHidden(true)
     }

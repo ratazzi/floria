@@ -31,6 +31,20 @@ final class MacOS27PresentationTests: XCTestCase {
         XCTAssertTrue(presenter.contains("window.isOpaque = true"))
     }
 
+    func testSidebarBrandMarkUsesTheGeneratedIconSilhouette() throws {
+        let source = try source("CompactDashboardView.swift")
+        let start = try XCTUnwrap(source.range(of: "struct FloriaMark: View {"))
+        let end = try XCTUnwrap(
+            source.range(
+                of: "private struct DashboardSection",
+                range: start.upperBound..<source.endIndex))
+        let mark = source[start.lowerBound..<end.lowerBound]
+
+        XCTAssertTrue(mark.contains("FloriaImages.menuBarTemplate"))
+        XCTAssertTrue(mark.contains("Image(nsImage: image)"))
+        XCTAssertFalse(mark.contains("Capsule()"))
+    }
+
     private func source(_ name: String) throws -> String {
         let packageRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
