@@ -3,21 +3,24 @@ import XCTest
 
 final class ProductLanguageTests: XCTestCase {
     func testMacFuseSetupLeadsWithRecoveryAndDoesNotSendUsersToAnEmptyPane() throws {
-        let source = try source("MacFuseSetup.swift")
+        let setup = try source("MacFuseSetup.swift")
+        let backend = try source("MacFuseKernelBackend.swift")
 
-        XCTAssertTrue(source.contains(#""1. Enable third-party kernel extensions""#))
-        XCTAssertTrue(source.contains(#""2. Approve macFUSE after restarting""#))
-        XCTAssertTrue(source.contains(#""If System Settings has no Allow button yet, that is expected before this step.""#))
-        XCTAssertTrue(source.contains("Do not enable the macFUSE switches under File System Extensions."))
-        XCTAssertTrue(source.contains("No alert or Allow button after Recheck?"))
-        XCTAssertTrue(source.contains(#""Copy manual load command""#))
+        XCTAssertTrue(setup.contains(#""1. Enable third-party kernel extensions""#))
+        XCTAssertTrue(setup.contains(#""2. Approve macFUSE after restarting""#))
+        XCTAssertTrue(setup.contains(#""If System Settings has no Allow button yet, that is expected before this step.""#))
+        XCTAssertTrue(setup.contains("Do not enable the macFUSE switches under File System Extensions."))
+        XCTAssertTrue(setup.contains("No alert or Allow button after Floria requests it?"))
+        XCTAssertTrue(setup.contains(#""Copy manual load command""#))
+        XCTAssertTrue(setup.contains("Floria will ask macFUSE’s trusted loader"))
         XCTAssertTrue(
-            source.contains(
-                "/usr/bin/sudo /usr/bin/kmutil load -p /Library/Filesystems/macfuse.fs/Contents/Extensions/26/macfuse.kext"))
-        XCTAssertTrue(source.contains(#""Copy doctor command""#))
-        XCTAssertTrue(source.contains(#""/Applications/Floria.app/Contents/Resources/floria" doctor"#))
-        XCTAssertFalse(source.contains("doctor --config"))
-        XCTAssertFalse(source.contains(#"Button("Open Privacy & Security")"#))
+            backend.contains(
+                "/Library/Filesystems/macfuse.fs/Contents/Resources/load_macfuse"))
+        XCTAssertTrue(backend.contains("/usr/bin/sudo /usr/bin/kmutil load -p"))
+        XCTAssertTrue(setup.contains(#""Copy doctor command""#))
+        XCTAssertTrue(setup.contains(#""/Applications/Floria.app/Contents/Resources/floria" doctor"#))
+        XCTAssertFalse(setup.contains("doctor --config"))
+        XCTAssertFalse(setup.contains(#"Button("Open Privacy & Security")"#))
     }
 
     func testOfflineDaemonRetryActuallyReconcilesTheDaemon() throws {
@@ -28,10 +31,13 @@ final class ProductLanguageTests: XCTestCase {
         XCTAssertTrue(source.contains("state.recheckMacFuseSetup()"))
     }
 
-    func testMissingKernelDeviceIsPresentedDuringTheProbeInsteadOfAfterTheFullTimeout() throws {
+    func testMissingKernelDeviceRequestsTheLoaderBeforeStartingTheDaemon() throws {
         let source = try source("AppState.swift")
 
-        XCTAssertTrue(source.contains("elapsedSeconds == 0 && !kernelBackendReady"))
+        let loader = try XCTUnwrap(source.range(of: "MacFuseKernelBackend().ensureLoaded()"))
+        let daemon = try XCTUnwrap(source.range(of: "manager.ensureRunning()"))
+        XCTAssertLessThan(loader.lowerBound, daemon.lowerBound)
+        XCTAssertTrue(source.contains("if !MacFuseSetupStage.isKernelBackendReady"))
         XCTAssertTrue(source.contains("self.macFuseSetupStage = .approveKext"))
     }
 

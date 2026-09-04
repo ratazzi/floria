@@ -18,17 +18,11 @@ enum MacFuseSetupStage: String, Identifiable {
     }
 
     static var isKernelBackendReady: Bool {
-        let names = (try? FileManager.default.contentsOfDirectory(atPath: "/dev")) ?? []
-        return kernelBackendReady(deviceNames: names)
+        MacFuseKernelBackend.kernelBackendIsReady
     }
 
     static func kernelBackendReady(deviceNames: [String]) -> Bool {
-        deviceNames.contains(where: { name in
-            let prefix = "macfuse"
-            guard name.hasPrefix(prefix) else { return false }
-            let suffix = name.dropFirst(prefix.count)
-            return !suffix.isEmpty && suffix.utf8.allSatisfy { (48...57).contains($0) }
-        })
+        MacFuseKernelBackend.kernelBackendReady(deviceNames: deviceNames)
     }
 
     static var isFloriaMounted: Bool {
@@ -112,8 +106,10 @@ struct MacFuseSetupView: View {
 
     private static let doctorCommand =
         #""/Applications/Floria.app/Contents/Resources/floria" doctor"#
-    private static let manualLoadCommand =
-        "/usr/bin/sudo /usr/bin/kmutil load -p /Library/Filesystems/macfuse.fs/Contents/Extensions/26/macfuse.kext"
+    private static var manualLoadCommand: String {
+        MacFuseKernelBackend.manualLoadCommand(
+            osMajorVersion: ProcessInfo.processInfo.operatingSystemVersion.majorVersion)
+    }
 
     private var currentStage: MacFuseSetupStage {
         state.macFuseSetupStage ?? stage
@@ -225,6 +221,18 @@ struct MacFuseSetupView: View {
         Text("macFUSE is installed, but its kernel backend is not ready. On a new Apple silicon Mac, System Settings can show no Allow button until kernel extensions are enabled in recoveryOS first.")
             .font(.callout)
 
+        if let error = state.macFuseLoadError {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Floria couldn’t request the macFUSE kernel backend.")
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(.red)
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+        }
+
         approvalSteps
 
         VStack(alignment: .leading, spacing: 7) {
@@ -288,7 +296,7 @@ struct MacFuseSetupView: View {
 
         VStack(alignment: .leading, spacing: 7) {
             Text("2. Approve macFUSE after restarting").font(.callout.weight(.medium))
-            Text("Reopen Floria and click Recheck to trigger a new mount attempt. When macOS shows the system-extension alert, use its Open System Settings button, allow macFUSE, and restart when asked.")
+            Text("Reopen Floria or click Recheck. Floria will ask macFUSE’s trusted loader to activate the kernel backend before it starts the protected file system. When macOS shows the system-extension alert, use its Open System Settings button, allow macFUSE, and restart when asked.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -296,7 +304,7 @@ struct MacFuseSetupView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
-            Text("No alert or Allow button after Recheck? Run the official macFUSE troubleshooting command in Terminal, enter your administrator password, then return to Privacy & Security.")
+            Text("No alert or Allow button after Floria requests it? Run the official macFUSE troubleshooting command in Terminal, enter your administrator password, then return to Privacy & Security.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

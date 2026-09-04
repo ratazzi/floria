@@ -84,6 +84,7 @@ final class AppState {
     /// Non-nil while macFUSE setup is incomplete; drives the setup sheet.
     var macFuseSetupStage: MacFuseSetupStage?
     var macFuseRechecking = false
+    var macFuseLoadError: String?
     var recents: [RecentAccess] = []
     var workspace: WorkspaceStore
     var policyMode = RuntimePolicyStatus.normal
@@ -232,14 +233,11 @@ final class AppState {
         }
     }
 
-    /// Run the macFUSE readiness ladder: not installed → stop the daemon (no crash loop)
-    /// and show install guidance; installed → start the daemon and require an agent connection,
-    /// a numbered kernel device, and an actual Floria macFUSE mount. The agent socket opens
-    /// before the blocking mount call, so a connection and global device nodes are not sufficient.
-    /// A missing numbered device is
-    /// shown after the first probe second so setup does not look inert while launchd, Keychain,
-    /// or macFUSE is waiting; the sheet remains provisional and closes only after the mount exists.
-    /// Once the numbered device exists, another startup error is shown as a daemon mount failure.
+    /// Run the macFUSE readiness ladder: not installed → show install guidance; installed but no
+    /// numbered kernel device → invoke macFUSE's trusted loader before touching daemon/Keychain
+    /// state; ready → start the daemon and require an agent connection plus an actual Floria mount.
+    /// The agent socket opens before the blocking mount call, so a connection and a global device
+    /// node are not sufficient on their own.
     private func evaluateMacFuseSetup(timeoutSeconds: Int) {
         macFuseProbeTask?.cancel()
         guard DaemonManager.isProductionApp else { return }
@@ -250,15 +248,43 @@ final class AppState {
             DispatchQueue.global(qos: .utility).async { manager.stop() }
             return
         }
-        Self.setupLog.notice(
-            "macFUSE setup probe started; kernel_backend_ready=\(MacFuseSetupStage.isKernelBackendReady, privacy: .public) timeout_seconds=\(timeoutSeconds, privacy: .public)")
-        DispatchQueue.global(qos: .utility).async { manager.ensureRunning() }
         macFuseProbeTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            if !MacFuseSetupStage.isKernelBackendReady {
+                self.macFuseSetupStage = .approveKext
+                self.macFuseLoadError = nil
+                Self.setupLog.notice(
+                    "requesting the macFUSE kernel backend before starting the daemon")
+                let result = await Task.detached(priority: .utility) {
+                    MacFuseKernelBackend().ensureLoaded()
+                }.value
+                guard !Task.isCancelled else { return }
+                switch result {
+                case .ready:
+                    Self.setupLog.notice("macFUSE loader published a numbered device")
+                case .requested(let status):
+                    Self.setupLog.notice(
+                        "macFUSE loader request completed; status=\(status, privacy: .public); waiting for system approval or restart")
+                    DispatchQueue.global(qos: .utility).async { manager.stop() }
+                    return
+                case .failed(let message):
+                    self.macFuseLoadError = message
+                    Self.setupLog.error(
+                        "macFUSE loader request failed: \(message, privacy: .public)")
+                    DispatchQueue.global(qos: .utility).async { manager.stop() }
+                    return
+                }
+            }
+
+            self.macFuseLoadError = nil
+            Self.setupLog.notice(
+                "macFUSE mount probe started; timeout_seconds=\(timeoutSeconds, privacy: .public)")
+            DispatchQueue.global(qos: .utility).async { manager.ensureRunning() }
             var loggedPremountConnection = false
             var observedFailedRun = false
             for elapsedSeconds in 0..<timeoutSeconds {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
-                guard let self, !Task.isCancelled else { return }
+                guard !Task.isCancelled else { return }
                 let kernelBackendReady = MacFuseSetupStage.isKernelBackendReady
                 let floriaMounted = MacFuseSetupStage.isFloriaMounted
                 if MacFuseSetupStage.daemonConnectionProvesReady(
@@ -305,7 +331,7 @@ final class AppState {
                 // idempotent for a running job and kickstarts a loaded, successfully exited one.
                 await Task.detached(priority: .utility) { manager.ensureRunning() }.value
             }
-            guard let self, !Task.isCancelled else { return }
+            guard !Task.isCancelled else { return }
             let stage = MacFuseSetupStage.afterFailedDaemonProbe(
                 isInstalled: MacFuseSetupStage.isInstalled,
                 kernelBackendReady: MacFuseSetupStage.isKernelBackendReady)
