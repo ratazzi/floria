@@ -163,6 +163,8 @@ final class PromptPresenter {
         window.level = .floating
         window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
         window.tabbingMode = .disallowed
+        window.backgroundColor = .controlBackgroundColor
+        window.isOpaque = true
         window.contentView = NSHostingView(rootView: content)
         window.center()
         return window

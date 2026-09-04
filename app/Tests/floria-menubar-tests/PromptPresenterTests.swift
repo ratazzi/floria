@@ -49,6 +49,18 @@ final class PromptPresenterTests: XCTestCase {
     }
 
     @MainActor
+    func testAuthorizationWindowOwnsTheDashboardBackground() throws {
+        let presenter = makePresenter()
+        presenter.show(fixturePrompt()) { _ in }
+
+        let window = try XCTUnwrap(presenter.activeWindow)
+        XCTAssertTrue(window.isOpaque)
+        XCTAssertEqual(window.backgroundColor, NSColor.controlBackgroundColor)
+
+        window.performClose(nil)
+    }
+
+    @MainActor
     func testExpiredPromptDeniesAndDismissesItself() async {
         let presenter = PromptPresenter(
             dockVisibilityController: DockVisibilityController { _ in },
