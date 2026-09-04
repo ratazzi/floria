@@ -1197,7 +1197,7 @@ private struct CompactProjectDetailView: View {
             .padding(.top, 22)
             .padding(.bottom, 28)
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(Color(nsColor: .controlBackgroundColor))
         .sheet(isPresented: $showingWorktrees) {
             ProjectCheckoutsSheet(store: state.workspace, projectID: project.id)
         }
