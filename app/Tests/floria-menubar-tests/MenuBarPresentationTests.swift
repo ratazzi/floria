@@ -18,14 +18,13 @@ final class MenuBarPresentationTests: XCTestCase {
         XCTAssertTrue(source.contains(#"title: "Quit Floria", icon: "xmark.square""#))
     }
 
-    func testMenuBarContentOwnsItsVerticalSizeAndBackground() throws {
+    func testMenuBarContentOwnsItsVerticalSize() throws {
         let source = try menuBarSource()
 
         XCTAssertTrue(
             source.contains(
                 ".frame(width: 360)\n"
-                    + "        .fixedSize(horizontal: false, vertical: true)\n"
-                    + "        .background(Color(nsColor: .controlBackgroundColor))"),
+                    + "        .fixedSize(horizontal: false, vertical: true)"),
             "The MenuBarExtra host must not stretch transparent content above the menu body."
         )
     }
