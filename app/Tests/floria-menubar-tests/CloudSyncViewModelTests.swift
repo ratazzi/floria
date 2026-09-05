@@ -673,6 +673,10 @@ private actor CloudSyncViewServiceStub: CloudSyncServicing {
 
     func reviewConflicts() async throws -> [SyncConflictReview] { conflicts }
 
+    func keepICloudVersions() async throws -> CloudSyncOutcome {
+        throw CloudSyncServiceError.unconfiguredTestDependency
+    }
+
     func resolveConflict(
         entityID: String,
         selectedRevisionID: String
