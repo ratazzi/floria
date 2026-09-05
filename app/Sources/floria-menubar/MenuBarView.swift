@@ -129,7 +129,6 @@ struct MenuBarView: View {
         }
         .frame(width: 360)
         .fixedSize(horizontal: false, vertical: true)
-        .background(Color(nsColor: .controlBackgroundColor))
         .task {
             await state.reloadSystemHealth()
             await state.reloadPolicyMode()
