@@ -9,6 +9,7 @@ protocol CloudSyncServicing: Sendable {
     func pendingVaultID() async -> String?
     func localStatus() async throws -> SyncDomainStatus?
     func reviewConflicts() async throws -> [SyncConflictReview]
+    func keepICloudVersions() async throws -> CloudSyncOutcome
     func resolveConflict(entityID: String, selectedRevisionID: String) async throws
         -> SyncDomainStatus
     func projectsWithoutLocalFolder() async throws -> [SyncedProject]
@@ -372,6 +373,19 @@ final class CloudSyncViewModel {
         }
     }
 
+    func keepICloudVersions() async {
+        await perform {
+            let outcome = try await self.service.keepICloudVersions()
+            self.status = outcome.status
+            await self.refreshPersistentState()
+            await self.refreshPostSyncDetails(
+                for: outcome.status, authenticatedBootstrap: outcome.authenticatedBootstrap)
+            self.notice = self.syncAttentionMessage == nil
+                ? "iCloud versions were kept. All versions remain in encrypted history."
+                : nil
+        }
+    }
+
     private func refreshLocalStatus() async {
         defer { isLocalStatusLoaded = true }
         do {
@@ -614,6 +628,7 @@ struct SyncView: View {
     @State private var pendingRemoval: SyncVaultDevice?
     @State private var pendingConflictSelection: ConflictSelection?
     @State private var pendingLibraryReview: SyncLibraryReview?
+    @State private var showingKeepICloudConfirmation = false
 
     init(
         service: any CloudSyncServicing,
@@ -673,6 +688,12 @@ struct SyncView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
+                if !model.conflicts.isEmpty {
+                    Button("Keep iCloud Versions…") {
+                        showingKeepICloudConfirmation = true
+                    }
+                    .disabled(model.isWorking)
+                }
                 Button("Done") { dismiss() }
                     .keyboardShortcut(.defaultAction)
             }
@@ -698,6 +719,14 @@ struct SyncView: View {
             Button("Cancel", role: .cancel) { pendingLibraryReview = nil }
         } message: { review in
             Text(libraryReviewMessage(review))
+        }
+        .confirmationDialog("Keep iCloud Versions?", isPresented: $showingKeepICloudConfirmation) {
+            Button("Keep iCloud Versions") {
+                Task { await model.keepICloudVersions() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Use the current iCloud version for every conflicting item. Local versions remain in encrypted history.")
         }
         .confirmationDialog(
             "Keep This Version?",

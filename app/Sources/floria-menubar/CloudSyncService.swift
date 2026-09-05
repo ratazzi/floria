@@ -395,6 +395,35 @@ actor CloudSyncService {
             resolvedAt: Self.timestamp())
     }
 
+    func keepICloudVersions() async throws -> CloudSyncOutcome {
+        guard preferences.isEnabled else { throw CloudSyncServiceError.disabled }
+        try requireCloudKit()
+        if let syncTask { _ = try await syncTask.task.value }
+        let id = UUID()
+        let task = Task { try await self.performKeepICloudVersions() }
+        syncTask = (id, task)
+        defer {
+            if syncTask?.id == id { syncTask = nil }
+        }
+        return try await task.value
+    }
+
+    private func performKeepICloudVersions() async throws -> CloudSyncOutcome {
+        let status = try await control.recordSyncStatus()
+        let reviews = try await control.reviewRecordSyncConflicts()
+        let container = CKContainer(identifier: ProductIdentity.cloudKitContainerIdentifier)
+        let selections = try await CloudConflictSelection.fetchPlan(
+            reviews: reviews, vaultID: status.vaultID, database: container.privateCloudDatabase)
+        for selection in selections {
+            try Task.checkCancellation()
+            _ = try await control.resolveRecordSyncConflict(
+                entityID: selection.entityID,
+                selectedRevisionID: selection.revisionID,
+                resolvedAt: Self.timestamp())
+        }
+        return try await performSyncNow()
+    }
+
     func projectsWithoutLocalFolder() async throws -> [SyncedProject] {
         guard preferences.isEnabled else { throw CloudSyncServiceError.disabled }
         return try await control.syncedProjectsWithoutLocalFolder()
