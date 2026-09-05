@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use floria_catalog::{
     validate_replicated_catalog, Binding, Environment, ReplicatedCatalog, ReplicatedProject,
-    ReplicatedSurface, Resource, ResourceKind, SurfaceInput, SurfaceKind,
+    ReplicatedSurface, Resource, ResourceKind, ResourceSource, SshIdentitySelection, SurfaceInput, SurfaceKind,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -236,6 +236,15 @@ impl CatalogEntitySet {
             if active_only && document.lifecycle == EntityLifecycle::Archived {
                 continue;
             }
+            if let CatalogEntityState::Surface(surface) = &document.state {
+                if document.lifecycle == EntityLifecycle::Active
+                    && self.has_equivalent_promoted_access(surface)
+                {
+                    // An older Mac may republish the pre-promotion representation. Only an
+                    // identical capability can share the successor's runtime identity.
+                    continue;
+                }
+            }
             if !active_only
                 && document.lifecycle == EntityLifecycle::Archived
                 && matches!(
@@ -263,6 +272,42 @@ impl CatalogEntitySet {
             }
         }
         Ok(catalog)
+    }
+
+    fn has_equivalent_promoted_access(&self, surface: &ReplicatedSurface) -> bool {
+        if surface.kind != SurfaceKind::UnixSocket { return false; }
+        let SurfaceInput::SshAgent { binding_ids, route: Some(route) } = &surface.input else {
+            return false;
+        };
+        let active = self.documents.values()
+            .filter(|document| document.lifecycle == EntityLifecycle::Active);
+        let Some(resource) = active.clone().find_map(|document| match &document.state {
+            CatalogEntityState::Resource(resource) if resource.id == surface.id => Some(resource),
+            _ => None,
+        }) else { return false; };
+        let ResourceSource::SshAccess(spec) = &resource.source else { return false; };
+        let Some(environment) = active.clone().find_map(|document| match &document.state {
+            CatalogEntityState::Environment(environment) if environment.id == surface.environment_id => Some(environment),
+            _ => None,
+        }) else { return false; };
+        let mut identities = Vec::new();
+        for id in binding_ids {
+            let Some(binding) = active.clone().find_map(|document| match &document.state {
+                CatalogEntityState::Binding(binding) if &binding.id == id => Some(binding),
+                _ => None,
+            }) else { return false; };
+            if binding.enabled {
+                identities.push(SshIdentitySelection {
+                    resource_id: binding.resource_id.clone(), selection: binding.selection.clone(),
+                });
+            }
+        }
+        resource.kind == ResourceKind::SshAccess
+            && resource.name == surface.name
+            && resource.enforcement == surface.enforcement
+            && spec.route == *route
+            && spec.project_ids == [environment.project_id.clone()]
+            && spec.identities == identities
     }
 }
 
@@ -520,10 +565,32 @@ mod tests {
             origin: ResourceOrigin::default(),
         })));
 
+        let archived_documents = documents.clone();
         let entities = CatalogEntitySet::from_documents(documents).unwrap();
         let active = entities.active_catalog().unwrap();
         assert!(active.surfaces.iter().all(|surface| surface.id != access_id));
         assert!(active.resources.iter().any(|resource| resource.id == access_id));
+
+        let mut republished = archived_documents;
+        for document in &mut republished {
+            if matches!(&document.state, CatalogEntityState::Surface(surface) if surface.id == access_id) {
+                document.lifecycle = EntityLifecycle::Active;
+            }
+            if let CatalogEntityState::Resource(resource) = &mut document.state {
+                if resource.id == access_id {
+                    let ResourceSource::SshAccess(spec) = &mut resource.source else { unreachable!() };
+                    spec.identities[0].selection = EntrySelection::All;
+                }
+            }
+        }
+        let recovered = CatalogEntitySet::from_documents(republished.clone()).unwrap();
+        assert!(recovered.active_catalog().unwrap().surfaces.iter().all(|surface| surface.id != access_id));
+        for document in &mut republished {
+            if let CatalogEntityState::Resource(resource) = &mut document.state {
+                if resource.id == access_id { resource.enforcement = Enforcement::Allow; }
+            }
+        }
+        assert!(CatalogEntitySet::from_documents(republished).is_err());
     }
 
     #[test]
