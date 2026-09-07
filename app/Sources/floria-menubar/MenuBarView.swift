@@ -128,7 +128,9 @@ struct MenuBarView: View {
             }
         }
         .frame(width: 360)
-        .fixedSize(horizontal: false, vertical: true)
+        .presentationSizing(.fitted)
+        .presentationCornerRadius(MenuBarWindowChrome.cornerRadius)
+        .background(MenuBarWindowChrome())
         .task {
             await state.reloadSystemHealth()
             await state.reloadPolicyMode()
