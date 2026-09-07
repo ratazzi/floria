@@ -6,6 +6,14 @@ import XCTest
 
 @MainActor
 final class MenuBarWindowChromeTests: XCTestCase {
+    func testBackgroundUsesTheNativeActiveMenuMaterial() {
+        let background = MenuBarWindowChrome.makeBackgroundView()
+
+        XCTAssertEqual(background.material, .menu)
+        XCTAssertEqual(background.blendingMode, .behindWindow)
+        XCTAssertEqual(background.state, .active)
+    }
+
     func testConfigureClipsTheTransparentHostToContinuousRoundedCorners() throws {
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 360, height: 290),
