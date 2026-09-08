@@ -38,6 +38,23 @@ private struct DashboardCommands: Commands {
 /// Menubar app with a full workspace window and non-modal authorization windows.
 /// The Dock icon follows user-facing windows rather than the background app lifetime.
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var menuBarController: MenuBarController?
+
+    @MainActor
+    func installMenuBar(state: AppState, openDashboard: @escaping () -> Void) {
+        guard menuBarController == nil else { return }
+        let controller = MenuBarController { [weak self] in
+            AnyView(MenuBarView(state: state, openDashboard: {
+                self?.menuBarController?.close()
+                DockVisibilityController.shared.prepareToShowDashboard()
+                openDashboard()
+                NSApp.activate(ignoringOtherApps: true)
+            }))
+        }
+        menuBarController = controller
+        controller.observePolicy(state)
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let icon = FloriaImages.applicationIcon {
             NSApp.applicationIconImage = icon
@@ -54,36 +71,12 @@ struct FloriaMenuBarApp: App {
     @State private var state = AppState()
 
     var body: some Scene {
-        MenuBarExtra {
-            MenuBarView(state: state)
-        } label: {
-            // Do not put a TimelineView here: on macOS 26 a periodic status-item label caused
-            // continuous invalidation (~99% CPU). AppState's refresh task drives mode changes.
-            if let image = FloriaImages.menuBarTemplate {
-                Image(nsImage: image)
-                    .renderingMode(.template)
-                    .foregroundStyle(
-                        state.policyMode.isAuditOnly() ? Color.orange : Color.primary)
-                    .accessibilityLabel("Floria")
-            } else {
-                Image(
-                    systemName: state.policyMode.isAuditOnly()
-                        ? "eye.circle.fill" : "lock.shield")
-                    .symbolRenderingMode(.hierarchical)
-                    .foregroundStyle(
-                        state.policyMode.isAuditOnly() ? Color.orange : Color.primary)
-                    .accessibilityLabel("Floria")
-            }
-        }
-        // `.window` turns the dropdown into a real anchored window that hosts arbitrary
-        // SwiftUI (search field, hover rows, ...) instead of an NSMenu.
-        .menuBarExtraStyle(.window)
-
         // The daemon owns login-time startup. Launching the GUI is therefore an explicit user
         // action and should present the workspace immediately; the menu bar remains available
         // after the window is closed.
         Window("floria", id: "dashboard") {
             DashboardView(state: state)
+                .background(MenuBarInstallation(state: state, appDelegate: appDelegate))
                 .background(
                     DashboardWindowTracker(
                         dockVisibilityController: DockVisibilityController.shared))
