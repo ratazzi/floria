@@ -62,10 +62,10 @@ private extension ActiveGrant {
     }
 }
 
-/// The window-style dropdown: search header, recent-access list, footer actions.
+/// Popover content: search header, recent-access list, footer actions.
 struct MenuBarView: View {
-    @Environment(\.openWindow) private var openWindow
     @Bindable var state: AppState
+    let openDashboard: () -> Void
     @State private var searchText = ""
     @State private var listContentHeight: CGFloat = 0
     @State private var pendingConfirmation: MenuBarConfirmation?
@@ -113,8 +113,7 @@ struct MenuBarView: View {
                 },
                 openSystemHealth: {
                     state.systemHealthPresentationRequested = true
-                    DockVisibilityController.shared.prepareToShowDashboard()
-                    openWindow(id: "dashboard")
+                    openDashboard()
                 })
             Divider()
             if hasListContent {
@@ -123,12 +122,11 @@ struct MenuBarView: View {
                 emptyState
             }
             Divider()
-            MenuBarFooter(state: state) {
+            MenuBarFooter(state: state, openDashboard: openDashboard) {
                 pendingConfirmation = .clearRecent(count: state.recents.count)
             }
         }
         .frame(width: 360)
-        .fixedSize(horizontal: false, vertical: true)
         .task {
             await state.reloadSystemHealth()
             await state.reloadPolicyMode()
@@ -148,7 +146,7 @@ struct MenuBarView: View {
         }
     }
 
-    // Plain VStack, not LazyVStack: the MenuBarExtra window sizes itself to the content's
+    // Plain VStack, not LazyVStack: the popover sizes itself to the content's
     // ideal height, and lazy content measures as zero before it has a viewport — the whole
     // list collapses to nothing. The list is capped at 30 groups, eager layout is cheap.
     // A ScrollView's own ideal height is unrelated to its content's, so the viewport is
@@ -531,6 +529,25 @@ private struct ActiveAccessHeader: View {
     }
 }
 
+private struct MenuBarHoverRowModifier: ViewModifier {
+    @Binding var isHovered: Bool
+
+    func body(content: Content) -> some View {
+        content
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .background(isHovered ? Color.primary.opacity(0.06) : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .onHover { isHovered = $0 }
+    }
+}
+
+private extension View {
+    func menuBarHoverRow(isHovered: Binding<Bool>) -> some View {
+        modifier(MenuBarHoverRowModifier(isHovered: isHovered))
+    }
+}
+
 private struct ActiveGrantRow: View {
     let grant: ActiveGrant
     let revoke: () -> Void
@@ -572,9 +589,7 @@ private struct ActiveGrantRow: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
-        .background(hovered ? Color.primary.opacity(0.06) : Color.clear)
-        .clipShape(RoundedRectangle(cornerRadius: 6))
-        .onHover { hovered = $0 }
+        .menuBarHoverRow(isHovered: $hovered)
         .help(tooltip)
     }
 
@@ -672,9 +687,7 @@ private struct AccessRow: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
-        .background(hovered ? Color.primary.opacity(0.06) : Color.clear)
-        .clipShape(RoundedRectangle(cornerRadius: 6))
-        .onHover { hovered = $0 }
+        .menuBarHoverRow(isHovered: $hovered)
         .help(tooltip)
     }
 
@@ -710,8 +723,7 @@ private struct AccessRow: View {
 /// Footer actions styled as menu items with hover highlight and shortcut hints.
 private struct MenuBarFooter: View {
     @Bindable var state: AppState
-    @Environment(\.openWindow) private var openWindow
-    @Environment(\.dismiss) private var dismiss
+    let openDashboard: () -> Void
     let requestClearConfirmation: () -> Void
 
     var body: some View {
@@ -730,13 +742,7 @@ private struct MenuBarFooter: View {
             .padding(.top, 2)
             .padding(.bottom, 4)
             MenuItemButton(title: "Open Floria", icon: "macwindow", shortcut: "D") {
-                // The window-style extra panel stays up on its own; close it
-                // like a menu would before handing focus to the dashboard.
-                dismiss()
-                DockVisibilityController.shared.prepareToShowDashboard()
-                openWindow(id: "dashboard")
-                // Changing an accessory app back to regular doesn't make it frontmost.
-                NSApp.activate(ignoringOtherApps: true)
+                openDashboard()
             }
             .keyboardShortcut("d")
             MenuItemButton(title: "Clear Recent…", icon: "trash", shortcut: "K") {
@@ -774,13 +780,10 @@ private struct MenuItemButton: View {
                         .foregroundStyle(.tertiary)
                 }
             }
-            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         .padding(.horizontal, 8)
         .padding(.vertical, 5)
-        .background(hovered ? Color.primary.opacity(0.06) : Color.clear)
-        .clipShape(RoundedRectangle(cornerRadius: 6))
-        .onHover { hovered = $0 }
+        .menuBarHoverRow(isHovered: $hovered)
     }
 }

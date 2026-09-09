@@ -2,13 +2,13 @@ import Foundation
 import XCTest
 
 final class MenuBarPresentationTests: XCTestCase {
-    func testMenuBarExtraDoesNotHostTransientConfirmationDialogs() throws {
+    func testPopoverKeepsConfirmationInsideItsContent() throws {
         let source = try menuBarSource()
 
         XCTAssertFalse(
             source.contains(".confirmationDialog("),
-            "MenuBarExtra windows dismiss before transient confirmation panels receive clicks; "
-                + "keep confirmations inside MenuBarView's anchored window."
+            "Keep confirmations inside MenuBarView so transient popover dismissal "
+                + "does not interrupt the confirmation."
         )
     }
 
@@ -18,24 +18,30 @@ final class MenuBarPresentationTests: XCTestCase {
         XCTAssertTrue(source.contains(#"title: "Quit Floria", icon: "xmark.square""#))
     }
 
-    func testMenuBarContentOwnsItsVerticalSize() throws {
+    func testMenuBarContentUsesAnArrowlessAppKitPanel() throws {
         let source = try menuBarSource()
 
-        XCTAssertTrue(
-            source.contains(
-                ".frame(width: 360)\n"
-                    + "        .fixedSize(horizontal: false, vertical: true)"),
-            "The MenuBarExtra host must not stretch transparent content above the menu body."
-        )
+        XCTAssertTrue(source.contains(".frame(width: 360)"))
+        XCTAssertFalse(source.contains("MenuBarWindowChrome"))
+        XCTAssertFalse(source.contains(".presentationCornerRadius"))
+        let controller = try self.source("MenuBarController.swift")
+        XCTAssertTrue(controller.contains("NSPanel"))
+        XCTAssertFalse(controller.contains("= NSPopover()"))
+        XCTAssertTrue(controller.contains("styleMask: [.borderless, .fullSizeContentView]"))
+        XCTAssertFalse(try appSource().contains("MenuBarExtra"))
     }
 
     func testStatusItemHasAnAccessibleProductName() throws {
-        let source = try appSource()
+        let source = try source("MenuBarController.swift")
+        XCTAssertTrue(source.contains(#"setAccessibilityLabel("Floria")"#))
+    }
 
-        XCTAssertEqual(
-            source.components(separatedBy: #".accessibilityLabel("Floria")"#).count - 1,
-            2
-        )
+    func testInteractiveMenuRowsShareOneFullWidthHoverTreatment() throws {
+        let source = try menuBarSource()
+
+        XCTAssertTrue(source.contains(".frame(maxWidth: .infinity, alignment: .leading)"))
+        XCTAssertTrue(source.contains(".contentShape(Rectangle())"))
+        XCTAssertEqual(source.components(separatedBy: ".menuBarHoverRow(isHovered: $hovered)").count - 1, 3)
     }
 
     private func menuBarSource() throws -> String {
