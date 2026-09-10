@@ -497,6 +497,24 @@ impl Floria {
 }
 
 impl Shared {
+    fn setattr_attr(&self, ino: u64, write_fh: Option<u64>) -> Option<fuser::FileAttr> {
+        // Managed item aliases have their own inodes, distinct from legacy surface/secret inodes.
+        let mut attr = self.items.as_ref()
+            .and_then(|items| items.item_for_file_ino(ino))
+            .and_then(|item| self.item_file_attr(ino, &item))
+            .or_else(|| self.surfaces.as_ref()
+                .and_then(|ns| ns.surface_for_ino(ino))
+                .and_then(|registered| self.surface_attr(ino, &registered)))
+            .or_else(|| self.secrets.as_ref()
+                .and_then(|ns| ns.id_for_ino(ino))
+                .and_then(|id| self.secret_attr(ino, &id)))
+            .or_else(|| self.attr_for(ino))?;
+        if let Some(len) = write_fh.and_then(|fh| self.writes.len(fh)) {
+            attr.size = len;
+        }
+        Some(attr)
+    }
+
     fn attr_for(&self, ino: u64) -> Option<fuser::FileAttr> {
         let node = self.tree.get(ino)?;
         let attr = match &node.kind {
@@ -1808,30 +1826,13 @@ impl fuser::Filesystem for Floria {
             SetattrPlan::Apply { truncate_to: None } => {}
         }
         // Reply with the current attr, sized from the write buffer if one is open on this fd.
-        let mut attr = match self
-            .inner
-            .surfaces
-            .as_ref()
-            .and_then(|ns| ns.surface_for_ino(ino.0))
-            .and_then(|registered| self.inner.surface_attr(ino.0, &registered))
-            .or_else(|| {
-                self.inner
-                    .secrets
-                    .as_ref()
-                    .and_then(|ns| ns.id_for_ino(ino.0))
-                    .and_then(|id| self.inner.secret_attr(ino.0, &id))
-            })
-            .or_else(|| self.inner.attr_for(ino.0))
-        {
+        let attr = match self.inner.setattr_attr(ino.0, write_fh) {
             Some(a) => a,
             None => {
                 reply.error(Errno::ENOENT);
                 return;
             }
         };
-        if let Some(len) = write_fh.and_then(|f| self.inner.writes.len(f)) {
-            attr.size = len;
-        }
         reply.attr(&TTL, &attr);
     }
 
@@ -3127,6 +3128,53 @@ key_source = "ssh"
         assert_eq!(error.errno.code(), libc::EINVAL);
         assert!(error.to_string().contains("entries changed"));
         assert_eq!(store.current_version(DIRECT_SECRET_ID), 2);
+    }
+
+    #[test]
+    fn managed_item_setattr_returns_attributes_after_editor_truncation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(ReadWriteStore::fixture());
+        let shared = shared_fixture(&[], store.clone(), None, None, tmp.path());
+        let items = shared.items.as_ref().unwrap();
+        let item = items.get(RAW_SECRET_ID).unwrap();
+        let ino = items.file_ino_for(&item.id);
+        let identity = Arc::new(ProcessIdentity::bare(4242, 501, 20));
+        let fh = shared.writes.insert(ino, identity, b"protected-value".to_vec());
+        shared.write_targets.insert(fh, WriteOpenTarget::Secret {
+            id: RAW_SECRET_ID.into(),
+            virtual_path: format!("items/{RAW_SECRET_ID}/protected.txt"),
+        });
+        shared.writes.truncate(fh, 0).unwrap();
+        let attr = shared.setattr_attr(ino, Some(fh))
+            .expect("ftruncate must not return ENOENT for a managed item inode");
+        assert_eq!(attr.ino, INodeNo(ino));
+        assert_eq!(attr.size, 0);
+        assert_eq!(attr.perm, 0o640);
+        shared.writes.write_at(fh, 0, b"edited-value").unwrap();
+        assert_eq!(shared.setattr_attr(ino, Some(fh)).unwrap().size, 12);
+        shared.commit_write(fh).unwrap();
+        assert_eq!(store.current_bytes(RAW_SECRET_ID), b"edited-value");
+    }
+
+    #[test]
+    fn configured_item_setattr_uses_its_surface_backing_and_write_buffer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = surface_catalog(&tmp.path().join("catalog.sqlite"));
+        let registry = Arc::new(SurfaceRegistry::from_snapshot(&catalog.snapshot().unwrap()));
+        let shared = shared_fixture(&[], Arc::new(ReadWriteStore::fixture()),
+            Some(catalog), Some(registry), tmp.path());
+        let items = shared.items.as_ref().unwrap();
+        let item = items.list().into_iter().find(|item| matches!(
+            &item.backing, ManagedItemBacking::Surface(id) if id == "fixture-direct-surface"
+        )).unwrap();
+        let ino = items.file_ino_for(&item.id);
+        let identity = Arc::new(ProcessIdentity::bare(4242, 501, 20));
+        let fh = shared.writes.insert(ino, identity, Vec::new());
+        let attr = shared.setattr_attr(ino, Some(fh)).unwrap();
+        assert_eq!(attr.ino, INodeNo(ino));
+        assert_eq!(attr.size, 0);
+        assert_eq!(attr.perm, 0o644);
+        assert!(shared.setattr_attr(u64::MAX, None).is_none());
     }
 
     #[test]
