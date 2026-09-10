@@ -562,7 +562,7 @@ pub(super) fn protected_file(
     })
 }
 
-fn local_file_path(snapshot: &CatalogSnapshot, record: &SecretRecord) -> Option<PathBuf> {
+pub(super) fn local_file_path(snapshot: &CatalogSnapshot, record: &SecretRecord) -> Option<PathBuf> {
     if let Some(source_path) = record.source_path() {
         return Some(source_path.to_path_buf());
     }

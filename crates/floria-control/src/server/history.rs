@@ -41,6 +41,24 @@ pub(super) fn history_display(
     snapshot: &CatalogSnapshot,
     stored: &[SecretRecord],
 ) -> Option<String> {
+    if let Some(item_path) = path.strip_prefix("items/") {
+        let (item_id, basename) = item_path.split_once('/')?;
+        if item_id.is_empty() || basename.is_empty() || basename.contains('/') {
+            return None;
+        }
+        return snapshot.surfaces.iter()
+            .find(|surface| snapshot.managed_item_id_for_surface(surface) == item_id)
+            .map(|surface| surface.path.as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| surface.name.clone()))
+            .or_else(|| stored.iter()
+                .find(|record| record.id.as_str() == item_id)
+                .map(|record| super::protected_files::local_file_path(snapshot, record)
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| record.display_name())))
+            // Historical events can outlive their item; keep the recorded filename useful.
+            .or_else(|| Some(basename.to_string()));
+    }
     if let Some(surface_id) = path.strip_prefix("surfaces/") {
         return snapshot
             .surfaces
