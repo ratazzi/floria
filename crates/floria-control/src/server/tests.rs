@@ -1285,6 +1285,37 @@
     }
 
     #[test]
+    fn item_history_uses_local_file_paths_and_keeps_deleted_filenames_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
+        let project_path = dir.path().join("project");
+        catalog.upsert_project(&Project {
+            id: "fixture-project".into(), name: "Fixture".into(),
+            path: project_path.clone(), ..Default::default()
+        }).unwrap();
+        let snapshot = catalog.snapshot().unwrap();
+        let source_path = project_path.join(".env.development");
+        let mut record = SecretRecord {
+            id: "00000000-0000-0000-0000-000000000901".parse().unwrap(),
+            origin: SecretOrigin::File { source_path: source_path.clone() },
+            mode: 0o600, size: 0, created: "fixture-time".into(), current_version: 1,
+            enforcement: Enforcement::Prompt, environment_ids: None,
+            placements: Vec::new(), metadata: Default::default(),
+        };
+        let path = format!("items/{}/.env.development", record.id);
+        assert_eq!(history_display(&path, &snapshot, &[record.clone()]),
+            Some(source_path.display().to_string()));
+        record.origin = SecretOrigin::Managed { label: ".env.development".into() };
+        record.placements = vec![ManagedPlacement::project(
+            "fixture-project", ".env.development", Vec::new(),
+        ).unwrap()];
+        assert_eq!(history_display(&path, &snapshot, &[record]),
+            Some(source_path.display().to_string()));
+        assert_eq!(history_display(&path, &snapshot, &[]), Some(".env.development".into()));
+        assert_eq!(history_display("items/missing/", &snapshot, &[]), None);
+    }
+
+    #[test]
     fn access_history_returns_persisted_reader_metadata_with_surface_display_path() {
         let dir = tempfile::tempdir().unwrap();
         let catalog = Catalog::open(dir.path().join("catalog.sqlite")).unwrap();
@@ -1362,6 +1393,11 @@
         };
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].display.as_deref(), display_path.to_str());
+        assert_eq!(
+            history_display("items/fixture-surface/.env", &catalog.snapshot().unwrap(), &[]),
+            Some(display_path.display().to_string()),
+            "reloaded item events must keep the same project path as live events",
+        );
         assert_eq!(events[0].identity.exe.as_deref(), Some("/usr/bin/fixture-reader"));
         assert_eq!(events[0].identity.chain, "fixture-shell -> fixture-reader");
         assert_eq!(
