@@ -254,6 +254,30 @@ impl StateAuthenticator {
         Ok(self.checkpoints.load(domain)?.map_or(0, |checkpoint| checkpoint.generation))
     }
 
+    /// Reconstruct only the exact state already committed to the trusted checkpoint.
+    /// This read-only recovery operation neither advances Keychain nor accepts a future state.
+    pub fn reconstruct_checkpointed_state<T: Serialize>(
+        &self,
+        domain: &str,
+        candidates: impl IntoIterator<Item = T>,
+    ) -> IntegrityResult<Vec<u8>> {
+        let checkpoint = self.checkpoints.load(domain)?
+            .ok_or_else(|| invalid(domain, "trusted checkpoint is missing"))?;
+        for candidate in candidates {
+            let payload = serde_json::to_vec(&candidate)?;
+            if self.verify_mac(domain, checkpoint.generation, &payload, &checkpoint.mac).is_ok() {
+                let envelope = Envelope {
+                    format: ENVELOPE_FORMAT,
+                    generation: checkpoint.generation,
+                    payload: base64::engine::general_purpose::STANDARD.encode(payload),
+                    mac: checkpoint.mac,
+                };
+                return Ok(serde_json::to_vec(&envelope)?);
+            }
+        }
+        Err(invalid(domain, "no candidate matches the trusted checkpoint"))
+    }
+
     /// Authenticate an append-only record without advancing a rollback checkpoint.
     ///
     /// Callers still persist their latest accepted tail through [`StateAuthenticator::persist`].
@@ -729,5 +753,40 @@ mod tests {
             auth.load::<Fixture>(&path, "fixture"),
             Err(IntegrityError::Invalid { .. })
         ));
+    }
+
+    #[test]
+    fn reconstructs_only_the_committed_state_after_an_interrupted_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        let auth = StateAuthenticator::for_tests([12; KEY_BYTES]);
+        auth.persist(&path, "fixture", 0, &Fixture { value: "committed".into() }).unwrap();
+        let committed = fs::read(&path).unwrap();
+        let payload = serde_json::to_vec(&Fixture { value: "uncommitted".into() }).unwrap();
+        let torn = Envelope {
+            format: ENVELOPE_FORMAT,
+            generation: 2,
+            payload: base64::engine::general_purpose::STANDARD.encode(&payload),
+            mac: auth.mac("fixture", 2, &payload),
+        };
+        fs::write(&path, serde_json::to_vec(&torn).unwrap()).unwrap();
+        assert!(auth.load::<Fixture>(&path, "fixture").is_err());
+
+        let recovered = auth.reconstruct_checkpointed_state("fixture", [
+            Fixture { value: "uncommitted".into() },
+            Fixture { value: "committed".into() },
+        ]).unwrap();
+        assert_eq!(recovered, committed);
+        assert_eq!(auth.checkpoint_generation("fixture").unwrap(), 1);
+        fs::write(&path, recovered).unwrap();
+        assert_eq!(auth.load::<Fixture>(&path, "fixture").unwrap().value.unwrap().value, "committed");
+
+        auth.persist(&path, "fixture", 1, &Fixture { value: "newer".into() }).unwrap();
+        assert!(auth.reconstruct_checkpointed_state("fixture", [
+            Fixture { value: "committed".into() },
+        ]).is_err());
+        assert!(auth.reconstruct_checkpointed_state("unknown", [
+            Fixture { value: "newer".into() },
+        ]).is_err());
     }
 }
