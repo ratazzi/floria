@@ -759,7 +759,7 @@ private struct MenuBarFooter: View {
     }
 }
 
-private struct MenuItemButton: View {
+struct MenuItemButton: View {
     let title: String
     let icon: String
     var shortcut: String?
@@ -780,10 +780,11 @@ private struct MenuItemButton: View {
                         .foregroundStyle(.tertiary)
                 }
             }
+            // Plain buttons need the full hit shape inside their label, including padding.
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .menuBarHoverRow(isHovered: $hovered)
         }
         .buttonStyle(.plain)
-        .padding(.horizontal, 8)
-        .padding(.vertical, 5)
-        .menuBarHoverRow(isHovered: $hovered)
     }
 }
