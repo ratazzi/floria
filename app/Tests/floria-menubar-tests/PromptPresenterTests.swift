@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 
 @testable import floria_menubar
 
@@ -46,6 +47,35 @@ final class PromptPresenterTests: XCTestCase {
 
         window.performClose(nil)
         XCTAssertNil(presenter.activeWindow)
+    }
+
+    @MainActor
+    func testExplicitDenialSendsTheSelectedDuration() throws {
+        for scope: PromptGrantScope in [.once, .today, .untilLock, .timed(seconds: 900)] {
+            let presenter = makePresenter()
+            var observed: DecisionMsg?
+            presenter.show(fixturePrompt()) { observed = $0 }
+            let window = try XCTUnwrap(presenter.activeWindow)
+            let host = try XCTUnwrap(window.contentView as? NSHostingView<AuthorizationPromptView>)
+
+            host.rootView.deny(scope)
+
+            XCTAssertEqual(observed?.outcome, "deny")
+            XCTAssertEqual(observed?.scope, scope.wireScope)
+            XCTAssertEqual(observed?.ttl_secs, scope.ttlSeconds)
+            XCTAssertNil(presenter.activeWindow)
+        }
+    }
+
+    @MainActor
+    func testClosingWindowDoesNotRememberADenial() throws {
+        let presenter = makePresenter()
+        var observed: DecisionMsg?
+        presenter.show(fixturePrompt()) { observed = $0 }
+        try XCTUnwrap(presenter.activeWindow).performClose(nil)
+        XCTAssertEqual(observed?.outcome, "deny")
+        XCTAssertNil(observed?.scope)
+        XCTAssertNil(observed?.ttl_secs)
     }
 
     @MainActor

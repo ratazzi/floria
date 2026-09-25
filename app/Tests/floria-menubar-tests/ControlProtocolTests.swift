@@ -742,6 +742,14 @@ final class ControlProtocolTests: XCTestCase {
         XCTAssertEqual(grant.scope, "today")
         XCTAssertEqual(grant.target, "~/.pgpass")
         XCTAssertEqual(grant.expirationDate?.timeIntervalSince1970, 1_800_000_600)
+        XCTAssertFalse(grant.isDenied)
+
+        var deniedValue = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(grant)) as? [String: Any])
+        deniedValue["allowed"] = false
+        let denied = try JSONDecoder().decode(
+            ActiveGrant.self, from: JSONSerialization.data(withJSONObject: deniedValue))
+        XCTAssertTrue(denied.isDenied)
     }
 
     func testAccessHistoryRequestAndResultMatchRustWireShape() throws {

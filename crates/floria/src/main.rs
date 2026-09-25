@@ -2413,6 +2413,7 @@ impl RuntimePolicyController for AgentPolicyController {
             grants
                 .into_iter()
                 .map(|grant| ControlActiveGrant {
+                    allowed: grant.allowed,
                     id: grant.id,
                     subject: grant.subject,
                     object: grant.object,

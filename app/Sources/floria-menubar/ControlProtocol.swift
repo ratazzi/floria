@@ -80,6 +80,8 @@ struct RuntimePolicyStatus: Codable, Equatable, Sendable {
 }
 
 struct ActiveGrant: Codable, Equatable, Identifiable, Sendable {
+    let allowed: Bool?
+    var isDenied: Bool { allowed == false }
     let id: String
     let subject: String
     let object: String
@@ -93,7 +95,7 @@ struct ActiveGrant: Codable, Equatable, Identifiable, Sendable {
     let target: String
 
     enum CodingKeys: String, CodingKey {
-        case id, subject, object, operation, enforcement, scope, client, executable, target
+        case id, subject, object, operation, enforcement, scope, client, executable, target, allowed
         case expiresAt = "expires_at"
         case bundleID = "bundle_id"
     }

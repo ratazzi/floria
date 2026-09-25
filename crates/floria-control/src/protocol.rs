@@ -515,6 +515,7 @@ pub struct ProjectCheckoutCandidate {
 /// normalized subject/object; display fields explain the grant without exposing secret content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveGrant {
+    pub allowed: bool,
     pub id: String,
     pub subject: String,
     pub object: String,
@@ -1196,6 +1197,7 @@ mod tests {
         assert_eq!(revoke["params"]["id"], "fixture-grant");
 
         let result = serde_json::to_value(ControlResult::ActiveGrants(vec![ActiveGrant {
+            allowed: false,
             id: "fixture-grant".to_string(),
             subject: "exe:/usr/bin/cat".to_string(),
             object: "secrets/fixture".to_string(),
@@ -1211,6 +1213,7 @@ mod tests {
         .unwrap();
         assert_eq!(result["type"], "active_grants");
         assert_eq!(result["value"][0]["client"], "cat");
+        assert_eq!(result["value"][0]["allowed"], false);
         assert_eq!(result["value"][0]["enforcement"], "prompt");
         assert_eq!(result["value"][0]["scope"], "today");
     }

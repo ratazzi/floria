@@ -214,8 +214,8 @@ impl SocketAgent {
         let generation = self.grant_generation.load(Ordering::Acquire);
         let flight_key = (key.clone(), generation);
 
-        if self.grant_valid(&key) {
-            return Decision::allow("cached grant").with_rule("grant");
+        if let Some(decision) = self.cached_decision(&key) {
+            return decision;
         }
 
         let (flight, is_leader) = {
@@ -226,8 +226,8 @@ impl SocketAgent {
 
             // A previous leader may have installed a grant after our optimistic check but before
             // we acquired the coordinator lock.
-            if self.grant_valid(&key) {
-                return Decision::allow("cached grant").with_rule("grant");
+            if let Some(decision) = self.cached_decision(&key) {
+                return decision;
             }
 
             match flights.get(&flight_key) {
@@ -280,19 +280,22 @@ impl SocketAgent {
         );
 
         match result {
-            PromptResult::Decision(d) if d.allow => {
+            PromptResult::Decision(d) => {
                 if self.grant_generation.load(Ordering::Acquire) == generation {
                     if let Some(lifetime) = grant_lifetime(&d) {
                         if let Err(error) =
-                            self.grants.insert(key.clone(), lifetime, grant_metadata(req))
+                            self.grants.insert_decision(key.clone(), lifetime, grant_metadata(req), d.allow)
                         {
                             tracing::warn!(%error, "persisting authorization grant failed");
                         }
                     }
                 }
-                Decision::allow("prompt: allowed").with_rule("prompt")
+                if d.allow {
+                    Decision::allow("prompt: allowed").with_rule("prompt")
+                } else {
+                    Decision::deny("prompt: denied").with_rule("prompt")
+                }
             }
-            PromptResult::Decision(_) => Decision::deny("prompt: denied").with_rule("prompt"),
             PromptResult::NoApp => {
                 Decision::deny("no agent app connected").with_rule("fail-closed")
             }
@@ -302,9 +305,15 @@ impl SocketAgent {
         }
     }
 
-    /// True if a non-expired grant exists for `key`; expired grants are evicted.
-    fn grant_valid(&self, key: &GrantKey) -> bool {
-        self.grants.is_valid(key)
+    /// Reuse only explicit, unexpired user decisions; failures are never remembered.
+    fn cached_decision(&self, key: &GrantKey) -> Option<Decision> {
+        self.grants.decision(key).map(|allowed| {
+            if allowed {
+                Decision::allow("cached grant").with_rule("grant")
+            } else {
+                Decision::deny("cached denial").with_rule("grant")
+            }
+        })
     }
 }
 
@@ -768,6 +777,87 @@ mod tests {
 
         assert_eq!(prompt_count, 2);
         assert!(decisions.into_iter().all(|allowed| allowed));
+    }
+
+    #[test]
+    fn repeated_reads_after_deny_today_do_not_prompt_again() {
+        assert_repeated_denial_prompts(Some("today"), 1);
+    }
+
+    #[test]
+    fn repeated_reads_respect_denial_duration() {
+        for scope in [Some("until_lock"), Some("ttl")] {
+            assert_repeated_denial_prompts(scope, 1);
+        }
+        for scope in [None, Some("once")] {
+            assert_repeated_denial_prompts(scope, 2);
+        }
+    }
+
+    fn assert_repeated_denial_prompts(scope: Option<&str>, expected_prompts: usize) {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = Arc::new(prompt_only_agent(tmp.path()));
+        let mut app = connect_test_app(&agent, &tmp.path().join("agent.sock"));
+        let worker = {
+            let agent = Arc::clone(&agent);
+            std::thread::spawn(move || {
+                for pid in [4242, 4243] {
+                    let mut identity = ProcessIdentity::bare(pid, 501, 20);
+                    identity.exe_path = Some("/Applications/Warp.app/Contents/MacOS/warp".into());
+                    assert!(!agent.authorize(&req(&identity, Operation::Read)).is_allowed());
+                }
+            })
+        };
+        let mut prompts = 0;
+        let mut accesses = 0;
+        while accesses < 2 {
+            let message: Value = read_msg(&mut app).unwrap();
+            match message["type"].as_str() {
+                Some("prompt") => {
+                    prompts += 1;
+                    write_msg(&mut app, &json!({
+                        "type": "decision", "req_id": message["req_id"],
+                        "outcome": "deny", "scope": scope
+                    })).unwrap();
+                }
+                Some("access_event") => accesses += 1,
+                other => panic!("unexpected message: {other:?}"),
+            }
+        }
+        worker.join().unwrap();
+        assert_eq!(prompts, expected_prompts, "unexpected prompts for denial scope {scope:?}");
+    }
+
+    #[test]
+    fn cached_denial_is_scoped_to_subject_object_revision_and_operation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = prompt_only_agent(tmp.path());
+        let identity = ProcessIdentity::bare(1234, 501, 20);
+        let mut request = req(&identity, Operation::Read);
+        request.object_revision = Some("v1");
+        let key = GrantKey::new(
+            grant_key(&identity, None), grant_object(&request),
+            Operation::Read, Enforcement::Prompt,
+        );
+        agent.grants.insert_decision(key, timed_grant(), fixture_grant_metadata(), false).unwrap();
+        let decision = agent.authorize(&request);
+        assert!(!decision.is_allowed());
+        assert_eq!(decision.rule_id.as_deref(), Some("grant"));
+
+        let other = ProcessIdentity::bare(5678, 501, 20);
+        let mut other_subject = req(&other, Operation::Read);
+        other_subject.object_revision = Some("v1");
+        let mut other_object = req(&identity, Operation::Read);
+        other_object.object_revision = Some("v1");
+        other_object.path = "secrets/other";
+        let mut other_revision = req(&identity, Operation::Read);
+        other_revision.object_revision = Some("v2");
+        let mut other_operation = req(&identity, Operation::Write);
+        other_operation.object_revision = Some("v1");
+        for other in [other_subject, other_object, other_revision, other_operation] {
+            // No GUI is connected: a cache miss reaches the prompt's fail-closed path.
+            assert_eq!(agent.authorize(&other).rule_id.as_deref(), Some("fail-closed"));
+        }
     }
 
     #[test]
