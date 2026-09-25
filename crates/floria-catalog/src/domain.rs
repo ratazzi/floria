@@ -640,6 +640,13 @@ impl CatalogSnapshot {
     /// backing Secret id. Other Surfaces are independently created Managed Items and use their
     /// own stable Surface id.
     pub fn managed_item_id_for_surface<'a>(&'a self, surface: &'a Surface) -> &'a str {
+        // Checkout instances carry a different materialized path, but their identity must
+        // match the canonical Surface used by the mounted registry and policy engine.
+        let surface = self
+            .surfaces
+            .iter()
+            .find(|canonical| canonical.id == surface.id)
+            .unwrap_or(surface);
         if !surface.kind.is_file() {
             return &surface.id;
         }

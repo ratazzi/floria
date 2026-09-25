@@ -190,8 +190,8 @@ impl ManagedSymlink {
 }
 
 /// Materialize each configured file Surface at the primary checkout and every provisioned
-/// worktree that selected the Surface's Environment. The mounted target remains the one canonical
-/// Surface id; only project-facing links multiply.
+/// worktree that selected the Surface's Environment. The mounted target retains the canonical
+/// Managed Item identity; only project-facing links multiply.
 pub fn file_surface_instances(snapshot: &CatalogSnapshot) -> SurfaceResult<Vec<Surface>> {
     let mut instances = Vec::new();
     for surface in snapshot.surfaces.iter().filter(|surface| is_file_surface(surface.kind)) {
@@ -1282,6 +1282,109 @@ mod tests {
             ensure_file_surface_link(&surface, &mount).unwrap(),
             SurfaceLinkState::Ready
         );
+    }
+
+    #[test]
+    fn configured_worktree_links_resolve_to_the_registered_managed_item() {
+        use floria_catalog::{
+            Binding, OriginKind, OriginSource, Resource, ResourceCodec,
+            ResourceKind, ResourceOrigin, ResourceSource, ValueShape,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let primary = dir.path().join("project");
+        let worktree = dir.path().join("worktree");
+        let mount = dir.path().join("mount");
+        let relative = Path::new("ingress/.dev.vars");
+        std::fs::create_dir_all(primary.join("ingress")).unwrap();
+        std::fs::create_dir_all(worktree.join("ingress")).unwrap();
+        let mut surface = fixture_surface(primary.join(relative));
+        surface.input = SurfaceInput::Bindings { binding_ids: vec!["binding".to_string()] };
+        let mut snapshot = CatalogSnapshot {
+            projects: vec![Project {
+                id: "project".to_string(),
+                path: primary.clone(),
+                ..Default::default()
+            }],
+            environments: vec![Environment {
+                id: surface.environment_id.clone(),
+                project_id: "project".to_string(),
+                name: "Development".to_string(),
+                position: 0,
+            }],
+            checkouts: vec![ProjectCheckout {
+                id: "worktree".to_string(),
+                project_id: "project".to_string(),
+                path: worktree.clone(),
+                environment_id: Some(surface.environment_id.clone()),
+                kind: ProjectCheckoutKind::Worktree,
+                git_common_dir: None,
+            }],
+            resources: vec![Resource {
+                id: "resource".to_string(),
+                name: ".dev.vars".to_string(),
+                kind: ResourceKind::EnvFile,
+                shape: ValueShape::KeyValueSet,
+                codec: ResourceCodec::Dotenv,
+                default_env_key: None,
+                entries: Vec::new(),
+                source: ResourceSource::SecretRef {
+                    secret_id: "configured-secret".to_string(),
+                    managed_source_ids: Vec::new(),
+                },
+                enforcement: surface.enforcement,
+                metadata: Default::default(),
+                origin: ResourceOrigin {
+                    kind: OriginKind::Discovered,
+                    sources: vec![OriginSource {
+                        path: primary.join(relative),
+                        project_id: Some("project".to_string()),
+                        environment: Some("Development".to_string()),
+                        imported_at: "2026-09-23T00:00:00Z".to_string(),
+                    }],
+                },
+            }],
+            bindings: vec![Binding {
+                id: "binding".to_string(),
+                project_id: "project".to_string(),
+                resource_id: "resource".to_string(),
+                ..Default::default()
+            }],
+            surfaces: vec![surface],
+            ..Default::default()
+        };
+
+        for direct in [false, true] {
+            if direct {
+                snapshot.surfaces[0].kind = SurfaceKind::File(FileBacking::EnvFileDirect);
+                snapshot.surfaces[0].input = SurfaceInput::Resource {
+                    resource_id: "resource".to_string(),
+                };
+            }
+            let registry = crate::SurfaceRegistry::from_snapshot(&snapshot);
+            let plan = registry.get("fixture-dotenv").unwrap();
+            let registered_id = plan.catalog_snapshot().managed_item_id_for_surface(&plan.surface);
+            assert_eq!(registered_id, "configured-secret");
+            let target = managed_item_target(&mount, registered_id, relative).unwrap();
+            std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+            std::fs::write(&target, b"FIXTURE=1\n").unwrap();
+
+            for instance in file_surface_instances(&snapshot).unwrap() {
+                ensure_file_surface_link_in_snapshot(&snapshot, &instance, &mount).unwrap();
+                let path = instance.path.unwrap();
+                assert_eq!(std::fs::read_link(&path).unwrap(), target);
+                assert!(path.exists(), "managed link must resolve: {}", path.display());
+            }
+
+            let broken_target = managed_item_target(&mount, "fixture-dotenv", relative).unwrap();
+            replace_file_with_symlink(&worktree.join(relative), &broken_target).unwrap();
+            let links = managed_file_links(&snapshot, &[], &mount).unwrap();
+            let link = links.iter().find(|link| link.path() == worktree.join(relative)).unwrap();
+            assert_eq!(link.status().unwrap(), ManagedLinkStatus::Replaced);
+            link.repair().unwrap();
+            assert_eq!(std::fs::read_link(link.path()).unwrap(), target);
+            assert!(link.path().exists());
+        }
     }
 
     #[test]
