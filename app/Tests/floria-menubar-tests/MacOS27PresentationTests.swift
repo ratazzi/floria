@@ -36,7 +36,7 @@ final class MacOS27PresentationTests: XCTestCase {
         let start = try XCTUnwrap(source.range(of: "struct FloriaMark: View {"))
         let end = try XCTUnwrap(
             source.range(
-                of: "private struct DashboardSection",
+                of: "struct DashboardSection",
                 range: start.upperBound..<source.endIndex))
         let mark = source[start.lowerBound..<end.lowerBound]
 
