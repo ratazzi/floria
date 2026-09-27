@@ -4,9 +4,9 @@ import SwiftUI
 /// Full access-log browser retained as a top-level destination in the workspace dashboard.
 struct AccessLogView: View {
     @Bindable var state: AppState
+    var search: String
     @State private var grouping: Grouping = .client
     @State private var selection: SidebarFilter? = SidebarFilter.all
-    @State private var search = ""
     @State private var showingClearConfirmation = false
 
     enum Grouping: String, CaseIterable {
@@ -45,14 +45,15 @@ struct AccessLogView: View {
     }
 
     var body: some View {
-        NavigationSplitView {
+        HSplitView {
             sidebar
-                .navigationSplitViewColumnWidth(min: 180, ideal: 220)
-        } detail: {
-            accessTable
+                .frame(minWidth: 160, idealWidth: 190, maxWidth: 220)
+            VStack(spacing: 0) {
+                accessTable
+                bottomBar
+            }
+            .frame(minWidth: 600, maxWidth: .infinity, maxHeight: .infinity)
         }
-        .searchable(text: $search, placement: .toolbar, prompt: "Filter")
-        .navigationTitle("Recent Access")
         .confirmationDialog(
             "Clear recent activity?",
             isPresented: $showingClearConfirmation
@@ -83,13 +84,17 @@ struct AccessLogView: View {
                     icon: Image(systemName: "tray.full")
                 )
                 .tag(SidebarFilter.all)
+                .listRowSeparator(.hidden)
                 ForEach(groups, id: \.name) { g in
                     SidebarRow(name: g.name, count: g.count, icon: icon(for: g.name))
                         .tag(SidebarFilter.group(g.name))
+                        .listRowSeparator(.hidden)
                 }
             }
-            .listStyle(.sidebar)
+            .listStyle(.inset)
+            .scrollContentBackground(.hidden)
         }
+        .background(Color(nsColor: .controlBackgroundColor))
         // Groups come and go as events arrive; fall back to All if the selection vanished.
         .onChange(of: grouping) { selection = .all }
     }
@@ -121,11 +126,11 @@ struct AccessLogView: View {
                 }
                 .help(ev.chain)
             }
-            .width(min: 110, ideal: 150)
+            .width(min: 80, ideal: 100, max: 130)
             TableColumn("Op") { ev in
                 OperationBadge(operation: ev.operation)
             }
-            .width(56)
+            .width(44)
             TableColumn("Decision") { ev in
                 HStack(spacing: 5) {
                     Circle()
@@ -134,16 +139,20 @@ struct AccessLogView: View {
                     Text(ev.decision).foregroundStyle(.secondary)
                 }
             }
-            .width(80)
-            TableColumn("Rule") { ev in
-                Text(ev.ruleLabel).foregroundStyle(.secondary)
-            }
-            .width(min: 80, ideal: 110)
+            .width(74)
             TableColumn("Path") { ev in
                 Text(ev.shownPath)
                     .truncationMode(.middle)
                     .help(eventDetail(ev))
             }
+            .width(min: 120, ideal: 170)
+            TableColumn("Rule") { ev in
+                Text(ev.ruleLabel)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .help(ev.ruleLabel)
+            }
+            .width(min: 60, ideal: 70, max: 100)
         }
         .overlay {
             if events.isEmpty {
@@ -156,9 +165,6 @@ struct AccessLogView: View {
                     )
                 }
             }
-        }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            bottomBar
         }
     }
 
@@ -186,6 +192,32 @@ struct AccessLogView: View {
         .padding(.vertical, 8)
         .background(.bar)
         .overlay(alignment: .top) { Divider() }
+    }
+}
+
+struct AccessLogSheet: View {
+    @Bindable var state: AppState
+    @Environment(\.dismiss) private var dismiss
+    @State private var search = ""
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 16) {
+                Text("Access Log").font(.title3.weight(.semibold))
+                Spacer()
+                TextField("Search access log", text: $search)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 260)
+                Button("Done") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding(.horizontal, 18)
+            .frame(height: 64)
+            Divider()
+            AccessLogView(state: state, search: search)
+        }
+        .background(Color(nsColor: .controlBackgroundColor))
+        .frame(minWidth: 920, minHeight: 620)
     }
 }
 
