@@ -14,7 +14,7 @@ final class PromptPresenter {
         subsystem: ProductIdentity.bundleIdentifier, category: "prompt")
 
     private enum Choice {
-        case deny
+        case deny(PromptGrantScope?)
         case allow(PromptGrantScope)
     }
 
@@ -105,7 +105,7 @@ final class PromptPresenter {
             let window = makeWindow(for: pending.prompt)
             let windowController = NSWindowController(window: window)
             let delegate = PromptWindowDelegate { [weak self] in
-                self?.settle(.deny, requestID: pending.prompt.req_id)
+                self?.settle(.deny(nil), requestID: pending.prompt.req_id)
             }
             window.delegate = delegate
             let session = ActivePrompt(
@@ -143,8 +143,8 @@ final class PromptPresenter {
         let content = AuthorizationPromptView(
             prompt: prompt,
             frameHeight: height,
-            deny: { [weak self] in
-                self?.settle(.deny, requestID: prompt.req_id)
+            deny: { [weak self] scope in
+                self?.settle(.deny(scope), requestID: prompt.req_id)
             },
             allow: { [weak self] scope in
                 self?.settle(.allow(scope), requestID: prompt.req_id)
@@ -179,9 +179,9 @@ final class PromptPresenter {
         closeWindow(session)
 
         switch choice {
-        case .deny:
+        case .deny(let scope):
             session.timeoutTask?.cancel()
-            complete(session, decision: denyDecision(for: session.pending.prompt))
+            complete(session, decision: denyDecision(for: session.pending.prompt, scope: scope))
 
         case .allow(let scope):
             let prompt = session.pending.prompt
@@ -243,8 +243,10 @@ final class PromptPresenter {
         _ = previousApplication.activate(from: .current)
     }
 
-    private func denyDecision(for prompt: PromptMsg) -> DecisionMsg {
-        DecisionMsg(req_id: prompt.req_id, outcome: "deny", scope: nil, ttl_secs: nil)
+    private func denyDecision(for prompt: PromptMsg, scope: PromptGrantScope? = nil) -> DecisionMsg {
+        DecisionMsg(
+            req_id: prompt.req_id, outcome: "deny",
+            scope: scope?.wireScope, ttl_secs: scope?.ttlSeconds)
     }
 
     @objc private func applicationDidBecomeActive() {
