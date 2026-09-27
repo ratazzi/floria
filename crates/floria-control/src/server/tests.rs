@@ -1138,6 +1138,7 @@
         let policy: Arc<dyn RuntimePolicyController> = Arc::new(FixturePolicy {
             status: Mutex::new(PolicyModeStatus::default()),
             grants: Mutex::new(vec![ActiveGrant {
+                allowed: true,
                 id: "fixture-grant".to_string(),
                 subject: "exe:/usr/bin/cat".to_string(),
                 object: "secrets/fixture".to_string(),
@@ -1179,6 +1180,7 @@
         assert_eq!(
             client.request(ControlCommand::GrantList).unwrap(),
             ControlResult::ActiveGrants(vec![ActiveGrant {
+                allowed: true,
                 id: "fixture-grant".to_string(),
                 subject: "exe:/usr/bin/cat".to_string(),
                 object: "secrets/fixture".to_string(),

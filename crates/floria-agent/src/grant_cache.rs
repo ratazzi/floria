@@ -12,7 +12,8 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-const SCHEMA_VERSION: u32 = 3;
+// Older daemons must reject this schema rather than treat a denial as an allow.
+const SCHEMA_VERSION: u32 = 4;
 const INTEGRITY_DOMAIN: &str = "authorization-grants";
 const MAXIMUM_TTL: Duration = Duration::from_secs(26 * 60 * 60);
 
@@ -69,6 +70,7 @@ pub struct GrantMetadata {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ActiveGrant {
+    pub allowed: bool,
     pub id: String,
     pub subject: String,
     pub object: String,
@@ -80,6 +82,7 @@ pub struct ActiveGrant {
 }
 
 struct GrantRecord {
+    allowed: bool,
     lifetime: GrantRecordLifetime,
     metadata: GrantMetadata,
 }
@@ -250,28 +253,45 @@ impl GrantCache {
         self.persist_best_effort(&entries, "reset rejected grant state");
     }
 
+    #[cfg(test)]
     pub(crate) fn is_valid(&self, key: &GrantKey) -> bool {
+        self.decision(key) == Some(true)
+    }
+
+    pub(crate) fn decision(&self, key: &GrantKey) -> Option<bool> {
         let mut entries = self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         match entries.get(key) {
-            Some(GrantRecord { lifetime: GrantRecordLifetime::UntilLock, .. }) => true,
+            Some(GrantRecord { lifetime: GrantRecordLifetime::UntilLock, allowed, .. }) => Some(*allowed),
             Some(GrantRecord {
                 lifetime: GrantRecordLifetime::Timed { monotonic, .. },
+                allowed,
                 ..
-            }) if *monotonic > Instant::now() => true,
+            }) if *monotonic > Instant::now() => Some(*allowed),
             Some(_) => {
                 entries.remove(key);
                 self.persist_best_effort(&entries, "remove expired grant");
-                false
+                None
             }
-            None => false,
+            None => None,
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn insert(
         &self,
         key: GrantKey,
         lifetime: GrantLifetime,
         metadata: GrantMetadata,
+    ) -> io::Result<()> {
+        self.insert_decision(key, lifetime, metadata, true)
+    }
+
+    pub(crate) fn insert_decision(
+        &self,
+        key: GrantKey,
+        lifetime: GrantLifetime,
+        metadata: GrantMetadata,
+        allowed: bool,
     ) -> io::Result<()> {
         let lifetime = match lifetime {
             GrantLifetime::UntilLock => GrantRecordLifetime::UntilLock,
@@ -298,7 +318,7 @@ impl GrantCache {
             }
         };
         let mut entries = self.entries.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        entries.insert(key, GrantRecord { lifetime, metadata });
+        entries.insert(key, GrantRecord { allowed, lifetime, metadata });
         self.persist_best_effort(&entries, "insert grant");
         Ok(())
     }
@@ -381,6 +401,7 @@ impl GrantCache {
             .insert(
                 key,
                 GrantRecord {
+                    allowed: true,
                     lifetime: GrantRecordLifetime::Timed {
                         monotonic: Instant::now() - Duration::from_secs(1),
                         unix: 1,
@@ -405,6 +426,9 @@ struct GrantDocument {
 
 #[derive(Serialize, Deserialize)]
 struct PersistedGrant {
+    // Schema 3 stored only approvals. Preserve them during the schema 4 upgrade.
+    #[serde(default = "legacy_allowed")]
+    allowed: bool,
     subject: String,
     object: String,
     operation: String,
@@ -417,8 +441,12 @@ struct PersistedGrant {
     target: String,
 }
 
+fn legacy_allowed() -> bool {
+    true
+}
+
 fn load_document(document: GrantDocument) -> io::Result<HashMap<GrantKey, GrantRecord>> {
-    if document.version != SCHEMA_VERSION {
+    if document.version != SCHEMA_VERSION && document.version != 3 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported grant store schema {}", document.version),
@@ -453,6 +481,7 @@ fn load_document(document: GrantDocument) -> io::Result<HashMap<GrantKey, GrantR
                 persisted.enforcement,
             ),
             GrantRecord {
+                allowed: persisted.allowed,
                 lifetime: GrantRecordLifetime::Timed {
                     monotonic,
                     unix: persisted.expires_at,
@@ -478,6 +507,7 @@ fn persisted_document(entries: &HashMap<GrantKey, GrantRecord>) -> GrantDocument
                 return None;
             };
             Some(PersistedGrant {
+                allowed: record.allowed,
                 subject: key.subject.clone(),
                 object: key.object.clone(),
                 operation: key.operation.as_str().to_string(),
@@ -518,6 +548,7 @@ fn active_grant(key: &GrantKey, record: &GrantRecord) -> ActiveGrant {
         GrantRecordLifetime::UntilLock => (GrantScope::UntilLock, None),
     };
     ActiveGrant {
+        allowed: record.allowed,
         id: grant_id(key),
         subject: key.subject.clone(),
         object: key.object.clone(),
@@ -619,6 +650,60 @@ mod tests {
     }
 
     #[test]
+    fn remembered_denials_persist_expire_and_can_be_revoked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grants.json");
+        let auth = authenticator();
+        let cache = GrantCache::open(&path, Arc::clone(&auth));
+        cache.insert_decision(
+            key(Operation::Read), timed(Duration::from_secs(600)), metadata(), false,
+        ).unwrap();
+        let reopened = GrantCache::open(&path, auth);
+        assert_eq!(reopened.decision(&key(Operation::Read)), Some(false));
+        assert_eq!(reopened.decision(&key(Operation::Write)), None);
+        let active = reopened.active().unwrap();
+        assert_eq!(active.len(), 1);
+        assert!(!active[0].allowed);
+        assert!(reopened.revoke(&active[0].id).unwrap());
+        assert_eq!(reopened.decision(&key(Operation::Read)), None);
+        reopened.insert_decision(
+            key(Operation::Read), timed(Duration::ZERO), metadata(), false,
+        ).unwrap();
+        assert_eq!(reopened.decision(&key(Operation::Read)), None);
+    }
+
+    #[test]
+    fn lock_bound_denial_is_cleared_on_lock_and_never_reloaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grants.json");
+        let auth = authenticator();
+        let cache = GrantCache::open(&path, Arc::clone(&auth));
+        cache.insert_decision(
+            key(Operation::Read), GrantLifetime::UntilLock, metadata(), false,
+        ).unwrap();
+        assert_eq!(cache.decision(&key(Operation::Read)), Some(false));
+        assert_eq!(GrantCache::open(&path, auth).decision(&key(Operation::Read)), None);
+        assert!(cache.clear_until_lock().unwrap());
+        assert_eq!(cache.decision(&key(Operation::Read)), None);
+    }
+
+    #[test]
+    fn schema_three_approvals_survive_the_decision_store_upgrade() {
+        let document: GrantDocument = serde_json::from_value(serde_json::json!({
+            "version": 3,
+            "grants": [{
+                "subject": "repo:/fixture/project", "object": "secrets/fixture",
+                "operation": "read", "enforcement": "prompt", "scope": "today",
+                "expires_at": now_unix() + 600, "client": "fixture-client",
+                "executable": null, "bundle_id": null, "target": "~/.fixture"
+            }]
+        })).unwrap();
+        let entries = load_document(document).unwrap();
+        assert!(entries[&key(Operation::Read)].allowed);
+        assert_eq!(persisted_document(&entries).version, 4);
+    }
+
+    #[test]
     fn grant_survives_reopen_and_file_is_private() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("grants.json");
@@ -700,6 +785,7 @@ mod tests {
         let document = GrantDocument {
             version: SCHEMA_VERSION,
             grants: vec![PersistedGrant {
+                allowed: true,
                 subject: "repo:/fixture/project".to_string(),
                 object: "secrets/fixture".to_string(),
                 operation: "read".to_string(),

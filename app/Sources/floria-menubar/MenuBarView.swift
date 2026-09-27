@@ -262,7 +262,7 @@ private enum MenuBarConfirmation: Equatable {
     var title: String {
         switch self {
         case .clearRecent: "Clear recent activity?"
-        case .revokeAll: "Revoke active access?"
+        case .revokeAll: "Clear remembered decisions?"
         case .auditOnly: "Enable Audit Only?"
         }
     }
@@ -272,7 +272,7 @@ private enum MenuBarConfirmation: Equatable {
         case .clearRecent:
             "This clears only the activity shown in Floria. The daemon audit log on disk is not deleted."
         case .revokeAll:
-            "Apps using these temporary grants will need authorization again the next time they access the protected item."
+            "Temporary approvals and denials will be removed. Apps will need authorization again the next time they access the protected item."
         case .auditOnly:
             "Ask and Touch ID items will be allowed without interaction. Every access will still be audited, and explicit deny rules remain blocked."
         }
@@ -512,7 +512,7 @@ private struct ActiveAccessHeader: View {
         HStack(spacing: 5) {
             Image(systemName: "clock.badge.checkmark")
                 .font(.caption2)
-            Text("Active Access")
+            Text("Remembered Decisions")
                 .font(.caption.weight(.semibold))
             Text("\(count)")
                 .font(.caption2.monospacedDigit())
@@ -555,11 +555,11 @@ private struct ActiveGrantRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Image(systemName: "checkmark.shield.fill")
+            Image(systemName: grant.isDenied ? "xmark.shield.fill" : "checkmark.shield.fill")
                 .font(.caption)
-                .foregroundStyle(.blue)
+                .foregroundStyle(grant.isDenied ? Color.red : Color.blue)
                 .frame(width: 12)
-            Text(grant.operation)
+            Text(grant.isDenied ? "denied \(grant.operation)" : grant.operation)
                 .font(.caption2.weight(.semibold))
                 .foregroundStyle(operationColor)
                 .padding(.horizontal, 5)
@@ -585,7 +585,7 @@ private struct ActiveGrantRow: View {
                     .foregroundStyle(hovered ? Color.orange : Color.secondary)
             }
             .buttonStyle(.plain)
-            .help("Revoke this temporary authorization")
+            .help(grant.isDenied ? "Remove this temporary denial" : "Revoke this temporary authorization")
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)

@@ -221,7 +221,7 @@ struct PromptPresentation {
 struct AuthorizationPromptView: View {
     let prompt: PromptMsg
     let frameHeight: CGFloat
-    let deny: () -> Void
+    let deny: (PromptGrantScope) -> Void
     let allow: (PromptGrantScope) -> Void
 
     @State private var grantPreset = PromptGrantPreset.today
@@ -253,7 +253,7 @@ struct AuthorizationPromptView: View {
 
             Divider()
             HStack {
-                Button("Deny", role: .cancel, action: deny)
+                Button("Deny \(scope.title)", role: .cancel) { deny(scope) }
                     .keyboardShortcut(.cancelAction)
                 Spacer()
                 Button(primaryButtonTitle) { allow(scope) }
@@ -528,10 +528,10 @@ struct AuthorizationScopePicker: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 12) {
-                Text("Authorization scope")
+                Text("Decision duration")
                     .font(.headline)
                 Spacer()
-                Picker("Authorization scope", selection: $preset) {
+                Picker("Decision duration", selection: $preset) {
                     ForEach(PromptGrantPreset.allCases, id: \.self) { option in
                         Text(option.title).tag(option)
                     }
@@ -587,19 +587,19 @@ struct AuthorizationScopePicker: View {
     private var scopeDescription: String {
         switch scope {
         case .once:
-            return "Allow only this request."
+            return "Allow or deny only this request."
         case .today:
             return operation == "sign"
-                ? "Reuse this approval for the same client and SSH identity until the end of today."
-                : "Reuse this approval for the same client and file until the end of today."
+                ? "Remember allow or deny for the same client and SSH identity until the end of today."
+                : "Remember allow or deny for the same client and file until the end of today."
         case .untilLock:
             return operation == "sign"
-                ? "Reuse this approval until this Mac locks or Floria disconnects."
-                : "Reuse this approval until this Mac locks or Floria disconnects."
+                ? "Remember allow or deny until this Mac locks or Floria disconnects."
+                : "Remember allow or deny until this Mac locks or Floria disconnects."
         case .timed:
             return operation == "sign"
-                ? "Reuse this approval for the same client and SSH identity for \(scope.title)."
-                : "Reuse this approval for the same client and file for \(scope.title)."
+                ? "Remember allow or deny for the same client and SSH identity for \(scope.title)."
+                : "Remember allow or deny for the same client and file for \(scope.title)."
         }
     }
 }
