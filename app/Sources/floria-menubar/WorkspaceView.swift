@@ -315,7 +315,6 @@ enum WorkspaceSidebarSelection: Hashable {
 /// Main product workspace: choose a project and environment, compose typed bindings,
 /// then inspect the concrete file/socket surfaces exposed to local processes.
 struct AdvancedWorkspaceView: View {
-    @Environment(\.dismiss) private var dismiss
     @Bindable var state: AppState
     private let initialSelection: WorkspaceSidebarSelection
     @State private var selection: WorkspaceSidebarSelection?
@@ -345,7 +344,7 @@ struct AdvancedWorkspaceView: View {
     var body: some View {
         HStack(spacing: 0) {
             sidebar
-                .frame(width: 252)
+                .frame(width: 220)
             Divider()
             VStack(spacing: 0) {
                 workspaceToolbar
@@ -354,6 +353,7 @@ struct AdvancedWorkspaceView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+        .background(Color(nsColor: .controlBackgroundColor))
         .ignoresSafeArea(.container, edges: .top)
         .focusedSceneValue(\.focusAppSearch) {
             searchIsFocused = true
@@ -432,25 +432,43 @@ struct AdvancedWorkspaceView: View {
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass")
                     .foregroundStyle(.secondary)
-                TextField("Search current view", text: $search)
+                TextField(selection == .accessLog ? "Search access log" : "Search current view", text: $search)
                     .textFieldStyle(.plain)
                     .focused($searchIsFocused)
                     .onExitCommand {
                         if search.isEmpty {
-                            dismiss()
+                            searchIsFocused = false
                         } else {
                             search = ""
                         }
                     }
+                if !search.isEmpty {
+                    Button {
+                        search = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.tertiary)
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("Clear search")
+                } else {
+                    Text("⌘F")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 4))
+                }
             }
-            .padding(.horizontal, 12)
-            .frame(maxWidth: 430)
+            .padding(.horizontal, 11)
+            .frame(minWidth: 180, maxWidth: .infinity)
             .frame(height: 34)
             .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
             .overlay {
                 RoundedRectangle(cornerRadius: 8)
-                    .stroke(Color.secondary.opacity(0.22), lineWidth: 1)
+                    .stroke(Color.secondary.opacity(0.18), lineWidth: 1)
             }
+            .layoutPriority(1)
 
             Menu {
                 Button("New Project", systemImage: "folder.badge.plus") {
@@ -476,12 +494,16 @@ struct AdvancedWorkspaceView: View {
                 }
             } label: {
                 Image(systemName: "plus")
-                    .frame(width: 30, height: 30)
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
             }
-            .buttonStyle(.bordered)
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
             .accessibilityLabel("Add workspace item")
+            .fixedSize()
+            .help("Add workspace item")
 
-            Spacer(minLength: 16)
+            Divider().frame(height: 28)
 
             Menu {
                 ProtectionMenuContent(
@@ -510,7 +532,9 @@ struct AdvancedWorkspaceView: View {
                     needsAttention: state.systemHealth?.hasIssues == true
                         || state.systemHealthError != nil)
             }
-            .buttonStyle(.bordered)
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
             .accessibilityLabel(
                 state.systemHealth?.hasIssues == true || state.systemHealthError != nil
                     ? "System health needs attention"
@@ -519,8 +543,9 @@ struct AdvancedWorkspaceView: View {
                         : (state.connected ? "Protected policy" : "Daemon offline")))
         }
         .padding(.horizontal, 18)
-        .frame(height: 90)
-        .background(Color(nsColor: .windowBackgroundColor))
+        .frame(height: 52)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .gesture(WindowDragGesture())
     }
 
     private var sidebar: some View {
@@ -680,7 +705,7 @@ struct AdvancedWorkspaceView: View {
                 importIdentity: { showingImportSshIdentity = true },
                 connectExternalAgent: { showingConnectExternalAgent = true })
         case .accessLog:
-            AccessLogView(state: state)
+            AccessLogView(state: state, search: search)
         case nil:
             ContentUnavailableView("Select a project", systemImage: "folder")
         }
@@ -732,7 +757,7 @@ private struct ProjectWorkspaceView: View {
                     ProjectAccessPane(state: state)
                 }
             }
-            .frame(minWidth: 500, idealWidth: 720)
+            .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
 
             Divider()
             SurfaceInspector(
@@ -743,8 +768,9 @@ private struct ProjectWorkspaceView: View {
                 addDirectEnvFile: { showingAddDirectEnvFile = true },
                 addLinesFile: { showingAddLinesFile = true },
                 addSshAgent: { showingAddSshAgent = true })
-                .frame(width: 390)
+                .frame(width: 320)
         }
+        .background(Color(nsColor: .controlBackgroundColor))
         .sheet(isPresented: $showingAddBinding) {
             AddBindingSheet(store: store)
         }
@@ -806,71 +832,78 @@ private struct ProjectWorkspaceView: View {
     }
 
     private var projectHeader: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 3) {
+        HStack(spacing: 12) {
+            Image(systemName: "folder")
+                .font(.system(size: 20))
+                .foregroundStyle(Color.blue.opacity(0.78))
+                .frame(width: 34, height: 34)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 10) {
                     Text(store.selectedProject?.name ?? "Project")
                         .font(.title2.bold())
-                    Text(store.selectedProject?.path ?? "")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    environmentMenu
                 }
-                Spacer()
-                Menu {
-                    Button("Add Environment", systemImage: "plus") {
-                        showingNewEnvironment = true
-                    }
-                    Button("Open Project in Finder", systemImage: "folder") {
-                        guard let path = store.selectedProject?.path else { return }
-                        NSWorkspace.shared.open(URL(fileURLWithPath: path))
-                    }
-                    Button("Copy Project Path", systemImage: "doc.on.doc") {
-                        guard let path = store.selectedProject?.path else { return }
-                        copyToPasteboard(path)
-                    }
-                    Divider()
-                    Button("Remove Current Environment", systemImage: "minus.circle", role: .destructive) {
-                        confirmingRemoveEnvironment = true
-                    }
-                    .disabled((store.selectedProject?.environments.count ?? 0) <= 1)
-                    Button("Remove Project", systemImage: "trash", role: .destructive) {
-                        confirmingRemoveProject = true
-                    }
-                } label: {
-                    Image(systemName: "ellipsis")
-                }
-                .buttonStyle(.bordered)
-            }
-
-            HStack(spacing: 10) {
-                Text("Environment")
-                    .font(.caption.weight(.semibold))
+                Text(((store.selectedProject?.path ?? "") as NSString).abbreviatingWithTildeInPath)
+                    .font(.callout)
                     .foregroundStyle(.secondary)
-                Picker(
-                    "Environment",
-                    selection: Binding(
-                        get: { store.selectedEnvironmentID },
-                        set: { store.selectEnvironment($0) })
-                ) {
-                    ForEach(store.selectedProject?.environments ?? []) { environment in
-                        Text(environment.name).tag(environment.id)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            Spacer()
+            Menu {
+                Button("Add Environment", systemImage: "plus") {
+                    showingNewEnvironment = true
+                }
+                Button("Open Project in Finder", systemImage: "folder") {
+                    guard let path = store.selectedProject?.path else { return }
+                    NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                }
+                Button("Copy Project Path", systemImage: "doc.on.doc") {
+                    guard let path = store.selectedProject?.path else { return }
+                    copyToPasteboard(path)
+                }
+                Divider()
+                Button("Remove Current Environment", systemImage: "minus.circle", role: .destructive) {
+                    confirmingRemoveEnvironment = true
+                }
+                .disabled((store.selectedProject?.environments.count ?? 0) <= 1)
+                Button("Remove Project", systemImage: "trash", role: .destructive) {
+                    confirmingRemoveProject = true
+                }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .accessibilityLabel("Project actions")
+        }
+        .padding(.horizontal, 28)
+        .padding(.top, 22)
+        .padding(.bottom, 20)
+    }
+
+    private var environmentMenu: some View {
+        ProjectEnvironmentMenu(name: store.selectedEnvironment?.name ?? "No environment") {
+            ForEach(store.selectedProject?.environments ?? []) { environment in
+                Button {
+                    store.selectEnvironment(environment.id)
+                } label: {
+                    if environment.id == store.selectedEnvironmentID {
+                        Label(environment.name, systemImage: "checkmark")
+                    } else {
+                        Text(environment.name)
                     }
                 }
-                .pickerStyle(.menu)
-                .labelsHidden()
-                .frame(maxWidth: 260, alignment: .leading)
-                Button {
-                    showingNewEnvironment = true
-                } label: {
-                    Image(systemName: "plus")
-                }
-                .buttonStyle(.borderless)
-                .help("Add environment")
+            }
+            Divider()
+            Button("Add Environment", systemImage: "plus") {
+                showingNewEnvironment = true
             }
         }
-        .padding(.horizontal, 24)
-        .padding(.top, 20)
-        .padding(.bottom, 14)
     }
 }
 
@@ -895,7 +928,7 @@ private struct ProjectTabBar: View {
             }
             Spacer()
         }
-        .padding(.horizontal, 16)
+        .padding(.horizontal, 28)
         .padding(.bottom, 8)
     }
 }
@@ -907,11 +940,16 @@ private struct BindingsPane: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Bindings").font(.title3.bold())
+                HStack(alignment: .center, spacing: 12) {
                     Text("Compose this environment from reusable resources")
                         .font(.callout)
                         .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                    Button("Add Binding", systemImage: "plus") {
+                        showingAddBinding = true
+                    }
+                    .buttonStyle(.bordered)
+                    .fixedSize()
                 }
 
                 BindingSection(
@@ -920,22 +958,6 @@ private struct BindingsPane: View {
                 BindingSection(
                     title: "\(store.selectedEnvironment?.name ?? "Environment") only",
                     bindings: store.environmentBindings, store: store)
-
-                Button {
-                    showingAddBinding = true
-                } label: {
-                    Label("Add binding", systemImage: "plus")
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 11)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .overlay {
-                    RoundedRectangle(cornerRadius: 9)
-                        .stroke(
-                            Color.secondary.opacity(0.45),
-                            style: StrokeStyle(lineWidth: 1, dash: [5, 4]))
-                }
 
                 HStack(spacing: 7) {
                     Image(
@@ -952,7 +974,7 @@ private struct BindingsPane: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
             }
-            .padding(24)
+            .padding(28)
         }
     }
 }
@@ -963,10 +985,11 @@ private struct BindingSection: View {
     @Bindable var store: WorkspaceStore
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(title)
-                .font(.callout.weight(.semibold))
+        DashboardSection(title: title) {
+            Text("\(bindings.count)")
+                .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
+        } content: {
             VStack(spacing: 0) {
                 ForEach(Array(bindings.enumerated()), id: \.element.id) { index, binding in
                     if let resource = store.resource(binding.resourceID) {
@@ -977,16 +1000,10 @@ private struct BindingSection: View {
                 if bindings.isEmpty {
                     Text("No bindings in this scope")
                         .font(.callout)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(14)
+                        .padding(16)
                 }
-            }
-            .background(Color.primary.opacity(0.025))
-            .clipShape(RoundedRectangle(cornerRadius: 10))
-            .overlay {
-                RoundedRectangle(cornerRadius: 10)
-                    .stroke(Color.secondary.opacity(0.18), lineWidth: 1)
             }
         }
     }
@@ -1054,6 +1071,7 @@ private struct BindingRow: View {
                     .contentShape(Rectangle())
             }
                 .menuStyle(.borderlessButton)
+                .menuIndicator(.hidden)
                 .fixedSize()
                 .accessibilityLabel("More")
                 .foregroundStyle(.secondary)
@@ -1085,6 +1103,7 @@ private struct EnvironmentPreviewPane: View {
             }
             .padding(.vertical, 4)
         }
+        .scrollContentBackground(.hidden)
         .overlay {
             if store.resolvedExports.isEmpty {
                 ContentUnavailableView("No exported values", systemImage: "eye.slash")
@@ -1115,6 +1134,7 @@ private struct ProjectAccessPane: View {
             }
             .padding(.vertical, 3)
         }
+        .scrollContentBackground(.hidden)
         .overlay {
             if state.recents.isEmpty {
                 ContentUnavailableView("No project access yet", systemImage: "clock")
@@ -1155,6 +1175,7 @@ private struct SurfaceInspector: View {
                             .pickerStyle(.menu)
                             .labelsHidden()
                             .font(.headline)
+                            .frame(maxWidth: 170)
                             Spacer()
                             Menu {
                                 Button("Composed Env Output", systemImage: "doc.text") {
@@ -1178,8 +1199,11 @@ private struct SurfaceInspector: View {
                                 }
                             } label: {
                                 Image(systemName: "plus")
+                                    .frame(width: 28, height: 28)
                             }
-                            .buttonStyle(.borderless)
+                            .menuStyle(.borderlessButton)
+                            .menuIndicator(.hidden)
+                            .fixedSize()
                             .help("Add managed item")
                             Menu {
                                 Button(
@@ -1204,25 +1228,26 @@ private struct SurfaceInspector: View {
                                 }
                             } label: {
                                 Image(systemName: "ellipsis")
-                                    .frame(width: 22, height: 22)
+                                    .frame(width: 28, height: 28)
                             }
                             .menuStyle(.borderlessButton)
+                            .menuIndicator(.hidden)
                             .fixedSize()
                             .accessibilityLabel(
                                 surface.kind == .unixSocket
                                     ? "SSH access actions" : "Managed file actions")
-                            if let link = surface.managedLink {
-                                SurfaceStatusBadge(link: link, readyTitle: "Ready")
-                            }
+                        }
+                        if let path = surface.path {
+                            Text(path)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                                .truncationMode(.middle)
+                                .textSelection(.enabled)
                         }
                         HStack(spacing: 10) {
-                            if let path = surface.path {
-                                Text(path)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(2)
-                                    .truncationMode(.middle)
-                                    .textSelection(.enabled)
+                            if let link = surface.managedLink {
+                                SurfaceStatusBadge(link: link, readyTitle: "Ready")
                             }
                             Spacer(minLength: 4)
                             SecurityLevelMenu(level: surface.securityLevel) { securityLevel in
@@ -1231,7 +1256,7 @@ private struct SurfaceInspector: View {
                             }
                         }
                     }
-                    .padding(20)
+                    .padding(24)
 
                     Divider()
                     switch surface.kind {
@@ -1260,10 +1285,22 @@ private struct SurfaceInspector: View {
                             store: store, manageSocket: { showingManageSurface = true })
                     }
                 }
-                .background(Color.primary.opacity(0.018))
+                .background(Color(nsColor: .controlBackgroundColor))
             } else {
-                VStack(spacing: 12) {
-                    ContentUnavailableView("No managed item", systemImage: "doc.badge.plus")
+                VStack(spacing: 16) {
+                    Image(systemName: "doc.badge.plus")
+                        .font(.system(size: 24))
+                        .foregroundStyle(Color.blue.opacity(0.78))
+                        .frame(width: 48, height: 48)
+                        .background(Color.blue.opacity(0.09), in: RoundedRectangle(cornerRadius: 11))
+                    VStack(spacing: 6) {
+                        Text("No configured item")
+                            .font(.headline)
+                        Text("Add an output to use this environment’s bindings.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
                     Menu("Add Managed Item", systemImage: "plus") {
                         Button("Composed Env Output", action: addDotenvFile)
                         Button("direnv Output", action: addDirenvFile)
@@ -1273,10 +1310,15 @@ private struct SurfaceInspector: View {
                         Divider()
                         Button("SSH Access", action: addSshAgent)
                     }
-                    .buttonStyle(.borderedProminent)
+                    .menuStyle(.borderlessButton)
+                    .fixedSize()
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 7))
                 }
+                .padding(28)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .background(Color.primary.opacity(0.018))
+                .background(Color(nsColor: .controlBackgroundColor))
             }
         }
         .sheet(isPresented: $showingManageSurface) {

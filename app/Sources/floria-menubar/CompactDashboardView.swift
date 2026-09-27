@@ -179,8 +179,7 @@ struct DashboardView: View {
                 })
         }
         .sheet(isPresented: $showingAccessLog) {
-            AccessLogView(state: state)
-                .frame(minWidth: 920, minHeight: 620)
+            AccessLogSheet(state: state)
         }
         .sheet(isPresented: $showingSystemHealth) {
             SystemHealthView(state: state)
@@ -980,7 +979,7 @@ struct FloriaMark: View {
     }
 }
 
-private struct DashboardSection<Trailing: View, Content: View>: View {
+struct DashboardSection<Trailing: View, Content: View>: View {
     let title: String
     @ViewBuilder let trailing: Trailing
     @ViewBuilder let content: Content
@@ -1018,6 +1017,34 @@ private struct DashboardSection<Trailing: View, Content: View>: View {
                 }
                 .shadow(color: .black.opacity(0.035), radius: 5, y: 2)
         }
+    }
+}
+
+struct ProjectEnvironmentMenu<Content: View>: View {
+    let name: String
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        HStack(spacing: 5) {
+            Menu { content } label: {
+                Text(name)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            Image(systemName: "chevron.down")
+                .font(.system(size: 8, weight: .semibold))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 9)
+        .frame(height: 22)
+        .background(Color.secondary.opacity(0.09), in: Capsule())
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Environment")
+        .accessibilityValue(name)
     }
 }
 
@@ -1331,40 +1358,20 @@ private struct CompactProjectDetailView: View {
     }
 
     private var environmentMenu: some View {
-        HStack(spacing: 5) {
-            Menu {
-                ForEach(project.environments) { environment in
-                    Button {
-                        state.workspace.selectEnvironment(environment.id)
-                    } label: {
-                        if environment.id == selectedEnvironment?.id {
-                            Label(environment.name, systemImage: "checkmark")
-                        } else {
-                            Text(environment.name)
-                        }
+        ProjectEnvironmentMenu(name: selectedEnvironment?.name ?? "No environment") {
+            ForEach(project.environments) { environment in
+                Button {
+                    state.workspace.selectEnvironment(environment.id)
+                } label: {
+                    if environment.id == selectedEnvironment?.id {
+                        Label(environment.name, systemImage: "checkmark")
+                    } else {
+                        Text(environment.name)
                     }
                 }
-            } label: {
-                Text(selectedEnvironment?.name ?? "No environment")
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
             }
-            .menuStyle(.borderlessButton)
-            .menuIndicator(.hidden)
-            .fixedSize()
-            .disabled(project.environments.isEmpty)
-
-            Image(systemName: "chevron.down")
-                .font(.system(size: 8, weight: .semibold))
-                .foregroundStyle(.secondary)
         }
-        .padding(.horizontal, 9)
-        .frame(height: 22)
-        .background(Color.secondary.opacity(0.09), in: Capsule())
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("Environment")
-        .accessibilityValue(selectedEnvironment?.name ?? "No environment")
+        .disabled(project.environments.isEmpty)
     }
 
     private var managedSection: some View {
