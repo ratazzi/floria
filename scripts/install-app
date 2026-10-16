@@ -130,7 +130,7 @@ wait_for_app_to_stop() {
     local deadline=$((SECONDS + WAIT_SECONDS))
 
     while ((SECONDS < deadline)); do
-        if ! pgrep -x "${APP_NAME}" >/dev/null; then
+        if ! LC_ALL=C pgrep -x "${APP_NAME}" >/dev/null; then
             return 0
         fi
         sleep 0.25
@@ -159,7 +159,9 @@ start_installed_app() {
     local deadline=$((SECONDS + WAIT_SECONDS))
 
     while ((SECONDS < deadline)); do
-        if pgrep -x "${APP_NAME}" >/dev/null; then
+        # macOS pgrep scans process names that may contain invalid UTF-8 bytes.
+        # Match the ASCII app name bytewise, independent of the user's locale.
+        if LC_ALL=C pgrep -x "${APP_NAME}" >/dev/null; then
             return 0
         fi
 
@@ -214,9 +216,9 @@ BUILD_NUMBER="${BUILD_NUMBER}" \
     mise run build-app
 refuse_built_cloudkit_downgrade
 
-if pgrep -x "${APP_NAME}" >/dev/null; then
+if LC_ALL=C pgrep -x "${APP_NAME}" >/dev/null; then
     echo "==> Stopping previous ${APP_NAME} app"
-    killall "${APP_NAME}"
+    LC_ALL=C killall "${APP_NAME}"
     wait_for_app_to_stop
 fi
 
