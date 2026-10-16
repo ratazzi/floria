@@ -41,6 +41,25 @@ module Floria
       output
     end
 
+    def build_daemon(env:)
+      executable = nil
+      command = ["cargo", "build", "--release", "-p", "floria", "--message-format=json-render-diagnostics"]
+      Open3.popen2(env, *command, chdir: ROOT) do |input, output, process|
+        input.close
+        output.each_line do |line|
+          message = JSON.parse(line)
+          next unless message["reason"] == "compiler-artifact"
+          next unless message.dig("target", "name") == "floria" && message.dig("target", "kind") == ["bin"]
+
+          executable = message["executable"]
+        end
+        raise "command failed: cargo build" unless process.value.success?
+      end
+      raise "Cargo did not report an existing floria executable" unless executable && File.file?(executable)
+
+      executable
+    end
+
     def build_app
       version = File.read(File.join(ROOT, "Cargo.toml"))[/^version = "([^"]+)"$/, 1]
       build = ENV.fetch("BUILD_NUMBER", Time.now.strftime("%Y%m%d%H%M"))
@@ -68,13 +87,14 @@ module Floria
       end
 
       puts "==> Building Rust daemon"
-      if identity == "-"
-        run!("cargo", "build", "--release", "-p", "floria", env: { "FLORIA_SIGNING_TEAM_ID" => nil, "FLORIA_INSECURE_DEVELOPMENT_BUILD" => "1" })
-      else
-        raise "A signed build requires FLORIA_SIGNING_TEAM_ID" unless team.match?(/\A[A-Z0-9]{10}\z/)
+      rust_env = if identity == "-"
+                   { "FLORIA_SIGNING_TEAM_ID" => nil, "FLORIA_INSECURE_DEVELOPMENT_BUILD" => "1" }
+                 else
+                   raise "A signed build requires FLORIA_SIGNING_TEAM_ID" unless team.match?(/\A[A-Z0-9]{10}\z/)
 
-        run!("cargo", "build", "--release", "-p", "floria", env: { "FLORIA_SIGNING_TEAM_ID" => team })
-      end
+                   { "FLORIA_SIGNING_TEAM_ID" => team }
+                 end
+      daemon_binary = build_daemon(env: rust_env)
 
       puts "==> Building Swift app"
       run!("swift", "build", "--package-path", "app", "--configuration", "release", "--product", PRODUCT_NAME)
@@ -85,7 +105,7 @@ module Floria
       FileUtils.mkdir_p([File.join(APP_BUNDLE, "Contents/MacOS"), File.join(APP_BUNDLE, "Contents/Resources")])
       {
         File.join(bin, PRODUCT_NAME) => "Contents/MacOS/#{APP_NAME}",
-        "target/release/floria" => "Contents/Resources/floria",
+        daemon_binary => "Contents/Resources/floria",
         "floria.toml" => "Contents/Resources/floria.toml",
         "app/Assets/AppIcon.icns" => "Contents/Resources/AppIcon.icns",
         "app/Assets/MenuBarTemplate.png" => "Contents/Resources/MenuBarTemplate.png",

@@ -1133,12 +1133,8 @@ fn cmd_mount(config: &Path) -> Result<()> {
     )
         .context("starting agent socket")?;
     agent.replace_managed_policy(managed_policy_items(&snapshot, &records));
-    let audit_authority = Arc::new(AuthenticatedAuditAuthority::new(
-        Arc::clone(&state_authenticator),
-        cfg.audit_log.with_extension("integrity.json"),
-    ));
     let audit = Arc::new(
-        AuditLog::open_authenticated(&cfg.audit_log, audit_authority)
+        open_authenticated_audit(&cfg.audit_log, Arc::clone(&state_authenticator))
             .context("opening authenticated audit log")?,
     );
     let ssh_authorizer: Arc<dyn Authorizer> = agent.clone();
@@ -1634,6 +1630,30 @@ struct AgentSshIdentityDiscovery;
 
 const AUDIT_CHECKPOINT_DOMAIN: &str = "audit-log-checkpoint";
 const AUDIT_EVENT_DOMAIN: &str = "audit-log-event";
+
+/// Called during startup while the daemon lifecycle lock excludes other writers.
+fn open_authenticated_audit(
+    path: &Path,
+    authenticator: Arc<floria_integrity::StateAuthenticator>,
+) -> Result<AuditLog> {
+    let checkpoint_path = path.with_extension("integrity.json");
+    let authority = Arc::new(AuthenticatedAuditAuthority::new(
+        authenticator.clone(), checkpoint_path.clone(),
+    ));
+    match authenticator.load::<AuditCheckpoint>(&checkpoint_path, AUDIT_CHECKPOINT_DOMAIN) {
+        Err(floria_integrity::IntegrityError::AheadOfCheckpoint { expected, actual, .. }) => {
+            let candidates = floria_core::audit::verified_audit_checkpoints(path, authority.as_ref())?;
+            authenticator.restore_checkpointed_state(
+                &checkpoint_path, AUDIT_CHECKPOINT_DOMAIN, candidates,
+            )?;
+            tracing::warn!(expected, actual,
+                "reconstructed committed audit checkpoint after interrupted persistence");
+        }
+        Err(error) => return Err(error.into()),
+        Ok(_) => {}
+    }
+    Ok(AuditLog::open_authenticated(path, authority)?)
+}
 
 struct AuthenticatedAuditAuthority {
     authenticator: Arc<floria_integrity::StateAuthenticator>,
@@ -3222,6 +3242,25 @@ fn cmd_doctor(config: &Path) -> Result<()> {
                         }
                         (Ok(DaemonLockState::Free), None) => {
                             report("daemon lifecycle (not running; mount path free)", true, "");
+                            // A live writer may be between its disk and Keychain commits. Only
+                            // inspect the checkpoint offline; doctor must never repair it.
+                            let checkpoint = (|| -> Result<()> {
+                                let authenticator = Arc::new(
+                                    floria_integrity::StateAuthenticator::keychain()?,
+                                );
+                                AuthenticatedAuditAuthority::new(
+                                    authenticator, cfg.audit_log.with_extension("integrity.json"),
+                                ).load_checkpoint()?;
+                                Ok(())
+                            })();
+                            match checkpoint {
+                                Ok(()) => report("audit checkpoint matches Keychain", true, ""),
+                                Err(error) => {
+                                    report("audit checkpoint matches Keychain", false,
+                                        &format!("{error:#}"));
+                                    ok = false;
+                                }
+                            }
                         }
                         (Ok(DaemonLockState::Free), Some(mount)) if mount.is_floria() => {
                             report(
@@ -3368,6 +3407,131 @@ mod tests {
     use floria_core::authz::Enforcement;
     use floria_store::SecretOrigin;
     use ssh_key::{Algorithm, LineEnding, PrivateKey};
+
+    fn interrupted_audit_fixture() -> (
+        tempfile::TempDir, PathBuf, Arc<floria_integrity::StateAuthenticator>, Vec<u8>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let checkpoint_path = path.with_extension("integrity.json");
+        let auth = Arc::new(floria_integrity::StateAuthenticator::for_tests([71; 32]));
+        let authority = Arc::new(AuthenticatedAuditAuthority::new(
+            auth.clone(), checkpoint_path.clone(),
+        ));
+        drop(AuditLog::open_authenticated(&path, authority).unwrap());
+        let mut rows = Vec::new();
+        let mut previous = "genesis".to_string();
+        for sequence in 1..=2_u64 {
+            let event = serde_json::json!({"event": "fixture"});
+            let payload = serde_json::to_vec(&(1_u32, sequence, &previous, &event)).unwrap();
+            let tag = auth.authenticate_detached(AUDIT_EVENT_DOMAIN, &payload);
+            rows.extend(serde_json::to_vec(&serde_json::json!({
+                "format": 1, "sequence": sequence, "previous": previous,
+                "event": event, "tag": tag,
+            })).unwrap());
+            rows.push(b'\n');
+            let checkpoint = AuditCheckpoint {
+                sequence, head: tag.clone(), file_size: rows.len() as u64,
+            };
+            if sequence == 1 {
+                auth.persist(&checkpoint_path, AUDIT_CHECKPOINT_DOMAIN, 1, &checkpoint).unwrap();
+            } else {
+                // Same key, separate checkpoint store: simulate the disk half of a commit only.
+                let interrupted = floria_integrity::StateAuthenticator::for_tests([71; 32]);
+                interrupted.persist(&checkpoint_path, AUDIT_CHECKPOINT_DOMAIN, 2, &checkpoint).unwrap();
+            }
+            previous = tag;
+        }
+        std::fs::write(&path, &rows).unwrap();
+        assert!(auth.load::<AuditCheckpoint>(&checkpoint_path, AUDIT_CHECKPOINT_DOMAIN).is_err());
+        (dir, path, auth, rows)
+    }
+
+    #[test]
+    fn audit_startup_recovers_interrupted_checkpoint_commit() {
+        let (_dir, path, auth, rows) = interrupted_audit_fixture();
+        let checkpoint_path = path.with_extension("integrity.json");
+        for _ in 0..2 {
+            let audit = open_authenticated_audit(&path, auth.clone()).unwrap();
+            audit.ensure_healthy().unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), rows);
+        }
+        assert_eq!(auth.load::<AuditCheckpoint>(&checkpoint_path, AUDIT_CHECKPOINT_DOMAIN)
+            .unwrap().value.unwrap().sequence, 2);
+    }
+
+    #[test]
+    fn audit_startup_recovery_rejects_damaged_chain_without_changing_checkpoint() {
+        for damage in ["truncated", "partial", "tampered", "missing", "symlink"] {
+            let (_dir, path, auth, mut rows) = interrupted_audit_fixture();
+            let checkpoint_path = path.with_extension("integrity.json");
+            let original = std::fs::read(&checkpoint_path).unwrap();
+            match damage {
+                "truncated" => rows.clear(),
+                "partial" => { rows.pop(); }
+                "tampered" => {
+                    let index = rows.windows(7).rposition(|bytes| bytes == b"fixture").unwrap();
+                    rows[index] = b'X';
+                }
+                "missing" | "symlink" => {}
+                _ => unreachable!(),
+            }
+            std::fs::write(&path, rows).unwrap();
+            if damage == "missing" || damage == "symlink" {
+                std::fs::remove_file(&path).unwrap();
+                if damage == "symlink" {
+                    std::os::unix::fs::symlink(&checkpoint_path, &path).unwrap();
+                }
+            }
+            assert!(open_authenticated_audit(&path, auth.clone()).is_err(), "{damage}");
+            assert_eq!(std::fs::read(&checkpoint_path).unwrap(), original, "{damage}");
+            assert_eq!(auth.checkpoint_generation(AUDIT_CHECKPOINT_DOMAIN).unwrap(), 2);
+        }
+    }
+
+    #[test]
+    fn audit_startup_recovery_is_repeatable_without_a_new_log_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audit.jsonl");
+        let checkpoint_path = path.with_extension("integrity.json");
+        let auth = Arc::new(floria_integrity::StateAuthenticator::for_tests([72; 32]));
+        drop(open_authenticated_audit(&path, auth.clone()).unwrap());
+        let committed = std::fs::read(&checkpoint_path).unwrap();
+        for _ in 0..3 {
+            let interrupted = floria_integrity::StateAuthenticator::for_tests([72; 32]);
+            interrupted.persist(&checkpoint_path, AUDIT_CHECKPOINT_DOMAIN, 1, &AuditCheckpoint {
+                sequence: 0, head: "genesis".into(), file_size: 0,
+            }).unwrap();
+            let audit = open_authenticated_audit(&path, auth.clone()).unwrap();
+            audit.ensure_healthy().unwrap();
+            assert_eq!(std::fs::read(&checkpoint_path).unwrap(), committed);
+            assert_eq!(auth.checkpoint_generation(AUDIT_CHECKPOINT_DOMAIN).unwrap(), 1);
+        }
+    }
+
+    #[test]
+    fn audit_startup_does_not_recover_missing_untrusted_or_rolled_back_checkpoint() {
+        for damage in ["missing", "tampered", "rollback", "missing-authority"] {
+            let (_dir, path, auth, _) = interrupted_audit_fixture();
+            let checkpoint_path = path.with_extension("integrity.json");
+            let auth = match damage {
+                "missing" => { std::fs::remove_file(&checkpoint_path).unwrap(); auth }
+                "tampered" => { std::fs::write(&checkpoint_path, b"{}").unwrap(); auth }
+                "rollback" => {
+                    let isolated = floria_integrity::StateAuthenticator::for_tests([71; 32]);
+                    isolated.persist(&checkpoint_path, AUDIT_CHECKPOINT_DOMAIN, 0, &AuditCheckpoint {
+                        sequence: 0, head: "genesis".into(), file_size: 0,
+                    }).unwrap();
+                    auth
+                }
+                "missing-authority" => Arc::new(floria_integrity::StateAuthenticator::for_tests([71; 32])),
+                _ => unreachable!(),
+            };
+            let original = std::fs::read(&checkpoint_path).ok();
+            assert!(open_authenticated_audit(&path, auth).is_err(), "{damage}");
+            assert_eq!(std::fs::read(&checkpoint_path).ok(), original, "{damage}");
+        }
+    }
 
     fn test_store_key(directory: &Path) -> Arc<dyn floria_store::KeyProvider> {
         let path = directory.join("id_ed25519");

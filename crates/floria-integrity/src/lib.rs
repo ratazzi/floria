@@ -46,6 +46,8 @@ pub enum IntegrityError {
     Invalid { domain: String, reason: String },
     #[error("authenticated state for {domain} was rolled back from generation {expected} to {actual}")]
     Rollback { domain: String, expected: u64, actual: u64 },
+    #[error("invalid authenticated state for {domain}: state generation {actual} is ahead of Keychain checkpoint {expected}")]
+    AheadOfCheckpoint { domain: String, expected: u64, actual: u64 },
 }
 
 pub type IntegrityResult<T> = Result<T, IntegrityError>;
@@ -194,13 +196,11 @@ impl StateAuthenticator {
                 });
             }
             if envelope.generation > checkpoint.generation {
-                return Err(invalid(
-                    domain,
-                    format!(
-                        "state generation {} is ahead of Keychain checkpoint {}",
-                        envelope.generation, checkpoint.generation
-                    ),
-                ));
+                return Err(IntegrityError::AheadOfCheckpoint {
+                    domain: domain.to_string(),
+                    expected: checkpoint.generation,
+                    actual: envelope.generation,
+                });
             }
             if envelope.mac != checkpoint.mac {
                 return Err(invalid(domain, "checkpoint MAC does not match the state file"));
@@ -276,6 +276,19 @@ impl StateAuthenticator {
             }
         }
         Err(invalid(domain, "no candidate matches the trusted checkpoint"))
+    }
+
+    /// Restore only a state whose exact bytes are already committed in Keychain. Callers must
+    /// hold their state writer lock and validate the entire source of candidate states first.
+    /// The atomic replacement is safe to repeat if interrupted; Keychain is never advanced.
+    pub fn restore_checkpointed_state<T: Serialize>(
+        &self,
+        path: &Path,
+        domain: &str,
+        candidates: impl IntoIterator<Item = T>,
+    ) -> IntegrityResult<()> {
+        let encoded = self.reconstruct_checkpointed_state(domain, candidates)?;
+        write_private_atomic(path, &encoded)
     }
 
     /// Authenticate an append-only record without advancing a rollback checkpoint.
@@ -751,7 +764,7 @@ mod tests {
 
         assert!(matches!(
             auth.load::<Fixture>(&path, "fixture"),
-            Err(IntegrityError::Invalid { .. })
+            Err(IntegrityError::AheadOfCheckpoint { .. })
         ));
     }
 
