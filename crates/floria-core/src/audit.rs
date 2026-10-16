@@ -735,6 +735,33 @@ fn verify_audit_chain(
     authority: Option<&dyn AuditAuthority>,
     required_checkpoint: Option<&AuditCheckpoint>,
 ) -> std::io::Result<AuditCheckpoint> {
+    let mut file = open_private_audit_read(path)?;
+    read_verified_access_chain(&mut file, authority, required_checkpoint, 0)
+        .map(|(checkpoint, _)| checkpoint)
+}
+
+/// Fully authenticate the chain before returning possible committed prefix checkpoints.
+/// Used only for interrupted checkpoint recovery, never to trust an uncommitted disk tail.
+pub fn verified_audit_checkpoints(
+    path: &Path,
+    authority: &dyn AuditAuthority,
+) -> std::io::Result<Vec<AuditCheckpoint>> {
+    let mut file = open_private_audit_read(path)?;
+    let before = file_stamp(&file.metadata()?);
+    let mut candidates = vec![AuditCheckpoint {
+        sequence: 0, head: GENESIS_HASH.to_string(), file_size: 0,
+    }];
+    read_verified_access_chain_with_prefixes(&mut file, Some(authority), None, 0,
+        &mut |checkpoint| candidates.push(checkpoint))?;
+    if file_stamp(&file.metadata()?) != before
+        || file_stamp(&std::fs::symlink_metadata(path)?) != before
+    {
+        return Err(std::io::Error::other("audit log changed during recovery verification"));
+    }
+    Ok(candidates)
+}
+
+fn open_private_audit_read(path: &Path) -> std::io::Result<File> {
     let metadata = std::fs::symlink_metadata(path)?;
     if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
         return Err(std::io::Error::new(
@@ -749,12 +776,10 @@ fn verify_audit_chain(
         ));
     }
 
-    let mut file = OpenOptions::new()
+    OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
-    read_verified_access_chain(&mut file, authority, required_checkpoint, 0)
-        .map(|(checkpoint, _)| checkpoint)
+        .open(path)
 }
 
 fn read_verified_access_chain(
@@ -762,6 +787,16 @@ fn read_verified_access_chain(
     authority: Option<&dyn AuditAuthority>,
     required_checkpoint: Option<&AuditCheckpoint>,
     limit: usize,
+) -> std::io::Result<(AuditCheckpoint, Vec<AuditAccessRecord>)> {
+    read_verified_access_chain_with_prefixes(file, authority, required_checkpoint, limit, &mut |_| {})
+}
+
+fn read_verified_access_chain_with_prefixes(
+    file: &mut File,
+    authority: Option<&dyn AuditAuthority>,
+    required_checkpoint: Option<&AuditCheckpoint>,
+    limit: usize,
+    prefix: &mut dyn FnMut(AuditCheckpoint),
 ) -> std::io::Result<(AuditCheckpoint, Vec<AuditAccessRecord>)> {
     let expected_size = file.metadata()?.len();
     let mut sequence = 0_u64;
@@ -809,6 +844,7 @@ fn read_verified_access_chain(
         }
         sequence = envelope.sequence;
         head = envelope.tag;
+        prefix(AuditCheckpoint { sequence, head: head.clone(), file_size });
         if let Some(checkpoint) = required_checkpoint {
             if sequence == checkpoint.sequence {
                 if head != checkpoint.head || file_size != checkpoint.file_size {
